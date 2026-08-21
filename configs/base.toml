@@ -25,9 +25,22 @@ thinking = "max"
 # explicitly allows fast mode.
 fast_mode = false
 timeout_seconds = 3600
+# Pi's provider idle timeout is separate from the outer experiment horizon.
+# Keep this explicit so Mono, Parallel, and CPS use the same retry contract.
+http_idle_timeout_ms = 600000
 # Leave binary empty in the manifest to use the mounted PI_BIN/AISW shim.
 binary = ""
 extension = "contextswarm_mini/pi_fast_mode.mjs"
+
+[pi.retry]
+enabled = true
+max_retries = 10
+base_delay_ms = 2000
+
+[pi.retry.provider]
+# Agent-level retry remains observable; avoid a second hidden SDK retry loop.
+max_retries = 0
+max_retry_delay_ms = 60000
 
 [aisw]
 enabled = true

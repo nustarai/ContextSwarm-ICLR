@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import signal
 import shutil
@@ -20,6 +23,9 @@ from .config import ExperimentConfig
 from .models import AgentResult
 
 
+_STDERR_LINE_LIMIT_BYTES = 256 * 1024
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -28,6 +34,7 @@ def now_iso() -> str:
 class PiAgent:
     config: ExperimentConfig
     trace_path: Path | None = None
+    _trace_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def binary(self) -> str:
         configured = self.config.pi_binary.strip() or os.environ.get("MINI_SWARM_PI_BIN", "").strip()
@@ -43,8 +50,24 @@ class PiAgent:
             return configured_aisw
         return os.environ.get("PI_BIN", "pi")
 
-    def command(self) -> list[str]:
-        command = [self.binary(), "--mode", "rpc", "--thinking", self.config.thinking]
+    def command(
+        self,
+        *,
+        session_dir: Path | None = None,
+        session_id: str | None = None,
+    ) -> list[str]:
+        command = [
+            self.binary(),
+            "--mode",
+            "rpc",
+            "--approve",
+            "--thinking",
+            self.config.thinking,
+        ]
+        if session_dir is not None:
+            command.extend(["--session-dir", str(session_dir)])
+        if session_id:
+            command.extend(["--session-id", session_id])
         extension = self.config.pi_extension.strip()
         if self.config.fast_mode and extension:
             extension_path = self.config.resolve_runtime_path(extension)
@@ -115,18 +138,176 @@ class PiAgent:
     ) -> AgentResult:
         started = now_iso()
         command = self.command()
-        output: list[str] = []
-        errors: list[str] = []
+        output = _TailBuffer(6_000)
+        errors = _TailBuffer(4_000)
         events = 0
         timed_out = False
         cancelled = False
         returncode = 1
-        process: subprocess.Popen[str] | None = None
+        process: subprocess.Popen[bytes] | None = None
         trace_handle = None
+        selector: selectors.BaseSelector | None = None
+        settled_seen = False
+        agent_end_seen = False
+        prompt_rejected = False
+        pending_assistant_error = ""
+        retry_final_error = ""
+        assistant_streamed = False
+        request_id = f"contextswarm-{uuid.uuid4().hex}"
+        session_id = _session_id(self.trace_path, actor_id, episode)
+        session_root = workdir / ".pi" / "sessions"
+        session_dir = session_root / session_id
+        stdout_buffer = bytearray()
+        stderr_buffer = bytearray()
+        stderr_overflow = False
+        index_path: Path | None = None
+
+        def consume_stdout_line(line: str) -> None:
+            nonlocal events
+            nonlocal settled_seen
+            nonlocal agent_end_seen
+            nonlocal prompt_rejected
+            nonlocal pending_assistant_error
+            nonlocal retry_final_error
+            nonlocal assistant_streamed
+
+            payload = _parse_json_line(line)
+            if payload is None:
+                value = line.strip()
+                if value:
+                    errors.append(f"Pi emitted non-JSON RPC output: {_redact_sensitive_text(value)}")
+                return
+            events += 1
+            event_type = str(payload.get("type") or payload.get("event") or "unknown")
+
+            if event_type == "message_start" and _message_role(payload) == "assistant":
+                assistant_streamed = False
+            rendered = _event_text(payload)
+            if event_type == "message_update" and rendered:
+                assistant_streamed = True
+            elif event_type == "message_end" and assistant_streamed:
+                # The streamed deltas are already in the rolling tail. Avoid
+                # duplicating the authoritative final message.
+                rendered = ""
+            if rendered:
+                output.append(_redact_sensitive_text(rendered), separator="")
+
+            outcome = _assistant_outcome(payload)
+            if outcome is not None:
+                stop_reason, error_message = outcome
+                if stop_reason == "error":
+                    pending_assistant_error = error_message or "Pi assistant stopped with an error"
+                elif stop_reason in {"stop", "toolUse"}:
+                    pending_assistant_error = ""
+                    retry_final_error = ""
+
+            if event_type == "auto_retry_end":
+                if payload.get("success") is False:
+                    retry_final_error = _text_field(payload, "finalError", "errorMessage")
+                    if retry_final_error and not pending_assistant_error:
+                        pending_assistant_error = retry_final_error
+                elif payload.get("success") is True:
+                    retry_final_error = ""
+            if event_type == "agent_end":
+                agent_end_seen = True
+            elif event_type == "agent_settled":
+                settled_seen = True
+            elif (
+                event_type == "response"
+                and payload.get("id") == request_id
+                and payload.get("success") is False
+            ):
+                prompt_rejected = True
+                pending_assistant_error = _text_field(payload, "error", "message") or "Pi RPC prompt rejected"
+
+            diagnostic = _event_error(payload)
+            if diagnostic:
+                errors.append(f"{event_type}: {_redact_sensitive_text(diagnostic)}")
+            if trace_handle is not None:
+                row = {
+                    "at": now_iso(),
+                    "task_id": task_id,
+                    "actor_id": actor_id,
+                    "episode": episode,
+                    "session_id": session_id,
+                    "type": event_type,
+                    "has_text": bool(rendered),
+                    "text_chars": len(rendered),
+                    **_usage_fields(payload),
+                    **_event_trace_fields(payload),
+                }
+                with self._trace_lock:
+                    trace_handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                    trace_handle.flush()
+
+        def consume_stdout_bytes(chunk: bytes, *, final: bool = False) -> None:
+            stdout_buffer.extend(chunk)
+            while True:
+                newline = stdout_buffer.find(b"\n")
+                if newline < 0:
+                    break
+                raw = bytes(stdout_buffer[:newline])
+                del stdout_buffer[: newline + 1]
+                consume_stdout_line(raw.decode("utf-8", errors="replace"))
+            if final and stdout_buffer:
+                raw = bytes(stdout_buffer)
+                stdout_buffer.clear()
+                consume_stdout_line(raw.decode("utf-8", errors="replace"))
+
+        def consume_stderr_line(raw: bytes) -> None:
+            value = raw.decode("utf-8", errors="replace").rstrip("\r")
+            if value:
+                errors.append(_redact_sensitive_text(value))
+
+        def consume_stderr_bytes(chunk: bytes, *, final: bool = False) -> None:
+            nonlocal stderr_overflow
+            pending = chunk
+            while pending:
+                newline = pending.find(b"\n")
+                if stderr_overflow:
+                    if newline < 0:
+                        pending = b""
+                        break
+                    errors.append("Pi stderr line omitted because it exceeded the framing limit")
+                    stderr_overflow = False
+                    pending = pending[newline + 1 :]
+                    continue
+                if newline >= 0:
+                    segment = pending[:newline]
+                    if len(stderr_buffer) + len(segment) > _STDERR_LINE_LIMIT_BYTES:
+                        errors.append("Pi stderr line omitted because it exceeded the framing limit")
+                    else:
+                        stderr_buffer.extend(segment)
+                        consume_stderr_line(bytes(stderr_buffer))
+                    stderr_buffer.clear()
+                    pending = pending[newline + 1 :]
+                    continue
+                if len(stderr_buffer) + len(pending) > _STDERR_LINE_LIMIT_BYTES:
+                    stderr_buffer.clear()
+                    stderr_overflow = True
+                else:
+                    stderr_buffer.extend(pending)
+                pending = b""
+            if final:
+                if stderr_overflow:
+                    errors.append("Pi stderr line omitted because it exceeded the framing limit")
+                    stderr_overflow = False
+                elif stderr_buffer:
+                    raw = bytes(stderr_buffer)
+                    stderr_buffer.clear()
+                    consume_stderr_line(raw)
+
         try:
+            session_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(session_root, 0o700)
+            session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(session_dir, 0o700)
+            _prepare_project_settings(workdir, self.config)
+            command = self.command(session_dir=session_dir, session_id=session_id)
             if self.trace_path is not None:
                 self.trace_path.parent.mkdir(parents=True, exist_ok=True)
                 trace_handle = self.trace_path.open("a", encoding="utf-8")
+                index_path = self.trace_path.with_name("pi_session_index.jsonl")
             process = subprocess.Popen(  # noqa: S603 - command is manifest/array-derived.
                 command,
                 cwd=workdir,
@@ -139,16 +320,14 @@ class PiAgent:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                bufsize=1,
+                bufsize=0,
                 start_new_session=True,
             )
             assert process.stdin is not None
-            request_id = f"contextswarm-{uuid.uuid4().hex}"
             process.stdin.write(
                 json.dumps({"id": request_id, "type": "prompt", "message": prompt}, ensure_ascii=False)
-                + "\n"
+                .encode("utf-8")
+                + b"\n"
             )
             process.stdin.flush()
             assert process.stdout is not None and process.stderr is not None
@@ -159,8 +338,10 @@ class PiAgent:
             if deadline_monotonic is not None:
                 timeout_seconds = min(timeout_seconds, max(0.1, deadline_monotonic - time.monotonic()))
             deadline = time.monotonic() + timeout_seconds
-            terminal_seen = False
-            while time.monotonic() < deadline:
+            while True:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
                 if cancel_event is not None and cancel_event.is_set():
                     cancelled = True
                     break
@@ -168,71 +349,47 @@ class PiAgent:
                 if not ready and process.poll() is not None:
                     break
                 for key, _ in ready:
-                    line = key.fileobj.readline()
-                    if line == "":
+                    chunk = os.read(key.fileobj.fileno(), 65_536)
+                    if not chunk:
                         try:
                             selector.unregister(key.fileobj)
                         except Exception:
                             pass
                         continue
                     if key.data == "stderr":
-                        errors.append(line.rstrip())
+                        consume_stderr_bytes(chunk)
                         continue
-                    payload = _parse_json_line(line)
-                    if payload is None:
-                        output.append(line.rstrip())
-                        continue
-                    events += 1
-                    event_type = str(payload.get("type") or payload.get("event") or "unknown")
-                    rendered = _event_text(payload)
-                    if rendered:
-                        output.append(rendered)
-                    if trace_handle is not None:
-                        usage = _usage_fields(payload)
-                        trace_handle.write(
-                            json.dumps(
-                                {
-                                    "at": now_iso(),
-                                    "task_id": task_id,
-                                    "actor_id": actor_id,
-                                    "episode": episode,
-                                    "type": event_type,
-                                    "has_text": bool(rendered),
-                                    **usage,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-                        trace_handle.flush()
-                    if event_type in {"agent_end", "agent_settled"}:
-                        terminal_seen = True
-                if terminal_seen:
+                    consume_stdout_bytes(chunk)
+                if settled_seen or prompt_rejected:
                     break
-            else:
-                timed_out = True
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-            if timed_out or cancelled:
-                _terminate(process)
-            elif process.poll() is None:
-                try:
-                    process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    _terminate(process)
-            returncode = process.wait(timeout=10)
+            selector.close()
+            selector = None
+            _close_stdin(process)
+            remaining_stdout, remaining_stderr, drain_error = _drain_process(
+                process,
+                terminate=timed_out or cancelled,
+            )
+            consume_stdout_bytes(remaining_stdout, final=True)
+            consume_stderr_bytes(remaining_stderr, final=True)
+            if drain_error:
+                errors.append(drain_error)
+            returncode = process.returncode if process.returncode is not None else 1
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-            errors.append(str(exc))
+            errors.append(_redact_sensitive_text(str(exc)))
             if process is not None:
-                _terminate(process)
                 try:
-                    returncode = process.wait(timeout=5)
+                    _close_stdin(process)
+                    remaining_stdout, remaining_stderr, drain_error = _drain_process(process, terminate=True)
+                    consume_stdout_bytes(remaining_stdout, final=True)
+                    consume_stderr_bytes(remaining_stderr, final=True)
+                    if drain_error:
+                        errors.append(drain_error)
+                    returncode = process.returncode if process.returncode is not None else 1
                 except Exception:
                     returncode = 124
         finally:
+            if selector is not None:
+                selector.close()
             if process is not None:
                 for stream in (process.stdin, process.stdout, process.stderr):
                     if stream is not None:
@@ -242,6 +399,42 @@ class PiAgent:
                             pass
             if trace_handle is not None:
                 trace_handle.close()
+            if index_path is not None:
+                session_file = _find_session_file(session_dir, session_id)
+                run_dir = self.trace_path.parent if self.trace_path is not None else None
+                index_row = {
+                    "at": now_iso(),
+                    "task_id": task_id,
+                    "actor_id": actor_id,
+                    "episode": episode,
+                    "session_id": session_id,
+                    "session_dir": _artifact_path(session_dir, run_dir),
+                    "session_file": _artifact_path(session_file, run_dir) if session_file else None,
+                }
+                try:
+                    with self._trace_lock:
+                        with index_path.open("a", encoding="utf-8") as index_handle:
+                            index_handle.write(json.dumps(index_row, ensure_ascii=False, sort_keys=True) + "\n")
+                except OSError as exc:
+                    errors.append(f"Unable to write Pi session index: {_redact_sensitive_text(str(exc))}")
+
+        if timed_out:
+            errors.append("Pi RPC deadline elapsed before agent_settled")
+            returncode = returncode if returncode != 0 else 124
+        elif cancelled:
+            errors.append("Pi RPC was cancelled before agent_settled")
+            returncode = returncode if returncode != 0 else 130
+        elif prompt_rejected:
+            returncode = returncode if returncode != 0 else 1
+        elif settled_seen:
+            final_error = pending_assistant_error or retry_final_error
+            if final_error:
+                errors.append(f"Pi RPC agent settled with an error: {_redact_sensitive_text(final_error)}")
+                returncode = returncode if returncode != 0 else 1
+        elif process is not None:
+            suffix = " after agent_end" if agent_end_seen else ""
+            errors.append(f"Pi RPC process exited before agent_settled{suffix}")
+            returncode = returncode if returncode != 0 else 1
         return AgentResult(
             agent_id=actor_id,
             task_id=task_id,
@@ -250,8 +443,8 @@ class PiAgent:
             started_at=started,
             finished_at=now_iso(),
             command=command,
-            output_tail="\n".join(output)[-6_000:],
-            error_tail="\n".join(errors)[-4_000:],
+            output_tail=output.value(),
+            error_tail=errors.value(),
             events=events,
             timed_out=timed_out,
             cancelled=cancelled,
@@ -267,46 +460,305 @@ def _parse_json_line(line: str) -> dict[str, Any] | None:
 
 
 def _event_text(payload: Mapping[str, Any]) -> str:
-    for key in ("text", "message", "delta", "content", "output"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            return value
+    event_type = str(payload.get("type") or "")
+    if event_type == "message_update":
+        update = payload.get("assistantMessageEvent")
+        if isinstance(update, Mapping) and update.get("type") == "text_delta":
+            delta = update.get("delta")
+            return delta if isinstance(delta, str) else ""
+        return ""
+    if event_type == "message_end" and _message_role(payload) == "assistant":
+        message = payload.get("message")
+        if isinstance(message, Mapping):
+            return _content_text(message.get("content"))
     return ""
 
 
 def _usage_fields(payload: Mapping[str, Any]) -> dict[str, int]:
     usage = payload.get("usage")
     if not isinstance(usage, Mapping):
+        message = payload.get("message")
+        usage = message.get("usage") if isinstance(message, Mapping) else None
+    if not isinstance(usage, Mapping):
         return {}
     result: dict[str, int] = {}
     for source, target in (
+        ("input", "input_tokens"),
+        ("output", "output_tokens"),
+        ("cacheRead", "cache_read_tokens"),
+        ("cacheWrite", "cache_write_tokens"),
+        ("totalTokens", "total_tokens"),
         ("input_tokens", "input_tokens"),
         ("output_tokens", "output_tokens"),
         ("total_tokens", "total_tokens"),
     ):
         value = usage.get(source)
-        if isinstance(value, int) and value >= 0:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             result[target] = value
     return result
 
 
-def _terminate(process: subprocess.Popen[str]) -> None:
+class _TailBuffer:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.parts: deque[str] = deque()
+        self.size = 0
+
+    def append(self, value: str, *, separator: str = "\n") -> None:
+        text = str(value or "")
+        if not text:
+            return
+        if self.parts:
+            text = separator + text
+        self.parts.append(text)
+        self.size += len(text)
+        while self.size > self.limit and self.parts:
+            excess = self.size - self.limit
+            first = self.parts[0]
+            if len(first) <= excess:
+                self.parts.popleft()
+                self.size -= len(first)
+            else:
+                self.parts[0] = first[excess:]
+                self.size -= excess
+
+    def value(self) -> str:
+        return "".join(self.parts)
+
+
+def _prepare_project_settings(workdir: Path, config: ExperimentConfig) -> Path:
+    settings_dir = workdir / ".pi"
+    settings_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(settings_dir, 0o700)
+    settings_path = settings_dir / "settings.json"
+    existing: dict[str, Any] = {}
+    if settings_path.exists():
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"Pi project settings must contain an object: {settings_path}")
+        existing = payload
+    retry = dict(existing.get("retry")) if isinstance(existing.get("retry"), Mapping) else {}
+    provider = dict(retry.get("provider")) if isinstance(retry.get("provider"), Mapping) else {}
+    provider.update(
+        {
+            "maxRetries": config.pi_provider_max_retries,
+            "maxRetryDelayMs": config.pi_provider_max_retry_delay_ms,
+        }
+    )
+    retry.update(
+        {
+            "enabled": config.pi_retry_enabled,
+            "maxRetries": config.pi_retry_max_retries,
+            "baseDelayMs": config.pi_retry_base_delay_ms,
+            "provider": provider,
+        }
+    )
+    existing.update(
+        {
+            "httpIdleTimeoutMs": config.pi_http_idle_timeout_ms,
+            "retry": retry,
+        }
+    )
+    temporary = settings_path.with_name(f"settings.json.tmp-{uuid.uuid4().hex}")
+    temporary.write_text(json.dumps(existing, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    temporary.replace(settings_path)
+    os.chmod(settings_path, 0o600)
+    return settings_path
+
+
+def _session_id(trace_path: Path | None, actor_id: str, episode: int) -> str:
+    run_label = trace_path.parent.name if trace_path is not None else "local"
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "-", f"{run_label}-{actor_id}-e{episode}").strip("-._")
+    digest_input = f"{trace_path or ''}\0{actor_id}\0{episode}".encode()
+    digest = hashlib.sha256(digest_input).hexdigest()[:16]
+    return f"{readable[:64] or 'contextswarm'}-{digest}"
+
+
+def _find_session_file(session_dir: Path, session_id: str) -> Path | None:
+    try:
+        candidates = [
+            path
+            for path in session_dir.glob("*.jsonl")
+            if path.name == f"{session_id}.jsonl" or path.name.endswith(f"_{session_id}.jsonl")
+        ]
+        return max(candidates, key=lambda path: path.stat().st_mtime_ns) if candidates else None
+    except OSError:
+        return None
+
+
+def _artifact_path(path: Path, run_dir: Path | None) -> str:
+    resolved = path.resolve()
+    if run_dir is not None:
+        try:
+            return str(resolved.relative_to(run_dir.resolve()))
+        except ValueError:
+            pass
+    return str(resolved)
+
+
+def _message_role(payload: Mapping[str, Any]) -> str:
+    message = payload.get("message")
+    return str(message.get("role") or "") if isinstance(message, Mapping) else ""
+
+
+def _assistant_outcome(payload: Mapping[str, Any]) -> tuple[str, str] | None:
+    if payload.get("type") not in {"message_end", "turn_end"}:
+        return None
+    message = payload.get("message")
+    if not isinstance(message, Mapping) or message.get("role") != "assistant":
+        return None
+    stop_reason = str(message.get("stopReason") or message.get("stop_reason") or "")
+    error_message = _text_field(message, "errorMessage", "error_message")
+    return stop_reason, error_message
+
+
+def _content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    parts: list[str] = []
+    for item in value:
+        if not isinstance(item, Mapping) or item.get("type") != "text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
+
+
+def _text_field(payload: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _event_error(payload: Mapping[str, Any]) -> str:
+    outcome = _assistant_outcome(payload)
+    if outcome is not None and outcome[0] == "error":
+        return outcome[1]
+    direct = _text_field(payload, "errorMessage", "finalError", "error")
+    if direct:
+        return direct
+    if payload.get("type") == "tool_execution_end" and payload.get("isError") is True:
+        result = payload.get("result")
+        if isinstance(result, Mapping):
+            return _content_text(result.get("content"))
+    return ""
+
+
+def _event_trace_fields(payload: Mapping[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for source, target in (
+        ("willRetry", "will_retry"),
+        ("success", "success"),
+        ("attempt", "retry_attempt"),
+        ("maxAttempts", "retry_max_attempts"),
+        ("delayMs", "retry_delay_ms"),
+        ("isError", "tool_error"),
+    ):
+        value = payload.get(source)
+        if isinstance(value, (bool, int)):
+            fields[target] = value
+    tool_name = payload.get("toolName")
+    if isinstance(tool_name, str) and tool_name:
+        fields["tool_name"] = tool_name[:120]
+    outcome = _assistant_outcome(payload)
+    if outcome is not None and outcome[0]:
+        fields["stop_reason"] = outcome[0][:80]
+    error = _event_error(payload)
+    if error:
+        sanitized = _redact_sensitive_text(error)
+        fields.update(
+            {
+                "error_category": _error_category(sanitized),
+                "error_chars": len(error),
+                "error_sha256": hashlib.sha256(sanitized.encode()).hexdigest()[:16],
+            }
+        )
+    return fields
+
+
+def _error_category(value: str) -> str:
+    lowered = value.lower()
+    for category, needles in (
+        ("timeout", ("timeout", "timed out")),
+        ("rate_limit", ("rate limit", "too many requests", "429")),
+        ("provider_5xx", ("500", "502", "503", "504", "server error", "overloaded")),
+        ("transport", ("connection", "network", "socket", "websocket", "fetch failed")),
+        ("context", ("context window", "context length", "overflow")),
+        ("authentication", ("unauthorized", "forbidden", "authentication")),
+    ):
+        if any(needle in lowered for needle in needles):
+            return category
+    return "other"
+
+
+_URL_PATTERN = re.compile(r"\b(?:https?|wss?)://[^\s<>'\"]+", re.IGNORECASE)
+_BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/=]+")
+_AUTHORIZATION_PATTERN = re.compile(
+    r"(?i)([\"']?authorization[\"']?\s*[:=]\s*)"
+    r"(?:[\"']?(?:Bearer|Basic)\s+[A-Za-z0-9._~+\-/=]+[\"']?)"
+)
+_SECRET_PATTERN = re.compile(
+    r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|authorization|token|password|"
+    r"credential|client[_-]?secret|secret)[\"']?\s*[:=]\s*)"
+    r"(?:[\"'][^\"']*[\"']|[^\s,;}]+)"
+)
+
+
+def _redact_sensitive_text(value: str) -> str:
+    text = _AUTHORIZATION_PATTERN.sub(r"\1<redacted>", str(value or ""))
+    text = _BEARER_PATTERN.sub("Bearer <redacted>", text)
+    text = _SECRET_PATTERN.sub(r"\1<redacted>", text)
+    return _URL_PATTERN.sub("<redacted-url>", text)
+
+
+def _close_stdin(process: subprocess.Popen[bytes]) -> None:
+    stream = process.stdin
+    if stream is not None:
+        try:
+            stream.close()
+        except OSError:
+            pass
+        process.stdin = None
+
+
+def _signal_process(process: subprocess.Popen[bytes], sig: signal.Signals) -> None:
     if process.poll() is not None:
         return
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process.pid, sig)
     except (OSError, ProcessLookupError):
         try:
-            process.terminate()
+            if sig == signal.SIGKILL:
+                process.kill()
+            else:
+                process.terminate()
         except OSError:
             pass
+
+
+def _drain_process(process: subprocess.Popen[bytes], *, terminate: bool) -> tuple[bytes, bytes, str]:
+    if terminate:
+        _signal_process(process, signal.SIGTERM)
+    grace_seconds = 5 if terminate else 10
     try:
-        process.wait(timeout=5)
+        stdout, stderr = process.communicate(timeout=grace_seconds)
+        diagnostic = ""
     except subprocess.TimeoutExpired:
+        _signal_process(process, signal.SIGKILL)
+        diagnostic = (
+            f"Pi RPC process drain exceeded {grace_seconds}s after "
+            f"{'SIGTERM' if terminate else 'stdin close'}; sent SIGKILL"
+        )
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            try:
-                process.kill()
-            except OSError:
-                pass
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.output or b""
+            stderr = exc.stderr or b""
+            diagnostic += "; process still did not exit within 5s of SIGKILL"
+    return stdout or b"", stderr or b"", diagnostic

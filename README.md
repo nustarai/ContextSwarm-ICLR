@@ -109,6 +109,18 @@ assignment_policy = "least_active"
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
 pieces/messages。Mono 和 Parallel 仍保持通信关闭、固定 baseline 语义。
 
+Pi transport 设置由共享 `[pi]` / `[pi.retry]` manifest 明确控制，三种模式
+不会隐式继承宿主机 `~/.pi`。默认 provider idle timeout 为 600 秒；一次
+`agent_end` 只代表底层调用结束，runner 会继续等待 Pi 自动 retry/compaction，
+直到收到 `agent_settled` 才结束该 agent。外层 experiment horizon 仍是硬截止。
+
+每个 worker 的实际 Pi settings 写入其私有 `.pi/settings.json`；每次调用的原始
+session 进一步隔离在该 worker 的 `.pi/sessions/<session-id>/`，避免 CPS 高并发
+反复扫描其他 session，也不为 Mono/Parallel 增加共享通信面。它们位于 run 目录
+内，因此容器使用 `--rm` 后仍会保留；`pi_session_index.jsonl` 记录对应相对路径。
+session 可能包含完整 prompt、工具输出和 provider 错误，仅用于本地诊断，公开
+artifact 或运行摘要前必须审查，不能提交到 Git。
+
 Scaling sweep manifests：
 
 ```text

@@ -6,7 +6,6 @@ IMAGE="${CONTEXTSWARM_MINI_IMAGE:-contextswarm-iclr-mini:latest}"
 AISW_BINARY="${CONTEXTSWARM_NUROUTER_BINARY:-${CONTEXTSWARM_AISW_BINARY:-${HOME}/.local/share/contextswarm/aisw-linux-aarch64}}"
 NODE_CONFIG="${CONTEXTSWARM_NUROUTER_NODE_CONFIG:-${CONTEXTSWARM_AISW_NODE_CONFIG:-}}"
 AISW_METADATA="${CONTEXTSWARM_AISW_LAUNCHER_METADATA:-}"
-PI_HOME="${CONTEXTSWARM_PI_HOME:-}"
 CODEX_HOME="${CONTEXTSWARM_CODEX_HOME:-}"
 MEMORY="${CONTEXTSWARM_MINI_MEMORY:-16g}"
 CONFIG="configs/cps.toml"
@@ -118,13 +117,6 @@ if (( MOCK == 0 )); then
   )
   if [[ -n "${AISW_METADATA}" ]]; then
     DOCKER_ARGS+=("-v" "${AISW_METADATA}:/opt/contextswarm-input/aisw/$(basename "${AISW_METADATA}"):ro")
-  fi
-  if [[ -n "${PI_HOME}" ]]; then
-    if [[ ! -d "${PI_HOME}" ]]; then
-      echo "Pi home not found: ${PI_HOME}" >&2
-      exit 2
-    fi
-    DOCKER_ARGS+=("-v" "${PI_HOME}:/root/.pi:ro")
   fi
   if [[ -n "${CODEX_HOME}" ]]; then
     if [[ ! -d "${CODEX_HOME}" ]]; then
