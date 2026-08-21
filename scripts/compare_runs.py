@@ -14,7 +14,8 @@ def main() -> int:
     args = parser.parse_args()
     print(
         "run\tmode\tcommunication\tallocation\tscore/max\tnorm_auc\tstatus"
-        "\tpieces\tmessages\tdecisions\tfallbacks\tscheduler_s\tscheduler_tokens\tslot_util"
+        "\tpieces\tmessages\tdecisions\tfallbacks\tscheduler_s\tscheduler_tokens"
+        "\tsolver_slot_util\tcompute_slot_util"
     )
     for path in args.run:
         final = json.loads((path / "final.json").read_text(encoding="utf-8"))
@@ -37,6 +38,7 @@ def main() -> int:
                     str(allocation.get("fallback_decisions", 0)),
                     str(allocation.get("total_latency_seconds", 0)),
                     str(allocation.get("scheduler_total_tokens", 0)),
+                    str(allocation.get("solver_slot_utilization", 0)),
                     str(allocation.get("compute_slot_utilization", 0)),
                 ]
             )

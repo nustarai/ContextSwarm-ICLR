@@ -126,7 +126,9 @@ agent_timeout_seconds = 120 # 只约束中央 Agent scheduler 的单次判断
 
 三者都不抢占正在运行的 solver，只有已释放的 slot 才会重新分配。Agent scheduler
 的 wall-clock 和 token 会计入实验成本。`final.json.score_time` 给出固定 horizon 的
-normalized score-time AUC。
+normalized score-time AUC。`solver_slot_utilization` 只统计实际解题时间；
+`compute_slot_utilization` 还会把释放 slot 上的 scheduler 判断时间计入计算占用。
+`scripts/compare_runs.py` 同时报告两者，避免把调度占用误读为解题吞吐。
 
 每次尝试使用独立 workspace，完成后把较强 candidate 合并到
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
