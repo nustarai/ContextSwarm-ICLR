@@ -109,6 +109,19 @@ assignment_policy = "least_active"
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
 pieces/messages。Mono 和 Parallel 仍保持通信关闭、固定 baseline 语义。
 
+Scaling sweep manifests：
+
+```text
+configs/scale_1h_mono.toml
+configs/scale_1h_parallel.toml
+configs/scale_1h_cps24.toml
+configs/scale_1h_cps48.toml
+configs/scale_1h_cps96.toml
+```
+
+其中 Parallel 保持每题一个 baseline agent；CPS24/48/96 分别从每题 2/4/8
+个 agent 起步，总槽位分别为 24/48/96。
+
 用于短 canary 的 180 秒 manifest 已保留在 `configs/3min_*.toml`：
 
 ```bash
