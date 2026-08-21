@@ -758,12 +758,15 @@ def _evaluate_candidate(
     candidate: Path,
     deadline: float,
     gate: threading.BoundedSemaphore,
-    admission_timeout_seconds: float = 30.0,
 ) -> Verdict:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "run_horizon_elapsed"})
-    if not gate.acquire(timeout=min(remaining, max(0.1, float(admission_timeout_seconds)))):
+    # Evaluator contention is part of the shared experiment horizon.  A fixed
+    # admission timeout can reject a candidate while substantial run time is
+    # still available, especially in high-concurrency cells.  Wait for the
+    # gate for exactly the remaining horizon instead.
+    if not gate.acquire(timeout=remaining):
         return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "evaluator_admission_horizon_elapsed"})
     try:
         return evaluator.evaluate(task, candidate, deadline_monotonic=deadline)
