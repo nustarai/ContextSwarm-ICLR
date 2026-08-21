@@ -34,6 +34,8 @@ cps.sqlite3              # CPS 模式
 communication_trace.jsonl # CPS 事件投影
 elastic_assignments.jsonl  # CPS 动态 agent 分配
 elastic_scheduler_state.json # CPS 调度器收尾状态
+allocation_decisions.jsonl   # 自适应分配决策及当时的因果快照
+allocation_summary.json      # policy 延迟、fallback、token 与 slot 利用率
 workers/<task>/result.lean # parallel/CPS compatibility path
 workers/<task>/agents/<actor>/result.lean # elastic CPS attempts
 workers/<task>/best/result.lean # elastic CPS best candidate
@@ -105,6 +107,27 @@ cancel_on_proved = true     # 题目证明后取消同题仍运行的 agent
 assignment_policy = "least_active"
 ```
 
+`assignment_policy` 仅保留为底层初始 lease 顺序；初始池之后的新 slot 由
+manifest 的 `[allocation].policy` 选择：
+
+```toml
+[allocation]
+policy = "uniform"          # uniform | formula | agent
+piece_limit_per_task = 3    # 每题最多暴露给 policy 的近期 CPS pieces
+piece_body_chars = 1200
+agent_timeout_seconds = 120 # 只约束中央 Agent scheduler 的单次判断
+```
+
+- `uniform`：不读取 progress，按题目清单做确定性 round-robin；
+- `formula`：读取统一 snapshot，使用 `[allocation.formula]` 中冻结的纯算术权重；
+- `agent`：读取同一 snapshot 与有界 CPS 文本，不接收任何公式或权重，只输出
+  严格的 `task_id/reason/evidence_piece_ids` JSON。它没有 CPS 写接口；非法、超时
+  或在推理期间变为过期的选择会记录并回退 round-robin。
+
+三者都不抢占正在运行的 solver，只有已释放的 slot 才会重新分配。Agent scheduler
+的 wall-clock 和 token 会计入实验成本。`final.json.score_time` 给出固定 horizon 的
+normalized score-time AUC。
+
 每次尝试使用独立 workspace，完成后把较强 candidate 合并到
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
 pieces/messages。Mono 和 Parallel 仍保持通信关闭、固定 baseline 语义。
@@ -133,6 +156,24 @@ configs/scale_1h_cps96.toml
 
 其中 Parallel 保持每题一个 baseline agent；CPS24/48/96 分别从每题 2/4/8
 个 agent 起步，总槽位分别为 24/48/96。
+
+一小时 CPS48 allocation 对照使用下面三个 manifest；它们都是 12 题、每题初始
+4 个 solver、总 48 slots，除 `allocation.policy` 与输出目录/名称外合同相同：
+
+```text
+configs/allocation_1h_cps48_uniform.toml
+configs/allocation_1h_cps48_formula.toml
+configs/allocation_1h_cps48_agent.toml
+```
+
+完成后可直接比较：
+
+```bash
+python3 scripts/compare_runs.py \
+  runs/1h_allocation/uniform/<run-id> \
+  runs/1h_allocation/formula/<run-id> \
+  runs/1h_allocation/agent/<run-id>
+```
 
 用于短 canary 的 180 秒 manifest 已保留在 `configs/3min_*.toml`：
 

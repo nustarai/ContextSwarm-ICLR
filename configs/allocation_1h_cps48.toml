@@ -1,0 +1,13 @@
+extends = ["scale_1h_cps48.toml"]
+
+# Shared contract for the three allocation treatments.  Each arm differs only
+# in allocation.policy; the initial pool is exactly 12 tasks x 4 agents.
+[experiment]
+name = "mobench-allocation-1h-cps48"
+assignment_policy = "round_robin"
+output_root = "runs/1h_allocation"
+
+[allocation]
+piece_limit_per_task = 3
+piece_body_chars = 1200
+agent_timeout_seconds = 120

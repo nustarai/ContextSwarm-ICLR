@@ -55,6 +55,7 @@ class PiAgent:
         *,
         session_dir: Path | None = None,
         session_id: str | None = None,
+        isolated: bool = False,
     ) -> list[str]:
         command = [
             self.binary(),
@@ -68,8 +69,18 @@ class PiAgent:
             command.extend(["--session-dir", str(session_dir)])
         if session_id:
             command.extend(["--session-id", session_id])
+        if isolated:
+            command.extend(
+                [
+                    "--no-tools",
+                    "--no-context-files",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "--no-extensions",
+                ]
+            )
         extension = self.config.pi_extension.strip()
-        if self.config.fast_mode and extension:
+        if self.config.fast_mode and extension and not isolated:
             extension_path = self.config.resolve_runtime_path(extension)
             if extension_path.is_file():
                 command.extend(["--extension", str(extension_path)])
@@ -135,6 +146,7 @@ class PiAgent:
         extra_env: Mapping[str, str] | None = None,
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        isolated: bool = False,
     ) -> AgentResult:
         started = now_iso()
         command = self.command()
@@ -303,7 +315,11 @@ class PiAgent:
             session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(session_dir, 0o700)
             _prepare_project_settings(workdir, self.config)
-            command = self.command(session_dir=session_dir, session_id=session_id)
+            command = self.command(
+                session_dir=session_dir,
+                session_id=session_id,
+                isolated=isolated,
+            )
             if self.trace_path is not None:
                 self.trace_path.parent.mkdir(parents=True, exist_ok=True)
                 trace_handle = self.trace_path.open("a", encoding="utf-8")

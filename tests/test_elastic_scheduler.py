@@ -68,6 +68,32 @@ class ElasticSchedulerTests(unittest.TestCase):
         self.assertEqual(snapshot["remaining_slots"], 0)
         self.assertEqual(snapshot["tasks"]["a"]["initial_admitted"], 2)
 
+    def test_explicit_task_admission_preserves_scheduler_invariants(self) -> None:
+        current = [0.0]
+        scheduler = ElasticScheduler(
+            ["a", "b"],
+            max_parallel=2,
+            initial_agents=1,
+            horizon=10,
+            clock=lambda: current[0],
+        )
+        first = scheduler.next_assignment()
+        second = scheduler.next_assignment()
+        self.assertFalse(scheduler.has_pending_initial)
+        assert first is not None and second is not None
+        scheduler.finish(first)
+        targeted = scheduler.next_assignment_for("b")
+        self.assertIsNotNone(targeted)
+        assert targeted is not None
+        self.assertEqual(targeted.task_id, "b")
+        self.assertEqual(len(scheduler.active("b")), 2)
+        scheduler.task_solved("b")
+        scheduler.finish(targeted)
+        self.assertIsNone(scheduler.next_assignment_for("b"))
+        current[0] = 10.0
+        scheduler.finish(second)
+        self.assertIsNone(scheduler.next_assignment_for("a"))
+
 
 if __name__ == "__main__":
     unittest.main()

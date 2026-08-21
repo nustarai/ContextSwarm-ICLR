@@ -182,6 +182,15 @@ class ElasticScheduler:
             return tuple(task_id for task_id, state in self._tasks.items() if not state.solved)
 
     @property
+    def has_pending_initial(self) -> bool:
+        """Whether an unsolved task has not yet received its initial quota."""
+        with self._lock:
+            return any(
+                not state.solved and state.initial_admitted < state.initial_agents
+                for state in self._tasks.values()
+            )
+
+    @property
     def done(self) -> bool:
         with self._lock:
             return not self._active and (
@@ -262,20 +271,47 @@ class ElasticScheduler:
             state = self._select_task()
             if state is None:
                 return None
-            generation = state.next_generation
-            state.next_generation += 1
-            if state.initial_admitted < state.initial_agents:
-                state.initial_admitted += 1
-            assignment = AgentAssignment(
-                task_id=state.task_id,
-                agent_id=f"agent-{state.task_id}-{generation}",
-                generation=generation,
-                admitted_at=admitted_at,
-            )
-            self._active[assignment.agent_id] = assignment
-            self._active_by_task[state.task_id][assignment.agent_id] = assignment
-            self._history.append({"event": "agent_admitted", **assignment.__dict__})
-            return assignment
+            return self._admit_locked(state, admitted_at)
+
+    def next_assignment_for(
+        self,
+        task_id: object,
+        *,
+        now: float | None = None,
+    ) -> AgentAssignment | None:
+        """Claim one slot for an explicitly selected eligible task.
+
+        This is the narrow integration point for CPS allocation policies.  It
+        preserves the same capacity, solved-task, and horizon checks as
+        :meth:`next_assignment`; the caller controls only the task choice.
+        """
+        normalized = self._task_id(task_id)
+        with self._lock:
+            admitted_at = float(self._clock() if now is None else now)
+            if len(self._active) >= self.max_parallel or self._horizon_reached(admitted_at):
+                return None
+            state = self._tasks.get(normalized)
+            if state is None:
+                raise KeyError(f"unknown task id: {normalized}")
+            if state.solved:
+                return None
+            return self._admit_locked(state, admitted_at)
+
+    def _admit_locked(self, state: _TaskState, admitted_at: float) -> AgentAssignment:
+        generation = state.next_generation
+        state.next_generation += 1
+        if state.initial_admitted < state.initial_agents:
+            state.initial_admitted += 1
+        assignment = AgentAssignment(
+            task_id=state.task_id,
+            agent_id=f"agent-{state.task_id}-{generation}",
+            generation=generation,
+            admitted_at=admitted_at,
+        )
+        self._active[assignment.agent_id] = assignment
+        self._active_by_task[state.task_id][assignment.agent_id] = assignment
+        self._history.append({"event": "agent_admitted", **assignment.__dict__})
+        return assignment
 
     # Short aliases keep call sites readable and make the object easy to wrap.
     claim = next_assignment

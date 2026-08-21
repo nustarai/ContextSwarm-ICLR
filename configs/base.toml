@@ -17,6 +17,31 @@ max_tasks = 0
 time_limit_seconds = 3600
 seed = 0
 
+# Post-initial CPS slot allocation.  Uniform is the backward-compatible
+# deterministic baseline; the formula arm freezes every coefficient here.
+[allocation]
+policy = "uniform"
+piece_limit_per_task = 3
+piece_body_chars = 1200
+agent_timeout_seconds = 120
+
+[allocation.formula]
+active_balance_weight = 2.0
+candidate_quality_weight = 1.5
+recent_progress_weight = 1.25
+cps_evidence_weight = 0.75
+starvation_weight = 1.0
+failure_penalty = 0.75
+duplication_penalty = 0.5
+progress_window_seconds = 600.0
+starvation_window_seconds = 600.0
+evidence_saturation = 3.0
+failure_saturation = 3.0
+proved_quality = 1.0
+compiles_with_sorry_quality = 0.8
+verify_fail_quality = 0.35
+other_status_quality = 0.0
+
 [pi]
 model = "openai-codex/gpt-5.6-sol"
 thinking = "max"

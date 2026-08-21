@@ -271,6 +271,78 @@ class CPSStore:
         messages = self.inbox(task_id=task_id, recipient=actor_id, limit=limit)
         return {"pieces": pieces, "messages": messages}
 
+    def progress_snapshot(
+        self,
+        task_ids: Iterable[str],
+        *,
+        recent_limit: int = 3,
+        body_chars: int = 1_200,
+    ) -> dict[str, dict[str, Any]]:
+        """Return bounded per-task CPS statistics in one read transaction.
+
+        Allocation policies use this projection instead of receiving a database
+        handle.  The scheduler therefore cannot publish pieces or accidentally
+        feed its own decisions back into the communication substrate.
+        """
+        ordered_ids = tuple(dict.fromkeys(str(task_id) for task_id in task_ids))
+        recent_limit = max(1, min(int(recent_limit), 20))
+        body_chars = max(1, min(int(body_chars), _MAX_TEXT))
+        result: dict[str, dict[str, Any]] = {
+            task_id: {
+                "piece_count": 0,
+                "validation_piece_count": 0,
+                "strategy_piece_count": 0,
+                "duplicate_piece_count": 0,
+                "latest_created_at": "",
+                "recent_pieces": [],
+            }
+            for task_id in ordered_ids
+        }
+        if not ordered_ids:
+            return result
+        placeholders = ",".join("?" for _ in ordered_ids)
+        with self._db() as db:
+            rows = db.execute(
+                f"""SELECT rowid,id,task_id,author,kind,title,body,created_at
+                    FROM pieces
+                    WHERE active=1 AND task_id IN ({placeholders})
+                    ORDER BY rowid DESC""",
+                ordered_ids,
+            ).fetchall()
+        titles: dict[str, dict[str, int]] = {task_id: {} for task_id in ordered_ids}
+        for raw in rows:
+            item = dict(raw)
+            task_id = str(item["task_id"])
+            stats = result[task_id]
+            stats["piece_count"] += 1
+            kind = str(item.get("kind") or "")
+            if kind == "validation_result":
+                stats["validation_piece_count"] += 1
+            elif kind in {"proof_strategy", "strategy", "handoff", "lemma", "blocker"}:
+                stats["strategy_piece_count"] += 1
+            normalized_title = " ".join(str(item.get("title") or "").lower().split())
+            if normalized_title and kind != "validation_result":
+                titles[task_id][normalized_title] = titles[task_id].get(normalized_title, 0) + 1
+            if not stats["latest_created_at"]:
+                stats["latest_created_at"] = str(item.get("created_at") or "")
+            if len(stats["recent_pieces"]) < recent_limit:
+                body = str(item.get("body") or "")
+                stats["recent_pieces"].append(
+                    {
+                        "piece_id": str(item.get("id") or ""),
+                        "kind": kind,
+                        "title": str(item.get("title") or "")[:300],
+                        "body": body if len(body) <= body_chars else body[:body_chars] + "…",
+                        "author": str(item.get("author") or "")[:256],
+                        "created_at": str(item.get("created_at") or ""),
+                    }
+                )
+        for task_id, counts in titles.items():
+            result[task_id]["duplicate_piece_count"] = sum(
+                max(0, count - 1) for count in counts.values()
+            )
+        return result
+
     def summary(self) -> dict[str, Any]:
         with self._db() as db:
             pieces = int(db.execute("SELECT COUNT(*) FROM pieces").fetchone()[0])

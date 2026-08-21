@@ -8,6 +8,7 @@ import datetime as dt
 import json
 from queue import Empty, Queue
 from pathlib import Path
+import re
 import shutil
 import threading
 import time
@@ -15,6 +16,15 @@ import traceback
 import uuid
 from typing import Any, Iterable, Mapping
 
+from .allocation import (
+    AgentAllocationPolicy,
+    AllocationDecision,
+    EvidencePiece,
+    FormulaAllocationPolicy,
+    TaskProgress,
+    TaskProgressSnapshot,
+    UniformAllocationPolicy,
+)
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
 from .evaluator import LeanEvaluator, MockEvaluator
@@ -66,9 +76,16 @@ class _ElasticTaskState:
     task_root: Path
     lock: threading.RLock = field(default_factory=threading.RLock)
     attempts: int = 0
+    completed_attempts: int = 0
     solved: bool = False
+    retired: bool = False
     best_verdict: Verdict | None = None
     best_candidate: Path | None = None
+    last_verdict_status: str = "NONE"
+    last_feedback: str = ""
+    consecutive_failures: int = 0
+    last_assignment_at: float = 0.0
+    last_progress_at: float = 0.0
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -87,6 +104,154 @@ def _verdict_priority(verdict: Verdict | None) -> tuple[int, float]:
         "OUT_OF_HORIZON": 0,
     }
     return (status_rank.get(verdict.status, 0), float(verdict.score))
+
+
+_ENDPOINT_RE = re.compile(r"https?://[^\s\])}>\"']+")
+
+
+def _allocation_feedback(verdict: Verdict) -> str:
+    raw = str(
+        verdict.response.get("error_message")
+        or verdict.response.get("reason")
+        or verdict.error
+        or verdict.status
+    )
+    return _ENDPOINT_RE.sub("<redacted-endpoint>", raw).strip()[:1_200]
+
+
+def _seconds_since_cps_timestamp(raw: str) -> float | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    except ValueError:
+        return None
+    return max(0.0, (dt.datetime.now(dt.timezone.utc) - parsed).total_seconds())
+
+
+def _allocation_runtime_metrics(
+    history: Iterable[Mapping[str, object]],
+    *,
+    run_started_monotonic: float,
+    deadline: float,
+    max_parallel: int,
+    policy_latency_seconds: float,
+) -> dict[str, Any]:
+    admitted: dict[str, tuple[str, float]] = {}
+    finished: dict[str, float] = {}
+    for event in history:
+        event_type = str(event.get("event") or "")
+        agent_id = str(event.get("agent_id") or "")
+        if event_type == "agent_admitted" and agent_id:
+            admitted[agent_id] = (
+                str(event.get("task_id") or ""),
+                float(event.get("admitted_at") or run_started_monotonic),
+            )
+        elif event_type == "agent_finished" and agent_id:
+            finished[agent_id] = float(event.get("finished_at") or deadline)
+    per_task: dict[str, float] = {}
+    solver_seconds = 0.0
+    for agent_id, (task_id, started) in admitted.items():
+        bounded_start = min(deadline, max(run_started_monotonic, started))
+        bounded_end = min(deadline, max(bounded_start, finished.get(agent_id, deadline)))
+        duration = max(0.0, bounded_end - bounded_start)
+        solver_seconds += duration
+        per_task[task_id] = per_task.get(task_id, 0.0) + duration
+    capacity_seconds = max(0.0, deadline - run_started_monotonic) * max_parallel
+    solver_utilization = solver_seconds / capacity_seconds if capacity_seconds else 0.0
+    compute_seconds = solver_seconds + max(0.0, policy_latency_seconds)
+    compute_utilization = compute_seconds / capacity_seconds if capacity_seconds else 0.0
+    return {
+        "solver_agent_seconds": round(solver_seconds, 6),
+        "scheduler_compute_seconds": round(max(0.0, policy_latency_seconds), 6),
+        "capacity_seconds": round(capacity_seconds, 6),
+        "solver_slot_utilization": round(min(1.0, solver_utilization), 8),
+        "compute_slot_utilization": round(min(1.0, compute_utilization), 8),
+        "per_task_agent_seconds": {
+            task_id: round(seconds, 6) for task_id, seconds in sorted(per_task.items())
+        },
+    }
+
+
+def _scheduler_token_usage(trace_path: Path) -> dict[str, int]:
+    per_session: dict[str, dict[str, int]] = {}
+    try:
+        lines = trace_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not str(row.get("actor_id") or "").startswith("allocation-scheduler-"):
+            continue
+        session = str(row.get("session_id") or row.get("actor_id") or "unknown")
+        usage = per_session.setdefault(session, {})
+        for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens"):
+            value = row.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                usage[key] = max(usage.get(key, 0), value)
+    return {
+        "scheduler_model_sessions": len(per_session),
+        "scheduler_input_tokens": sum(row.get("input_tokens", 0) for row in per_session.values()),
+        "scheduler_output_tokens": sum(row.get("output_tokens", 0) for row in per_session.values()),
+        "scheduler_cache_read_tokens": sum(row.get("cache_read_tokens", 0) for row in per_session.values()),
+        "scheduler_cache_write_tokens": sum(row.get("cache_write_tokens", 0) for row in per_session.values()),
+        "scheduler_total_tokens": sum(row.get("total_tokens", 0) for row in per_session.values()),
+    }
+
+
+def _score_time_metrics(run_dir: Path, *, horizon_seconds: float, max_score: int) -> dict[str, Any]:
+    try:
+        meta = json.loads((run_dir / "run_meta.json").read_text(encoding="utf-8"))
+        started = dt.datetime.fromisoformat(str(meta["started_at"]).replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=dt.timezone.utc)
+    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        started = dt.datetime.now(dt.timezone.utc)
+    proofs: dict[str, float] = {}
+    try:
+        lines = (run_dir / "scoreboard_history.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+            if float(row.get("score") or 0.0) < 1.0:
+                continue
+            task_id = str(row.get("task_id") or "")
+            at = dt.datetime.fromisoformat(str(row.get("at") or "").replace("Z", "+00:00"))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=dt.timezone.utc)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        elapsed = min(max(0.0, (at - started).total_seconds()), max(0.0, horizon_seconds))
+        if task_id and (task_id not in proofs or elapsed < proofs[task_id]):
+            proofs[task_id] = elapsed
+    ordered = sorted(proofs.values())
+    horizon = max(0.0, float(horizon_seconds))
+    area = 0.0
+    previous = 0.0
+    score = 0
+    for elapsed in ordered:
+        area += score * max(0.0, elapsed - previous)
+        score += 1
+        previous = elapsed
+    area += score * max(0.0, horizon - previous)
+    denominator = horizon * max_score
+    return {
+        "score_time_auc": round(area, 6),
+        "normalized_score_time_auc": round(area / denominator, 8) if denominator else 0.0,
+        "verified_proof_times_seconds": [round(value, 6) for value in ordered],
+        "time_to_first_proof_seconds": round(ordered[0], 6) if ordered else None,
+        "time_to_k_proofs_seconds": {
+            str(index): round(value, 6) for index, value in enumerate(ordered, start=1)
+        },
+    }
 
 
 def load_tasks(config: ExperimentConfig) -> list[Task]:
@@ -146,6 +311,7 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "initial_agents_per_task": config.initial_agents_per_task,
         "max_attempts_per_task": config.max_attempts_per_task,
         "assignment_policy": config.assignment_policy,
+        "allocation": config.allocation.public_dict(),
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
         "model": config.model,
@@ -330,21 +496,18 @@ def _run_elastic_cps(
     deadline: float,
     evaluator_gate: threading.BoundedSemaphore,
 ) -> list[tuple[AgentResult, Verdict]]:
-    """Run CPS with an elastic, task-aware agent pool.
+    """Run one fixed CPS computation substrate with selectable slot allocation."""
 
-    A task receives ``initial_agents_per_task`` leases initially.  When a
-    lease finishes, the scheduler assigns the freed slot to an unfinished
-    task, preferring tasks below their initial quota and then using the
-    scheduler's fair round-robin retry order.  Every attempt has its own
-    workspace; a task-local best candidate is copied into the next attempt so
-    agents can combine CPS messages with concrete code rather than racing on a
-    single ``result.lean`` file.
-    """
-
+    run_started_monotonic = deadline - config.time_limit_seconds
     states: dict[str, _ElasticTaskState] = {}
     for task in tasks:
         task_root = run_dir / "workers" / task.slug
-        state = _ElasticTaskState(task=task, task_root=task_root)
+        state = _ElasticTaskState(
+            task=task,
+            task_root=task_root,
+            last_assignment_at=run_started_monotonic,
+            last_progress_at=run_started_monotonic,
+        )
         best_dir = task_root / "best"
         best_dir.mkdir(parents=True, exist_ok=True)
         best_path = best_dir / "result.lean"
@@ -353,23 +516,143 @@ def _run_elastic_cps(
         state.best_candidate = best_path
         states[task.slug] = state
 
+    task_order = [task.slug for task in tasks]
     scheduler = ElasticScheduler(
-        [task.slug for task in tasks],
+        task_order,
         max_parallel=config.max_parallel,
         initial_agents=config.initial_agents_per_task,
         horizon=max(0.0, deadline - time.monotonic()),
         assignment_policy=config.assignment_policy,
     )
     assignments_path = run_dir / "elastic_assignments.jsonl"
+    decisions_path = run_dir / "allocation_decisions.jsonl"
+    decisions_path.write_text("", encoding="utf-8")
     roster_path = run_dir / "actors.json"
     roster_lock = threading.RLock()
+    allocation_lock = threading.RLock()
     roster: list[dict[str, Any]] = []
     roster_path.write_text("[]\n", encoding="utf-8")
     jobs: Queue[AgentAssignment] = Queue()
     results: list[tuple[AgentResult, Verdict]] = []
     results_lock = threading.RLock()
+    decision_index = 0
+    initial_assignment_count = 0
+    adaptive_assignments = 0
 
-    def record_assignment(assignment: AgentAssignment) -> None:
+    assert policy.store is not None
+    store = policy.store
+
+    def invoke_scheduler_agent(
+        snapshot: TaskProgressSnapshot,
+        prompt: str,
+        index: int,
+    ) -> AgentResult:
+        actor_id = f"allocation-scheduler-{index}"
+        if mock_agent:
+            result = _mock_result(actor_id, "__allocation__", index)
+            selected = snapshot.eligible_task_ids[0] if snapshot.eligible_task_ids else ""
+            result.output_tail = json.dumps(
+                {
+                    "task_id": selected,
+                    "reason": "mock scheduler decision",
+                    "evidence_piece_ids": [],
+                },
+                sort_keys=True,
+            )
+            return result
+        workdir = run_dir / "allocation_scheduler" / f"decision-{index:06d}"
+        workdir.mkdir(parents=True, exist_ok=True)
+        scheduler_deadline = min(
+            deadline,
+            time.monotonic() + config.allocation.agent_timeout_seconds,
+        )
+        return pi_agent.run(
+            task_id="__allocation__",
+            actor_id=actor_id,
+            episode=index,
+            prompt=prompt,
+            workdir=workdir,
+            deadline_monotonic=scheduler_deadline,
+            isolated=True,
+        )
+
+    if config.allocation.policy == "uniform":
+        allocator: Any = UniformAllocationPolicy(task_order)
+    elif config.allocation.policy == "formula":
+        allocator = FormulaAllocationPolicy(task_order, config.allocation.formula)
+    else:
+        allocator = AgentAllocationPolicy(task_order, invoke_scheduler_agent)
+
+    def build_snapshot(index: int) -> TaskProgressSnapshot:
+        now_mono = time.monotonic()
+        cps = store.progress_snapshot(
+            task_order,
+            recent_limit=config.allocation.piece_limit_per_task,
+            body_chars=config.allocation.piece_body_chars,
+        )
+        scheduler_unsolved = set(scheduler.unsolved_tasks)
+        progress_rows: list[TaskProgress] = []
+        for task_id in task_order:
+            state = states[task_id]
+            stats = cps[task_id]
+            with state.lock:
+                solved = state.solved
+                retired = state.retired
+                attempts = state.attempts
+                completed_attempts = state.completed_attempts
+                best = state.best_verdict
+                last_status = state.last_verdict_status
+                last_feedback = state.last_feedback
+                failures = state.consecutive_failures
+                assignment_age = max(0.0, now_mono - state.last_assignment_at)
+                progress_age = max(0.0, now_mono - state.last_progress_at)
+            piece_age = _seconds_since_cps_timestamp(str(stats["latest_created_at"]))
+            if piece_age is not None:
+                progress_age = min(progress_age, piece_age)
+            capped = config.max_attempts_per_task > 0 and attempts >= config.max_attempts_per_task
+            eligible = (
+                task_id in scheduler_unsolved
+                and not solved
+                and not retired
+                and not capped
+            )
+            pieces = tuple(EvidencePiece(**item) for item in stats["recent_pieces"])
+            progress_rows.append(
+                TaskProgress(
+                    task_id=task_id,
+                    eligible=eligible,
+                    solved=solved,
+                    active_agents=len(scheduler.active(task_id)),
+                    attempts=attempts,
+                    completed_attempts=completed_attempts,
+                    best_status=best.status if best is not None else "NONE",
+                    best_score=float(best.score) if best is not None else 0.0,
+                    last_verdict_status=last_status,
+                    last_feedback=last_feedback,
+                    consecutive_failures=failures,
+                    seconds_since_last_assignment=assignment_age,
+                    seconds_since_progress=progress_age,
+                    piece_count=int(stats["piece_count"]),
+                    validation_piece_count=int(stats["validation_piece_count"]),
+                    strategy_piece_count=int(stats["strategy_piece_count"]),
+                    duplicate_piece_count=int(stats["duplicate_piece_count"]),
+                    recent_pieces=pieces,
+                )
+            )
+        return TaskProgressSnapshot(
+            decision_index=index,
+            elapsed_seconds=max(0.0, now_mono - run_started_monotonic),
+            remaining_seconds=max(0.0, deadline - now_mono),
+            free_slots=scheduler.remaining_slots,
+            tasks=tuple(progress_rows),
+        )
+
+    def record_assignment(
+        assignment: AgentAssignment,
+        *,
+        phase: str,
+        decision: AllocationDecision | None = None,
+    ) -> None:
         row = {
             "at": utc_now(),
             "event": "agent_assigned",
@@ -377,6 +660,9 @@ def _run_elastic_cps(
             "agent_id": assignment.agent_id,
             "generation": assignment.generation,
             "admitted_at": assignment.admitted_at,
+            "allocation_phase": phase,
+            "allocation_policy": config.allocation.policy,
+            "decision_index": decision.decision_index if decision is not None else None,
         }
         with assignments_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
@@ -400,37 +686,134 @@ def _run_elastic_cps(
             agent_id=assignment.agent_id,
             episode=assignment.generation,
             active_slots=scheduler.active_slots,
+            allocation_phase=phase,
+            allocation_policy=config.allocation.policy,
+            decision_index=decision.decision_index if decision is not None else None,
         )
 
-    def claim_next() -> AgentAssignment | None:
-        """Claim a lease, respecting an optional per-task attempt cap."""
-        while time.monotonic() < deadline:
-            assignment = scheduler.next_assignment()
-            if assignment is None:
-                return None
-            state = states[assignment.task_id]
+    def record_decision(
+        decision: AllocationDecision,
+        snapshot: TaskProgressSnapshot,
+        assignment: AgentAssignment | None,
+        *,
+        execution_snapshot: TaskProgressSnapshot | None = None,
+    ) -> None:
+        row = {
+            "at": utc_now(),
+            **decision.as_dict(snapshot=snapshot),
+            "assigned_agent_id": assignment.agent_id if assignment is not None else None,
+            "assigned_generation": assignment.generation if assignment is not None else None,
+        }
+        if execution_snapshot is not None:
+            row["execution_snapshot"] = execution_snapshot.as_dict()
+        with decisions_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        logger.event(
+            "allocation_decision",
+            decision_index=decision.decision_index,
+            allocation_policy=decision.policy,
+            requested_task_id=decision.requested_task_id,
+            selected_task_id=decision.selected_task_id,
+            fallback=decision.fallback,
+            fallback_reason=decision.fallback_reason,
+            latency_seconds=decision.latency_seconds,
+            assigned_agent_id=assignment.agent_id if assignment is not None else None,
+        )
+
+    def retire_exhausted_tasks() -> None:
+        if config.max_attempts_per_task <= 0:
+            return
+        for task_id, state in states.items():
             with state.lock:
                 exhausted = (
-                    config.max_attempts_per_task > 0
+                    not state.solved
+                    and not state.retired
                     and state.attempts >= config.max_attempts_per_task
                 )
-                if not exhausted:
-                    state.attempts += 1
+                if exhausted:
+                    state.retired = True
             if exhausted:
-                # The lease was only a probe for a task which reached its
-                # configured attempt budget.  Retire it immediately; no
-                # process was launched for this assignment.
-                scheduler.finish(assignment, solved=True)
-                state.solved = True
-                state.cancel_event.set()
+                scheduler.task_solved(task_id)
                 logger.event(
                     "task_attempt_budget_exhausted",
-                    task_id=assignment.task_id,
+                    task_id=task_id,
                     max_attempts=config.max_attempts_per_task,
                 )
-                continue
-            record_assignment(assignment)
-            return assignment
+
+    def accept_assignment(
+        assignment: AgentAssignment,
+        *,
+        phase: str,
+        decision: AllocationDecision | None = None,
+    ) -> AgentAssignment:
+        nonlocal initial_assignment_count
+        state = states[assignment.task_id]
+        with state.lock:
+            state.attempts += 1
+            state.last_assignment_at = assignment.admitted_at
+        record_assignment(assignment, phase=phase, decision=decision)
+        if phase == "initial":
+            initial_assignment_count += 1
+        return assignment
+
+    def claim_next(*, initial_fill: bool = False) -> AgentAssignment | None:
+        """Claim one lease; only post-initial claims invoke the treatment policy."""
+        nonlocal decision_index
+        nonlocal adaptive_assignments
+        with allocation_lock:
+            while time.monotonic() < deadline:
+                retire_exhausted_tasks()
+                if initial_fill or scheduler.has_pending_initial:
+                    assignment = scheduler.next_assignment()
+                    if assignment is None:
+                        return None
+                    state = states[assignment.task_id]
+                    with state.lock:
+                        unavailable = state.solved or state.retired
+                    if unavailable:
+                        scheduler.finish(assignment, solved=True)
+                        continue
+                    return accept_assignment(assignment, phase="initial")
+
+                decision_index += 1
+                snapshot = build_snapshot(decision_index)
+                if not snapshot.eligible_task_ids:
+                    return None
+                decision = allocator.choose(snapshot)
+                assignment = None
+                execution_snapshot: TaskProgressSnapshot | None = None
+                if time.monotonic() < deadline and decision.selected_task_id:
+                    assignment = scheduler.next_assignment_for(decision.selected_task_id)
+                if assignment is None and time.monotonic() < deadline:
+                    execution_snapshot = build_snapshot(decision_index)
+                    if execution_snapshot.eligible_task_ids:
+                        decision = allocator.fallback(
+                            execution_snapshot,
+                            "selected task became ineligible before admission",
+                            prior=decision,
+                        )
+                        if decision.selected_task_id:
+                            assignment = scheduler.next_assignment_for(decision.selected_task_id)
+                if assignment is None:
+                    if not decision.fallback:
+                        decision.fallback = True
+                        decision.fallback_reason = "run horizon reached before admission"
+                    record_decision(
+                        decision,
+                        snapshot,
+                        None,
+                        execution_snapshot=execution_snapshot,
+                    )
+                    return None
+                adaptive_assignments += 1
+                accept_assignment(assignment, phase="adaptive", decision=decision)
+                record_decision(
+                    decision,
+                    snapshot,
+                    assignment,
+                    execution_snapshot=execution_snapshot,
+                )
+                return assignment
         return None
 
     def prepare_workspace(state: _ElasticTaskState, assignment: AgentAssignment) -> tuple[Path, Path]:
@@ -466,7 +849,7 @@ def _run_elastic_cps(
             "Read it before editing result.lean. Keep your candidate in result.lean; "
             "the runner will merge the strongest verified candidate."
         )
-        db_path = str(policy.store.path) if policy.store is not None else ""
+        db_path = str(store.path)
         env = {
             "CONTEXTSWARM_CPS_DB": db_path,
             "CONTEXTSWARM_ASSIGNMENT_FILE": str(assignments_path),
@@ -519,14 +902,25 @@ def _run_elastic_cps(
         )
 
         solved = verdict.score >= 1.0
+        feedback = _allocation_feedback(verdict)
         with state.lock:
+            prior_priority = _verdict_priority(state.best_verdict)
             candidate_is_usable = verdict.status not in {
                 "LOCAL_REJECTED",
                 "OUT_OF_HORIZON",
                 "CANCELLED",
                 "RUNNING",
             }
-            if candidate_is_usable and _verdict_priority(verdict) >= _verdict_priority(state.best_verdict):
+            improved = candidate_is_usable and _verdict_priority(verdict) > prior_priority
+            state.completed_attempts += 1
+            state.last_verdict_status = verdict.status
+            state.last_feedback = feedback
+            if improved or solved:
+                state.last_progress_at = time.monotonic()
+                state.consecutive_failures = 0
+            elif candidate_is_usable:
+                state.consecutive_failures += 1
+            if candidate_is_usable and _verdict_priority(verdict) >= prior_priority:
                 state.best_verdict = verdict
                 try:
                     shutil.copy2(workdir / "result.lean", best_path)
@@ -540,11 +934,6 @@ def _run_elastic_cps(
             scheduler.task_solved(task.slug)
 
         if policy.enabled:
-            feedback = verdict.error or str(
-                verdict.response.get("error_message")
-                or verdict.response.get("reason")
-                or verdict.status
-            )
             policy.publish(
                 task.slug,
                 actor,
@@ -557,12 +946,12 @@ def _run_elastic_cps(
             )
         return result, verdict, solved
 
-    # Fill the initial pool.  A queue worker will immediately request a new
-    # assignment after each completion, so no task is permanently tied to a
-    # Python thread.
+    # All arms receive an identical initial pool.  Only a slot released after
+    # this fill (or after an unfinished initial quota on a smaller pool) enters
+    # the allocation treatment.
     initial_assignments: list[AgentAssignment] = []
     for _ in range(config.max_parallel):
-        assignment = claim_next()
+        assignment = claim_next(initial_fill=True)
         if assignment is None:
             break
         initial_assignments.append(assignment)
@@ -607,7 +996,6 @@ def _run_elastic_cps(
             for future in futures:
                 future.result()
 
-    # Emit a terminal result for tasks which never received a usable verdict.
     seen_tasks = {verdict.task_id for _, verdict in results}
     for task in tasks:
         state = states[task.slug]
@@ -615,8 +1003,29 @@ def _run_elastic_cps(
             continue
         fallback = Verdict(task.slug, "TIME_LIMIT", 0.0, 0.0, {"reason": "no_assignment_completed"})
         results.append((_mock_result(f"scheduler-{task.slug}", task.slug, state.attempts), fallback))
+
+    scheduler_state = scheduler.snapshot()
     (run_dir / "elastic_scheduler_state.json").write_text(
-        json.dumps(scheduler.snapshot(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(scheduler_state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    allocation_summary = allocator.summary()
+    allocation_summary.update(
+        _allocation_runtime_metrics(
+            scheduler.history(),
+            run_started_monotonic=run_started_monotonic,
+            deadline=deadline,
+            max_parallel=config.max_parallel,
+            policy_latency_seconds=float(allocation_summary["total_latency_seconds"]),
+        )
+    )
+    allocation_summary.update(_scheduler_token_usage(run_dir / "pi_events.jsonl"))
+    allocation_summary["initial_pool_size"] = len(initial_assignments)
+    allocation_summary["initial_assignments"] = initial_assignment_count
+    allocation_summary["adaptive_assignments"] = adaptive_assignments
+    allocation_summary["decision_log"] = decisions_path.name
+    (run_dir / "allocation_summary.json").write_text(
+        json.dumps(allocation_summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return results
@@ -828,6 +1237,12 @@ def _write_final(
 ) -> None:
     rows = {key: value.as_dict() for key, value in sorted(verdicts.items())}
     agent_rows = [item.as_dict() for item in agent_results]
+    try:
+        allocation_summary = json.loads(
+            (run_dir / "allocation_summary.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        allocation_summary = None
     final = {
         "schema_version": "contextswarm_mini_run_v1",
         "status": status,
@@ -845,6 +1260,12 @@ def _write_final(
             for status in sorted({str(item.get("status")) for item in rows.values()})
         },
         "cps": dict(cps_summary or {"enabled": False}),
+        "allocation": allocation_summary,
+        "score_time": _score_time_metrics(
+            run_dir,
+            horizon_seconds=config.time_limit_seconds,
+            max_score=len(rows),
+        ),
         "finished_at": utc_now(),
     }
     (run_dir / "final.json").write_text(

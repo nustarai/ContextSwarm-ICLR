@@ -14,7 +14,7 @@ from unittest.mock import patch
 from contextswarm_mini.config import load_config
 from contextswarm_mini.cps import CPSStore, make_policy
 from contextswarm_mini.evaluator import LeanEvaluator, MockEvaluator, _is_proved, normalize_base_url
-from contextswarm_mini.runner import load_tasks, run_experiment
+from contextswarm_mini.runner import _score_time_metrics, load_tasks, run_experiment
 from contextswarm_mini.pi_agent import (
     PiAgent,
     _event_text,
@@ -71,6 +71,20 @@ class MiniRuntimeTests(unittest.TestCase):
         ):
             config = load_config(manifest, ROOT)
             self.assertEqual(tuple(getattr(config, field) for field in transport_fields), expected)
+
+        allocation_arms = [
+            load_config(f"configs/allocation_1h_cps48_{name}.toml", ROOT)
+            for name in ("uniform", "formula", "agent")
+        ]
+        contracts = []
+        for config in allocation_arms:
+            public = config.public_dict()
+            public.pop("name")
+            allocation = dict(public.pop("allocation"))
+            allocation.pop("policy")
+            contracts.append((public, allocation))
+        self.assertEqual(contracts, [contracts[0]] * 3)
+        self.assertEqual([config.allocation.policy for config in allocation_arms], ["uniform", "formula", "agent"])
 
     def test_cps_store_and_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -131,6 +145,65 @@ class MiniRuntimeTests(unittest.TestCase):
             )
             self.assertTrue((run_dir / "elastic_scheduler_state.json").exists())
 
+    def test_three_allocation_policies_share_initial_pool_and_log_decisions(self) -> None:
+        initial_orders: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for policy_name in ("uniform", "formula", "agent"):
+                base = load_config("configs/smoke.toml", ROOT)
+                config = replace(
+                    base,
+                    allocation=replace(base.allocation, policy=policy_name),
+                    max_tasks=2,
+                    max_parallel=2,
+                    initial_agents_per_task=1,
+                    max_attempts_per_task=3,
+                    time_limit_seconds=2,
+                )
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=True,
+                    output_override=root / policy_name,
+                )
+                assignments = [
+                    json.loads(line)
+                    for line in (run_dir / "elastic_assignments.jsonl").read_text().splitlines()
+                ]
+                initial = [row for row in assignments if row["allocation_phase"] == "initial"]
+                initial_orders.append([row["task_id"] for row in initial])
+                decisions = [
+                    json.loads(line)
+                    for line in (run_dir / "allocation_decisions.jsonl").read_text().splitlines()
+                ]
+                self.assertGreaterEqual(len(decisions), 1)
+                self.assertTrue(all(row["policy"] == policy_name for row in decisions))
+                summary = json.loads((run_dir / "allocation_summary.json").read_text())
+                self.assertEqual(summary["policy"], policy_name)
+                final = json.loads((run_dir / "final.json").read_text())
+                self.assertEqual(final["allocation"]["policy"], policy_name)
+                self.assertIn("normalized_score_time_auc", final["score_time"])
+            self.assertEqual(initial_orders, [initial_orders[0]] * 3)
+
+    def test_score_time_auc_records_verified_proof_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "run_meta.json").write_text(
+                json.dumps({"started_at": "2026-08-21T00:00:00+00:00"})
+            )
+            (run_dir / "scoreboard_history.jsonl").write_text(
+                json.dumps(
+                    {
+                        "at": "2026-08-21T00:00:01+00:00",
+                        "task_id": "p1",
+                        "score": 1.0,
+                    }
+                )
+                + "\n"
+            )
+            score_time = _score_time_metrics(run_dir, horizon_seconds=10, max_score=2)
+            self.assertEqual(score_time["time_to_first_proof_seconds"], 1.0)
+            self.assertEqual(score_time["normalized_score_time_auc"], 0.45)
+
     def test_baselines_do_not_receive_cps_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = run_experiment(
@@ -172,6 +245,19 @@ class MiniRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0)
             self.assertEqual(result.events, 3)
+
+    def test_isolated_pi_command_disables_tools_and_context_discovery(self) -> None:
+        config = replace(load_config("configs/smoke.toml", ROOT), fast_mode=True)
+        command = PiAgent(config).command(isolated=True)
+        for flag in (
+            "--no-tools",
+            "--no-context-files",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-extensions",
+        ):
+            self.assertIn(flag, command)
+        self.assertNotIn("--extension", command)
 
     def test_pi_rpc_waits_through_retry_until_agent_settled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
