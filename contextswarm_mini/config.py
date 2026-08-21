@@ -106,6 +106,12 @@ class ExperimentConfig:
     pi_binary: str
     pi_extension: str
     pi_timeout_seconds: int
+    pi_http_idle_timeout_ms: int
+    pi_retry_enabled: bool
+    pi_retry_max_retries: int
+    pi_retry_base_delay_ms: int
+    pi_provider_max_retries: int
+    pi_provider_max_retry_delay_ms: int
     aisw_enabled: bool
     aisw_binary: str
     aisw_node_config: str
@@ -165,6 +171,13 @@ class ExperimentConfig:
             "model": self.model,
             "thinking": self.thinking,
             "fast_mode": self.fast_mode,
+            "pi_timeout_seconds": self.pi_timeout_seconds,
+            "pi_http_idle_timeout_ms": self.pi_http_idle_timeout_ms,
+            "pi_retry_enabled": self.pi_retry_enabled,
+            "pi_retry_max_retries": self.pi_retry_max_retries,
+            "pi_retry_base_delay_ms": self.pi_retry_base_delay_ms,
+            "pi_provider_max_retries": self.pi_provider_max_retries,
+            "pi_provider_max_retry_delay_ms": self.pi_provider_max_retry_delay_ms,
             "pi_binary_configured": bool(self.pi_binary),
             "aisw_enabled": self.aisw_enabled,
             "aisw_binary_configured": bool(self.aisw_binary),
@@ -258,6 +271,34 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     model = _text(pi.get("model"), "openai-codex/gpt-5.6-sol")
     thinking = _text(pi.get("thinking"), "max")
     pi_timeout = _positive_int(pi.get("timeout_seconds"), "pi.timeout_seconds", horizon)
+    pi_http_idle_timeout_ms = _nonnegative_int(
+        pi.get("http_idle_timeout_ms"),
+        "pi.http_idle_timeout_ms",
+        600_000,
+    )
+    pi_retry = _as_dict(pi.get("retry"), "pi.retry")
+    pi_retry_provider = _as_dict(pi_retry.get("provider"), "pi.retry.provider")
+    pi_retry_enabled = bool(pi_retry.get("enabled", True))
+    pi_retry_max_retries = _nonnegative_int(
+        pi_retry.get("max_retries"),
+        "pi.retry.max_retries",
+        10,
+    )
+    pi_retry_base_delay_ms = _positive_int(
+        pi_retry.get("base_delay_ms"),
+        "pi.retry.base_delay_ms",
+        2_000,
+    )
+    pi_provider_max_retries = _nonnegative_int(
+        pi_retry_provider.get("max_retries"),
+        "pi.retry.provider.max_retries",
+        0,
+    )
+    pi_provider_max_retry_delay_ms = _nonnegative_int(
+        pi_retry_provider.get("max_retry_delay_ms"),
+        "pi.retry.provider.max_retry_delay_ms",
+        60_000,
+    )
     fast_mode = bool(pi.get("fast_mode", True))
 
     aisw_enabled = bool(aisw.get("enabled", True))
@@ -308,6 +349,12 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         pi_binary=_text(pi.get("binary")),
         pi_extension=_text(pi.get("extension")),
         pi_timeout_seconds=pi_timeout,
+        pi_http_idle_timeout_ms=pi_http_idle_timeout_ms,
+        pi_retry_enabled=pi_retry_enabled,
+        pi_retry_max_retries=pi_retry_max_retries,
+        pi_retry_base_delay_ms=pi_retry_base_delay_ms,
+        pi_provider_max_retries=pi_provider_max_retries,
+        pi_provider_max_retry_delay_ms=pi_provider_max_retry_delay_ms,
         aisw_enabled=aisw_enabled,
         aisw_binary=aisw_binary,
         aisw_node_config=aisw_node_config,
