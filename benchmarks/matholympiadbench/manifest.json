@@ -1,0 +1,10 @@
+{
+  "schema_version": "contextswarm_mini_matholympiadbench_v1",
+  "dataset": "matholympiadbench",
+  "subset": "latest12",
+  "problem_ids": "problem_ids.json",
+  "lean_env_id": "formal_matholympiadbench",
+  "verification_profile": "formal_proof",
+  "source_revision": "f286b8942a7b9517be103139d2240adaeabbc1e5f195eb2817aacf9109b1bb95",
+  "candidate_filename": "result.lean"
+}

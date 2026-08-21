@@ -1,0 +1,26 @@
+{
+  "dataset": "matholympiadbench",
+  "problem_id": "Imo2024P6",
+  "slug": "imo2024_p6",
+  "subset": "test",
+  "namespace": null,
+  "theorem_name": "imo2024_p6",
+  "theorem_names": [
+    "imo2024_p6"
+  ],
+  "imports": [
+    "Mathlib",
+    "Aesop"
+  ],
+  "lean_env_id": "formal_matholympiadbench",
+  "source_kind": "matholympiadbench_project_multi_assignment",
+  "source_index": 215,
+  "source_name": "Imo2024P6",
+  "source_sha256": "f286b8942a7b9517be103139d2240adaeabbc1e5f195eb2817aacf9109b1bb95",
+  "category": "algebra",
+  "tags": [
+    "algebra"
+  ],
+  "split": "test",
+  "solved": true
+}

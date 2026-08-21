@@ -1,0 +1,17 @@
+extends = ["base.toml"]
+
+[experiment]
+name = "mobench-3min-cps"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 12
+episodes_per_task = 2
+time_limit_seconds = 180
+output_root = "runs/3min"
+
+[pi]
+timeout_seconds = 180
+
+[lean]
+server_url = "http://127.0.0.1:19000"
+

@@ -1,0 +1,14 @@
+[project]
+name = "contextswarm-iclr-mini"
+version = "0.1.0"
+description = "Minimal NuRouter/AISW Pi harness for reproducible ContextSwarm communication experiments"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+contextswarm-mini = "contextswarm_mini.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+

@@ -1,0 +1,29 @@
+{
+  "dataset": "matholympiadbench",
+  "problem_id": "UK2024R1P1",
+  "slug": "uk2024_r1_p1",
+  "subset": "test",
+  "namespace": null,
+  "theorem_name": "uk2024_r1_p1",
+  "theorem_names": [
+    "uk2024_r1_p1"
+  ],
+  "imports": [
+    "Mathlib",
+    "Aesop"
+  ],
+  "lean_env_id": "formal_matholympiadbench",
+  "source_kind": "matholympiadbench_project_multi_assignment",
+  "source_index": 94,
+  "source_name": "UK2024R1P1",
+  "source_sha256": "f286b8942a7b9517be103139d2240adaeabbc1e5f195eb2817aacf9109b1bb95",
+  "category": "combinatorics",
+  "tags": [
+    "combinatorics"
+  ],
+  "split": "test",
+  "solved": true,
+  "curated_corrections": [
+    "uk2024_r1_p1_count_good_permutations_as_subtype"
+  ]
+}

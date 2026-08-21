@@ -1,0 +1,9 @@
+extends = ["base.toml"]
+
+[experiment]
+name = "mobench-cps-hybrid"
+mode = "cps"
+communication = "hybrid"
+max_parallel = 12
+episodes_per_task = 2
+

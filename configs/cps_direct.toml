@@ -1,0 +1,9 @@
+extends = ["base.toml"]
+
+[experiment]
+name = "mobench-cps-direct-message"
+mode = "cps"
+communication = "direct"
+max_parallel = 12
+episodes_per_task = 2
+

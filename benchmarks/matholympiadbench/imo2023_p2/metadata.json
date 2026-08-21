@@ -1,0 +1,26 @@
+{
+  "dataset": "matholympiadbench",
+  "problem_id": "Imo2023P2",
+  "slug": "imo2023_p2",
+  "subset": "test",
+  "namespace": null,
+  "theorem_name": "imo2023_p1",
+  "theorem_names": [
+    "imo2023_p1"
+  ],
+  "imports": [
+    "Mathlib",
+    "Aesop"
+  ],
+  "lean_env_id": "formal_matholympiadbench",
+  "source_kind": "matholympiadbench_project_multi_assignment",
+  "source_index": 164,
+  "source_name": "Imo2023P2",
+  "source_sha256": "f286b8942a7b9517be103139d2240adaeabbc1e5f195eb2817aacf9109b1bb95",
+  "category": "geometry",
+  "tags": [
+    "geometry"
+  ],
+  "split": "test",
+  "solved": false
+}

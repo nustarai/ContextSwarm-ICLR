@@ -1,0 +1,50 @@
+# Shared paper-facing contract.  Do not put API keys or AISW tokens here.
+
+[experiment]
+name = "mobench-cps"
+dataset_root = "benchmarks/matholympiadbench"
+problem_ids = "benchmarks/matholympiadbench/problem_ids.json"
+output_root = "runs"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 12
+episodes_per_task = 2
+max_tasks = 0
+time_limit_seconds = 3600
+seed = 0
+
+[pi]
+model = "openai-codex/gpt-5.6-sol"
+thinking = "max"
+# Standard routing is the portable default for the compact artifact.  Set this
+# to true only after the NuRouter coordinator exposes runtime-policy and
+# explicitly allows fast mode.
+fast_mode = false
+timeout_seconds = 3600
+# Leave binary empty in the manifest to use the mounted PI_BIN/AISW shim.
+binary = ""
+extension = "contextswarm_mini/pi_fast_mode.mjs"
+
+[aisw]
+enabled = true
+binary = "~/.local/share/contextswarm/aisw-linux-aarch64"
+node_config = "~/.nurouter/node.toml"
+# Set this only when node.toml does not already provide coordinator_url.
+coordinator_url = ""
+account = ""
+group = ""
+lease_wait_seconds = 7200
+lease_retry_interval_seconds = 2
+
+[lean]
+server_url = "http://127.0.0.1:18000"
+env_id = "formal_matholympiadbench"
+timeout_seconds = 300
+max_concurrent_evaluations = 1
+verification_profile = "formal_proof"
+judge_mode = "fast"
+
+[docker]
+image = "contextswarm-iclr-mini:latest"
+memory_mb = 16384
+internet = "online"

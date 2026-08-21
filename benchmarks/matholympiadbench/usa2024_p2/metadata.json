@@ -1,0 +1,31 @@
+{
+  "dataset": "matholympiadbench",
+  "problem_id": "Usa2024P2",
+  "slug": "usa2024_p2",
+  "subset": "test",
+  "namespace": null,
+  "theorem_name": "usa2024_p2",
+  "theorem_names": [
+    "usa2024_p2"
+  ],
+  "imports": [
+    "Mathlib",
+    "Aesop"
+  ],
+  "lean_env_id": "formal_matholympiadbench",
+  "source_kind": "matholympiadbench_project_multi_assignment",
+  "source_index": 224,
+  "source_name": "Usa2024P2",
+  "source_sha256": "f286b8942a7b9517be103139d2240adaeabbc1e5f195eb2817aacf9109b1bb95",
+  "category": "combinatorics",
+  "tags": [
+    "combinatorics"
+  ],
+  "split": "test",
+  "solved": false,
+  "curated_corrections": [
+    "usa2024_p2_uses_100_sets",
+    "usa2024_p2_intersection_size_multiple_direction",
+    "usa2024_p2_fixed_threshold_50"
+  ]
+}

@@ -1,0 +1,8 @@
+.git
+__pycache__
+*.py[cod]
+.pytest_cache
+runs
+.smoke-runs
+output
+9585_ContextSwarm_Scaling_Cont.pdf
