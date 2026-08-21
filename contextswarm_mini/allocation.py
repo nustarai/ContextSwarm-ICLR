@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import math
+import threading
 import time
 from typing import Any, Callable, Iterable, Mapping
 
@@ -350,6 +351,7 @@ class AgentAllocationPolicy:
         self._fallback = UniformAllocationPolicy(task_order)
         self._invoke = invoke
         self._decisions: list[AllocationDecision] = []
+        self._lock = threading.RLock()
 
     @staticmethod
     def prompt(snapshot: TaskProgressSnapshot) -> str:
@@ -415,7 +417,8 @@ SNAPSHOT:
         parsed, error = self._parse(result, snapshot)
         latency = time.monotonic() - started
         if parsed is None:
-            fallback = self._fallback.choose(snapshot)
+            with self._lock:
+                fallback = self._fallback.choose(snapshot)
             decision = AllocationDecision(
                 decision_index=snapshot.decision_index,
                 policy=self.name,
@@ -439,7 +442,8 @@ SNAPSHOT:
                 agent_returncode=result.returncode,
                 agent_timed_out=result.timed_out,
             )
-        self._decisions.append(decision)
+        with self._lock:
+            self._decisions.append(decision)
         return decision
 
     def fallback(
@@ -449,20 +453,23 @@ SNAPSHOT:
         *,
         prior: AllocationDecision | None = None,
     ) -> AllocationDecision:
-        replacement = self._fallback.choose(snapshot)
-        decision = prior or replacement
-        decision.selected_task_id = replacement.selected_task_id
-        decision.fallback = True
-        decision.fallback_reason = _combine_fallback_reasons(decision.fallback_reason, reason)
-        if prior is None:
-            decision.policy = self.name
-            self._decisions.append(decision)
+        with self._lock:
+            replacement = self._fallback.choose(snapshot)
+            decision = prior or replacement
+            decision.selected_task_id = replacement.selected_task_id
+            decision.fallback = True
+            decision.fallback_reason = _combine_fallback_reasons(decision.fallback_reason, reason)
+            if prior is None:
+                decision.policy = self.name
+                self._decisions.append(decision)
         return decision
 
     def summary(self) -> dict[str, Any]:
-        result = _decision_summary(self.name, self._decisions)
-        result["agent_calls"] = len(self._decisions)
-        result["agent_timeouts"] = sum(decision.agent_timed_out for decision in self._decisions)
+        with self._lock:
+            decisions = list(self._decisions)
+        result = _decision_summary(self.name, decisions)
+        result["agent_calls"] = len(decisions)
+        result["agent_timeouts"] = sum(decision.agent_timed_out for decision in decisions)
         return result
 
 

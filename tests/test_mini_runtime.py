@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from contextswarm_mini.config import load_config
+from contextswarm_mini.allocation import AgentAllocationPolicy
 from contextswarm_mini.cps import CPSStore, make_policy
 from contextswarm_mini.evaluator import LeanEvaluator, MockEvaluator, _is_proved, normalize_base_url
 from contextswarm_mini.runner import _score_time_metrics, load_tasks, run_experiment
@@ -183,6 +184,55 @@ class MiniRuntimeTests(unittest.TestCase):
                 self.assertEqual(final["allocation"]["policy"], policy_name)
                 self.assertIn("normalized_score_time_auc", final["score_time"])
             self.assertEqual(initial_orders, [initial_orders[0]] * 3)
+
+    def test_agent_scheduler_calls_run_concurrently_for_released_slots(self) -> None:
+        active = 0
+        max_active = 0
+        counter_lock = threading.Lock()
+        original_choose = AgentAllocationPolicy.choose
+
+        def observed_choose(policy, snapshot):
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.1)
+                return original_choose(policy, snapshot)
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_config("configs/smoke.toml", ROOT)
+            config = replace(
+                base,
+                allocation=replace(base.allocation, policy="agent"),
+                max_tasks=4,
+                max_parallel=4,
+                initial_agents_per_task=1,
+                max_attempts_per_task=2,
+                time_limit_seconds=2,
+            )
+            with patch.object(AgentAllocationPolicy, "choose", observed_choose):
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+            summary = json.loads((run_dir / "allocation_summary.json").read_text())
+            assignments = [
+                json.loads(line)
+                for line in (run_dir / "elastic_assignments.jsonl").read_text().splitlines()
+            ]
+            self.assertGreaterEqual(max_active, 2)
+            self.assertGreaterEqual(summary["decisions"], 2)
+            self.assertTrue(
+                all(
+                    sum(row["task_id"] == task_id for row in assignments) <= 2
+                    for task_id in {row["task_id"] for row in assignments}
+                )
+            )
 
     def test_score_time_auc_records_verified_proof_time(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

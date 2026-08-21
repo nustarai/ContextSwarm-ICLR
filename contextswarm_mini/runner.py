@@ -760,7 +760,8 @@ def _run_elastic_cps(
         """Claim one lease; only post-initial claims invoke the treatment policy."""
         nonlocal decision_index
         nonlocal adaptive_assignments
-        with allocation_lock:
+        allocation_lock.acquire()
+        try:
             while time.monotonic() < deadline:
                 retire_exhausted_tasks()
                 if initial_fill or scheduler.has_pending_initial:
@@ -779,7 +780,21 @@ def _run_elastic_cps(
                 snapshot = build_snapshot(decision_index)
                 if not snapshot.eligible_task_ids:
                     return None
-                decision = allocator.choose(snapshot)
+                if config.allocation.policy == "agent":
+                    # A released solver slot can run its own read-only scheduler
+                    # call.  Release only the orchestration lock while the model
+                    # reasons so simultaneous completions keep all compute slots
+                    # occupied; index/snapshot and final admission remain atomic.
+                    allocation_lock.release()
+                    try:
+                        decision = allocator.choose(snapshot)
+                    finally:
+                        allocation_lock.acquire()
+                else:
+                    decision = allocator.choose(snapshot)
+                # Another concurrent scheduler call may have consumed the
+                # selected task's final attempt while this decision reasoned.
+                retire_exhausted_tasks()
                 assignment = None
                 execution_snapshot: TaskProgressSnapshot | None = None
                 if time.monotonic() < deadline and decision.selected_task_id:
@@ -814,7 +829,9 @@ def _run_elastic_cps(
                     execution_snapshot=execution_snapshot,
                 )
                 return assignment
-        return None
+            return None
+        finally:
+            allocation_lock.release()
 
     def prepare_workspace(state: _ElasticTaskState, assignment: AgentAssignment) -> tuple[Path, Path]:
         workdir = state.task_root / "agents" / assignment.agent_id
