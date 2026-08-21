@@ -37,6 +37,7 @@ class AgentResult:
     error_tail: str = ""
     events: int = 0
     timed_out: bool = False
+    cancelled: bool = False
     mocked: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -52,6 +53,7 @@ class AgentResult:
             "error_tail": self.error_tail,
             "events": self.events,
             "timed_out": self.timed_out,
+            "cancelled": self.cancelled,
             "mocked": self.mocked,
         }
 
@@ -84,4 +86,3 @@ class RunState:
     finished_at: str | None = None
     verdicts: dict[str, Verdict] = field(default_factory=dict)
     agent_results: list[AgentResult] = field(default_factory=list)
-

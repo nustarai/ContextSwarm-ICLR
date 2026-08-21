@@ -7,6 +7,7 @@ communication = "blackboard"
 max_parallel = 1
 episodes_per_task = 1
 max_tasks = 1
+max_attempts_per_task = 2
 time_limit_seconds = 30
 
 [aisw]
@@ -15,4 +16,3 @@ enabled = false
 [pi]
 fast_mode = false
 timeout_seconds = 10
-

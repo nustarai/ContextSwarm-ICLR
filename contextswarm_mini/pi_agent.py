@@ -11,6 +11,7 @@ import selectors
 import signal
 import shutil
 import subprocess
+import threading
 import time
 from typing import Any, Mapping
 import uuid
@@ -110,6 +111,7 @@ class PiAgent:
         workdir: Path,
         extra_env: Mapping[str, str] | None = None,
         deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AgentResult:
         started = now_iso()
         command = self.command()
@@ -117,6 +119,7 @@ class PiAgent:
         errors: list[str] = []
         events = 0
         timed_out = False
+        cancelled = False
         returncode = 1
         process: subprocess.Popen[str] | None = None
         trace_handle = None
@@ -158,6 +161,9 @@ class PiAgent:
             deadline = time.monotonic() + timeout_seconds
             terminal_seen = False
             while time.monotonic() < deadline:
+                if cancel_event is not None and cancel_event.is_set():
+                    cancelled = True
+                    break
                 ready = selector.select(timeout=0.5)
                 if not ready and process.poll() is not None:
                     break
@@ -210,7 +216,7 @@ class PiAgent:
                     process.stdin.close()
                 except OSError:
                     pass
-            if timed_out:
+            if timed_out or cancelled:
                 _terminate(process)
             elif process.poll() is None:
                 try:
@@ -248,6 +254,7 @@ class PiAgent:
             error_tail="\n".join(errors)[-4_000:],
             events=events,
             timed_out=timed_out,
+            cancelled=cancelled,
         )
 
 

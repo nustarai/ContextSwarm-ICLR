@@ -62,6 +62,32 @@ class MiniRuntimeTests(unittest.TestCase):
             self.assertTrue((run_dir / "cps.sqlite3").exists())
             self.assertTrue((run_dir / "scoreboard_history.jsonl").exists())
 
+    def test_elastic_cps_reuses_slots_and_keeps_task_verdicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_config("configs/smoke.toml", ROOT),
+                max_tasks=3,
+                max_parallel=2,
+                initial_agents_per_task=1,
+                max_attempts_per_task=2,
+                time_limit_seconds=2,
+            )
+            run_dir = run_experiment(
+                config,
+                mock_agent=True,
+                output_override=Path(temporary),
+            )
+            assignments = [
+                json.loads(line)
+                for line in (run_dir / "elastic_assignments.jsonl").read_text().splitlines()
+            ]
+            self.assertGreaterEqual(len(assignments), 3)
+            self.assertEqual(
+                set(json.loads((run_dir / "final.json").read_text())["verdicts"]),
+                {"imo2024_p1", "imo2024_p2", "imo2024_p3"},
+            )
+            self.assertTrue((run_dir / "elastic_scheduler_state.json").exists())
+
     def test_baselines_do_not_receive_cps_surface(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = run_experiment(

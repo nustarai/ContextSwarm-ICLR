@@ -4,7 +4,7 @@ extends = ["base.toml"]
 name = "mobench-1h-cps"
 mode = "cps"
 communication = "blackboard"
-max_parallel = 12
+max_parallel = 24
 episodes_per_task = 2
 time_limit_seconds = 3600
 output_root = "runs/1h"
@@ -14,4 +14,4 @@ timeout_seconds = 3600
 
 [lean]
 server_url = "http://127.0.0.1:19000"
-max_concurrent_evaluations = 1
+max_concurrent_evaluations = 4

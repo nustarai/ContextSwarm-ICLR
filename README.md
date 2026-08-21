@@ -6,7 +6,9 @@
 
 - `mono`：一个 Pi session 顺序处理 12 个任务，作为单体 baseline；
 - `parallel`：每个任务一个独立 Pi session，不共享 CPS；
-- `cps`：bounded episodes 重用任务上下文，并通过可替换通信策略写入 SQLite WAL；
+- `cps`：弹性 agent pool；默认每道题先分配 2 个 agent，总并行槽位为 24。agent
+  完成后，空闲槽位会继续分配给未完成题目；同题 agent 通过 SQLite WAL/CPS
+  context 和 task-local best candidate 合作；
 - `cps_direct` / `cps_hybrid`：用于通信机制 ablation。
 
 ## 先做本地 smoke
@@ -30,7 +32,11 @@ scoreboard_history.jsonl
 final.json
 cps.sqlite3              # CPS 模式
 communication_trace.jsonl # CPS 事件投影
-workers/<task>/result.lean # parallel/CPS
+elastic_assignments.jsonl  # CPS 动态 agent 分配
+elastic_scheduler_state.json # CPS 调度器收尾状态
+workers/<task>/result.lean # parallel/CPS compatibility path
+workers/<task>/agents/<actor>/result.lean # elastic CPS attempts
+workers/<task>/best/result.lean # elastic CPS best candidate
 workers/mono/tasks/<task>/result.lean # mono
 ```
 
@@ -89,6 +95,20 @@ scripts/run_docker.sh --config configs/parallel.toml
 scripts/run_docker.sh --config configs/cps.toml
 ```
 
+CPS 的弹性调度字段位于 `[experiment]`：
+
+```toml
+max_parallel = 24           # 全局 agent 槽位
+initial_agents_per_task = 2 # 每题的初始 agent 数
+max_attempts_per_task = 0   # 0 = 直到 horizon；可设有限重试上限
+cancel_on_proved = true     # 题目证明后取消同题仍运行的 agent
+assignment_policy = "least_active"
+```
+
+每次尝试使用独立 workspace，完成后把较强 candidate 合并到
+`workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
+pieces/messages。Mono 和 Parallel 仍保持通信关闭、固定 baseline 语义。
+
 用于短 canary 的 180 秒 manifest 已保留在 `configs/3min_*.toml`：
 
 ```bash
@@ -99,8 +119,9 @@ scripts/run_docker.sh --config configs/3min_cps.toml
 
 3 分钟 horizon 到达后，runner 会停止 Pi session，并跳过已经迟到的 Lean
 提交/长轮询；这保证 container closeout 不会被 evaluator queue 无限拖延。
-`[lean].max_concurrent_evaluations` 默认是 1，与本 canary 的单 Goedel-Prover
-worker 对齐；提高它应当和 Judge worker/内存容量一起调整。
+弹性 CPS manifest 将 `[lean].max_concurrent_evaluations` 设为 4，建议同时给
+独立 Goedel-Prover Judge 配置至少 4 个 worker；Mono/Parallel baseline 仍可用
+较低并发。该值应当始终和 Judge worker/内存容量一起调整。
 
 如果 AISW binary 或 node config 不在默认路径：
 

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import datetime as dt
 import json
+from queue import Empty, Queue
 from pathlib import Path
 import shutil
 import threading
@@ -17,6 +18,7 @@ from typing import Any, Iterable, Mapping
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
 from .evaluator import LeanEvaluator, MockEvaluator
+from .elastic_scheduler import AgentAssignment, ElasticScheduler
 from .models import AgentResult, Task, Verdict
 from .pi_agent import PiAgent
 from .preflight import PreflightError, run_preflight
@@ -54,6 +56,37 @@ class RunLogger:
         with self.lock:
             with (self.output_dir / "scoreboard_history.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+@dataclass
+class _ElasticTaskState:
+    """Run-local state for multiple agents collaborating on one task."""
+
+    task: Task
+    task_root: Path
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    attempts: int = 0
+    solved: bool = False
+    best_verdict: Verdict | None = None
+    best_candidate: Path | None = None
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+
+def _verdict_priority(verdict: Verdict | None) -> tuple[int, float]:
+    if verdict is None:
+        return (-1, -1.0)
+    status_rank = {
+        "PROVED": 4,
+        "AC": 4,
+        "PASSED": 4,
+        "COMPILES_WITH_SORRY": 2,
+        "VERIFY_FAIL": 1,
+        "CHEATING": 1,
+        "LOCAL_REJECTED": 0,
+        "RUNNING": 0,
+        "OUT_OF_HORIZON": 0,
+    }
+    return (status_rank.get(verdict.status, 0), float(verdict.score))
 
 
 def load_tasks(config: ExperimentConfig) -> list[Task]:
@@ -96,9 +129,12 @@ def load_tasks(config: ExperimentConfig) -> list[Task]:
 
 def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
     task_list = list(tasks)
-    sessions = len(task_list) if config.mode != "mono" else 1
-    if config.mode == "cps":
-        sessions *= config.episodes_per_task
+    if config.mode == "mono":
+        sessions = 1
+    elif config.uses_cps:
+        sessions = min(config.max_parallel, len(task_list) * config.initial_agents_per_task)
+    else:
+        sessions = len(task_list)
     return {
         "name": config.name,
         "mode": config.mode,
@@ -107,6 +143,9 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "task_count": len(task_list),
         "episodes_per_task": config.episodes_per_task,
         "max_parallel": config.max_parallel,
+        "initial_agents_per_task": config.initial_agents_per_task,
+        "max_attempts_per_task": config.max_attempts_per_task,
+        "assignment_policy": config.assignment_policy,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
         "model": config.model,
@@ -190,6 +229,24 @@ def run_experiment(
             )
             agent_results.append(mono_result)
             verdicts.update(mono_verdicts)
+        elif config.uses_cps:
+            results = _run_elastic_cps(
+                config,
+                tasks,
+                run_dir,
+                logger,
+                evaluator,
+                pi_agent,
+                policy,
+                mock_agent=mock_agent,
+                deadline=run_deadline,
+                evaluator_gate=evaluator_gate,
+            )
+            for result, verdict in results:
+                agent_results.append(result)
+                current = verdicts.get(verdict.task_id)
+                if _verdict_priority(verdict) >= _verdict_priority(current):
+                    verdicts[verdict.task_id] = verdict
         else:
             results = _run_task_workers(
                 config,
@@ -258,6 +315,311 @@ def _run_mono(
         logger.scoreboard(verdict, episode=1, agent_id="mono")
         logger.event("evaluation_finished", **verdict.as_dict(), agent_id="mono", episode=1)
     return result, verdicts
+
+
+def _run_elastic_cps(
+    config: ExperimentConfig,
+    tasks: list[Task],
+    run_dir: Path,
+    logger: RunLogger,
+    evaluator: Any,
+    pi_agent: PiAgent,
+    policy: CommunicationPolicy,
+    *,
+    mock_agent: bool,
+    deadline: float,
+    evaluator_gate: threading.BoundedSemaphore,
+) -> list[tuple[AgentResult, Verdict]]:
+    """Run CPS with an elastic, task-aware agent pool.
+
+    A task receives ``initial_agents_per_task`` leases initially.  When a
+    lease finishes, the scheduler assigns the freed slot to an unfinished
+    task, preferring tasks below their initial quota and then using the
+    scheduler's fair round-robin retry order.  Every attempt has its own
+    workspace; a task-local best candidate is copied into the next attempt so
+    agents can combine CPS messages with concrete code rather than racing on a
+    single ``result.lean`` file.
+    """
+
+    states: dict[str, _ElasticTaskState] = {}
+    for task in tasks:
+        task_root = run_dir / "workers" / task.slug
+        state = _ElasticTaskState(task=task, task_root=task_root)
+        best_dir = task_root / "best"
+        best_dir.mkdir(parents=True, exist_ok=True)
+        best_path = best_dir / "result.lean"
+        if not best_path.exists():
+            best_path.write_text(task.baseline_code, encoding="utf-8")
+        state.best_candidate = best_path
+        states[task.slug] = state
+
+    scheduler = ElasticScheduler(
+        [task.slug for task in tasks],
+        max_parallel=config.max_parallel,
+        initial_agents=config.initial_agents_per_task,
+        horizon=max(0.0, deadline - time.monotonic()),
+        assignment_policy=config.assignment_policy,
+    )
+    assignments_path = run_dir / "elastic_assignments.jsonl"
+    roster_path = run_dir / "actors.json"
+    roster_lock = threading.RLock()
+    roster: list[dict[str, Any]] = []
+    roster_path.write_text("[]\n", encoding="utf-8")
+    jobs: Queue[AgentAssignment] = Queue()
+    results: list[tuple[AgentResult, Verdict]] = []
+    results_lock = threading.RLock()
+
+    def record_assignment(assignment: AgentAssignment) -> None:
+        row = {
+            "at": utc_now(),
+            "event": "agent_assigned",
+            "task_id": assignment.task_id,
+            "agent_id": assignment.agent_id,
+            "generation": assignment.generation,
+            "admitted_at": assignment.admitted_at,
+        }
+        with assignments_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        with roster_lock:
+            roster.append(
+                {
+                    "actor_id": assignment.agent_id,
+                    "task_id": assignment.task_id,
+                    "episode": assignment.generation,
+                }
+            )
+            temporary = roster_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(roster, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(roster_path)
+        logger.event(
+            "agent_assigned",
+            task_id=assignment.task_id,
+            agent_id=assignment.agent_id,
+            episode=assignment.generation,
+            active_slots=scheduler.active_slots,
+        )
+
+    def claim_next() -> AgentAssignment | None:
+        """Claim a lease, respecting an optional per-task attempt cap."""
+        while time.monotonic() < deadline:
+            assignment = scheduler.next_assignment()
+            if assignment is None:
+                return None
+            state = states[assignment.task_id]
+            with state.lock:
+                exhausted = (
+                    config.max_attempts_per_task > 0
+                    and state.attempts >= config.max_attempts_per_task
+                )
+                if not exhausted:
+                    state.attempts += 1
+            if exhausted:
+                # The lease was only a probe for a task which reached its
+                # configured attempt budget.  Retire it immediately; no
+                # process was launched for this assignment.
+                scheduler.finish(assignment, solved=True)
+                state.solved = True
+                state.cancel_event.set()
+                logger.event(
+                    "task_attempt_budget_exhausted",
+                    task_id=assignment.task_id,
+                    max_attempts=config.max_attempts_per_task,
+                )
+                continue
+            record_assignment(assignment)
+            return assignment
+        return None
+
+    def prepare_workspace(state: _ElasticTaskState, assignment: AgentAssignment) -> tuple[Path, Path]:
+        workdir = state.task_root / "agents" / assignment.agent_id
+        _stage_task(state.task, workdir)
+        assert state.best_candidate is not None
+        with state.lock:
+            shutil.copy2(state.best_candidate, workdir / "result.lean")
+        return workdir, state.best_candidate
+
+    def execute_assignment(assignment: AgentAssignment) -> tuple[AgentResult, Verdict, bool]:
+        state = states[assignment.task_id]
+        workdir, best_path = prepare_workspace(state, assignment)
+        actor = assignment.agent_id
+        task = state.task
+        if state.solved:
+            result = _mock_result(actor, task.slug, assignment.generation)
+            verdict = Verdict(task.slug, "CANCELLED", 0.0, 0.0, {"reason": "task_already_solved"})
+            return result, verdict, False
+
+        digest = policy.digest(task.slug, actor, query=task.theorem_name)
+        prompt = build_task_prompt(
+            task,
+            task_workspace=str(workdir),
+            agent_id=actor,
+            episode=assignment.generation,
+            communication_enabled=policy.enabled,
+            digest=digest,
+        )
+        prompt += (
+            "\n\nElastic CPS handoff:\n"
+            f"Other agents on this task may have left a stronger candidate at {best_path}. "
+            "Read it before editing result.lean. Keep your candidate in result.lean; "
+            "the runner will merge the strongest verified candidate."
+        )
+        db_path = str(policy.store.path) if policy.store is not None else ""
+        env = {
+            "CONTEXTSWARM_CPS_DB": db_path,
+            "CONTEXTSWARM_ASSIGNMENT_FILE": str(assignments_path),
+            "CONTEXTSWARM_BEST_CANDIDATE_FILE": str(best_path),
+            "CONTEXTSWARM_TASK_ROOT": str(state.task_root),
+        }
+        if policy.enabled:
+            _write_context_piece_wrapper(workdir)
+            env["CONTEXTSWARM_ACTORS_FILE"] = str(roster_path)
+
+        if mock_agent:
+            result = _mock_result(actor, task.slug, assignment.generation)
+        else:
+            result = pi_agent.run(
+                task_id=task.slug,
+                actor_id=actor,
+                episode=assignment.generation,
+                prompt=prompt,
+                workdir=workdir,
+                extra_env=env,
+                deadline_monotonic=deadline,
+                cancel_event=state.cancel_event,
+            )
+        logger.event("agent_finished", **result.as_dict())
+
+        if result.cancelled or state.solved:
+            verdict = Verdict(
+                task.slug,
+                "CANCELLED",
+                0.0,
+                0.0,
+                {"reason": "task_solved_by_peer"},
+            )
+        else:
+            verdict = _evaluate_candidate(
+                evaluator,
+                task,
+                workdir / "result.lean",
+                deadline,
+                evaluator_gate,
+            )
+            verdict = _within_horizon(verdict, deadline)
+
+        logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
+        logger.event(
+            "evaluation_finished",
+            **verdict.as_dict(),
+            agent_id=actor,
+            episode=assignment.generation,
+        )
+
+        solved = verdict.score >= 1.0
+        with state.lock:
+            candidate_is_usable = verdict.status not in {
+                "LOCAL_REJECTED",
+                "OUT_OF_HORIZON",
+                "CANCELLED",
+                "RUNNING",
+            }
+            if candidate_is_usable and _verdict_priority(verdict) >= _verdict_priority(state.best_verdict):
+                state.best_verdict = verdict
+                try:
+                    shutil.copy2(workdir / "result.lean", best_path)
+                except OSError:
+                    pass
+            if solved:
+                state.solved = True
+                if config.cancel_on_proved:
+                    state.cancel_event.set()
+        if solved:
+            scheduler.task_solved(task.slug)
+
+        if policy.enabled:
+            feedback = verdict.error or str(
+                verdict.response.get("error_message")
+                or verdict.response.get("reason")
+                or verdict.status
+            )
+            policy.publish(
+                task.slug,
+                actor,
+                kind="validation_result",
+                title=f"attempt {assignment.generation}: {verdict.status}",
+                body=(
+                    f"Evaluator status={verdict.status}; score={verdict.score}. "
+                    f"Feedback: {feedback[:1200]} Shared candidate: {best_path}"
+                ),
+            )
+        return result, verdict, solved
+
+    # Fill the initial pool.  A queue worker will immediately request a new
+    # assignment after each completion, so no task is permanently tied to a
+    # Python thread.
+    initial_assignments: list[AgentAssignment] = []
+    for _ in range(config.max_parallel):
+        assignment = claim_next()
+        if assignment is None:
+            break
+        initial_assignments.append(assignment)
+        jobs.put(assignment)
+
+    worker_count = max(1, min(config.max_parallel, len(initial_assignments)))
+
+    def worker_loop() -> None:
+        while True:
+            try:
+                assignment = jobs.get(timeout=0.2)
+            except Empty:
+                if time.monotonic() >= deadline or scheduler.done:
+                    return
+                continue
+            try:
+                result, verdict, solved = execute_assignment(assignment)
+                with results_lock:
+                    results.append((result, verdict))
+                scheduler.finish(assignment, solved=solved)
+                replacement = claim_next()
+                if replacement is not None:
+                    jobs.put(replacement)
+            except Exception as exc:  # keep one failed worker from wedging the pool
+                logger.event(
+                    "elastic_worker_error",
+                    task_id=assignment.task_id,
+                    agent_id=assignment.agent_id,
+                    error=str(exc),
+                    traceback=traceback.format_exc()[-2_000:],
+                )
+                scheduler.finish(assignment, solved=False)
+                replacement = claim_next()
+                if replacement is not None:
+                    jobs.put(replacement)
+            finally:
+                jobs.task_done()
+
+    if initial_assignments:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(worker_loop) for _ in range(worker_count)]
+            for future in futures:
+                future.result()
+
+    # Emit a terminal result for tasks which never received a usable verdict.
+    seen_tasks = {verdict.task_id for _, verdict in results}
+    for task in tasks:
+        state = states[task.slug]
+        if task.slug in seen_tasks:
+            continue
+        fallback = Verdict(task.slug, "TIME_LIMIT", 0.0, 0.0, {"reason": "no_assignment_completed"})
+        results.append((_mock_result(f"scheduler-{task.slug}", task.slug, state.attempts), fallback))
+    (run_dir / "elastic_scheduler_state.json").write_text(
+        json.dumps(scheduler.snapshot(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return results
 
 
 def _run_task_workers(
@@ -396,11 +758,12 @@ def _evaluate_candidate(
     candidate: Path,
     deadline: float,
     gate: threading.BoundedSemaphore,
+    admission_timeout_seconds: float = 30.0,
 ) -> Verdict:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "run_horizon_elapsed"})
-    if not gate.acquire(timeout=min(remaining, 5.0)):
+    if not gate.acquire(timeout=min(remaining, max(0.1, float(admission_timeout_seconds)))):
         return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "evaluator_admission_horizon_elapsed"})
     try:
         return evaluator.evaluate(task, candidate, deadline_monotonic=deadline)

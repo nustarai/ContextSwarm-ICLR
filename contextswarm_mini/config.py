@@ -92,6 +92,10 @@ class ExperimentConfig:
     problem_ids_path: Path
     output_root: Path
     max_parallel: int
+    initial_agents_per_task: int
+    max_attempts_per_task: int
+    cancel_on_proved: bool
+    assignment_policy: str
     episodes_per_task: int
     max_tasks: int
     time_limit_seconds: int
@@ -150,6 +154,10 @@ class ExperimentConfig:
             "dataset_root": str(self.dataset_root),
             "problem_ids_path": str(self.problem_ids_path),
             "max_parallel": self.max_parallel,
+            "initial_agents_per_task": self.initial_agents_per_task,
+            "max_attempts_per_task": self.max_attempts_per_task,
+            "cancel_on_proved": self.cancel_on_proved,
+            "assignment_policy": self.assignment_policy,
             "episodes_per_task": self.episodes_per_task,
             "max_tasks": self.max_tasks,
             "time_limit_seconds": self.time_limit_seconds,
@@ -220,6 +228,23 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     output_root = Path(_text(experiment.get("output_root"), "runs"))
 
     max_parallel = _positive_int(experiment.get("max_parallel"), "experiment.max_parallel", 12)
+    initial_default = 2 if mode == "cps" else 1
+    initial_agents = _positive_int(
+        experiment.get("initial_agents_per_task"),
+        "experiment.initial_agents_per_task",
+        initial_default,
+    )
+    if mode != "cps":
+        initial_agents = 1
+    max_attempts = _nonnegative_int(
+        experiment.get("max_attempts_per_task"),
+        "experiment.max_attempts_per_task",
+        0 if mode == "cps" else 1,
+    )
+    cancel_on_proved = bool(experiment.get("cancel_on_proved", True))
+    assignment_policy = _text(experiment.get("assignment_policy"), "least_active")
+    if assignment_policy not in {"least_active", "round_robin"}:
+        raise ConfigError("experiment.assignment_policy must be least_active or round_robin")
     episodes = _positive_int(experiment.get("episodes_per_task"), "experiment.episodes_per_task", 1)
     max_tasks = _nonnegative_int(experiment.get("max_tasks"), "experiment.max_tasks", 0)
     horizon = _positive_int(experiment.get("time_limit_seconds"), "experiment.time_limit_seconds", 3600)
@@ -269,6 +294,10 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         problem_ids_path=problem_ids_path,
         output_root=output_root,
         max_parallel=max_parallel,
+        initial_agents_per_task=initial_agents,
+        max_attempts_per_task=max_attempts,
+        cancel_on_proved=cancel_on_proved,
+        assignment_policy=assignment_policy,
         episodes_per_task=episodes,
         max_tasks=max_tasks,
         time_limit_seconds=horizon,
