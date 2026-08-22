@@ -165,16 +165,19 @@ def _selection_db(path: Path, *, private_marker: str) -> _Store:
 
 
 class _ProtocolStore:
-    def __init__(self, rows, *, watermark: int = 1):
+    def __init__(self, rows, *, watermark: int = 1, complete: bool = True):
         self.rows = tuple(rows)
         self.watermark = watermark
+        self.complete = complete
         self.calls = []
 
     def read_allocation_projection_records(
         self, task_ids, *, after_watermark: int, limit: int
     ) -> TraceProjectionRecordBatch:
         self.calls.append((tuple(task_ids), after_watermark, limit))
-        return TraceProjectionRecordBatch(self.rows, self.watermark)
+        return TraceProjectionRecordBatch(
+            self.rows, self.watermark, complete=self.complete
+        )
 
 
 class _SnapshotStore:
@@ -337,6 +340,28 @@ class AllocationTraceBridgeTests(unittest.TestCase):
         ).read(["task-a"], store=incomplete)
         self.assertEqual(zero.source, "zero")
         self.assertTrue(zero.for_task("task-a").is_zero)
+
+        # Even when the returned page happens to end at the reported head, an
+        # explicit incomplete marker must fail closed rather than becoming a
+        # current-state snapshot.
+        marked_incomplete = _ProtocolStore(
+            [
+                {
+                    "sequence": 1,
+                    "record_id": "partial-1",
+                    "task_id": "task-a",
+                    "kind": "frontier",
+                    "lineage_id": "partial-lineage",
+                }
+            ],
+            watermark=1,
+            complete=False,
+        )
+        marked_zero = TraceProjectionBridge().read(
+            ["task-a"], store=marked_incomplete
+        )
+        self.assertEqual(marked_zero.source, "zero")
+        self.assertTrue(marked_zero.for_task("task-a").is_zero)
 
     def test_pinned_snapshot_pages_are_materialized_before_projection(self) -> None:
         source = _SnapshotStore(

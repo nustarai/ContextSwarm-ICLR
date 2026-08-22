@@ -615,6 +615,12 @@ def _legacy_batch_is_complete(batch: TraceProjectionRecordBatch) -> bool:
 
     if not isinstance(batch, TraceProjectionRecordBatch):
         return False
+    # ``complete`` is authoritative even on the compatibility protocol.  A
+    # source must not be able to smuggle a bounded page into a full-state
+    # allocator snapshot merely by reporting a watermark equal to its last
+    # returned row.
+    if batch.complete is not True:
+        return False
     sequences: list[int] = []
     identities: set[tuple[str, ...]] = set()
     for item in batch.records:
