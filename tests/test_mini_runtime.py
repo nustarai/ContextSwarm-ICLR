@@ -303,6 +303,13 @@ class MiniRuntimeTests(unittest.TestCase):
             "configs/scale_1h_cps24.toml",
             "configs/scale_1h_cps48.toml",
             "configs/scale_1h_cps96.toml",
+            "configs/formal_1h_mono.toml",
+            "configs/formal_1h_parallel.toml",
+            "configs/formal_1h_cps12.toml",
+            "configs/formal_1h_cps24.toml",
+            "configs/formal_1h_cps48.toml",
+            "configs/formal_1h_cps96.toml",
+            "configs/formal_1h_cps192.toml",
         ):
             config = load_config(manifest, ROOT)
             self.assertEqual(tuple(getattr(config, field) for field in transport_fields), expected)
@@ -324,6 +331,30 @@ class MiniRuntimeTests(unittest.TestCase):
             contracts.append((public, allocation))
         self.assertEqual(contracts, [contracts[0]] * 3)
         self.assertEqual([config.allocation.policy for config in allocation_arms], ["uniform", "formula", "agent"])
+
+        formal_manifests = {
+            "configs/formal_1h_mono.toml": ("mono", "none", 1, 1, 16_384),
+            "configs/formal_1h_parallel.toml": ("parallel", "none", 12, 1, 16_384),
+            "configs/formal_1h_cps12.toml": ("cps", "blackboard", 12, 1, 16_384),
+            "configs/formal_1h_cps24.toml": ("cps", "blackboard", 24, 2, 16_384),
+            "configs/formal_1h_cps48.toml": ("cps", "blackboard", 48, 4, 32_768),
+            "configs/formal_1h_cps96.toml": ("cps", "blackboard", 96, 8, 32_768),
+            "configs/formal_1h_cps192.toml": ("cps", "blackboard", 192, 16, 65_536),
+        }
+        for manifest, expected_contract in formal_manifests.items():
+            with self.subTest(manifest=manifest):
+                config = load_config(manifest, ROOT)
+                observed = (
+                    config.mode,
+                    config.communication,
+                    config.max_parallel,
+                    config.initial_agents_per_task,
+                    config.docker_memory_mb,
+                )
+                self.assertEqual(observed, expected_contract)
+                self.assertEqual(config.docker_network, "bridge")
+                self.assertTrue(config.lean_require_result_cache_disabled)
+                self.assertEqual(config.allocation.policy, "uniform")
 
     def test_cps_store_and_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

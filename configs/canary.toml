@@ -23,3 +23,6 @@ timeout_seconds = 180
 [lean]
 max_concurrent_evaluations = 1
 require_result_cache_disabled = true
+
+[docker]
+network = "bridge"

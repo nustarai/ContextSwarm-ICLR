@@ -76,6 +76,13 @@ class PreflightResultCacheTests(unittest.TestCase):
             "configs/allocation_1h_cps48_formula.toml",
             "configs/allocation_1h_cps48_agent.toml",
             "configs/canary.toml",
+            "configs/formal_1h_mono.toml",
+            "configs/formal_1h_parallel.toml",
+            "configs/formal_1h_cps12.toml",
+            "configs/formal_1h_cps24.toml",
+            "configs/formal_1h_cps48.toml",
+            "configs/formal_1h_cps96.toml",
+            "configs/formal_1h_cps192.toml",
         ):
             with self.subTest(path=path):
                 config = load_config(path, ROOT)
