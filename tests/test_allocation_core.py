@@ -4,10 +4,12 @@ import math
 import unittest
 
 from contextswarm_mini.allocation_core import (
+    AllocationDecision,
     AllocationStateSnapshot,
     LLM_SCHEDULER_PROMPT_MAX_BYTES,
     LLM_SCHEDULER_PROMPT_MAX_TOKENS,
     LLMSchedulerResponse,
+    LLMSchedulerCost,
     ReadOnlyLLMSchedulerPolicy,
     TaskState,
     TaskStateAllocationPolicy,
@@ -132,6 +134,45 @@ class AllocationCoreTests(unittest.TestCase):
             task("a", checker_quality=math.nan)
         with self.assertRaises(ValueError):
             TraceFeatures(drag=math.inf)
+
+    def test_core_records_reject_type_coercion_and_malformed_fields(self) -> None:
+        # IDs and declared ID collections are part of the causal identity.  Do
+        # not silently turn None/integers/bytes or a scalar string into a new
+        # valid identity by calling str(...) or iterating over its characters.
+        with self.assertRaisesRegex(ValueError, "task_id must be a string"):
+            TaskState(None, True, 0)
+        with self.assertRaisesRegex(ValueError, "trace_reference_ids must be a tuple or list"):
+            TaskState("a", True, 0, trace_reference_ids="trace-1")
+        with self.assertRaisesRegex(ValueError, "values must be a string"):
+            TaskState("a", True, 0, trace_reference_ids=(None,))
+        with self.assertRaisesRegex(ValueError, "decision_id must be a string"):
+            AllocationStateSnapshot(None, 0, 0, 1, 1, 0, 0, 1, (task("a", active=0),))
+        with self.assertRaisesRegex(ValueError, "tasks must be a tuple or list"):
+            AllocationStateSnapshot("d", 0, 0, 1, 1, 0, 0, 1, "not-tasks")
+        with self.assertRaisesRegex(ValueError, "trace_watermark contains control"):
+            AllocationStateSnapshot(
+                "d", 0, 0, 1, 1, 0, 0, 1, (task("a", active=0),), trace_watermark="W\n"
+            )
+        with self.assertRaisesRegex(ValueError, "decision_index must be a non-negative"):
+            AllocationDecision("d", "s", -1, "task_state", "a", "ok")
+        with self.assertRaisesRegex(ValueError, "policy must be a string"):
+            AllocationDecision("d", "s", 0, 1, "a", "ok")
+        with self.assertRaisesRegex(ValueError, "fallback must be a boolean"):
+            AllocationDecision("d", "s", 0, "task_state", "a", "ok", fallback=1)
+        with self.assertRaisesRegex(ValueError, "scheduler_cost must be"):
+            AllocationDecision(
+                "d", "s", 0, "task_state", "a", "ok", scheduler_cost={}
+            )
+
+    def test_core_record_sequences_are_detached_and_cost_type_is_preserved(self) -> None:
+        references = ["trace-a"]
+        record = AllocationDecision(
+            "d", "s", 0, "task_state", "a", "ok", trace_reference_ids=references
+        )
+        references.append("trace-b")
+        self.assertEqual(record.trace_reference_ids, ("trace-a",))
+        cost = LLMSchedulerCost(latency_seconds=2.0, occupied_slot_seconds=0.25)
+        self.assertEqual(cost.occupied_slot_seconds, 0.25)
 
     def test_strict_llm_parser_and_task_state_fallback(self) -> None:
         snap = snapshot(

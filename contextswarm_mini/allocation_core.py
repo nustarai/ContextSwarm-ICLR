@@ -95,6 +95,77 @@ def _nonnegative_int(name: str, value: int) -> int:
     return value
 
 
+def _bounded_text(
+    name: str,
+    value: Any,
+    *,
+    allow_empty: bool = False,
+    max_chars: int = MAX_IDENTIFIER_CHARS,
+    max_bytes: int | None = None,
+    reject_controls: bool = False,
+) -> str:
+    """Validate an externally supplied text field without coercing it.
+
+    The allocation core is an immutable boundary.  Coercing ``None``, bytes,
+    integers, or arbitrary objects with ``str(...)`` changes the identity of a
+    decision and can make a caller-owned iterable look like a list of IDs.
+    Keep normalization limited to the historical surrounding-whitespace trim,
+    and make the type/size contract explicit before hashing or serializing.
+    """
+
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if reject_controls and any(
+        ord(char) < 0x20
+        or ord(char) == 0x7F
+        or unicodedata.category(char) in {"Cc", "Cf", "Cs"}
+        for char in value
+    ):
+        if name == "decision_id":
+            raise ValueError("decision_id is an unsafe decision identifier")
+        raise ValueError(f"{name} contains control characters")
+    normalized = value.strip()
+    if not normalized and not allow_empty:
+        raise ValueError(f"{name} must be non-empty")
+    if len(normalized) > max_chars:
+        raise ValueError(f"{name} must be at most {max_chars} characters")
+    if max_bytes is not None:
+        try:
+            encoded_length = len(normalized.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"{name} must be valid UTF-8 text") from exc
+        if encoded_length > max_bytes:
+            raise ValueError(f"{name} exceeds its bounded UTF-8 size")
+    return normalized
+
+
+def _bounded_identifier_sequence(
+    name: str,
+    value: Any,
+    *,
+    max_items: int = MAX_TRACE_REFERENCES_PER_TASK,
+) -> tuple[str, ...]:
+    """Normalize a declared tuple/list of opaque IDs without broad coercion."""
+
+    # A scalar string is iterable, which was the source of a particularly
+    # subtle bug: ``"abc"`` became the three IDs ``("a", "b", "c")``.
+    # Accept only the two sequence shapes represented by the public dataclass
+    # contract; callers still receive an immutable tuple in the result.
+    if not isinstance(value, (tuple, list)):
+        raise ValueError(f"{name} must be a tuple or list of strings")
+    if len(value) > max_items:
+        raise ValueError(f"{name} must contain at most {max_items} values")
+    normalized = tuple(
+        _bounded_text(
+            f"{name} values", item, allow_empty=False, reject_controls=True
+        )
+        for item in value
+    )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{name} must be unique")
+    return normalized
+
+
 def _weight_dict(instance: object) -> dict[str, float]:
     return {item.name: float(getattr(instance, item.name)) for item in fields(instance)}
 
@@ -551,11 +622,7 @@ class TaskState:
     trace_source_outcome_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        task_id = str(self.task_id).strip()
-        if not task_id:
-            raise ValueError("task_id must be non-empty")
-        if len(task_id) > MAX_IDENTIFIER_CHARS:
-            raise ValueError(f"task_id must be at most {MAX_IDENTIFIER_CHARS} characters")
+        task_id = _bounded_text("task_id", self.task_id, reject_controls=True)
         if not isinstance(self.eligible, bool):
             raise ValueError("eligible must be a boolean")
         if not isinstance(self.trace, TraceFeatures):
@@ -566,18 +633,9 @@ class TaskState:
             "checker_outcome_ids",
             "trace_source_outcome_ids",
         ):
-            values = tuple(str(value).strip() for value in getattr(self, name))
-            if any(not value for value in values):
-                raise ValueError(f"{name} must contain non-empty strings")
-            if len(set(values)) != len(values):
-                raise ValueError(f"{name} must be unique")
-            if len(values) > MAX_TRACE_REFERENCES_PER_TASK:
-                raise ValueError(
-                    f"{name} must contain at most {MAX_TRACE_REFERENCES_PER_TASK} values"
-                )
-            if any(len(value) > MAX_IDENTIFIER_CHARS for value in values):
-                raise ValueError(f"{name} values must be at most {MAX_IDENTIFIER_CHARS} characters")
-            identifier_fields[name] = values
+            identifier_fields[name] = _bounded_identifier_sequence(
+                name, getattr(self, name)
+            )
         if set(identifier_fields["checker_outcome_ids"]) & set(
             identifier_fields["trace_source_outcome_ids"]
         ):
@@ -639,9 +697,11 @@ class AllocationStateSnapshot:
     allocation_parameters: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        decision_id = str(self.decision_id).strip()
-        if not decision_id:
-            raise ValueError("decision_id must be non-empty")
+        decision_id = _bounded_text(
+            "decision_id", self.decision_id, reject_controls=True
+        )
+        if not isinstance(self.tasks, (tuple, list)):
+            raise ValueError("tasks must be a tuple or list of TaskState records")
         tasks = tuple(self.tasks)
         if any(not isinstance(task, TaskState) for task in tasks):
             raise ValueError("tasks must contain only TaskState records")
@@ -701,9 +761,12 @@ class AllocationStateSnapshot:
                 "active_solver_slots + scheduler_reserved_slots + free_slots must equal total_capacity"
             )
         for name in ("trace_watermark", "allocation_config_sha256"):
-            value = str(getattr(self, name)).strip()
-            if len(value) > MAX_IDENTIFIER_CHARS:
-                raise ValueError(f"{name} must be at most {MAX_IDENTIFIER_CHARS} characters")
+            value = _bounded_text(
+                name,
+                getattr(self, name),
+                allow_empty=True,
+                reject_controls=True,
+            )
             object.__setattr__(self, name, value)
         object.__setattr__(self, "allocation_parameters", _freeze_json(self.allocation_parameters))
 
@@ -911,12 +974,19 @@ class TraceStateScorer:
 
 
 def _immutable_scores(values: Mapping[str, float]) -> Mapping[str, float]:
-    return MappingProxyType(
-        {
-            str(key): _finite(f"score[{key!r}]", value)
-            for key, value in sorted(values.items())
-        }
-    )
+    if not isinstance(values, Mapping):
+        raise ValueError("scores must be a mapping")
+    normalized: dict[str, float] = {}
+    for key, value in values.items():
+        if not isinstance(key, str):
+            raise ValueError("score keys must be strings")
+        normalized_key = _bounded_text(
+            "score key", key, allow_empty=False, reject_controls=True
+        )
+        if normalized_key in normalized:
+            raise ValueError("score keys must be unique after normalization")
+        normalized[normalized_key] = _finite(f"score[{normalized_key!r}]", value)
+    return MappingProxyType(dict(sorted(normalized.items())))
 
 
 @dataclass(frozen=True)
@@ -1038,10 +1108,77 @@ class AllocationDecision:
     run_horizon_reached: bool = False
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "decision_id",
+            _bounded_text("decision_id", self.decision_id, reject_controls=True),
+        )
+        object.__setattr__(
+            self,
+            "state_id",
+            _bounded_text("state_id", self.state_id, reject_controls=True),
+        )
+        object.__setattr__(
+            self,
+            "decision_index",
+            _nonnegative_int("decision_index", self.decision_index),
+        )
+        object.__setattr__(
+            self,
+            "policy",
+            _bounded_text("policy", self.policy, reject_controls=True),
+        )
+        object.__setattr__(
+            self,
+            "selected_task_id",
+            _bounded_text(
+                "selected_task_id",
+                self.selected_task_id,
+                allow_empty=True,
+                reject_controls=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "reason",
+            _bounded_text(
+                "reason",
+                self.reason,
+                max_chars=MAX_SCHEDULER_REASON_CHARS,
+                max_bytes=MAX_SCHEDULER_REASON_BYTES,
+                reject_controls=True,
+            ),
+        )
         object.__setattr__(self, "scores", _immutable_scores(self.scores))
         object.__setattr__(self, "task_scores", _immutable_scores(self.task_scores))
         object.__setattr__(self, "trace_increments", _immutable_scores(self.trace_increments))
-        object.__setattr__(self, "trace_reference_ids", tuple(self.trace_reference_ids))
+        object.__setattr__(
+            self,
+            "trace_reference_ids",
+            _bounded_identifier_sequence(
+                "trace_reference_ids",
+                self.trace_reference_ids,
+                max_items=20,
+            ),
+        )
+        if not isinstance(self.fallback, bool):
+            raise ValueError("fallback must be a boolean")
+        object.__setattr__(
+            self,
+            "fallback_reason",
+            _bounded_text(
+                "fallback_reason",
+                self.fallback_reason,
+                allow_empty=True,
+                max_chars=MAX_SCHEDULER_REASON_CHARS,
+                max_bytes=MAX_SCHEDULER_REASON_BYTES,
+                reject_controls=True,
+            ),
+        )
+        if self.scheduler_cost is not None and not isinstance(
+            self.scheduler_cost, LLMSchedulerCost
+        ):
+            raise ValueError("scheduler_cost must be LLMSchedulerCost or None")
         if self.scheduler_outcome not in SCHEDULER_OUTCOMES:
             raise ValueError("scheduler_outcome is not recognized")
         for name in (
