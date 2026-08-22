@@ -219,6 +219,36 @@ class _CombinedCancelEvent:
             self._remote_event.wait(delay)
         return True
 
+    def cancellation_reason(self) -> str | None:
+        """Preserve caller cancellation provenance across the global latch.
+
+        The process-wide settlement latch takes precedence over a task-local
+        peer cancellation.  This prevents a run failure from being treated as
+        an innocuous delayed cancellation merely because both events became
+        set at nearly the same instant.
+        """
+
+        if self._remote_event.is_set():
+            return "remote_settlement_unconfirmed"
+        nested = getattr(self._caller_event, "cancellation_reason", None)
+        if callable(nested):
+            try:
+                reason = nested()
+            except Exception:
+                reason = None
+            if isinstance(reason, str) and reason:
+                return reason
+        return None
+
+    def settlement_callback(self) -> Any | None:
+        callback = getattr(self._caller_event, "settlement_callback", None)
+        if callable(callback):
+            try:
+                return callback()
+            except Exception:
+                return None
+        return None
+
 
 _NONTERMINAL_STATUSES = {
     "QUEUED",
@@ -307,6 +337,33 @@ def _cancel_requested(cancel_event: Any | None) -> bool:
     return cancel_event is not None and cancel_event.is_set()
 
 
+def _cancel_reason(cancel_event: Any | None) -> str | None:
+    """Read bounded cancellation provenance from runner/broker event views."""
+
+    if cancel_event is None:
+        return None
+    getter = getattr(cancel_event, "cancellation_reason", None)
+    if callable(getter):
+        try:
+            reason = getter()
+        except Exception:
+            reason = None
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
+def _settlement_callback(cancel_event: Any | None) -> Any | None:
+    callback = getattr(cancel_event, "settlement_callback", None)
+    if callable(callback):
+        try:
+            candidate = callback()
+        except Exception:
+            return None
+        return candidate if callable(candidate) else None
+    return None
+
+
 def _wait_for_cancel(
     cancel_event: Any | None,
     delay_seconds: float,
@@ -361,6 +418,15 @@ class LeanEvaluator:
         self._remote_unsettled_lock = threading.Lock()
         self._remote_unsettled_jobs = 0
         self._remote_settlement_event = threading.Event()
+        # A task solved by a peer may cancel a submitted Judge job whose
+        # worker takes longer than the short foreground grace window to reset.
+        # Such a job remains accounted for, but is reconciled asynchronously so
+        # it does not poison unrelated CPS admissions while the Judge is doing
+        # a known, bounded cancellation.  Unknown identities still use the
+        # fail-closed process latch above.
+        self._deferred_settlement_lock = threading.RLock()
+        self._deferred_settlements: dict[str, dict[str, Any]] = {}
+        self.deferred_settlement_timeout_seconds = 300.0
 
     @property
     def remote_unsettled_jobs(self) -> int:
@@ -379,6 +445,112 @@ class LeanEvaluator:
         with self._remote_unsettled_lock:
             self._remote_unsettled_jobs += 1
             self._remote_settlement_event.set()
+
+    @property
+    def pending_settlement_watchers(self) -> int:
+        """Number of known remote cancellations still awaiting a receipt."""
+
+        with self._deferred_settlement_lock:
+            return len(self._deferred_settlements)
+
+    def _start_settlement_watcher(
+        self,
+        job_id: Any,
+        response: Mapping[str, Any],
+        *,
+        cancel_endpoint: Any = None,
+        on_settled: Any | None = None,
+    ) -> bool:
+        """Keep a known cancelled job's gate accounted for until terminal.
+
+        The watcher never invents a terminal receipt and never releases a
+        caller-owned permit on timeout.  A timeout therefore transitions to
+        the same global fail-closed latch as any other unresolved remote job.
+        """
+
+        normalized = sanitize_worker_identifier(job_id)
+        if normalized is None:
+            return False
+        paths = self._settlement_poll_paths(
+            normalized,
+            response,
+            cancel_endpoint=cancel_endpoint,
+        )
+        if not paths:
+            return False
+        callback = on_settled if callable(on_settled) else None
+        with self._deferred_settlement_lock:
+            existing = self._deferred_settlements.get(normalized)
+            if existing is not None:
+                if callback is not None:
+                    existing.setdefault("callbacks", []).append(callback)
+                return True
+            record: dict[str, Any] = {
+                "job_id": normalized,
+                "response": dict(response),
+                "cancel_endpoint": cancel_endpoint,
+                "paths": tuple(paths),
+                "callbacks": [callback] if callback is not None else [],
+                "started_at": time.monotonic(),
+            }
+            self._deferred_settlements[normalized] = record
+        thread = threading.Thread(
+            target=self._settlement_watcher_loop,
+            args=(record,),
+            name=f"judge-settlement-{normalized}",
+            daemon=True,
+        )
+        record["thread"] = thread
+        thread.start()
+        return True
+
+    def _settlement_watcher_loop(self, record: Mapping[str, Any]) -> None:
+        job_id = str(record["job_id"])
+        paths = list(record.get("paths") or ())
+        response = dict(record.get("response") or {})
+        deadline = time.monotonic() + max(
+            0.1, float(self.deferred_settlement_timeout_seconds)
+        )
+        settled = False
+        while paths and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            wait_ms = max(1, min(1_000, int(remaining * 1_000)))
+            path = paths[0]
+            separator = "&" if "?" in path else "?"
+            try:
+                current = self._request(
+                    "GET",
+                    f"{path}{separator}wait_ms={wait_ms}",
+                    timeout_seconds=max(0.1, min(2.0, remaining)),
+                )
+            except EvaluatorError:
+                current = None
+            if isinstance(current, Mapping):
+                response = dict(current)
+                if self._authoritative_terminal_receipt(response, job_id):
+                    settled = True
+                    break
+            time.sleep(min(self.poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+
+        callbacks: list[Any] = []
+        with self._deferred_settlement_lock:
+            current_record = self._deferred_settlements.pop(job_id, None)
+            if current_record is not None:
+                callbacks = list(current_record.get("callbacks") or ())
+        if not settled:
+            # The identity was known, but the bounded watcher still could not
+            # prove termination.  At this point fail closed exactly as for an
+            # unknown/transport-ambiguous submission.
+            self._mark_remote_unsettled()
+            return
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                # A permit-release callback is orchestration bookkeeping; a
+                # callback failure must not turn a proven remote receipt into
+                # an unsafe release or crash the watcher thread.
+                continue
 
     def _combined_cancel_event(self, cancel_event: Any | None) -> Any:
         if cancel_event is None or cancel_event is self._remote_settlement_event:
@@ -700,6 +872,7 @@ class LeanEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
+        settlement_callback: Any | None = None,
     ) -> Verdict:
         """Evaluate a candidate, reusing an exact in-process probe when present."""
 
@@ -708,6 +881,7 @@ class LeanEvaluator:
             candidate_path,
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
             reuse_probe_cache=True,
         )
 
@@ -718,6 +892,7 @@ class LeanEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
+        settlement_callback: Any | None = None,
     ) -> Verdict:
         """Evaluate through a fresh Judge submission, bypassing probe cache.
 
@@ -731,6 +906,7 @@ class LeanEvaluator:
             candidate_path,
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
             reuse_probe_cache=False,
         )
 
@@ -742,6 +918,7 @@ class LeanEvaluator:
         deadline_monotonic: float | None,
         cancel_event: Any | None,
         reuse_probe_cache: bool,
+        settlement_callback: Any | None = None,
     ) -> Verdict:
         started = time.monotonic()
         code = _read_candidate(candidate_path)
@@ -779,6 +956,7 @@ class LeanEvaluator:
             response_profile=None,
             candidate_code=code,
             cancel_event=combined_cancel_event,
+            settlement_callback=settlement_callback,
         )
         verdict.cache_reused = bool(
             verdict.cache_reused
@@ -793,6 +971,7 @@ class LeanEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        settlement_callback: Any | None = None,
     ) -> Verdict:
         """Run the canonical evaluator with bounded worker-facing diagnostics."""
 
@@ -802,6 +981,7 @@ class LeanEvaluator:
             _read_candidate(candidate_path),
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
         )
 
     def probe_source(
@@ -811,6 +991,7 @@ class LeanEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        settlement_callback: Any | None = None,
     ) -> Verdict:
         """Probe a broker-owned immutable source snapshot."""
 
@@ -822,6 +1003,7 @@ class LeanEvaluator:
             candidate_code,
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
         )
 
     def _probe_source(
@@ -832,6 +1014,7 @@ class LeanEvaluator:
         *,
         deadline_monotonic: float | None,
         cancel_event: threading.Event | None,
+        settlement_callback: Any | None = None,
     ) -> Verdict:
         started = time.monotonic()
         if self.remote_unsettled_jobs > 0:
@@ -855,6 +1038,7 @@ class LeanEvaluator:
             response_profile=LEAN_PROBE_RESPONSE_PROFILE,
             candidate_code=code,
             cancel_event=combined_cancel_event,
+            settlement_callback=settlement_callback,
         )
         verdict.cache_reused = bool(
             verdict.cache_reused
@@ -896,6 +1080,7 @@ class LeanEvaluator:
         response_profile: str | None,
         candidate_code: str | None,
         cancel_event: threading.Event | None,
+        settlement_callback: Any | None = None,
     ) -> Verdict:
         contract_sha256 = task_contract_sha256(
             task,
@@ -1150,6 +1335,8 @@ class LeanEvaluator:
                             job_id,
                             response=response,
                             cancel_endpoint=cancel_endpoint,
+                            cancellation_reason=_cancel_reason(cancel_event),
+                            on_settled=settlement_callback,
                         )
                         return self._cancelled_verdict(
                             task,
@@ -1185,6 +1372,8 @@ class LeanEvaluator:
                                 job_id,
                                 response=response,
                                 cancel_endpoint=cancel_endpoint,
+                                cancellation_reason=_cancel_reason(cancel_event),
+                                on_settled=settlement_callback,
                             )
                             return self._cancelled_verdict(
                                 task,
@@ -1257,6 +1446,8 @@ class LeanEvaluator:
                             job_id,
                             response=response,
                             cancel_endpoint=cancel_endpoint,
+                            cancellation_reason=_cancel_reason(cancel_event),
+                            on_settled=settlement_callback,
                         )
                         return self._cancelled_verdict(
                             task,
@@ -1271,7 +1462,25 @@ class LeanEvaluator:
                     job_id,
                     response,
                     cancel_endpoint=cancel_endpoint,
+                    cancellation_reason=_cancel_reason(cancel_event),
+                    on_settled=settlement_callback,
                 )
+                if cancel_error == "cancel_settlement_deferred":
+                    cancellation = {
+                        "attempted": True,
+                        "succeeded": False,
+                        "settled": False,
+                        "unconfirmed": False,
+                        "deferred": True,
+                        "failure_category": cancel_error,
+                    }
+                    return self._cancelled_verdict(
+                        task,
+                        started=started,
+                        provenance=provenance,
+                        job_id=job_id,
+                        cancellation=cancellation,
+                    )
                 if cancel_error:
                     last_poll_error = cancel_error
                     safe_response = _safe_nonterminal_response(response)
@@ -1302,6 +1511,7 @@ class LeanEvaluator:
                     response_profile=response_profile,
                     candidate_code=code,
                     cancel_event=cancel_event,
+                    settlement_callback=settlement_callback,
                 )
                 if retried is not None:
                     return retried
@@ -1413,6 +1623,8 @@ class LeanEvaluator:
                         job_id,
                         response=response,
                         cancel_endpoint=cancel_endpoint,
+                        cancellation_reason=_cancel_reason(cancel_event),
+                        on_settled=settlement_callback,
                     )
                 return self._cancelled_verdict(
                     task,
@@ -1426,7 +1638,25 @@ class LeanEvaluator:
                     str(job_id),
                     response,
                     cancel_endpoint=cancel_endpoint,
+                    cancellation_reason=_cancel_reason(cancel_event),
+                    on_settled=settlement_callback,
                 )
+                if cancel_error == "cancel_settlement_deferred":
+                    cancellation_summary = {
+                        "attempted": True,
+                        "succeeded": False,
+                        "settled": False,
+                        "unconfirmed": False,
+                        "deferred": True,
+                        "failure_category": cancel_error,
+                    }
+                    return self._cancelled_verdict(
+                        task,
+                        started=started,
+                        provenance=provenance,
+                        job_id=job_id,
+                        cancellation=cancellation_summary,
+                    )
                 if _retryable_admission_rejection(response):
                     retried = self._retry_terminal_overload(
                         task,
@@ -1439,6 +1669,7 @@ class LeanEvaluator:
                             code if "code" in locals() else candidate_code
                         ),
                         cancel_event=cancel_event,
+                        settlement_callback=settlement_callback,
                     )
                     if retried is not None:
                         return retried
@@ -1526,6 +1757,7 @@ class LeanEvaluator:
         response_profile: str | None,
         candidate_code: str | None,
         cancel_event: threading.Event | None,
+        settlement_callback: Any | None = None,
     ) -> Verdict | None:
         """Resubmit once a previous job is definitively terminal and retryable."""
 
@@ -1545,6 +1777,7 @@ class LeanEvaluator:
             response_profile=response_profile,
             candidate_code=candidate_code,
             cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
         )
         prior = verdict.response.get("evaluator_overload_resubmissions", 0)
         verdict.response["evaluator_overload_resubmissions"] = (
@@ -1558,6 +1791,8 @@ class LeanEvaluator:
         response: Mapping[str, Any],
         *,
         cancel_endpoint: Any = None,
+        cancellation_reason: str | None = None,
+        on_settled: Any | None = None,
     ) -> tuple[dict[str, Any], str | None]:
         """Boundedly cancel an abandoned job and recover its terminal receipt."""
 
@@ -1565,6 +1800,8 @@ class LeanEvaluator:
             job_id,
             response,
             cancel_endpoint=cancel_endpoint,
+            cancellation_reason=cancellation_reason,
+            on_settled=on_settled,
         )
         return current, error
 
@@ -1574,6 +1811,8 @@ class LeanEvaluator:
         response: Mapping[str, Any],
         *,
         cancel_endpoint: Any = None,
+        cancellation_reason: str | None = None,
+        on_settled: Any | None = None,
     ) -> tuple[dict[str, Any], str | None, bool]:
         """Cancel and confirm terminal settlement within one absolute deadline."""
 
@@ -1649,6 +1888,19 @@ class LeanEvaluator:
                     max(0.0, deadline - time.monotonic()),
                 )
             )
+        if cancellation_reason == "task_solved_by_peer":
+            # The submission identity is known and the DELETE was accepted,
+            # but Lean worker reset may exceed the foreground grace window.
+            # Keep the job's capacity permit retained by the caller and let a
+            # bounded watcher release it only after a job-bound receipt.
+            deferred = self._start_settlement_watcher(
+                job_id,
+                last_nonterminal,
+                cancel_endpoint=cancel_endpoint,
+                on_settled=on_settled,
+            )
+            if deferred:
+                return last_nonterminal, "cancel_settlement_deferred", attempted
         self._mark_remote_unsettled()
         return last_nonterminal, "cancel_settlement_unconfirmed", attempted
 
@@ -1716,6 +1968,8 @@ class LeanEvaluator:
         *,
         response: Mapping[str, Any] | None = None,
         cancel_endpoint: Any = None,
+        cancellation_reason: str | None = None,
+        on_settled: Any | None = None,
     ) -> dict[str, Any]:
         """Cancel a job, reporting success only after terminal settlement."""
 
@@ -1732,17 +1986,22 @@ class LeanEvaluator:
             normalized_job_id,
             response or {"job_id": normalized_job_id, "status": "running"},
             cancel_endpoint=cancel_endpoint,
+            cancellation_reason=cancellation_reason,
+            on_settled=on_settled,
         )
         settled = self._authoritative_terminal_receipt(current, normalized_job_id)
-        return {
+        summary = {
             "attempted": attempted,
             "succeeded": attempted and settled,
             "settled": settled,
-            "unconfirmed": not settled,
+            "unconfirmed": not settled and error != "cancel_settlement_deferred",
             "failure_category": (
                 None if settled else (error or "cancel_settlement_unconfirmed")
             ),
         }
+        if error == "cancel_settlement_deferred":
+            summary["deferred"] = True
+        return summary
 
     def _cancel_request_path(
         self,
@@ -2320,6 +2579,8 @@ def safe_worker_response(
             "settled": cancellation.get("settled") is True,
             "unconfirmed": cancellation.get("unconfirmed") is True,
         }
+        if cancellation.get("deferred") is True:
+            safe_cancellation["deferred"] = True
         failure_category = cancellation.get("failure_category")
         if isinstance(failure_category, str) and failure_category.strip():
             safe_cancellation["failure_category"] = _safe_category(

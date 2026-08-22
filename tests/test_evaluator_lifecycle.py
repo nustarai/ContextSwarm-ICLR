@@ -592,6 +592,85 @@ class EvaluatorLifecycleTests(unittest.TestCase):
             },
         )
 
+    def test_peer_cancel_defers_known_job_without_global_latch(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.03,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 1.0
+        terminal = threading.Event()
+        released = threading.Event()
+        calls = 0
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            nonlocal calls
+            if method == "DELETE":
+                return {"job_id": "job-1", "status": "cancel_requested"}
+            calls += 1
+            if calls >= 4:
+                terminal.set()
+                return {"job_id": "job-1", "status": "cancelled"}
+            return {"job_id": "job-1", "status": "running"}
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={"job_id": "job-1", "status": "running"},
+                cancellation_reason="task_solved_by_peer",
+                on_settled=released.set,
+            )
+            self.assertTrue(summary["deferred"])
+            self.assertFalse(summary["unconfirmed"])
+            self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+            self.assertEqual(evaluator.pending_settlement_watchers, 1)
+            self.assertTrue(terminal.wait(timeout=1))
+            self.assertTrue(released.wait(timeout=1))
+
+        self.assertEqual(evaluator.pending_settlement_watchers, 0)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+
+    def test_peer_cancel_watcher_timeout_latches_and_retains_callback(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 0.05
+        released = threading.Event()
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            return {
+                "job_id": "job-1",
+                "status": "cancel_requested" if method == "DELETE" else "running",
+            }
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={"job_id": "job-1", "status": "running"},
+                cancellation_reason="task_solved_by_peer",
+                on_settled=released.set,
+            )
+            self.assertTrue(summary["deferred"])
+            self.assertTrue(evaluator.remote_settlement_event.wait(timeout=1))
+
+        self.assertFalse(released.is_set())
+        self.assertEqual(evaluator.pending_settlement_watchers, 0)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+
     def test_global_latch_wakes_and_settles_an_inflight_evaluation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

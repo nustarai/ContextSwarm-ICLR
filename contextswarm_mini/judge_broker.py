@@ -85,6 +85,9 @@ class JudgeBrokerDrainError(RuntimeError):
                 0, int(state.get("remote_unsettled_jobs", 0))
             ),
         }
+        pending = _nonnegative_count(state.get("pending_settlement_watchers", 0))
+        if pending:
+            self.state["pending_settlement_watchers"] = pending
 
 
 @dataclass
@@ -146,6 +149,20 @@ class _ClaimCancelEvent:
                 delay = 0.02
             self.claim.revoked_event.wait(timeout=delay)
         return True
+
+    def cancellation_reason(self) -> str | None:
+        if self.claim.revoked_event.is_set():
+            return "broker_revoked"
+        event = self.claim.cancel_event
+        getter = getattr(event, "cancellation_reason", None)
+        if callable(getter):
+            try:
+                reason = getter()
+            except Exception:
+                reason = None
+            if isinstance(reason, str) and reason:
+                return reason
+        return None
 
 
 class _BrokerHTTPServer(ThreadingHTTPServer):
@@ -311,15 +328,21 @@ class JudgeBroker:
         evaluator_unsettled_jobs = _nonnegative_count(
             getattr(self.evaluator, "remote_unsettled_jobs", 0)
         )
+        pending_watchers = _nonnegative_count(
+            getattr(self.evaluator, "pending_settlement_watchers", 0)
+        )
         with self._admission_condition:
             fifo_depth = len(self._admission_queue)
-        return {
+        state = {
             "active_handlers": max(0, int(active_handlers)),
             "fifo_depth": max(0, int(fifo_depth)),
             "remote_unsettled_jobs": (
                 max(0, int(broker_unsettled_jobs)) + evaluator_unsettled_jobs
             ),
         }
+        if pending_watchers:
+            state["pending_settlement_watchers"] = pending_watchers
+        return state
 
     @property
     def active_handlers(self) -> int:
@@ -369,7 +392,13 @@ class JudgeBroker:
     def _wait_for_drain(self, deadline_monotonic: float) -> dict[str, Any]:
         while True:
             state = self.drain_state()
-            if state["active_handlers"] == 0 and state["fifo_depth"] == 0:
+            if (
+                state["active_handlers"] == 0
+                and state["fifo_depth"] == 0
+                and _nonnegative_count(
+                    getattr(self.evaluator, "pending_settlement_watchers", 0)
+                ) == 0
+            ):
                 return {
                     "drained": state["remote_unsettled_jobs"] == 0,
                     **state,
@@ -824,6 +853,13 @@ class JudgeBroker:
                 evaluator_kwargs: dict[str, Any] = {
                     "deadline_monotonic": claim.deadline_monotonic,
                 }
+                # A known peer-cancelled job may outlive the foreground grace
+                # period.  Keep this gate permit retained and release it only
+                # after the evaluator's bounded watcher receives a terminal
+                # receipt.  Evaluators without this optional hook retain the
+                # legacy fail-closed behavior.
+                if _accepts_settlement_callback(evaluator_call):
+                    evaluator_kwargs["settlement_callback"] = self._release_evaluator_gate
                 if _accepts_cancel_event(evaluator_call):
                     evaluator_kwargs["cancel_event"] = _ClaimCancelEvent(claim)
                 evaluator_call_started = True
@@ -845,7 +881,15 @@ class JudgeBroker:
                         safe_response,
                     )
                 )
+                deferred_remote = _has_deferred_remote_work(
+                    verdict_status, safe_response
+                )
                 if call_unsettled:
+                    # Both unresolved classes retain the permit.  A deferred
+                    # known-job cancellation is released by its watcher;
+                    # an unknown job remains permanently fail-closed.
+                    retain_evaluator_gate = True
+                if call_unsettled and not deferred_remote:
                     # The evaluator has attempted cancellation but cannot
                     # prove the remote job terminal.  Permanently consume this
                     # process-local permit and latch a non-sensitive count;
@@ -890,7 +934,7 @@ class JudgeBroker:
                         "NETWORK_ERROR",
                     },
                 }
-                if call_unsettled:
+                if call_unsettled and not deferred_remote:
                     result.update(
                         {
                             "ok": False,
@@ -901,6 +945,17 @@ class JudgeBroker:
                         }
                     )
                     safe_response["remote_settlement_unconfirmed"] = True
+                elif deferred_remote:
+                    result.update(
+                        {
+                            "ok": False,
+                            "status": "TASK_CANCELLED",
+                            "proved": False,
+                            "score": 0.0,
+                            "retryable": False,
+                        }
+                    )
+                    safe_response["settlement_deferred"] = True
                 proof_claimed = verdict_status == "PROVED" or _safe_score(verdict.score) >= 1.0
                 if call_unsettled:
                     authoritative_verdict = None
@@ -1088,6 +1143,8 @@ class JudgeBroker:
         self.evaluator_gate.release()
         with self._admission_condition:
             self._admission_condition.notify_all()
+        with self._handler_condition:
+            self._handler_condition.notify_all()
 
     def _finish_judge_check(
         self,
@@ -1278,6 +1335,8 @@ class JudgeBroker:
                     options: dict[str, Any] = {
                         "deadline_monotonic": claim.deadline_monotonic,
                     }
+                    if _accepts_settlement_callback(probe_source):
+                        options["settlement_callback"] = self._release_evaluator_gate
                     if _accepts_cancel_event(probe_source):
                         options["cancel_event"] = _ClaimCancelEvent(claim)
                     evaluator_unsettled_before = _nonnegative_count(
@@ -1288,14 +1347,19 @@ class JudgeBroker:
                     evaluator_unsettled_after = _nonnegative_count(
                         getattr(self.evaluator, "remote_unsettled_jobs", 0)
                     )
-                    if (
+                    call_unsettled = (
                         evaluator_unsettled_after > evaluator_unsettled_before
                         or _has_unsettled_remote_work(
                             _safe_verdict_status(verdict.status),
                             verdict.response,
                         )
-                    ):
+                    )
+                    deferred_remote = _has_deferred_remote_work(
+                        _safe_verdict_status(verdict.status), verdict.response
+                    )
+                    if call_unsettled:
                         retain_evaluator_gate = True
+                    if call_unsettled and not deferred_remote:
                         self._mark_remote_unsettled()
                         result = _remote_settlement_control_result()
                     else:
@@ -1771,6 +1835,8 @@ class JudgeBroker:
                 metadata=metadata,
             )
             options: dict[str, Any] = {"deadline_monotonic": deadline}
+            if _accepts_settlement_callback(probe_source):
+                options["settlement_callback"] = self._release_evaluator_gate
             if _accepts_cancel_event(probe_source):
                 options["cancel_event"] = _ClaimCancelEvent(claim)
             evaluator_unsettled_before = _nonnegative_count(
@@ -1781,14 +1847,19 @@ class JudgeBroker:
             evaluator_unsettled_after = _nonnegative_count(
                 getattr(self.evaluator, "remote_unsettled_jobs", 0)
             )
-            if (
+            call_unsettled = (
                 evaluator_unsettled_after > evaluator_unsettled_before
                 or _has_unsettled_remote_work(
                     _safe_verdict_status(verdict.status),
                     verdict.response,
                 )
-            ):
+            )
+            deferred_remote = _has_deferred_remote_work(
+                _safe_verdict_status(verdict.status), verdict.response
+            )
+            if call_unsettled:
                 retain_evaluator_gate = True
+            if call_unsettled and not deferred_remote:
                 self._mark_remote_unsettled()
                 result = {
                     "status": "REMOTE_SETTLEMENT_UNCONFIRMED",
@@ -2225,6 +2296,32 @@ def _has_unsettled_remote_work(
         or response.get("remote_settlement_unconfirmed") is True
         or response.get("settlement_error") == "cancel_settlement_unconfirmed"
         or _has_unsettled_remote_cancellation(response)
+    )
+
+
+def _has_deferred_remote_work(
+    verdict_status: str,
+    response: Mapping[str, Any],
+) -> bool:
+    cancellation = response.get("judge_cancellation")
+    return (
+        response.get("settlement_error") == "cancel_settlement_deferred"
+        or (
+            isinstance(cancellation, Mapping)
+            and cancellation.get("deferred") is True
+        )
+    )
+
+
+def _accepts_settlement_callback(function: Callable[..., Any]) -> bool:
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "settlement_callback"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
     )
 
 

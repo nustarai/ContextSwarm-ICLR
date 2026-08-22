@@ -187,8 +187,19 @@ class _CallbackFailureState:
 class _AnyCancelEvent:
     """Small Event-compatible OR view used across runner-owned lifecycles."""
 
-    def __init__(self, *events: Any):
+    def __init__(self, *events: Any, reasons: tuple[str | None, ...] | None = None):
         self._events = tuple(event for event in events if event is not None)
+        if reasons is None:
+            self._reasons = (None,) * len(self._events)
+        else:
+            # Keep the event/reason pairing total even for callers which pass
+            # an event list containing ``None``.  Reasons are diagnostic
+            # metadata only; cancellation remains fail-closed by default.
+            normalized = tuple(reasons)
+            self._reasons = tuple(
+                normalized[index] if index < len(normalized) else None
+                for index in range(len(self._events))
+            )
 
     def is_set(self) -> bool:
         return any(bool(event.is_set()) for event in self._events)
@@ -205,6 +216,25 @@ class _AnyCancelEvent:
                 delay = 0.02
             threading.Event().wait(delay)
         return True
+
+    def cancellation_reason(self) -> str | None:
+        """Return the reason for the first active source, if one is known."""
+
+        for event, explicit in zip(self._events, self._reasons):
+            if not bool(event.is_set()):
+                continue
+            if explicit:
+                return explicit
+            nested = getattr(event, "cancellation_reason", None)
+            if callable(nested):
+                try:
+                    reason = nested()
+                except Exception:
+                    reason = None
+                if isinstance(reason, str) and reason:
+                    return reason
+            return None
+        return None
 
 
 class RemoteJudgeSettlementError(RuntimeError):
@@ -1627,6 +1657,7 @@ def _run_mono(
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
+        reasons=("runner_failure", "remote_settlement_unconfirmed"),
     )
 
     def admit_early_proof(
@@ -1830,6 +1861,7 @@ def _run_elastic_cps(
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
+        reasons=("runner_failure", "remote_settlement_unconfirmed"),
     )
 
     assert policy.store is not None
@@ -2436,6 +2468,7 @@ def _run_elastic_cps(
         assignment_cancel_event = _AnyCancelEvent(
             run_cancel_event,
             state.cancel_event,
+            reasons=("runner_failure", "task_solved_by_peer"),
         )
         if mock_agent:
             result = _mock_result(actor, task.slug, assignment.generation)
@@ -2881,6 +2914,7 @@ def _run_task_workers(
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
+        reasons=("runner_failure", "remote_settlement_unconfirmed"),
     )
 
     def execute(task: Task) -> tuple[AgentResult, Verdict]:
@@ -3140,6 +3174,8 @@ def _evaluate_candidate(
         evaluate_kwargs: dict[str, Any] = {"deadline_monotonic": deadline}
         if cancel_event is not None and _call_accepts_cancel_event(evaluator.evaluate):
             evaluate_kwargs["cancel_event"] = cancel_event
+        if _call_accepts_settlement_callback(evaluator.evaluate):
+            evaluate_kwargs["settlement_callback"] = lambda: _release_gate(gate)
         verdict = evaluator.evaluate(task, candidate, **evaluate_kwargs)
         verdict = _bind_legacy_test_mock_verdict(evaluator, task, candidate, verdict)
         evaluator_unsettled_after = _evaluator_remote_unsettled_jobs(evaluator)
@@ -3147,9 +3183,16 @@ def _evaluate_candidate(
             evaluator_unsettled_after > 0
             or _verdict_has_unsettled_remote_work(verdict)
         )
+        deferred_settlement = _verdict_has_deferred_remote_work(verdict)
+        if deferred_settlement:
+            # The evaluator retained this permit for its settlement watcher;
+            # the callback, not this finally block, owns its eventual release.
+            release_gate = False
         if call_unsettled:
             release_gate = False
             return _remote_settlement_verdict(task, verdict)
+        if deferred_settlement:
+            return verdict
         return verdict
     except BaseException:
         if _evaluator_remote_unsettled_jobs(evaluator) > evaluator_unsettled_before:
@@ -3220,8 +3263,37 @@ def _verdict_has_unsettled_remote_work(verdict: Verdict) -> bool:
             isinstance(cancellation, Mapping)
             and cancellation.get("attempted") is True
             and cancellation.get("settled") is not True
+            and cancellation.get("deferred") is not True
         )
     )
+
+
+def _verdict_has_deferred_remote_work(verdict: Verdict) -> bool:
+    response = verdict.response if isinstance(verdict.response, Mapping) else {}
+    cancellation = response.get("judge_cancellation")
+    return (
+        response.get("settlement_error") == "cancel_settlement_deferred"
+        or (
+            isinstance(cancellation, Mapping)
+            and cancellation.get("deferred") is True
+        )
+    )
+
+
+def _call_accepts_settlement_callback(function: Any) -> bool:
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "settlement_callback"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _release_gate(gate: threading.BoundedSemaphore) -> None:
+    gate.release()
 
 
 def _remote_settlement_verdict(
