@@ -25,6 +25,19 @@ POLICY_LLM_SCHEDULER = "llm_scheduler"
 MAX_SNAPSHOT_TASKS = 512
 MAX_TRACE_REFERENCES_PER_TASK = 100
 MAX_IDENTIFIER_CHARS = 512
+# Allocation parameters are manifest-owned in normal runs, but the pure core
+# also accepts them from callers.  Bound their shape before JSON encoding so a
+# malicious/custom Mapping cannot force an arbitrarily deep traversal or make
+# state-id construction materialize an unbounded object.
+MAX_ALLOCATION_PARAMETER_DEPTH = 16
+MAX_ALLOCATION_PARAMETER_NODES = 4096
+MAX_ALLOCATION_PARAMETER_KEYS = 256
+MAX_ALLOCATION_PARAMETER_ITEMS = 256
+MAX_ALLOCATION_PARAMETER_STRING_CHARS = 4096
+MAX_ALLOCATION_PARAMETER_BYTES = 256 * 1024
+MAX_ALLOCATION_PARAMETER_INTEGER_DIGITS = 128
+MAX_SCHEDULER_REASON_CHARS = 1000
+MAX_SCHEDULER_REASON_BYTES = 4096
 # The scheduler receives a bounded UTF-8 wire prompt.  The limit is a policy
 # input (and is therefore configurable by the runner), while this default keeps
 # direct users of the pure core safe when they do not have a manifest object.
@@ -68,18 +81,116 @@ def _weight_dict(instance: object) -> dict[str, float]:
     return {item.name: float(getattr(instance, item.name)) for item in fields(instance)}
 
 
+def _validate_allocation_parameters(
+    value: Any,
+    *,
+    depth: int = 0,
+    budget: list[int] | None = None,
+    active: set[int] | None = None,
+) -> None:
+    """Validate and bound an allocation-parameter JSON tree before copying it.
+
+    This deliberately runs before ``json.dumps``.  The previous implementation
+    let the JSON encoder recurse through caller-owned data first, so a deeply
+    nested value could raise ``RecursionError`` (or consume substantial memory)
+    before the scheduler's prompt bound had any chance to reject it.
+    """
+
+    if budget is None:
+        budget = [0]
+    if active is None:
+        active = set()
+    budget[0] += 1
+    if budget[0] > MAX_ALLOCATION_PARAMETER_NODES:
+        raise ValueError("allocation_parameters exceeds the bounded node limit")
+    if depth > MAX_ALLOCATION_PARAMETER_DEPTH:
+        raise ValueError("allocation_parameters exceeds the bounded depth limit")
+    if isinstance(value, Mapping):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("allocation_parameters must not contain cycles")
+        active.add(identity)
+        try:
+            count = len(value)
+        except Exception as exc:  # pragma: no cover - hostile custom Mapping
+            active.remove(identity)
+            raise ValueError("allocation_parameters mapping length is unavailable") from exc
+        if count > MAX_ALLOCATION_PARAMETER_KEYS:
+            raise ValueError("allocation_parameters exceeds the bounded key limit")
+        try:
+            items = value.items()
+            for index, (key, child) in enumerate(items):
+                if index >= MAX_ALLOCATION_PARAMETER_KEYS:
+                    raise ValueError("allocation_parameters exceeds the bounded key limit")
+                if not isinstance(key, str) or not key or len(key) > MAX_IDENTIFIER_CHARS:
+                    raise ValueError("allocation_parameters keys must be bounded strings")
+                _validate_allocation_parameters(
+                    child, depth=depth + 1, budget=budget, active=active
+                )
+        except ValueError:
+            raise
+        except Exception as exc:  # pragma: no cover - hostile custom Mapping
+            raise ValueError("allocation_parameters mapping is not readable") from exc
+        finally:
+            active.remove(identity)
+        return
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in active:
+            raise ValueError("allocation_parameters must not contain cycles")
+        active.add(identity)
+        if len(value) > MAX_ALLOCATION_PARAMETER_ITEMS:
+            active.remove(identity)
+            raise ValueError("allocation_parameters exceeds the bounded item limit")
+        try:
+            for child in value:
+                _validate_allocation_parameters(
+                    child, depth=depth + 1, budget=budget, active=active
+                )
+        finally:
+            active.remove(identity)
+        return
+    if value is None or isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        if len(str(abs(value))) > MAX_ALLOCATION_PARAMETER_INTEGER_DIGITS:
+            raise ValueError("allocation_parameters integer is too large")
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("allocation_parameters must contain finite numbers")
+        return
+    if isinstance(value, str):
+        if len(value) > MAX_ALLOCATION_PARAMETER_STRING_CHARS:
+            raise ValueError("allocation_parameters strings are too long")
+        return
+    raise ValueError("allocation_parameters must be finite JSON data")
+
+
 def _freeze_json(value: Any) -> Any:
-    """Detach and deeply freeze a JSON-compatible manifest fragment."""
+    """Detach and deeply freeze a bounded JSON-compatible manifest fragment."""
+
+    _validate_allocation_parameters(value)
 
     try:
-        detached = json.loads(json.dumps(value, allow_nan=False, sort_keys=True))
+        encoded = json.dumps(value, allow_nan=False, sort_keys=True, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > MAX_ALLOCATION_PARAMETER_BYTES:
+            raise ValueError("allocation_parameters exceeds the bounded byte limit")
+        detached = json.loads(encoded)
     except (TypeError, ValueError) as exc:
+        if str(exc).startswith("allocation_parameters exceeds"):
+            raise
         raise ValueError("allocation_parameters must be finite JSON data") from exc
-    if isinstance(detached, dict):
-        return MappingProxyType({str(key): _freeze_json(item) for key, item in detached.items()})
-    if isinstance(detached, list):
-        return tuple(_freeze_json(item) for item in detached)
-    return detached
+    def freeze_detached(item: Any) -> Any:
+        if isinstance(item, dict):
+            return MappingProxyType(
+                {str(key): freeze_detached(child) for key, child in item.items()}
+            )
+        if isinstance(item, list):
+            return tuple(freeze_detached(child) for child in item)
+        return item
+
+    return freeze_detached(detached)
 
 
 def _thaw_json(value: Any) -> Any:
@@ -191,6 +302,50 @@ def _scheduler_parameter_value(value: Any, *, key: str = "") -> Any:
         # whitespace or a URI marker.
         return "<redacted>"
     return "<redacted>"
+
+
+def _scheduler_reason_is_safe(value: Any) -> bool:
+    """Check the bounded model explanation before persisting it in artifacts.
+
+    The reason is model output, not an opaque identifier.  Accepting arbitrary
+    control characters or path/URI-like text here would let a provider inject
+    terminal/log markup or echo operator-local provenance into the run record.
+    Unsafe reasons are rejected and therefore use the charged deterministic
+    fallback; the raw value is never copied into an error message.
+    """
+
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped or len(stripped) > MAX_SCHEDULER_REASON_CHARS:
+        return False
+    try:
+        if len(stripped.encode("utf-8")) > MAX_SCHEDULER_REASON_BYTES:
+            return False
+    except UnicodeEncodeError:
+        return False
+    if any(
+        ord(char) < 0x20
+        or ord(char) == 0x7F
+        or unicodedata.category(char) == "Cf"
+        for char in stripped
+    ):
+        return False
+    lowered = stripped.lower()
+    if "\\" in stripped or "://" in stripped:
+        return False
+    if lowered.startswith(("file:", "path:", "data:", "mailto:")):
+        return False
+    # A slash is fine in ordinary prose (for example ``A/B``), but reject
+    # absolute/relative path-looking fragments rather than every slash.
+    if re.search(r"(?:^|[\s(])(?:\.\.?/|/[A-Za-z0-9_.-]|[A-Za-z]:[\\/])", stripped):
+        return False
+    # These markers are not useful allocation semantics and are common ways
+    # for a provider to echo caller-owned provenance.  Keep the rejection
+    # stable and case-insensitive without including the source text in errors.
+    if any(marker in lowered for marker in ("transcript", "private", "secret", "payload")):
+        return False
+    return True
 
 
 def _scheduler_state_dict(snapshot: "AllocationStateSnapshot") -> dict[str, Any]:
@@ -995,8 +1150,8 @@ def parse_llm_scheduler_output(
     if not isinstance(task_id, str) or task_id not in snapshot.eligible_task_ids:
         raise ValueError("scheduler task_id is not eligible")
     reason = payload["reason"]
-    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1_000:
-        raise ValueError("scheduler reason must be non-empty and at most 1000 characters")
+    if not _scheduler_reason_is_safe(reason):
+        raise ValueError("scheduler reason is unsafe or exceeds its bound")
     references = payload["trace_reference_ids"]
     if (
         not isinstance(references, list)

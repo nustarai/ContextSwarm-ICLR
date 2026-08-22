@@ -222,6 +222,67 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(decision.selected_task_id, "")
         self.assertEqual(decision.scheduler_cost.calls, 1)
 
+    def test_llm_reason_is_bounded_and_cannot_inject_provenance(self) -> None:
+        snap = snapshot(task("a", active=0))
+        for reason in (
+            "ok\noperator transcript",
+            "\u202eevil",
+            "file:///tmp/private",
+            "secret payload",
+            "x\x00y",
+        ):
+            with self.subTest(reason=repr(reason)):
+                raw = json.dumps(
+                    {
+                        "decision_id": "d1",
+                        "task_id": "a",
+                        "reason": reason,
+                        "trace_reference_ids": [],
+                    },
+                    ensure_ascii=False,
+                )
+                with self.assertRaisesRegex(ValueError, "reason is unsafe"):
+                    parse_llm_scheduler_output(raw, snap)
+                decision = ReadOnlyLLMSchedulerPolicy(
+                    lambda _current, _prompt, output=raw: LLMSchedulerResponse(output)
+                ).choose(snap)
+                self.assertTrue(decision.fallback)
+                self.assertEqual(decision.scheduler_cost.calls, 1)
+                self.assertNotIn("transcript", decision.fallback_reason.lower())
+
+    def test_allocation_parameters_are_bounded_before_state_hashing(self) -> None:
+        deep: object = 1
+        for _ in range(32):
+            deep = {"nested": deep}
+        with self.assertRaisesRegex(ValueError, "bounded depth"):
+            AllocationStateSnapshot(
+                "d", 0, 0, 1, 1, 0, 0, 1, (task("a", active=0),),
+                allocation_parameters=deep,
+            )
+        wide = {f"k{i}": i for i in range(257)}
+        with self.assertRaisesRegex(ValueError, "bounded key"):
+            AllocationStateSnapshot(
+                "d", 0, 0, 1, 1, 0, 0, 1, (task("a", active=0),),
+                allocation_parameters=wide,
+            )
+        cyclic: dict[str, object] = {}
+        cyclic["self"] = cyclic
+        with self.assertRaisesRegex(ValueError, "cycles"):
+            AllocationStateSnapshot(
+                "d", 0, 0, 1, 1, 0, 0, 1, (task("a", active=0),),
+                allocation_parameters=cyclic,
+            )
+
+    def test_prompt_byte_limit_is_exact_and_never_slices_json(self) -> None:
+        snap = snapshot(task("a", active=0))
+        unrestricted = ReadOnlyLLMSchedulerPolicy.prompt(snap)
+        exact = len(unrestricted.encode("utf-8"))
+        self.assertEqual(
+            ReadOnlyLLMSchedulerPolicy.prompt(snap, max_bytes=exact), unrestricted
+        )
+        with self.assertRaisesRegex(ValueError, "exceeds max bytes"):
+            ReadOnlyLLMSchedulerPolicy.prompt(snap, max_bytes=exact - 1)
+
     def test_llm_can_use_its_owned_scheduler_reservation(self) -> None:
         calls = []
         snap = AllocationStateSnapshot(
