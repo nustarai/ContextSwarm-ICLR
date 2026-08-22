@@ -1086,6 +1086,13 @@ class CloseoutLifecycleTests(unittest.TestCase):
                 "configs/scale_1h_cps24.toml",
                 "configs/scale_1h_cps48.toml",
                 "configs/scale_1h_cps96.toml",
+                "configs/formal_1h_mono.toml",
+                "configs/formal_1h_parallel.toml",
+                "configs/formal_1h_cps12.toml",
+                "configs/formal_1h_cps24.toml",
+                "configs/formal_1h_cps48.toml",
+                "configs/formal_1h_cps96.toml",
+                "configs/formal_1h_cps192.toml",
             ),
             180: (
                 "configs/3min_mono.toml",

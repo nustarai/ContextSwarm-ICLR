@@ -189,6 +189,23 @@ configs/scale_1h_cps96.toml
 其中 Parallel 保持每题一个 baseline agent；CPS24/48/96 分别从每题 2/4/8
 个 agent 起步，总槽位分别为 24/48/96。
 
+隔离的新 Judge 上运行完整七组正式 sweep 时，使用 commit-bound 的 bridge
+manifests：
+
+```text
+configs/formal_1h_mono.toml
+configs/formal_1h_parallel.toml
+configs/formal_1h_cps12.toml
+configs/formal_1h_cps24.toml
+configs/formal_1h_cps48.toml
+configs/formal_1h_cps96.toml
+configs/formal_1h_cps192.toml
+```
+
+它们统一固定 12 道题、同一模型/时限/四路 evaluator，并要求 Judge result cache
+关闭。CPS12/24/48/96/192 分别从每题 1/2/4/8/16 个 solver 起步，完成后的空闲
+slot 由 `allocation.policy = "uniform"` 继续分配给尚未证明的已有题目。
+
 一小时 CPS48 allocation 对照使用下面三个 manifest；它们都是 12 题、每题初始
 4 个 solver、总 48 slots，除 `allocation.policy` 与输出目录/名称外合同相同：
 
