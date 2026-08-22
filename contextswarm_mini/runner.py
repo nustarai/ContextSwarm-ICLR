@@ -472,6 +472,8 @@ def _is_bound_terminal_candidate_failure(
         "EXECUTION_TIMEOUT",
     }:
         return False
+    if verdict.task_id != task.slug:
+        return False
     candidate_sha = _normalized_sha256(candidate.sha256)
     observed_candidate_sha = _normalized_sha256(verdict.candidate_sha256)
     if candidate_sha is None or observed_candidate_sha != candidate_sha:
@@ -483,24 +485,38 @@ def _is_bound_terminal_candidate_failure(
     observed_contract = _normalized_sha256(verdict.task_contract_sha256)
     if expected_contract is None or observed_contract != expected_contract:
         return False
-    if not str(verdict.judge_job_id or "").strip():
-        return False
-    # A retryable hint on a closeout receipt can still denote a provider-side
-    # failure while the independent authority is unavailable.  Treat it as a
-    # candidate attempt only when the terminal reason explicitly binds the
-    # failure to this submitted candidate; a generic/contradictory reason such
-    # as ``verified_without_sorry`` remains closeout infrastructure noise.
-    if _response_value(verdict.response, "retryable") is True:
-        reason = str(_response_value(verdict.response, "terminal_reason") or "").strip().lower()
-        if reason not in {
-            "candidate_attempt_limit",
-            "candidate_failure",
-            "resource_limit",
-            "memory_limit_exceeded",
-            "execution_timeout",
-        }:
-            return False
-    return True
+    # Candidate/task/job provenance is the binding evidence.  Provider hints
+    # such as ``retryable`` and free-form ``terminal_reason`` values are not
+    # authoritative classifiers and must not turn a bound Judge outcome into
+    # infrastructure noise.  Explicitly marked legacy mock evaluators have no
+    # remote job id, but their mock marker is the test-only equivalent of that
+    # receipt binding.
+    return bool(
+        str(verdict.judge_job_id or "").strip()
+        or (
+            _allows_mock_provenance(evaluator)
+            and _response_value(verdict.response, "mock") is True
+        )
+    )
+
+
+def _mark_closeout_candidate_attempt(observed: Verdict) -> Verdict:
+    """Mark a bound terminal Judge result as ordinary candidate feedback."""
+
+    response = dict(observed.response)
+    response["closeout_candidate_attempt"] = True
+    return Verdict(
+        task_id=observed.task_id,
+        status=observed.status,
+        score=0.0,
+        elapsed_seconds=observed.elapsed_seconds,
+        response=response,
+        error=observed.error,
+        candidate_sha256=observed.candidate_sha256,
+        task_contract_sha256=observed.task_contract_sha256,
+        judge_job_id=observed.judge_job_id,
+        cache_reused=observed.cache_reused,
+    )
 
 
 def _mark_closeout_infrastructure_incomplete(
@@ -4384,6 +4400,23 @@ def _run_closeout(
                 "remote_settlement_unconfirmed",
                 mismatch,
             )
+        # A job-bound terminal resource/timeout receipt is ordinary
+        # candidate-attempt feedback even when no earlier solver authority is
+        # available.  Classify it before the prior-authority branch so health
+        # and scoreboard semantics are identical for both paths.
+        if _is_bound_terminal_candidate_failure(
+            evaluator,
+            task,
+            candidate,
+            observed,
+        ):
+            return _CloseoutDecision(
+                _mark_closeout_candidate_attempt(observed),
+                observed,
+                prior,
+                "evaluated",
+                mismatch,
+            )
         if prior is None:
             return _CloseoutDecision(
                 observed,
@@ -4406,38 +4439,6 @@ def _run_closeout(
                 observed,
                 prior,
                 "authority_confirmed",
-            )
-        if _is_bound_terminal_candidate_failure(
-            evaluator,
-            task,
-            candidate,
-            observed,
-        ):
-            # A fresh terminal resource/timeout receipt is a failed attempt
-            # for this exact frozen candidate.  It carries zero progress and
-            # must remain an ordinary evaluated closeout outcome, regardless
-            # of a provider-supplied retryable hint.  Prior solver authority
-            # is diagnostic linkage only and is not reused.
-            candidate_failure = Verdict(
-                task_id=observed.task_id,
-                status=observed.status,
-                score=0.0,
-                elapsed_seconds=observed.elapsed_seconds,
-                response={
-                    **dict(observed.response),
-                    "closeout_candidate_attempt": True,
-                },
-                error=observed.error,
-                candidate_sha256=observed.candidate_sha256,
-                task_contract_sha256=observed.task_contract_sha256,
-                judge_job_id=observed.judge_job_id,
-                cache_reused=observed.cache_reused,
-            )
-            return _CloseoutDecision(
-                candidate_failure,
-                observed,
-                prior,
-                "evaluated",
             )
         if _retryable_closeout_infrastructure_failure(observed):
             return _CloseoutDecision(
