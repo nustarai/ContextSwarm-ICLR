@@ -172,8 +172,14 @@ def _scan_sensitive(value: Any, path: str = "$") -> list[str]:
 
 
 def _get(mapping: Mapping[str, Any], *paths: str, default: Any = _UNSET) -> Any:
-    """Read a dotted path, trying aliases in order."""
+    """Read a dotted path, rejecting contradictory aliases.
 
+    Figure 4 producers retain a few compatibility aliases (for example
+    ``time_to_k`` and ``time_to_k_seconds``).  Silently preferring the first
+    alias would let a tampered artifact hide a disagreement, so all present
+    aliases must carry the same canonical JSON value.
+    """
+    found: list[tuple[str, Any]] = []
     for path in paths:
         current: Any = mapping
         for component in path.split("."):
@@ -181,7 +187,14 @@ def _get(mapping: Mapping[str, Any], *paths: str, default: Any = _UNSET) -> Any:
                 break
             current = current[component]
         else:
-            return current
+            found.append((path, current))
+    if found:
+        baseline = canonical_json(found[0][1])
+        if any(canonical_json(value) != baseline for _, value in found[1:]):
+            raise AllocatorSelectionError(
+                f"contradictory aliases for {', '.join(path for path, _ in found)}"
+            )
+        return found[0][1]
     if default is not _UNSET:
         return default
     raise AllocatorSelectionError(f"missing one of {', '.join(paths)}")
