@@ -401,7 +401,10 @@ class AgentRecoveryTests(unittest.TestCase):
             if name == "agent_recovery_exhausted"
         )
         self.assertEqual(exhausted["reason"], "insufficient_horizon_for_backoff")
-        self.assertTrue(result.run_horizon_reached)
+        # A backoff that no longer fits is not the same thing as the global
+        # experiment horizon being reached; task-level slot refill may still
+        # run while there is remaining time.
+        self.assertFalse(result.run_horizon_reached)
 
     def test_cancellation_during_backoff_prevents_relaunch(self) -> None:
         attempts: list[int] = []

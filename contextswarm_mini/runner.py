@@ -2325,6 +2325,12 @@ def _run_mono(
                 )
                 if (
                     result.returncode == 0
+                    # A bundle is only complete once every task has an
+                    # authoritative early proof.  If a subset was proved
+                    # before the Pi process failed, keep the refill alive for
+                    # the remaining tasks instead of prematurely freezing a
+                    # partial Mono result.
+                    or len(early_proofs) == len(tasks)
                     or not _agent_result_can_refill(
                         result,
                         deadline=deadline,

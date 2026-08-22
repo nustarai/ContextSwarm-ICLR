@@ -59,6 +59,27 @@ class _FailTwiceThenSucceedPi:
         )
 
 
+class _FailOnceThenSucceedPi(_FailTwiceThenSucceedPi):
+    def run(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        attempt = len(self.calls)
+        workdir = Path(kwargs["workdir"])
+        (workdir / "result.lean").write_text(
+            f"partial-{attempt}\n",
+            encoding="utf-8",
+        )
+        now = "2026-01-01T00:00:00+00:00"
+        return AgentResult(
+            agent_id=str(kwargs["actor_id"]),
+            task_id=str(kwargs["task_id"]),
+            episode=int(kwargs["episode"]),
+            returncode=0 if attempt >= 2 else 1,
+            started_at=now,
+            finished_at=now,
+            error_tail="" if attempt >= 2 else "Coordinator response failed",
+        )
+
+
 class _RecordingEvaluator:
     is_mock_evaluator = True
 
@@ -189,6 +210,82 @@ class CpsRecoveryPartialCandidateTests(unittest.TestCase):
             task_state = scheduler_state["tasks"][task.slug]
             self.assertTrue(task_state["retired"])
             self.assertEqual(task_state["retired_reason"], "attempt_budget_exhausted")
+
+    def test_refill_still_runs_when_inner_backoff_no_longer_fits(self):
+        base = load_config("configs/smoke.toml", ROOT)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            initial_agents_per_task=1,
+            max_attempts_per_task=2,
+            time_limit_seconds=2,
+            pi_recovery_enabled=True,
+            pi_recovery_max_restarts=1,
+            # Deliberately longer than the remaining test horizon.  The
+            # recovery helper must decline its in-session backoff without
+            # falsely marking the global horizon as reached; CPS then gets a
+            # chance to refill the released slot immediately.
+            pi_recovery_base_delay_ms=10_000,
+        )
+        task = load_tasks(config)[0]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            store = CPSStore(run_dir / "cps.sqlite3")
+            policy = make_policy(config.communication, store)
+            pi = _FailOnceThenSucceedPi()
+            evaluator = _RecordingEvaluator()
+            broker = _Broker()
+            scheduler_results: list[AgentResult] = []
+
+            results = _run_elastic_cps(
+                config,
+                [task],
+                run_dir,
+                logger,
+                evaluator,
+                pi,
+                policy,
+                mock_agent=False,
+                deadline=time.monotonic() + 0.5,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=broker,
+                scheduler_result_sink=scheduler_results,
+            )
+
+            self.assertEqual(len(pi.calls), 2)
+            self.assertEqual(len(evaluator.candidates), 1)
+            self.assertEqual(evaluator.candidates, ["partial-2\n"])
+            self.assertEqual(broker.calls, 2)
+            self.assertIn("AGENT_FAILURE", [verdict.status for _result, verdict in results])
+            self.assertIn("MOCK_SKIPPED", [verdict.status for _result, verdict in results])
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text().splitlines()
+            ]
+            self.assertTrue(
+                any(
+                    row.get("event") == "agent_recovery_exhausted"
+                    and row.get("reason") == "insufficient_horizon_for_backoff"
+                    for row in events
+                )
+            )
+            # This is a scheduler-level refill after the inner backoff was
+            # declined, so it is recorded as a second adaptive assignment
+            # rather than an in-session ``agent_refill_scheduled`` event.
+            self.assertEqual(
+                sum(row.get("event") == "agent_assigned" for row in events),
+                2,
+            )
+            self.assertTrue(
+                any(
+                    row.get("event") == "agent_assigned"
+                    and row.get("allocation_phase") == "adaptive"
+                    for row in events
+                )
+            )
 
 
 if __name__ == "__main__":

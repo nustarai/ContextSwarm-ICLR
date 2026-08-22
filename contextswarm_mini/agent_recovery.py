@@ -328,14 +328,25 @@ def run_with_recovery(
         delay = delay_base * (2**recovery_attempt)
         remaining = float(deadline_monotonic) - time.monotonic()
         if remaining <= delay:
-            result.run_horizon_reached = True
+            # The configured backoff no longer fits, but the fixed horizon
+            # may still have time left.  This is recovery exhaustion, not a
+            # natural horizon truncation: callers must be able to release the
+            # failed slot and perform their bounded task-level refill while
+            # ``is_recoverable_agent_failure`` still sees time remaining.
+            horizon_elapsed = time.monotonic() >= float(deadline_monotonic)
+            if horizon_elapsed:
+                result.run_horizon_reached = True
             emit(
                 "agent_recovery_exhausted",
                 recovery_attempt=recovery_attempt,
                 max_restarts=restart_limit,
                 returncode=result.returncode,
                 recoverable=False,
-                reason="insufficient_horizon_for_backoff",
+                reason=(
+                    "horizon_elapsed_before_backoff"
+                    if horizon_elapsed
+                    else "insufficient_horizon_for_backoff"
+                ),
             )
             return result
         next_attempt = recovery_attempt + 1
