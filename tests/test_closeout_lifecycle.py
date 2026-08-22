@@ -232,6 +232,47 @@ class _SolverProofThenConflictCloseout(_SolverProofThenRetryableCloseout):
         )
 
 
+class _SolverProofThenTerminalFailureCloseout(_SolverProofThenRetryableCloseout):
+    terminal_status = "RESOURCE_LIMIT"
+
+    def evaluate(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Verdict:
+        if deadline_monotonic is not None:
+            return super().evaluate(
+                task,
+                candidate,
+                deadline_monotonic=deadline_monotonic,
+            )
+        digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        return Verdict(
+            task.slug,
+            self.terminal_status,
+            0.0,
+            0.0,
+            {
+                "error_kind": (
+                    "memory_limit_exceeded"
+                    if self.terminal_status == "RESOURCE_LIMIT"
+                    else "timeout"
+                ),
+                "terminal_reason": (
+                    "resource_limit"
+                    if self.terminal_status == "RESOURCE_LIMIT"
+                    else "execution_timeout"
+                ),
+                "retryable": False,
+            },
+            candidate_sha256=digest,
+            task_contract_sha256=self.contract_sha256,
+            judge_job_id="closeout-terminal-failure",
+        )
+
+
 class _FixedCloseoutEvaluator:
     def __init__(self, verdict: Verdict, contract_sha256: str):
         self.verdict = verdict
@@ -413,6 +454,47 @@ class CloseoutLifecycleTests(unittest.TestCase):
             ]
             self.assertEqual(len(scoreboard), 1)
             self.assertEqual(scoreboard[0]["judge_job_id"], "solver-authority")
+
+    def test_prior_proof_does_not_turn_terminal_resource_failure_into_conflict(self) -> None:
+        for status in ("RESOURCE_LIMIT", "EXECUTION_TIMEOUT"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                _SolverProofThenTerminalFailureCloseout.terminal_status = status
+                config = replace(
+                    load_config("configs/smoke.toml", ROOT),
+                    max_tasks=1,
+                    max_parallel=1,
+                    initial_agents_per_task=1,
+                    max_attempts_per_task=1,
+                    time_limit_seconds=2,
+                    lean_max_concurrent_evaluations=1,
+                )
+                with patch(
+                    "contextswarm_mini.runner.MockEvaluator",
+                    _SolverProofThenTerminalFailureCloseout,
+                ):
+                    run_dir = run_experiment(
+                        config,
+                        mock_agent=True,
+                        output_override=Path(temporary),
+                    )
+
+                final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+                verdict = final["verdicts"]["imo2024_p1"]
+                self.assertEqual(final["status"], "COMPLETED")
+                self.assertEqual(final["score"], 0.0)
+                self.assertEqual(verdict["status"], status)
+                self.assertEqual(verdict["judge_job_id"], "closeout-terminal-failure")
+                self.assertNotIn("closeout_authority_conflict", final["health"]["issues"])
+                self.assertNotIn("closeout_incomplete", final["health"]["issues"])
+                events = [
+                    json.loads(line)
+                    for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                ]
+                closeout = next(
+                    row for row in events if row["event"] == "closeout_evaluation_finished"
+                )
+                self.assertTrue(closeout["scoreboard_recorded"])
+                self.assertFalse(closeout["authority_conflict"])
 
     def test_confirmed_closeout_keeps_original_exact_once_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

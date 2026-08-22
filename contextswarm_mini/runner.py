@@ -445,6 +445,41 @@ def _retryable_closeout_infrastructure_failure(verdict: Verdict) -> bool:
     )
 
 
+def _is_bound_terminal_candidate_failure(
+    evaluator: Any,
+    task: Task,
+    candidate: _FrozenCandidate,
+    verdict: Verdict,
+) -> bool:
+    """Recognize a job-bound terminal failure for the frozen candidate.
+
+    ``RESOURCE_LIMIT`` and ``EXECUTION_TIMEOUT`` are Judge outcomes of the
+    submitted candidate, even when a provider adds a ``retryable`` hint.  A
+    prior proof must therefore not turn a fresh, candidate-bound failure into
+    an authority contradiction or an infrastructure failure.  Require the
+    same provenance tuple used for authoritative receipts so malformed or
+    unbound envelopes do not silently enter this path.
+    """
+
+    if _normalized_verdict_status(verdict) not in {
+        "RESOURCE_LIMIT",
+        "EXECUTION_TIMEOUT",
+    }:
+        return False
+    candidate_sha = _normalized_sha256(candidate.sha256)
+    observed_candidate_sha = _normalized_sha256(verdict.candidate_sha256)
+    if candidate_sha is None or observed_candidate_sha != candidate_sha:
+        return False
+    try:
+        expected_contract = _normalized_sha256(_expected_task_contract(evaluator, task))
+    except Exception:
+        expected_contract = None
+    observed_contract = _normalized_sha256(verdict.task_contract_sha256)
+    if expected_contract is None or observed_contract != expected_contract:
+        return False
+    return bool(str(verdict.judge_job_id or "").strip())
+
+
 def _mark_closeout_infrastructure_incomplete(
     task: Task,
     candidate: _FrozenCandidate,
@@ -4313,6 +4348,23 @@ def _run_closeout(
                 prior,
                 "authority_confirmed",
             )
+        if _is_bound_terminal_candidate_failure(
+            evaluator,
+            task,
+            candidate,
+            observed,
+        ):
+            # A fresh terminal resource/timeout receipt is a failed attempt
+            # for this exact frozen candidate.  It carries zero progress and
+            # must remain an ordinary evaluated closeout outcome, regardless
+            # of a provider-supplied retryable hint.  Prior solver authority
+            # is diagnostic linkage only and is not reused.
+            return _CloseoutDecision(
+                observed,
+                observed,
+                prior,
+                "evaluated",
+            )
         if _retryable_closeout_infrastructure_failure(observed):
             return _CloseoutDecision(
                 _mark_closeout_infrastructure_incomplete(
@@ -4573,7 +4625,6 @@ def _run_health(
         if (
             status in incomplete_closeout_statuses
             or status in _NONTERMINAL_VERDICT_STATUSES
-            or _retryable_closeout_infrastructure_failure(verdict)
         ):
             issues.add("closeout_incomplete")
         if status == "AUTHORITY_CONFLICT":
