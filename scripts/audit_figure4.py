@@ -149,7 +149,7 @@ def _validate_contract(contract: Mapping[str, Any], summary: Mapping[str, Any]) 
     # is not present yet; a stable placeholder is preferable to an implicit
     # arm-specific default.
     selector = _contract_value(contract, "selector_identity", "selector.identity", "selector_name", "selection.selector_name")
-    visibility = _contract_value(contract, "selector_visibility", "selector.visibility", "visibility", "selection.visibility")
+    visibility = _contract_value(contract, "selector_visibility", "trace_visibility", "selector.visibility", "visibility", "selection.visibility")
     if not isinstance(selector, (str, Mapping)) or not selector:
         raise ValueError("selector identity must be non-empty")
     if visibility != "project_shared":
@@ -162,7 +162,7 @@ def _validate_contract(contract: Mapping[str, Any], summary: Mapping[str, Any]) 
     initial = _contract_value(contract, "initial_allocation", "initial_assignment", "initial_pool")
     transfer = _contract_value(contract, "candidate_transfer", "candidate_solution_transfer")
     stopping = _contract_value(contract, "stopping", "stopping_rule")
-    direct = _contract_value(contract, "direct_messages", "direct_message", "communication.direct_messages")
+    direct = _contract_value(contract, "direct_messages", "direct_messages_enabled", "direct_message", "communication.direct_messages")
     if not isinstance(model, str) or not model or not isinstance(evaluator, (str, Mapping)) or not evaluator:
         raise ValueError("model and evaluator contracts must be non-empty")
     if not isinstance(task_order, (list, tuple)) or list(task_order) != list(_task_order(summary)):
@@ -220,7 +220,7 @@ def _audit_arm(policy: str, run_dir: Path) -> dict[str, Any]:
         if summary.get("policy") != policy:
             raise ValueError("summary policy does not match arm")
         run_id = _required(summary, "run_id")
-        contract_id = _required(summary, "comparison_contract_id")
+        contract_id = _alias(summary, "comparison_contract_id", "comparison_contract_sha256")
         if not isinstance(run_id, str) or not run_id or not isinstance(contract_id, str) or not contract_id:
             raise ValueError("run_id and comparison_contract_id must be non-empty strings")
         paired_seed = _finite_number(_alias(summary, "paired_seed", "seed"), "paired_seed")
@@ -270,26 +270,40 @@ def _audit_arm(policy: str, run_dir: Path) -> dict[str, Any]:
         for section, required_keys in {
             "solver_usage": ("calls", "input_tokens", "output_tokens"),
             "evaluator_usage": ("calls",),
-            "scheduler_cost": ("calls", "input_tokens", "output_tokens", "total_tokens", "latency_seconds", "reserved_slot_seconds"),
-            "allocation_metrics": ("decisions", "fallbacks"),
         }.items():
             obj = summary.get(section)
             if not isinstance(obj, Mapping):
                 raise ValueError(f"{section} must be an object")
             for key in required_keys:
                 _finite_number(_required(obj, key, f"{section}.{key}"), f"{section}.{key}")
-        scheduler = summary["scheduler_cost"]
+        scheduler = summary.get("scheduler_cost", summary.get("llm_scheduler_cost"))
+        if not isinstance(scheduler, Mapping):
+            raise ValueError("scheduler_cost must be an object")
+        for key in ("calls", "input_tokens", "output_tokens", "total_tokens", "latency_seconds", "reserved_slot_seconds"):
+            _finite_number(_required(scheduler, key, f"scheduler_cost.{key}"), f"scheduler_cost.{key}")
+        allocation_obj = summary.get("allocation_metrics")
+        if allocation_obj is None:
+            if "allocation_decisions" not in summary or "fallback_decisions" not in summary:
+                raise ValueError("allocation_metrics is missing")
+            allocation_obj = {
+                "decisions": summary["allocation_decisions"],
+                "fallbacks": summary["fallback_decisions"],
+            }
+        if not isinstance(allocation_obj, Mapping):
+            raise ValueError("allocation_metrics must be an object")
+        for key in ("decisions", "fallbacks"):
+            _finite_number(_required(allocation_obj, key, f"allocation_metrics.{key}"), f"allocation_metrics.{key}")
         if scheduler["total_tokens"] != scheduler["input_tokens"] + scheduler["output_tokens"]:
             raise ValueError("scheduler total_tokens mismatch")
         if policy != "llm_scheduler" and any(float(scheduler[key]) != 0.0 for key in (
             "calls", "input_tokens", "output_tokens", "total_tokens", "latency_seconds", "reserved_slot_seconds"
         )):
             raise ValueError("non-LLM scheduler cost must be zero")
-        if policy == "llm_scheduler" and scheduler["calls"] != summary["allocation_metrics"]["decisions"]:
+        if policy == "llm_scheduler" and scheduler["calls"] != allocation_obj["decisions"]:
             raise ValueError("LLM scheduler calls must match allocation decisions")
-        if summary["allocation_metrics"]["fallbacks"] > summary["allocation_metrics"]["decisions"]:
+        if allocation_obj["fallbacks"] > allocation_obj["decisions"]:
             raise ValueError("allocation fallbacks exceed decisions")
-        if int(summary["allocation_metrics"]["decisions"]) != len(decisions):
+        if int(allocation_obj["decisions"]) != len(decisions):
             raise ValueError("allocation_metrics.decisions does not match decision artifact")
         decision_ids: set[str] = set()
         for row in decisions:
@@ -428,7 +442,7 @@ def audit_figure4(paths: Mapping[str, str | Path]) -> dict[str, Any]:
             summary = arm["summary"]
             try:
                 boundaries[policy] = (
-                    summary.get("comparison_contract_id"),
+                    summary.get("comparison_contract_id", summary.get("comparison_contract_sha256")),
                     summary.get("paired_seed", summary.get("seed")),
                     summary.get("repeat", summary.get("paired_repeat_id")),
                     tuple(_task_order(summary)),
