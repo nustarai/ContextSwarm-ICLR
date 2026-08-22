@@ -319,6 +319,40 @@ class AllocatorSelectionTests(unittest.TestCase):
         with self.assertRaises(AllocatorSelectionError):
             select_allocator(rows, _rule(*ids))
 
+    def test_selector_identity_alias_visibility_must_not_disagree(self) -> None:
+        rows = _validation_rows()
+        contract = rows[0]["comparison_contract"]
+        contract["selector_identity"] = {
+            "selector_name": "nustigmergy-v1",
+            "selection_config_id": "b" * 64,
+            "visibility": "private",
+        }
+        rows[0]["comparison_contract_sha256"] = canonical_sha256(contract)
+        with self.assertRaisesRegex(AllocatorSelectionError, "visibility"):
+            select_allocator(rows, _validation_rule())
+
+    def test_selector_identity_alias_config_id_must_not_disagree(self) -> None:
+        rows = _validation_rows()
+        contract = rows[0]["comparison_contract"]
+        contract["selector_identity"] = {
+            "selector_name": "nustigmergy-v1",
+            "selection_config_id": "c" * 64,
+            "visibility": "project_shared",
+        }
+        rows[0]["comparison_contract_sha256"] = canonical_sha256(contract)
+        with self.assertRaisesRegex(AllocatorSelectionError, "configuration"):
+            select_allocator(rows, _validation_rule())
+
+    def test_top_level_selector_visibility_aliases_must_not_disagree(self) -> None:
+        rows = _validation_rows()
+        contract = rows[0]["comparison_contract"]
+        # Use the nested compatibility container as the actual alias while
+        # retaining the top-level value.
+        contract["selector"] = {"visibility": "private"}
+        rows[0]["comparison_contract_sha256"] = canonical_sha256(contract)
+        with self.assertRaisesRegex(AllocatorSelectionError, "visibility"):
+            select_allocator(rows, _validation_rule())
+
     def test_exact_four_arms_and_config_hash_fail_closed(self) -> None:
         rows = _validation_rows()
         del rows[0]["arms"]["uniform_refill"]

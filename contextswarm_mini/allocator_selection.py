@@ -279,7 +279,7 @@ def _selector_identity(contract: Mapping[str, Any]) -> Any:
         return current
 
     candidates: list[tuple[str, Any]] = []
-    for path in ("selector_identity", "selector.identity"):
+    for path in ("selector_identity", "selector.identity", "selection"):
         value = read(path)
         if value is not _MISSING:
             candidates.append((path, value))
@@ -305,17 +305,45 @@ def _selector_identity(contract: Mapping[str, Any]) -> Any:
                 "contradictory selector identity object aliases"
             )
         identity: Any = objects[0][1]
-        object_name = identity.get("selector_name", _MISSING)
-        if leaves:
-            leaf_baseline = canonical_json(leaves[0][1])
-            if any(canonical_json(value) != leaf_baseline for _, value in leaves[1:]):
-                raise AllocatorSelectionError(
-                    "contradictory selector name aliases"
-                )
-            if object_name is not _MISSING and canonical_json(object_name) != leaf_baseline:
-                raise AllocatorSelectionError(
-                    "selector identity and selector name aliases disagree"
-                )
+
+        def object_fields(*names: str) -> list[tuple[str, Any]]:
+            values: list[tuple[str, Any]] = []
+            for path, value in objects:
+                for name in names:
+                    if name in value:
+                        values.append((f"{path}.{name}", value[name]))
+            return values
+
+        def contract_fields(*paths: str) -> list[tuple[str, Any]]:
+            values: list[tuple[str, Any]] = []
+            for path in paths:
+                value = read(path)
+                if value is not _MISSING:
+                    values.append((path, value))
+            return values
+
+        def require_agreement(values: list[tuple[str, Any]], label: str) -> None:
+            if not values:
+                return
+            baseline = canonical_json(values[0][1])
+            if any(canonical_json(value) != baseline for _, value in values[1:]):
+                raise AllocatorSelectionError(f"contradictory selector {label} aliases")
+
+        name_values = object_fields("selector_name") + leaves
+        require_agreement(name_values, "name")
+        visibility_values = object_fields("visibility") + contract_fields(
+            "selector_visibility",
+            "trace_visibility",
+            "selector.visibility",
+            "selection.visibility",
+        )
+        require_agreement(visibility_values, "visibility")
+        config_values = object_fields("config_sha256", "selection_config_id") + contract_fields(
+            "selector_config_sha256",
+            "selector.config_sha256",
+            "selection.selection_config_id",
+        )
+        require_agreement(config_values, "configuration")
     if not candidates:
         raise AllocatorSelectionError(
             "comparison_contract.selector_identity is missing"
