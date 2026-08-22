@@ -24,6 +24,16 @@ from .models import AgentResult
 
 
 _STDERR_LINE_LIMIT_BYTES = 256 * 1024
+_CPS_ENVIRONMENT_KEYS = frozenset(
+    {
+        "CONTEXTSWARM_CPS_DB",
+        "CONTEXTSWARM_ACTORS_FILE",
+        "CONTEXTSWARM_HORIZON_EPOCH_MS",
+        "CONTEXTSWARM_ASSIGNMENT_FILE",
+        "CONTEXTSWARM_BEST_CANDIDATE_FILE",
+        "CONTEXTSWARM_TASK_ROOT",
+    }
+)
 
 
 def now_iso() -> str:
@@ -86,6 +96,13 @@ class PiAgent:
         extra_env: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
         env = dict(os.environ)
+        # A notebook/operator shell may still carry variables from a previous
+        # CPS run.  Baselines inherit the ordinary process environment, but
+        # never an implicit communication surface; CPS call sites explicitly
+        # add the current run's values through ``extra_env`` below.
+        for key in tuple(env):
+            if key in _CPS_ENVIRONMENT_KEYS or key.startswith("CONTEXTSWARM_CPS_"):
+                env.pop(key, None)
         env.update(
             {
                 "PI_BIN": self.binary(),

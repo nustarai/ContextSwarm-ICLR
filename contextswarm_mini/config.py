@@ -123,6 +123,7 @@ class ExperimentConfig:
     lean_server_url: str
     lean_env_id: str
     lean_timeout_seconds: int
+    lean_max_lifecycle_seconds: int
     lean_max_concurrent_evaluations: int
     lean_verification_profile: str
     lean_judge_mode: str
@@ -188,6 +189,7 @@ class ExperimentConfig:
             "lean_server_url": _redact_endpoint(self.lean_server_url),
             "lean_env_id": self.lean_env_id,
             "lean_timeout_seconds": self.lean_timeout_seconds,
+            "lean_max_lifecycle_seconds": self.lean_max_lifecycle_seconds,
             "lean_max_concurrent_evaluations": self.lean_max_concurrent_evaluations,
             "lean_verification_profile": self.lean_verification_profile,
             "lean_judge_mode": self.lean_judge_mode,
@@ -317,6 +319,11 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     lean_url = _text(lean.get("server_url"), "http://127.0.0.1:18000")
     lean_env = _text(lean.get("env_id"), "formal_matholympiadbench")
     lean_timeout = _positive_int(lean.get("timeout_seconds"), "lean.timeout_seconds", 300)
+    lean_max_lifecycle = _positive_int(
+        lean.get("max_lifecycle_seconds"),
+        "lean.max_lifecycle_seconds",
+        max(3_600, (8 * lean_timeout) + 120),
+    )
     lean_max_evaluations = _positive_int(
         lean.get("max_concurrent_evaluations"),
         "lean.max_concurrent_evaluations",
@@ -366,6 +373,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         lean_server_url=lean_url,
         lean_env_id=lean_env,
         lean_timeout_seconds=lean_timeout,
+        lean_max_lifecycle_seconds=lean_max_lifecycle,
         lean_max_concurrent_evaluations=lean_max_evaluations,
         lean_verification_profile=profile,
         lean_judge_mode=judge_mode,

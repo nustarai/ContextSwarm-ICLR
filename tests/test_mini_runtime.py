@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -62,6 +63,17 @@ class MiniRuntimeTests(unittest.TestCase):
             "pi_provider_max_retry_delay_ms",
         )
         expected = tuple(getattr(mono, field) for field in transport_fields)
+        evaluator_fields = (
+            "lean_timeout_seconds",
+            "lean_max_lifecycle_seconds",
+            "lean_max_concurrent_evaluations",
+            "lean_verification_profile",
+            "lean_judge_mode",
+        )
+        expected_evaluator = tuple(
+            getattr(mono, field) for field in evaluator_fields
+        )
+        self.assertEqual(mono.lean_max_lifecycle_seconds, 3_600)
         for manifest in (
             "configs/parallel.toml",
             "configs/cps.toml",
@@ -71,6 +83,10 @@ class MiniRuntimeTests(unittest.TestCase):
         ):
             config = load_config(manifest, ROOT)
             self.assertEqual(tuple(getattr(config, field) for field in transport_fields), expected)
+            self.assertEqual(
+                tuple(getattr(config, field) for field in evaluator_fields),
+                expected_evaluator,
+            )
 
     def test_cps_store_and_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -132,15 +148,48 @@ class MiniRuntimeTests(unittest.TestCase):
             self.assertTrue((run_dir / "elastic_scheduler_state.json").exists())
 
     def test_baselines_do_not_receive_cps_surface(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            run_dir = run_experiment(
-                load_config("configs/parallel.toml", ROOT),
-                mock_agent=True,
-                output_override=Path(temporary),
+        for manifest in ("configs/mono.toml", "configs/parallel.toml"):
+            with self.subTest(manifest=manifest), tempfile.TemporaryDirectory() as temporary:
+                run_dir = run_experiment(
+                    load_config(manifest, ROOT),
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+                self.assertFalse((run_dir / "cps.sqlite3").exists())
+                self.assertFalse((run_dir / "communication_trace.jsonl").exists())
+                helpers = list((run_dir / "workers").rglob("context_piece"))
+                self.assertEqual(helpers, [])
+
+    def test_baseline_child_environment_drops_stale_cps_capabilities(self) -> None:
+        stale = {
+            "CONTEXTSWARM_CPS_DB": "/tmp/stale.sqlite3",
+            "CONTEXTSWARM_ACTORS_FILE": "/tmp/stale-actors.json",
+            "CONTEXTSWARM_HORIZON_EPOCH_MS": "9999999999999",
+            "CONTEXTSWARM_ASSIGNMENT_FILE": "/tmp/stale-assignments.jsonl",
+            "CONTEXTSWARM_BEST_CANDIDATE_FILE": "/tmp/stale-result.lean",
+            "CONTEXTSWARM_TASK_ROOT": "/tmp/stale-task",
+            "CONTEXTSWARM_CPS_FUTURE_CAPABILITY": "stale",
+        }
+        with patch.dict(os.environ, stale, clear=False):
+            for manifest in ("configs/mono.toml", "configs/parallel.toml"):
+                with self.subTest(manifest=manifest):
+                    agent = PiAgent(load_config(manifest, ROOT))
+                    env = agent.environment(
+                        task_id="fresh-task",
+                        actor_id="fresh-actor",
+                        workdir=ROOT,
+                    )
+                    self.assertTrue(stale.keys().isdisjoint(env))
+                    self.assertEqual(env["CONTEXTSWARM_TASK_ID"], "fresh-task")
+                    self.assertEqual(env["CONTEXTSWARM_ACTOR_ID"], "fresh-actor")
+
+            cps_env = PiAgent(load_config("configs/cps.toml", ROOT)).environment(
+                task_id="task",
+                actor_id="actor",
+                workdir=ROOT,
+                extra_env={"CONTEXTSWARM_CPS_DB": "/run/current.sqlite3"},
             )
-            self.assertFalse((run_dir / "cps.sqlite3").exists())
-            worker = run_dir / "workers" / "imo2024_p1"
-            self.assertFalse((worker / "context_piece").exists())
+            self.assertEqual(cps_env["CONTEXTSWARM_CPS_DB"], "/run/current.sqlite3")
 
     def test_verdict_helpers(self) -> None:
         self.assertEqual(normalize_base_url("http://judge/api/lean/jobs"), "http://judge")

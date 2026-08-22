@@ -34,7 +34,9 @@ cps.sqlite3              # CPS 模式
 communication_trace.jsonl # CPS 事件投影
 elastic_assignments.jsonl  # CPS 动态 agent 分配
 elastic_scheduler_state.json # CPS 调度器收尾状态
-workers/<task>/result.lean # parallel/CPS compatibility path
+closeout_candidates.json   # 三种模式统一的冻结候选索引与 SHA-256
+closeout_candidates/<task>/result.lean # feedback-free 最终评分快照
+workers/<task>/result.lean # parallel
 workers/<task>/agents/<actor>/result.lean # elastic CPS attempts
 workers/<task>/best/result.lean # elastic CPS best candidate
 workers/mono/tasks/<task>/result.lean # mono
@@ -142,11 +144,19 @@ scripts/run_docker.sh --config configs/3min_parallel.toml
 scripts/run_docker.sh --config configs/3min_cps.toml
 ```
 
-3 分钟 horizon 到达后，runner 会停止 Pi session，并跳过已经迟到的 Lean
-提交/长轮询；这保证 container closeout 不会被 evaluator queue 无限拖延。
-弹性 CPS manifest 将 `[lean].max_concurrent_evaluations` 设为 4，建议同时给
-独立 Goedel-Prover Judge 配置至少 4 个 worker；Mono/Parallel baseline 仍可用
-较低并发。该值应当始终和 Judge worker/内存容量一起调整。
+3 分钟 horizon 只限制 solver 与 CPS 通信：到点后 runner 停止 Pi session、拒绝
+新的 CPS 写入，并按各模式定义冻结每题一个候选。随后 Mono、Parallel、CPS
+统一进入 feedback-free closeout；此阶段不再改变候选，也不把 Judge 结果反馈给
+agent。这样，各模式在 horizon 收口时选中并冻结的候选，不会因为最终 Judge
+排队或执行跨过截止点而漏分。
+
+paper-facing manifest 统一将 `[lean].max_concurrent_evaluations` 设为 4；建议同时给
+独立 Goedel-Prover Judge 配置至少 4 个 worker。该值应当始终和 Judge worker/
+内存容量一起调整。`[lean].timeout_seconds`（默认 300 秒）是 Judge 单个后端
+命令的执行预算，不是提交到终态的总 wall time：合法 job lifecycle 还可能包含
+queue、冷 REPL header/body 以及 formal finalization。它也不是 solver horizon 或
+整个 closeout 的总预算。`[lean].max_lifecycle_seconds`（paper manifest 为 3600）
+是客户端防御畸形 receipt 的显式安全上界，不会缩短 Judge 正常公布的预算。
 
 如果 AISW binary 或 node config 不在默认路径：
 
@@ -191,9 +201,24 @@ CPS worker 在工作目录中获得 `./context_piece`：
 GET  /healthz
 POST /api/lean/jobs
 GET  /api/lean/jobs/<job_id>?wait_ms=1000
+DELETE /api/lean/jobs/<job_id>  # 客户端放弃未收口 job 时取消并对账
 ```
 
-提交字段包括 candidate `code`、baseline `target_code`、`problem_id`、`lean_env_id` 和 `verification_profile`. 只有 canonical `PROVED` / `AC` verdict 计入 `final.json`。
+提交字段包括 candidate `code`、baseline `target_code`、`problem_id`、`lean_env_id`
+和 `verification_profile`。客户端优先采用 Judge receipt 公布的 whole-job
+`lifecycle_deadline_ms`；兼容旧 Judge 时，会根据 receipt 的 queue deadline 和
+formal pipeline 上界保守推导。只有整个合法 lifecycle 加 terminal settlement
+窗口都结束后，才会请求取消并再次有界对账；畸形或超过客户端安全上界的
+lifecycle receipt 会 fail closed，不会造成无限轮询。客户端主动取消不会被记成普通
+`CANCELLED` 零分，而会标记为 degraded evaluator timeout。`final.json` 不会把
+`queued` / `running` 当作最终 verdict；无法确认终态会明确记录为
+`EVALUATOR_TIMEOUT`。Judge 明确返回的 pre-admission overload 会在 30 秒
+admission budget 内有界重试；已经排队后才返回的 terminal、retryable
+`rejected_overloaded` 至多重交一次 whole job。结果不明的 socket/proxy 失败不会
+盲目重交，以免复制仍在运行的 job。Judge 的 `error_kind`、
+`terminal_reason`、queue/execution timing 会保留在安全摘要中，以区分证明错误、
+执行超时、资源限制、过载和基础设施故障。只有 canonical `PROVED` / `AC`
+verdict 计入分数。
 
 ## 数据来源
 
