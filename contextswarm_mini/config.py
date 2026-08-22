@@ -111,6 +111,27 @@ _FORMULA_DEFAULTS: dict[str, float] = {
     "other_status_quality": 0.0,
 }
 
+_TASK_STATE_DEFAULTS: dict[str, float] = {
+    "checker_quality": 1.0,
+    "recent_progress": 1.0,
+    "starvation": 1.0,
+    "failure_no_progress": 1.0,
+}
+
+_TRACE_STATE_DEFAULTS: dict[str, float] = {
+    "actionability": 1.0,
+    "evidence_association": 1.0,
+    "positive_feedback": 1.0,
+    "negative_feedback": 1.0,
+    "drag": 1.0,
+}
+
+_ALLOCATION_NORMALIZATION_DEFAULTS: dict[str, float] = {
+    "progress_window_seconds": 600.0,
+    "starvation_window_seconds": 600.0,
+    "failure_saturation": 3.0,
+}
+
 
 @dataclass(frozen=True)
 class AllocationConfig:
@@ -121,6 +142,9 @@ class AllocationConfig:
     piece_body_chars: int
     agent_timeout_seconds: int
     formula: dict[str, float]
+    task_state: dict[str, float]
+    trace_state: dict[str, float]
+    normalization: dict[str, float]
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -129,6 +153,9 @@ class AllocationConfig:
             "piece_body_chars": self.piece_body_chars,
             "agent_timeout_seconds": self.agent_timeout_seconds,
             "formula": dict(sorted(self.formula.items())),
+            "task_state": dict(sorted(self.task_state.items())),
+            "trace_state": dict(sorted(self.trace_state.items())),
+            "normalization": dict(sorted(self.normalization.items())),
         }
 
 
@@ -339,6 +366,15 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     docker = _as_dict(payload.get("docker"), "docker")
     allocation = _as_dict(payload.get("allocation"), "allocation")
     allocation_formula = _as_dict(allocation.get("formula"), "allocation.formula")
+    allocation_task_state = _as_dict(
+        allocation.get("task_state"), "allocation.task_state"
+    )
+    allocation_trace_state = _as_dict(
+        allocation.get("trace_state"), "allocation.trace_state"
+    )
+    allocation_normalization = _as_dict(
+        allocation.get("normalization"), "allocation.normalization"
+    )
 
     mode = _text(experiment.get("mode"), "cps").lower()
     if mode not in {"mono", "parallel", "cps"}:
@@ -375,8 +411,20 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     if assignment_policy not in {"least_active", "round_robin"}:
         raise ConfigError("experiment.assignment_policy must be least_active or round_robin")
     allocation_policy = _text(allocation.get("policy"), "uniform").lower()
-    if allocation_policy not in {"uniform", "formula", "agent"}:
-        raise ConfigError("allocation.policy must be uniform, formula, or agent")
+    allowed_allocation_policies = {
+        "uniform",
+        "formula",
+        "agent",
+        "uniform_refill",
+        "task_state",
+        "trace_state",
+        "llm_scheduler",
+    }
+    if allocation_policy not in allowed_allocation_policies:
+        raise ConfigError(
+            "allocation.policy must be one of "
+            + ", ".join(sorted(allowed_allocation_policies))
+        )
     unknown_formula = set(allocation_formula) - set(_FORMULA_DEFAULTS)
     if unknown_formula:
         raise ConfigError(
@@ -386,6 +434,42 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         key: _number(allocation_formula.get(key), f"allocation.formula.{key}", default)
         for key, default in _FORMULA_DEFAULTS.items()
     }
+    parameter_tables = (
+        (
+            "allocation.task_state",
+            allocation_task_state,
+            _TASK_STATE_DEFAULTS,
+        ),
+        (
+            "allocation.trace_state",
+            allocation_trace_state,
+            _TRACE_STATE_DEFAULTS,
+        ),
+        (
+            "allocation.normalization",
+            allocation_normalization,
+            _ALLOCATION_NORMALIZATION_DEFAULTS,
+        ),
+    )
+    parsed_parameter_tables: list[dict[str, float]] = []
+    for table_name, values, defaults in parameter_tables:
+        unknown = set(values) - set(defaults)
+        if unknown:
+            raise ConfigError(
+                f"unknown {table_name} fields: " + ", ".join(sorted(unknown))
+            )
+        parsed = {
+            key: _number(values.get(key), f"{table_name}.{key}", default)
+            for key, default in defaults.items()
+        }
+        if any(value < 0 for value in parsed.values()):
+            raise ConfigError(f"{table_name} fields must not be negative")
+        parsed_parameter_tables.append(parsed)
+    task_state_parameters, trace_state_parameters, normalization_parameters = (
+        parsed_parameter_tables
+    )
+    if any(value <= 0 for value in normalization_parameters.values()):
+        raise ConfigError("allocation.normalization fields must be positive")
     for key in (
         "failure_penalty",
         "duplication_penalty",
@@ -418,6 +502,9 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
             120,
         ),
         formula=formula_parameters,
+        task_state=task_state_parameters,
+        trace_state=trace_state_parameters,
+        normalization=normalization_parameters,
     )
     episodes = _positive_int(experiment.get("episodes_per_task"), "experiment.episodes_per_task", 1)
     max_tasks = _nonnegative_int(experiment.get("max_tasks"), "experiment.max_tasks", 0)

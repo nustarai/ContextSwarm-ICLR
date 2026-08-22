@@ -1,0 +1,8 @@
+extends = ["figure4_dev_cps48.toml"]
+
+[experiment]
+name = "mobench-figure4-dev-cps48-trace-state"
+output_root = "runs/figure4_dev/trace_state"
+
+[allocation]
+policy = "trace_state"

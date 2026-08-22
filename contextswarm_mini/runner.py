@@ -31,6 +31,16 @@ from .allocation import (
     UniformAllocationPolicy,
     normalize_verdict_status,
 )
+from .allocation_core import (
+    AllocationStateSnapshot,
+    LLMSchedulerResponse,
+    TaskScoreWeights,
+    TaskState,
+    TraceFeatures,
+    TraceScoreWeights,
+    create_allocation_policy,
+)
+from .allocation_audit import AllocationAuditRecord, append_allocation_audit
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
 from .evaluator import CodingEvaluator, LeanEvaluator, MockEvaluator, sanitize_worker_text
@@ -933,6 +943,8 @@ def _allocation_runtime_metrics(
 ) -> dict[str, Any]:
     admitted: dict[str, tuple[str, float]] = {}
     finished: dict[str, float] = {}
+    reservations: dict[str, tuple[int, float]] = {}
+    reservation_seconds = 0.0
     for event in history:
         event_type = str(event.get("event") or "")
         agent_id = str(event.get("agent_id") or "")
@@ -943,6 +955,23 @@ def _allocation_runtime_metrics(
             )
         elif event_type == "agent_finished" and agent_id:
             finished[agent_id] = float(event.get("finished_at") or deadline)
+        elif event_type == "reservation_acquired":
+            reservation_id = str(event.get("reservation_id") or "")
+            if reservation_id:
+                reservations[reservation_id] = (
+                    int(event.get("slots") or 0),
+                    float(event.get("acquired_at") or run_started_monotonic),
+                )
+        elif event_type == "reservation_completed":
+            reservation_id = str(event.get("reservation_id") or "")
+            held = reservations.pop(reservation_id, None)
+            if held is not None:
+                slots, started = held
+                completed = float(event.get("completed_at") or deadline)
+                reservation_seconds += slots * max(
+                    0.0,
+                    min(deadline, completed) - max(run_started_monotonic, started),
+                )
     per_task: dict[str, float] = {}
     solver_seconds = 0.0
     for agent_id, (task_id, started) in admitted.items():
@@ -953,11 +982,22 @@ def _allocation_runtime_metrics(
         per_task[task_id] = per_task.get(task_id, 0.0) + duration
     capacity_seconds = max(0.0, deadline - run_started_monotonic) * max_parallel
     solver_utilization = solver_seconds / capacity_seconds if capacity_seconds else 0.0
-    compute_seconds = solver_seconds + max(0.0, policy_latency_seconds)
+    for slots, started in reservations.values():
+        reservation_seconds += slots * max(
+            0.0, min(deadline, deadline) - max(run_started_monotonic, started)
+        )
+    # Legacy agent arms predate capacity reservations. Keep their historical
+    # latency accounting; registered LLM Scheduler arms use actual reservation
+    # slot-seconds and never double-count model latency.
+    scheduler_compute_seconds = (
+        reservation_seconds if reservation_seconds else max(0.0, policy_latency_seconds)
+    )
+    compute_seconds = solver_seconds + scheduler_compute_seconds
     compute_utilization = compute_seconds / capacity_seconds if capacity_seconds else 0.0
     return {
         "solver_agent_seconds": round(solver_seconds, 6),
-        "scheduler_compute_seconds": round(max(0.0, policy_latency_seconds), 6),
+        "scheduler_compute_seconds": round(scheduler_compute_seconds, 6),
+        "scheduler_reserved_slot_seconds": round(reservation_seconds, 6),
         "capacity_seconds": round(capacity_seconds, 6),
         "solver_slot_utilization": round(min(1.0, solver_utilization), 8),
         "compute_slot_utilization": round(min(1.0, compute_utilization), 8),
@@ -994,6 +1034,108 @@ def _scheduler_token_usage(trace_path: Path) -> dict[str, int]:
         "scheduler_cache_write_tokens": sum(row.get("cache_write_tokens", 0) for row in per_session.values()),
         "scheduler_total_tokens": sum(row.get("total_tokens", 0) for row in per_session.values()),
     }
+
+
+_FIGURE4_POLICIES = frozenset(
+    {"uniform_refill", "task_state", "trace_state", "llm_scheduler"}
+)
+
+
+def _core_snapshot_from_legacy(
+    snapshot: TaskProgressSnapshot,
+    config: ExperimentConfig,
+    *,
+    scheduler_reserved_slots: int = 0,
+) -> AllocationStateSnapshot:
+    """Project the legacy runner snapshot into the issue #39 immutable API.
+
+    Until the Figure 3 selector bridge is installed, trace values are an
+    explicit zero projection. This keeps the development arm runnable and
+    makes Trace-State exactly reproduce Task-State on the same state.
+    """
+
+    tasks = tuple(
+        TaskState(
+            task_id=task.task_id,
+            eligible=task.eligible,
+            active_allocations=task.active_agents,
+            checker_quality=max(0.0, min(1.0, task.best_score)),
+            recent_progress=math.exp(
+                -max(0.0, task.seconds_since_progress)
+                / max(1.0, config.allocation.normalization["progress_window_seconds"])
+            ),
+            starvation=min(
+                1.0,
+                max(0.0, task.seconds_since_last_assignment)
+                / max(1.0, config.allocation.normalization["starvation_window_seconds"]),
+            ),
+            failure_no_progress=min(
+                1.0,
+                max(0, task.consecutive_failures)
+                / max(1.0, config.allocation.normalization["failure_saturation"]),
+            ),
+            trace=TraceFeatures(),
+        )
+        for task in snapshot.tasks
+    )
+    task_weights = config.allocation.task_state
+    trace_weights = config.allocation.trace_state
+    parameters = {
+        "task_state": dict(task_weights),
+        "trace_state": dict(trace_weights),
+        "normalization": dict(config.allocation.normalization),
+    }
+    allocation_config_sha256 = hashlib.sha256(
+        json.dumps(
+            parameters,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    active_solver_slots = sum(task.active_allocations for task in tasks)
+    return AllocationStateSnapshot(
+        decision_id=f"decision-{snapshot.decision_index:08d}",
+        decision_index=snapshot.decision_index,
+        elapsed_seconds=snapshot.elapsed_seconds,
+        remaining_seconds=snapshot.remaining_seconds,
+        total_capacity=config.max_parallel,
+        active_solver_slots=active_solver_slots,
+        scheduler_reserved_slots=scheduler_reserved_slots,
+        free_slots=max(
+            0,
+            config.max_parallel - active_solver_slots - scheduler_reserved_slots,
+        ),
+        tasks=tasks,
+        allocation_config_sha256=allocation_config_sha256,
+        allocation_parameters=parameters,
+    )
+
+
+def _legacy_decision_from_core(core: Any) -> AllocationDecision:
+    """Keep existing runner/artifact consumers compatible with core decisions."""
+
+    return AllocationDecision(
+        decision_index=core.decision_index,
+        policy=core.policy,
+        selected_task_id=core.selected_task_id,
+        reason=core.reason,
+        evidence_piece_ids=list(core.trace_reference_ids),
+        latency_seconds=(
+            float(core.scheduler_cost.latency_seconds)
+            if core.scheduler_cost is not None
+            else 0.0
+        ),
+        fallback=core.fallback,
+        fallback_reason=core.fallback_reason,
+        scores=dict(core.scores),
+        features={
+            task_id: {"task_score": float(core.task_scores.get(task_id, 0.0)),
+                      "trace_increment": float(core.trace_increments.get(task_id, 0.0))}
+            for task_id in core.scores
+        },
+    )
 
 
 def _runtime_limit_snapshot() -> dict[str, Any]:
@@ -1964,6 +2106,9 @@ def _run_elastic_cps(
     assignments_path = run_dir / "elastic_assignments.jsonl"
     decisions_path = run_dir / "allocation_decisions.jsonl"
     decisions_path.write_text("", encoding="utf-8")
+    audit_path = run_dir / "allocation_audit.jsonl"
+    if config.allocation.policy == "trace_state":
+        audit_path.write_text("", encoding="utf-8")
     roster_path = run_dir / "actors.json"
     roster_lock = threading.RLock()
     allocation_lock = threading.RLock()
@@ -2053,7 +2198,123 @@ def _run_elastic_cps(
         logger.event("allocation_scheduler_finished", **result.as_dict())
         return result
 
-    if config.allocation.policy == "uniform":
+    def invoke_core_scheduler_agent(
+        snapshot: AllocationStateSnapshot,
+        prompt: str,
+    ) -> LLMSchedulerResponse:
+        started = time.monotonic()
+        actor_id = f"allocation-scheduler-{snapshot.decision_index}"
+        if mock_agent:
+            result = _mock_result(actor_id, "__allocation__", snapshot.decision_index)
+            selected = snapshot.eligible_task_ids[0] if snapshot.eligible_task_ids else ""
+            result.output_tail = json.dumps(
+                {
+                    "decision_id": snapshot.decision_id,
+                    "task_id": selected,
+                    "reason": "mock scheduler decision",
+                    "trace_reference_ids": [],
+                },
+                sort_keys=True,
+            )
+        else:
+            workdir = run_dir / "allocation_scheduler" / f"decision-{snapshot.decision_index:06d}"
+            workdir.mkdir(parents=True, exist_ok=True)
+            result = pi_agent.run(
+                task_id="__allocation__",
+                actor_id=actor_id,
+                episode=snapshot.decision_index,
+                prompt=prompt,
+                workdir=workdir,
+                deadline_monotonic=min(
+                    deadline,
+                    time.monotonic() + config.allocation.agent_timeout_seconds,
+                ),
+                isolated=True,
+                cancel_event=run_cancel_event,
+            )
+        result.decision_index = snapshot.decision_index
+        with scheduler_results_lock:
+            scheduler_result_sink.append(result)
+        logger.event("allocation_scheduler_finished", **result.as_dict())
+        latency = max(0.0, time.monotonic() - started)
+        return LLMSchedulerResponse(
+            output=result.output_tail,
+            returncode=result.returncode,
+            timed_out=result.timed_out,
+            latency_seconds=latency,
+            occupied_slot_seconds=latency,
+        )
+
+    core_decisions: dict[int, tuple[AllocationStateSnapshot, Any]] = {}
+
+    class _CoreAllocatorAdapter:
+        def __init__(self, core_policy: Any) -> None:
+            self.core_policy = core_policy
+            self.decisions: list[Any] = []
+
+        def choose(self, legacy_snapshot: TaskProgressSnapshot) -> AllocationDecision:
+            core_snapshot = _core_snapshot_from_legacy(legacy_snapshot, config)
+            core_decision = self.core_policy.choose(core_snapshot)
+            self.decisions.append(core_decision)
+            core_decisions[core_decision.decision_index] = (core_snapshot, core_decision)
+            return _legacy_decision_from_core(core_decision)
+
+        def fallback(
+            self,
+            legacy_snapshot: TaskProgressSnapshot,
+            reason: str,
+            *,
+            prior: AllocationDecision | None = None,
+        ) -> AllocationDecision:
+            replacement = self.choose(legacy_snapshot)
+            decision = prior or replacement
+            decision.selected_task_id = replacement.selected_task_id
+            decision.fallback = True
+            decision.fallback_reason = _combine_fallback_reasons(
+                decision.fallback_reason, reason
+            )
+            return decision
+
+        def summary(self) -> dict[str, Any]:
+            latencies = [
+                float(item.scheduler_cost.latency_seconds)
+                for item in self.decisions
+                if item.scheduler_cost is not None
+            ]
+            return {
+                "schema_version": "contextswarm_allocation_summary_v2",
+                "policy": config.allocation.policy,
+                "decision_count": len(self.decisions),
+                "fallback_count": sum(item.fallback for item in self.decisions),
+                "agent_calls": sum(item.scheduler_cost is not None for item in self.decisions),
+                "total_latency_seconds": round(sum(latencies), 6),
+                "max_latency_seconds": round(max(latencies, default=0.0), 6),
+                "scheduler_cost": {
+                    "calls": sum(item.scheduler_cost is not None for item in self.decisions),
+                    "reserved_slot_seconds": round(
+                        sum(
+                            float(item.scheduler_cost.occupied_slot_seconds or 0.0)
+                            for item in self.decisions
+                            if item.scheduler_cost is not None
+                        ),
+                        6,
+                    ),
+                },
+            }
+
+    if config.allocation.policy in _FIGURE4_POLICIES:
+        core_policy = create_allocation_policy(
+            config.allocation.policy,
+            task_weights=TaskScoreWeights.from_mapping(config.allocation.task_state),
+            trace_weights=TraceScoreWeights.from_mapping(config.allocation.trace_state),
+            llm_invoker=(
+                invoke_core_scheduler_agent
+                if config.allocation.policy == "llm_scheduler"
+                else None
+            ),
+        )
+        allocator: Any = _CoreAllocatorAdapter(core_policy)
+    elif config.allocation.policy == "uniform":
         allocator: Any = UniformAllocationPolicy(task_order)
     elif config.allocation.policy == "formula":
         allocator = FormulaAllocationPolicy(task_order, config.allocation.formula)
@@ -2062,11 +2323,27 @@ def _run_elastic_cps(
 
     def build_snapshot(index: int) -> TaskProgressSnapshot:
         now_mono = time.monotonic()
-        cps = store.progress_snapshot(
-            task_order,
-            recent_limit=config.allocation.piece_limit_per_task,
-            body_chars=config.allocation.piece_body_chars,
-        )
+        if config.allocation.policy in _FIGURE4_POLICIES:
+            # The ordinary Figure 4 state is built without consulting the CPS
+            # store. Trace-State/LLM receive projection data through the
+            # selector bridge, never through Task-State recency or counts.
+            cps = {
+                task_id: {
+                    "latest_created_at": "",
+                    "piece_count": 0,
+                    "validation_piece_count": 0,
+                    "strategy_piece_count": 0,
+                    "duplicate_piece_count": 0,
+                    "recent_pieces": [],
+                }
+                for task_id in task_order
+            }
+        else:
+            cps = store.progress_snapshot(
+                task_order,
+                recent_limit=config.allocation.piece_limit_per_task,
+                body_chars=config.allocation.piece_body_chars,
+            )
         scheduler_unsolved = set(scheduler.unsolved_tasks)
         progress_rows: list[TaskProgress] = []
         for task_id in task_order:
@@ -2084,7 +2361,7 @@ def _run_elastic_cps(
                 assignment_age = max(0.0, now_mono - state.last_assignment_at)
                 progress_age = max(0.0, now_mono - state.last_progress_at)
             piece_age = _seconds_since_cps_timestamp(str(stats["latest_created_at"]))
-            if piece_age is not None:
+            if config.allocation.policy not in _FIGURE4_POLICIES and piece_age is not None:
                 progress_age = min(progress_age, piece_age)
             capped = config.max_attempts_per_task > 0 and attempts >= config.max_attempts_per_task
             eligible = (
@@ -2192,6 +2469,26 @@ def _run_elastic_cps(
             "assigned_generation": assignment.generation if assignment is not None else None,
             "disposition": disposition,
         }
+        core_record = core_decisions.get(decision.decision_index)
+        if core_record is not None:
+            core_snapshot, core_decision = core_record
+            row.update(
+                {
+                    "schema_version": "contextswarm_allocation_decision_v2",
+                    "decision_id": core_decision.decision_id,
+                    "state_id": core_decision.state_id,
+                    "eligible_task_ids": list(core_snapshot.eligible_task_ids),
+                    "task_only_scores": dict(core_decision.task_scores),
+                    "trace_increments": dict(core_decision.trace_increments),
+                    "total_scores": dict(core_decision.scores),
+                    "allocation_config_sha256": core_snapshot.allocation_config_sha256,
+                    "scheduler_cost": (
+                        core_decision.scheduler_cost.public_dict()
+                        if core_decision.scheduler_cost is not None
+                        else None
+                    ),
+                }
+            )
         if execution_snapshot is not None:
             row["execution_snapshot"] = execution_snapshot.as_dict()
         with decisions_path.open("a", encoding="utf-8") as handle:
@@ -2286,7 +2583,15 @@ def _run_elastic_cps(
                 snapshot = build_snapshot(decision_index)
                 if not snapshot.eligible_task_ids:
                     return None
-                if config.allocation.policy == "agent":
+                scheduler_reservation = None
+                if config.allocation.policy == "llm_scheduler":
+                    scheduler_reservation = scheduler.acquire_reservation(
+                        slots=1,
+                        purpose=f"llm_scheduler_decision_{decision_index}",
+                    )
+                    if scheduler_reservation is None:
+                        return None
+                if config.allocation.policy in {"agent", "llm_scheduler"}:
                     # A released solver slot can run its own read-only scheduler
                     # call.  Release only the orchestration lock while the model
                     # reasons so simultaneous completions keep all compute slots
@@ -2294,6 +2599,13 @@ def _run_elastic_cps(
                     allocation_lock.release()
                     try:
                         decision = allocator.choose(snapshot)
+                    except BaseException:
+                        if scheduler_reservation is not None:
+                            scheduler.release_reservation(
+                                scheduler_reservation,
+                                reason="scheduler_exception",
+                            )
+                        raise
                     finally:
                         allocation_lock.acquire()
                 else:
@@ -2304,6 +2616,11 @@ def _run_elastic_cps(
                 assignment = None
                 execution_snapshot: TaskProgressSnapshot | None = None
                 if decision.agent_run_horizon_reached:
+                    if scheduler_reservation is not None:
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="horizon_reached",
+                        )
                     record_decision(
                         decision,
                         snapshot,
@@ -2349,7 +2666,13 @@ def _run_elastic_cps(
                         return None
                     assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 elif time.monotonic() < deadline and decision.selected_task_id:
-                    assignment = scheduler.next_assignment_for(decision.selected_task_id)
+                    if scheduler_reservation is not None:
+                        assignment = scheduler.admit_reserved(
+                            scheduler_reservation,
+                            decision.selected_task_id,
+                        )
+                    else:
+                        assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 if assignment is None and time.monotonic() < deadline:
                     if scheduler.horizon_reached:
                         record_decision(
@@ -2396,6 +2719,11 @@ def _run_elastic_cps(
                         if decision.selected_task_id:
                             assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 if assignment is None:
+                    if scheduler_reservation is not None:
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="decision_not_admitted",
+                        )
                     record_decision(
                         decision,
                         snapshot,
@@ -2411,6 +2739,43 @@ def _run_elastic_cps(
                     assignment,
                     execution_snapshot=execution_snapshot,
                 )
+                if config.allocation.policy == "trace_state":
+                    core_record = core_decisions.get(decision.decision_index)
+                    if core_record is not None:
+                        core_snapshot, core_decision = core_record
+                        task_counterfactual = create_allocation_policy(
+                            "task_state",
+                            task_weights=TaskScoreWeights.from_mapping(
+                                config.allocation.task_state
+                            ),
+                        ).choose(core_snapshot)
+                        append_allocation_audit(
+                            audit_path,
+                            AllocationAuditRecord.create(
+                                state_id=core_snapshot.state_id,
+                                decision_id=core_snapshot.decision_id,
+                                eligible_task_ids=core_snapshot.eligible_task_ids,
+                                allocation_config_sha256=core_snapshot.allocation_config_sha256,
+                                task_only_scores=core_decision.task_scores,
+                                trace_increments=core_decision.trace_increments,
+                                trace_total_scores=core_decision.scores,
+                                allocation_before={
+                                    task.task_id: task.active_allocations
+                                    for task in core_snapshot.tasks
+                                },
+                                trace_state_selected_task_id=core_decision.selected_task_id,
+                                task_state_selected_task_id=task_counterfactual.selected_task_id,
+                                admitted_task_id=assignment.task_id,
+                                fallback_reason=decision.fallback_reason,
+                                active_slots_before=core_snapshot.active_solver_slots,
+                                active_slots_after=core_snapshot.active_solver_slots + 1,
+                                free_slots_before=core_snapshot.free_slots,
+                                free_slots_after=max(0, core_snapshot.free_slots - 1),
+                                scheduler_reserved_slots_before=core_snapshot.scheduler_reserved_slots,
+                                scheduler_reserved_slots_after=core_snapshot.scheduler_reserved_slots,
+                                total_capacity=core_snapshot.total_capacity,
+                            ),
+                        )
                 return assignment
             return None
         finally:
@@ -4283,8 +4648,109 @@ def _write_final(
         ),
         "finished_at": utc_now(),
     }
+    if config.allocation.policy in _FIGURE4_POLICIES:
+        _write_figure4_summary(run_dir, config, verdicts, allocation_summary)
     (run_dir / "final.json").write_text(
         json.dumps(final, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_figure4_summary(
+    run_dir: Path,
+    config: ExperimentConfig,
+    verdicts: Mapping[str, Verdict],
+    allocation_summary: Mapping[str, Any] | None,
+) -> None:
+    """Emit the machine-readable per-repeat Figure 4 development artifact."""
+
+    score_time = _score_time_metrics(
+        run_dir,
+        horizon_seconds=config.time_limit_seconds,
+        max_score=len(verdicts),
+    )
+    try:
+        history = [
+            json.loads(line)
+            for line in (run_dir / "scoreboard_history.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError):
+        history = []
+    accepted_history = [
+        {
+            "task_id": row.get("task_id"),
+            "score": float(row.get("score") or 0.0),
+            "horizon_elapsed_seconds": row.get("horizon_elapsed_seconds"),
+        }
+        for row in history
+        if str(row.get("source") or "") != "closeout"
+        and float(row.get("score") or 0.0) >= 1.0
+    ]
+    selected = getattr(config, "selection", None)
+    selector_identity = selected.public_dict() if selected is not None else {
+        "enabled": False,
+        "selector_name": "",
+        "selection_config_id": "",
+    }
+    contract = {
+        "dataset": config.dataset_name,
+        "ordered_task_ids": sorted(verdicts),
+        "paired_seed": config.seed,
+        "selector": selector_identity,
+        "model": config.model,
+        "horizon_seconds": config.time_limit_seconds,
+        "total_capacity": config.max_parallel,
+        "initial_agents_per_task": config.initial_agents_per_task,
+        "communication": config.communication,
+        "direct_messages_enabled": False,
+        "candidate_transfer": True,
+        "stopping_rule": "full_score_or_horizon",
+    }
+    contract_hash = hashlib.sha256(
+        json.dumps(contract, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    summary = {
+        "schema_version": "contextswarm_figure4_run_summary_v1",
+        "policy": config.allocation.policy,
+        "paired_repeat_id": str(config.extra.get("paired_repeat_id", "dev")),
+        "paired_seed": config.seed,
+        "ordered_task_ids": sorted(verdicts),
+        "horizon_seconds": config.time_limit_seconds,
+        "total_capacity": config.max_parallel,
+        "initial_allocation": {
+            task_id: config.initial_agents_per_task for task_id in sorted(verdicts)
+        },
+        "accepted_score_history": accepted_history,
+        "final_accepted_score": sum(
+            1 for verdict in verdicts.values() if float(verdict.score) >= 1.0
+        ),
+        "time_to_k_seconds": score_time.get("time_to_k_proofs_seconds", {}),
+        "nauc": score_time.get("normalized_score_time_auc", 0.0),
+        "solver_usage": {
+            "solver_agent_seconds": (allocation_summary or {}).get("solver_agent_seconds", 0.0),
+            "solver_slot_utilization": (allocation_summary or {}).get("solver_slot_utilization", 0.0),
+        },
+        "evaluator_usage": {
+            "terminal_verdict_count": len(verdicts),
+            "attempt_verdict_count": len(history),
+        },
+        "scheduler_cost": (allocation_summary or {}).get("scheduler_cost", {}),
+        "allocation_metrics": {
+            key: value
+            for key, value in (allocation_summary or {}).items()
+            if key in {"decision_count", "fallback_count", "agent_calls", "total_latency_seconds"}
+        },
+        "allocation_config": config.allocation.public_dict(),
+        "comparison_contract": contract,
+        "comparison_contract_sha256": contract_hash,
+    }
+    (run_dir / "figure4_run_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
