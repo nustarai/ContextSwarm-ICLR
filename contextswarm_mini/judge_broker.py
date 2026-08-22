@@ -2541,10 +2541,13 @@ def _valid_judge_checkpoint(result: Mapping[str, Any]) -> bool:
         result.get("task_contract_sha256")
     ) is None:
         return False
-    job_id = sanitize_worker_identifier(result.get("judge_job_id"))
     if status == "LOCAL_REJECTED":
-        return job_id is None
-    return job_id is not None
+        # LOCAL_REJECTED is a supervisor-local result and must carry no remote
+        # identity at all.  Checking the raw field is intentional: an invalid
+        # or empty non-None value must not disappear during sanitization and
+        # accidentally satisfy the local-only contract.
+        return result.get("judge_job_id") is None
+    return sanitize_worker_identifier(result.get("judge_job_id")) is not None
 
 
 def _safe_finite_float(value: Any) -> float:

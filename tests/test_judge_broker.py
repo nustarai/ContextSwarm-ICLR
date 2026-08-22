@@ -20,6 +20,7 @@ from contextswarm_mini.judge_broker import (
     CandidateSnapshot,
     JudgeBroker,
     JudgeBrokerDrainError,
+    _valid_judge_checkpoint,
 )
 from contextswarm_mini.models import Task, Verdict
 
@@ -365,6 +366,23 @@ def _wait_for_queue_depth(broker: JudgeBroker, depth: int) -> bool:
 
 
 class JudgeBrokerTests(unittest.TestCase):
+    def test_local_rejected_checkpoint_requires_raw_job_id_to_be_absent(self) -> None:
+        base = {
+            "accepted": True,
+            "status": "LOCAL_REJECTED",
+            "candidate_sha256": "a" * 64,
+            "task_contract_sha256": "b" * 64,
+            "judge_job_id": None,
+        }
+        self.assertTrue(_valid_judge_checkpoint(base))
+        for malformed in ("", "   ", 123, {}, "bad job id"):
+            with self.subTest(judge_job_id=malformed):
+                self.assertFalse(
+                    _valid_judge_checkpoint(
+                        {**base, "judge_job_id": malformed}
+                    )
+                )
+
     def test_cancel_path_falls_back_to_job_id_and_rejects_cross_origin_endpoint(self) -> None:
         evaluator = LeanEvaluator(
             "https://judge.invalid",
