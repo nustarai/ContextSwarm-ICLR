@@ -3241,18 +3241,53 @@ def _run_elastic_cps(
         )
 
     core_decisions: dict[int, tuple[AllocationStateSnapshot, Any]] = {}
+    # Keep one bridge instance for the run, but bind each materialization to
+    # the live selector runtime.  Passing only the SQLite path would bypass
+    # the runtime's pinned/causal snapshot protocol and (when a runtime is
+    # present) fail the bridge's store-identity guard.
     trace_projection_bridge = TraceProjectionBridge()
 
-    def allocation_trace_view(task_ids: Iterable[str]) -> AllocationTraceView | None:
+    # Trace rows may carry event timestamps.  Projection recency and
+    # stagnation must be evaluated at the same fixed wall-clock cut for every
+    # page in one allocation decision; deriving this from each page's newest
+    # row would make the score depend on pagination order.  The run's horizon
+    # origin is an already-pinned epoch/monotonic pair, so elapsed decision
+    # time can be converted without consulting an untrusted source clock.
+    trace_reference_monotonic = time.monotonic()
+    # Align the epoch cut with the runner's horizon origin rather than with
+    # entry to this helper (which may be delayed by setup).  This keeps event
+    # ages comparable to the elapsed time already recorded in snapshots.
+    trace_reference_epoch = time.time() - max(
+        0.0, trace_reference_monotonic - run_started_monotonic
+    )
+    # One immutable as-of time per allocation decision.  The LLM path reads
+    # the projection once before invoking the provider and once during
+    # admission revalidation; both reads must use the same cut or legitimate
+    # recency drift would make every provider response stale.
+    trace_reference_times: dict[int, float] = {}
+
+    def allocation_trace_view(
+        task_ids: Iterable[str],
+        *,
+        reference_time: float | None = None,
+    ) -> AllocationTraceView | None:
         """Read trace state only for the two registered trace-aware arms."""
 
         if not policy_reads_trace(config.allocation.policy):
             return None
-        selection_path = run_dir / "selection.sqlite3"
+        # The fallback is the bridge call instant and is only used by legacy
+        # test harnesses that invoke this helper outside the scheduler loop.
+        at = reference_time
+        if at is None:
+            at = trace_reference_epoch + max(
+                0.0, time.monotonic() - trace_reference_monotonic
+            )
         return trace_projection_bridge.read(
             task_ids,
-            store=selection_path if selection_path.is_file() else None,
+            selection_runtime=selection_runtime,
+            store=None,
             feedback_values=feedback_values_from_config(config),
+            reference_time=at,
         )
 
     class _CoreAllocatorAdapter:
@@ -3267,8 +3302,15 @@ def _run_elastic_cps(
             scheduler_reserved_slots: int | None = None,
             owned_scheduler_reservation_slots: int = 0,
         ) -> AllocationDecision:
+            decision_reference_time = trace_reference_epoch + max(
+                0.0, legacy_snapshot.elapsed_seconds
+            )
+            trace_reference_times[legacy_snapshot.decision_index] = (
+                decision_reference_time
+            )
             trace_view = allocation_trace_view(
-                item.task_id for item in legacy_snapshot.tasks
+                (item.task_id for item in legacy_snapshot.tasks),
+                reference_time=decision_reference_time,
             )
             core_snapshot = _core_snapshot_from_legacy(
                 legacy_snapshot,
@@ -3721,7 +3763,12 @@ def _run_elastic_cps(
                         scheduler_reserved_slots=scheduler.reservation_slots,
                         owned_scheduler_reservation_slots=1,
                         trace_view=allocation_trace_view(
-                            item.task_id for item in execution_snapshot.tasks
+                            (item.task_id for item in execution_snapshot.tasks),
+                            reference_time=trace_reference_times.get(
+                                decision.decision_index,
+                                trace_reference_epoch
+                                + max(0.0, execution_snapshot.elapsed_seconds),
+                            ),
                         ),
                     )
                     core_record = core_decisions.get(decision.decision_index)
