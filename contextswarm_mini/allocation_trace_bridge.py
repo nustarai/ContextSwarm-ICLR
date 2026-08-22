@@ -1107,23 +1107,7 @@ class TraceProjectionBridge:
                 watermark="sqlite-v1:" + watermark,
                 source="selection_store_sqlite_v1",
                 complete=True,
-                trace_references=tuple(
-                    (
-                        task_id,
-                        tuple(
-                            sorted(
-                                {
-                                    str(record.get("evidence_id") or "")
-                                    for record in records
-                                    if record.get("task_id") == task_id
-                                    and record.get("evidence_id")
-                                    and str(record.get("evidence_id")) not in ordinary_ids
-                                }
-                            )[:100]
-                        ),
-                    )
-                    for task_id in ordered
-                ),
+                trace_references=_trace_references(ordered, records, ordinary_ids),
             )
         except Exception as exc:
             return self.zero(ordered, reason=_bounded_reason(exc))
