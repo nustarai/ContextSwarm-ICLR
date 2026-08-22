@@ -360,13 +360,14 @@ def _validate_trace_audit(row: Mapping[str, Any], capacity: int, tasks: tuple[st
         raise ValueError("trace/task allocation vectors must cover task_order")
     if not isinstance(before, Mapping) or set(before) != set(tasks):
         raise ValueError("allocation_before must cover task_order")
-    trace_total = task_total = 0
+    before_total = trace_total = task_total = 0
     for item in tasks:
         b = _finite_number(before[item], f"allocation_before.{item}")
         t = _finite_number(trace[item], f"trace_slots.{item}")
         q = _finite_number(task[item], f"task_slots.{item}")
         if int(b) != b or int(t) != t or int(q) != q:
             raise ValueError("allocation vectors must contain integers")
+        before_total += int(b)
         trace_total += int(t)
         task_total += int(q)
     if trace_total > capacity or task_total > capacity or trace_total != task_total:
@@ -377,12 +378,29 @@ def _validate_trace_audit(row: Mapping[str, Any], capacity: int, tasks: tuple[st
         raise ValueError("capacity_delta_sum must be zero")
     if row.get("capacity_conserved") is not True:
         raise ValueError("capacity_conserved must be true")
+    trace_selected = row["trace_state_selected_task_id"]
+    task_selected = row["task_state_selected_task_id"]
+    admission_count = 0 if admitted is None else 1
+    for task_id in tasks:
+        expected_trace = int(before[task_id]) + (
+            admission_count if task_id == trace_selected else 0
+        )
+        expected_task = int(before[task_id]) + (
+            admission_count if task_id == task_selected else 0
+        )
+        if int(trace[task_id]) != expected_trace or int(task[task_id]) != expected_task:
+            raise ValueError("same-state after vectors are not one-slot admissions")
+    if admitted is not None and admitted != trace_selected:
+        raise ValueError("admitted_task_id must match trace-state selection")
     for moment in ("before", "after"):
         active = _finite_number(row.get(f"active_slots_{moment}"), f"active_slots_{moment}")
         free = _finite_number(row.get(f"free_slots_{moment}"), f"free_slots_{moment}")
         reserved = _finite_number(row.get(f"scheduler_reserved_slots_{moment}"), f"scheduler_reserved_slots_{moment}")
         if active + free + reserved != capacity:
             raise ValueError(f"{moment} slot accounting does not equal capacity")
+        vector_total = before_total if moment == "before" else trace_total
+        if active != vector_total:
+            raise ValueError(f"{moment} active slots do not match allocation vector")
 
 
 def audit_figure4(paths: Mapping[str, str | Path]) -> dict[str, Any]:
