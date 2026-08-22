@@ -22,6 +22,14 @@ class EvaluatorError(RuntimeError):
 class EvaluatorOverloadedError(EvaluatorError):
     """A definitive pre-admission rejection which is safe to retry."""
 
+    def __init__(
+        self,
+        message: str,
+        response: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.response = dict(response or {})
+
 
 _NONTERMINAL_STATUSES = {
     "QUEUED",
@@ -115,25 +123,45 @@ class LeanEvaluator:
             except (OSError, UnicodeError, json.JSONDecodeError):
                 error_payload = None
             exc.close()
-            error_text = (
-                str(error_payload.get("error") or "").lower()
+            error_code = (
+                str(error_payload.get("error") or "").strip().lower()
                 if isinstance(error_payload, Mapping)
                 else ""
             )
+            error_message = (
+                str(error_payload.get("message") or "").strip().lower()
+                if isinstance(error_payload, Mapping)
+                else ""
+            )
+            error_text = f"{error_code} {error_message}"
             confirmed_overload = (
                 isinstance(error_payload, Mapping)
-                and error_payload.get("ok") is False
                 and (
-                    "overload" in error_text
+                    error_code
+                    in {
+                        "admission_capacity_exceeded",
+                        "permit_unavailable",
+                    }
+                    or "overload" in error_text
                     or (
                         "queue" in error_text
                         and any(word in error_text for word in ("full", "capacity"))
                     )
+                    or (
+                        "ingress" in error_text
+                        and "capacity" in error_text
+                    )
                 )
             )
-            if status_code == 503 and confirmed_overload:
+            if (
+                status_code in {429, 503}
+                and method == "POST"
+                and path == "/api/lean/jobs"
+                and confirmed_overload
+            ):
                 raise EvaluatorOverloadedError(
-                    f"Lean admission overloaded ({method} {path})"
+                    f"Lean admission overloaded ({method} {path})",
+                    error_payload,
                 ) from exc
             raise EvaluatorError(f"Lean request failed ({method} {path}): {exc}") from exc
         except (URLError, TimeoutError, OSError) as exc:
@@ -271,8 +299,9 @@ class LeanEvaluator:
                     if not _retryable_admission_rejection(submitted):
                         break
                     last_admission_rejection = submitted
-                except EvaluatorOverloadedError:
-                    pass
+                except EvaluatorOverloadedError as exc:
+                    if exc.response:
+                        last_admission_rejection = exc.response
                 remaining_admission = admission_deadline - time.monotonic()
                 if remaining_admission > 0:
                     time.sleep(

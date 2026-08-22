@@ -50,6 +50,22 @@ class _LifecycleServer:
                         {"ok": False, "error": "upstream unavailable"},
                         status_code=503,
                     )
+                elif owner.mode == "unconfirmed_429":
+                    self._send(
+                        {"error": "account_quota_exhausted"},
+                        status_code=429,
+                    )
+                elif owner.mode == "always_http_429" or (
+                    owner.mode == "http_429_then_proved" and owner.post_count < 3
+                ):
+                    self._send(
+                        {
+                            "error": "admission_capacity_exceeded",
+                            "message": "HTTP ingress capacity is exhausted",
+                            "retry_after_ms": 250,
+                        },
+                        status_code=429,
+                    )
                 elif owner.mode == "always_overloaded" or (
                     owner.mode == "overloaded_then_proved" and owner.post_count < 3
                 ):
@@ -71,6 +87,7 @@ class _LifecycleServer:
                         }
                     )
                 elif owner.mode in {
+                    "http_429_then_proved",
                     "overloaded_then_proved",
                     "terminal_overloaded_then_proved",
                 }:
@@ -409,7 +426,11 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(server.deletes, 0)
 
     def test_definitive_admission_overload_is_retried(self) -> None:
-        for mode in ("overloaded_then_proved", "terminal_overloaded_then_proved"):
+        for mode in (
+            "http_429_then_proved",
+            "overloaded_then_proved",
+            "terminal_overloaded_then_proved",
+        ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 server = _LifecycleServer(mode)
@@ -426,7 +447,11 @@ class EvaluatorLifecycleTests(unittest.TestCase):
                 self.assertEqual(server.post_count, 3)
 
     def test_admission_overload_retry_is_bounded(self) -> None:
-        for mode in ("always_overloaded", "always_terminal_overloaded"):
+        for mode in (
+            "always_http_429",
+            "always_overloaded",
+            "always_terminal_overloaded",
+        ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 server = _LifecycleServer(mode)
@@ -477,20 +502,21 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(server.post_count, 2)
         self.assertEqual(verdict.response["evaluator_overload_resubmissions"], 1)
 
-    def test_unconfirmed_proxy_503_is_not_resubmitted(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            server = _LifecycleServer("unconfirmed_503")
-            with server.running() as url:
-                verdict = LeanEvaluator(
-                    url,
-                    lean_env_id="test",
-                    admission_retry_seconds=1.0,
-                ).evaluate(_task(root), self._candidate(root))
+    def test_unconfirmed_http_error_is_not_resubmitted(self) -> None:
+        for mode in ("unconfirmed_429", "unconfirmed_503"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                server = _LifecycleServer(mode)
+                with server.running() as url:
+                    verdict = LeanEvaluator(
+                        url,
+                        lean_env_id="test",
+                        admission_retry_seconds=1.0,
+                    ).evaluate(_task(root), self._candidate(root))
 
-        self.assertEqual(verdict.status, "EVALUATOR_ERROR")
-        self.assertEqual(verdict.score, 0.0)
-        self.assertEqual(server.post_count, 1)
+                self.assertEqual(verdict.status, "EVALUATOR_ERROR")
+                self.assertEqual(verdict.score, 0.0)
+                self.assertEqual(server.post_count, 1)
 
     def test_huge_finite_lifecycle_deadline_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
