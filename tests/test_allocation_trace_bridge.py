@@ -259,8 +259,8 @@ class AllocationTraceBridgeTests(unittest.TestCase):
         self.assertEqual(projection.feedback_exposure_count, 2)
         self.assertEqual(projection.positive_feedback_count, 1)
         self.assertEqual(projection.negative_feedback_count, 1)
-        self.assertEqual(projection.positive_feedback, 0.5)
-        self.assertEqual(projection.negative_feedback, 0.5)
+        self.assertAlmostEqual(projection.positive_feedback, 0.5)
+        self.assertAlmostEqual(projection.negative_feedback, 0.5)
         self.assertTrue(view.for_task("task-b").is_zero)
         self.assertEqual(
             view.references_for_task("task-a"),
@@ -410,6 +410,135 @@ class AllocationTraceBridgeTests(unittest.TestCase):
                 (("task-a",), "W", "c1", 2),
             ],
         )
+
+    def test_full_projection_receives_pinned_snapshot_metadata(self) -> None:
+        source = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(
+                        {
+                            "sequence": 1,
+                            "record_id": "trace-1",
+                            "task_id": "task-a",
+                            "kind": "piece_snapshot",
+                            "trace_id": "trace-1",
+                            "lineage_id": "lineage-1",
+                            "active": True,
+                            "event_time": 10.0,
+                        },
+                    ),
+                    trace_watermark="opaque-W",
+                    source_watermark=1,
+                    snapshot_id="source-snapshot-1",
+                    reference_time=12.5,
+                )
+            ]
+        )
+        bridge = TraceProjectionBridge()
+        calls = []
+        original = bridge.adapter.project_full_records
+
+        def recording_project(*args, **kwargs):
+            calls.append(dict(kwargs))
+            return original(*args, **kwargs)
+
+        bridge.adapter.project_full_records = recording_project  # type: ignore[method-assign]
+        view = bridge.read(["task-a"], store=source)
+        self.assertEqual(view.source, "selection_store_snapshot")
+        self.assertEqual(view.batch.snapshot_id, "source-snapshot-1")
+        self.assertEqual(calls[0]["source_watermark"], 1)
+        self.assertEqual(calls[0]["snapshot_id"], "source-snapshot-1")
+        self.assertEqual(calls[0]["reference_time"], 12.5)
+
+    def test_full_state_fields_change_identity_without_hashing_payload(self) -> None:
+        base = {
+            "sequence": 1,
+            "record_id": "trace-1",
+            "task_id": "task-a",
+            "kind": "piece_snapshot",
+            "trace_id": "trace-1",
+            "lineage_id": "lineage-1",
+            "active": True,
+            "event_time": 10.0,
+            "payload": "PRIVATE-CPS-BODY",
+        }
+        first = _SnapshotStore(
+            [TraceProjectionSnapshotPage(records=(base,), trace_watermark="W")]
+        )
+        changed = dict(base, active=False, lifecycle="stale")
+        second = _SnapshotStore(
+            [TraceProjectionSnapshotPage(records=(changed,), trace_watermark="W")]
+        )
+        first_view = TraceProjectionBridge().read(["task-a"], store=first)
+        second_view = TraceProjectionBridge().read(["task-a"], store=second)
+        self.assertNotEqual(first_view.watermark, second_view.watermark)
+        self.assertNotIn("PRIVATE-CPS-BODY", repr(first_view))
+        self.assertNotIn("PRIVATE-CPS-BODY", first_view.watermark)
+
+    def test_snapshot_metadata_drift_and_nonfinite_reference_time_fail_closed(self) -> None:
+        for pages in (
+            [
+                TraceProjectionSnapshotPage(
+                    records=(), trace_watermark="W", next_cursor="c1", complete=False,
+                    snapshot_id="S1", reference_time=1.0,
+                ),
+                TraceProjectionSnapshotPage(
+                    records=(), trace_watermark="W", snapshot_id="S2", reference_time=1.0,
+                ),
+            ],
+            [
+                TraceProjectionSnapshotPage(
+                    records=(), trace_watermark="W", next_cursor="c1", complete=False,
+                    snapshot_id="S", reference_time=1.0,
+                ),
+                TraceProjectionSnapshotPage(
+                    records=(), trace_watermark="W", snapshot_id="S", reference_time=2.0,
+                ),
+            ],
+        ):
+            view = TraceProjectionBridge().read(["task-a"], store=_SnapshotStore(pages))
+            self.assertEqual(view.source, "zero")
+        with self.assertRaises(ValueError):
+            TraceProjectionSnapshotPage(
+                records=(), trace_watermark="W", reference_time=float("nan")
+            )
+
+    def test_ordinary_outcome_is_excluded_from_projection_and_references(self) -> None:
+        source = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(
+                        {
+                            "sequence": 1,
+                            "record_id": "trace-row",
+                            "task_id": "task-a",
+                            "kind": "piece_snapshot",
+                            "trace_id": "trace-a",
+                            "lineage_id": "lineage-a",
+                            "active": True,
+                        },
+                        {
+                            "sequence": 2,
+                            "record_id": "ordinary-1",
+                            "task_id": "task-a",
+                            "kind": "evidence_link",
+                            "trace_id": "trace-a",
+                            "lineage_id": "lineage-a",
+                            "evidence_id": "ordinary-1",
+                            "source_outcome_id": "ordinary-1",
+                        },
+                    ),
+                    trace_watermark="W",
+                )
+            ]
+        )
+        view = TraceProjectionBridge().read(
+            ["task-a"], store=source, ordinary_outcome_ids=("ordinary-1",)
+        )
+        projection = view.for_task("task-a")
+        self.assertEqual(projection.evidence_association, 0.0)
+        self.assertEqual(projection.source_outcome_ids, ())
+        self.assertEqual(view.references_for_task("task-a"), ("trace-a",))
 
     def test_snapshot_watermark_drift_cursor_replay_and_source_head_fail_closed(self) -> None:
         drift = _SnapshotStore(

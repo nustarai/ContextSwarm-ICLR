@@ -22,6 +22,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
+import inspect
 import json
 import math
 from pathlib import Path
@@ -89,7 +90,13 @@ class TraceProjectionSnapshotPage:
     trace_watermark: str
     next_cursor: str = ""
     complete: bool = True
-    source_watermark: int | None = None
+    source_watermark: int | str | None = None
+    snapshot_id: str = ""
+    # Optional source-owned recency cut.  It is metadata only; it is never
+    # exposed to the allocator as free-form text.  Keeping it on the page
+    # lets a paged source attest that one-shot and paged materializations use
+    # the same reference clock.
+    reference_time: float | None = None
 
     def __post_init__(self) -> None:
         watermark = str(self.trace_watermark or "").strip()
@@ -100,6 +107,10 @@ class TraceProjectionSnapshotPage:
         if len(cursor) > 512:
             raise ValueError("next_cursor must be at most 512 characters")
         object.__setattr__(self, "next_cursor", cursor)
+        snapshot_id = str(self.snapshot_id or "").strip()
+        if len(snapshot_id) > 512:
+            raise ValueError("snapshot_id must be at most 512 characters")
+        object.__setattr__(self, "snapshot_id", snapshot_id)
         if not isinstance(self.complete, bool):
             raise ValueError("complete must be a boolean")
         if self.complete and cursor:
@@ -107,12 +118,28 @@ class TraceProjectionSnapshotPage:
         if not self.complete and not cursor:
             raise ValueError("an incomplete projection page requires next_cursor")
         if self.source_watermark is not None:
-            if (
-                isinstance(self.source_watermark, bool)
-                or not isinstance(self.source_watermark, int)
-                or self.source_watermark < 0
-            ):
-                raise ValueError("source_watermark must be a non-negative integer")
+            if isinstance(self.source_watermark, bool):
+                raise ValueError("source_watermark must be a bounded scalar")
+            if isinstance(self.source_watermark, int):
+                if self.source_watermark < 0:
+                    raise ValueError("source_watermark must be non-negative")
+            elif isinstance(self.source_watermark, str):
+                value = self.source_watermark.strip()
+                if not value or len(value) > 512:
+                    raise ValueError("source_watermark must be a bounded scalar")
+                object.__setattr__(self, "source_watermark", value)
+            else:
+                raise ValueError("source_watermark must be a bounded scalar")
+        if self.reference_time is not None:
+            if isinstance(self.reference_time, bool):
+                raise ValueError("reference_time must be finite")
+            try:
+                reference_time = float(self.reference_time)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("reference_time must be finite") from None
+            if not math.isfinite(reference_time):
+                raise ValueError("reference_time must be finite")
+            object.__setattr__(self, "reference_time", reference_time)
         object.__setattr__(self, "records", tuple(self.records))
 
 
@@ -140,64 +167,139 @@ def _snapshot_identity(
     source_watermark: str,
     records: Sequence[Any],
     ordinary_outcome_ids: Iterable[str],
+    *,
+    snapshot_id: str = "",
+    reference_time: float | None = None,
 ) -> str:
     """Hash only the bounded projection contract, never raw source metadata."""
 
-    normalized: list[dict[str, Any]] = []
-    for record in records:
-        if isinstance(record, Mapping):
-            normalized.append(
-                {
-                    key: record.get(key)
-                    for key in (
-                        "sequence",
-                        "record_id",
-                        "task_id",
-                        "kind",
-                        "lineage_id",
-                        "evidence_id",
-                        "worker_id",
-                        "source",
-                        "source_outcome_id",
-                        "exposure_id",
-                        "effective",
-                        "terminal",
-                    )
-                    if key in record
-                }
-            )
-        else:
-            normalized.append(
-                {
-                    key: getattr(record, key)
-                    for key in (
-                        "sequence",
-                        "record_id",
-                        "task_id",
-                        "kind",
-                        "lineage_id",
-                        "evidence_id",
-                        "worker_id",
-                        "source",
-                        "source_outcome_id",
-                        "exposure_id",
-                        "effective",
-                        "terminal",
-                    )
-                    if hasattr(record, key)
-                }
-            )
+    # Keep this list deliberately explicit.  These are the scalar fields that
+    # can affect the bounded allocator projection, including the newer
+    # full-current-state topology fields.  Query/payload/body fields must
+    # never be copied into an identity hash or an allocation artifact.
+    normalized = [_projection_signature(record) for record in records]
+    normalized.sort(
+        key=lambda item: json.dumps(
+            item, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
+        )
+    )
     return _canonical_sha(
         {
-            "schema": "contextswarm_trace_projection_snapshot_v1",
+            "schema": "contextswarm_trace_projection_snapshot_v2",
             "task_ids": list(task_ids),
             "source_watermark": str(source_watermark),
+            "snapshot_id": str(snapshot_id or "")[:512],
+            "reference_time": reference_time,
             "ordinary_outcome_ids": sorted(
                 {str(value).strip() for value in ordinary_outcome_ids if str(value).strip()}
             ),
             "records": normalized,
         }
     )
+
+
+_SAFE_PROJECTION_FIELDS = (
+    "sequence",
+    "record_id",
+    "task_id",
+    "kind",
+    "lineage_id",
+    "evidence_id",
+    "worker_id",
+    "source",
+    "source_outcome_id",
+    "exposure_id",
+    "effective",
+    "terminal",
+    "effective_declared",
+    "terminal_declared",
+    "trace_id",
+    "lifecycle",
+    "active",
+    "actionable",
+    "event_time",
+    "trust",
+    "trust_declared",
+    "trust_rank",
+    "feedback_value",
+    "committed_sequence",
+    "run_id",
+    "consumer_episode_id",
+    "target_trace_id",
+    "relation_kind",
+)
+
+
+def _safe_projection_value(value: Any) -> Any:
+    """Normalize one identity scalar without retaining arbitrary source data."""
+
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > 2**63 - 1:
+            raise ValueError("projection identity contains an out-of-range integer")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("projection identity contains a non-finite number")
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        if len(value) > 512:
+            raise ValueError("projection identity contains an overlong scalar")
+        return value
+    raise ValueError("projection identity contains an unsupported value")
+
+
+def _projection_signature(record: Any) -> dict[str, Any]:
+    """Return a canonical, bounded scalar view of a source record.
+
+    ``TraceProjectionRecord`` grew fields as the full-state contract became
+    explicit.  Extracting by attribute keeps this bridge compatible with both
+    old and new adapters; mapping aliases are normalized through the record
+    class first, while only the allowlisted topology scalars are retained.
+    """
+
+    if isinstance(record, Mapping):
+        normalized = TraceProjectionRecord.from_mapping(record)
+        result: dict[str, Any] = {}
+        for field in _SAFE_PROJECTION_FIELDS:
+            if hasattr(normalized, field):
+                result[field] = _safe_projection_value(getattr(normalized, field))
+            elif field in record:
+                result[field] = _safe_projection_value(record[field])
+        # Preserve newer aliases even when an older TraceProjectionRecord does
+        # not know them yet.
+        aliases = {
+            "trace_id": ("trace_id",),
+            "lifecycle": ("lifecycle", "status"),
+            "active": ("active", "is_active"),
+            "actionable": ("actionable", "is_actionable"),
+            "event_time": ("event_time", "timestamp", "created_seconds", "created_at", "observed_at"),
+            "trust": ("trust", "trust_weight", "trust_score"),
+            "trust_rank": ("trust_rank", "authority_rank"),
+            "feedback_value": ("feedback_value", "polarity"),
+            "committed_sequence": ("committed_sequence", "commit_sequence"),
+            "run_id": ("run_id", "experiment_id"),
+            "consumer_episode_id": ("consumer_episode_id", "episode_id", "consumer_id"),
+            "target_trace_id": ("target_trace_id", "target_piece_id"),
+            "relation_kind": ("relation_kind", "relation"),
+        }
+        for field, keys in aliases.items():
+            if field in result:
+                continue
+            for key in keys:
+                if key in record:
+                    result[field] = _safe_projection_value(record[key])
+                    break
+        return result
+    result = {}
+    for field in _SAFE_PROJECTION_FIELDS:
+        if hasattr(record, field):
+            result[field] = _safe_projection_value(getattr(record, field))
+    if not result:
+        raise TypeError("trace projection snapshot records must be records or mappings")
+    return result
 
 
 @dataclass(frozen=True)
@@ -538,6 +640,22 @@ def _record_evidence_id(record: Any) -> str:
     return str(getattr(record, "evidence_id", "") or "").strip()
 
 
+def _record_trace_id(record: Any) -> str:
+    if isinstance(record, Mapping):
+        return str(
+            record.get("trace_id")
+            or record.get("piece_id")
+            or record.get("context_piece_id")
+            or record.get("evidence_id")
+            or ""
+        ).strip()
+    return str(
+        getattr(record, "trace_id", "")
+        or getattr(record, "evidence_id", "")
+        or ""
+    ).strip()
+
+
 def _projection_record(record: Any) -> TraceProjectionRecord:
     """Normalize a source row without retaining its unbounded payload.
 
@@ -557,9 +675,32 @@ def _projection_record(record: Any) -> TraceProjectionRecord:
 def _projection_record_identity(record: TraceProjectionRecord) -> tuple[str, ...]:
     """Return an identity scoped to task/source for replay validation."""
 
-    if record.record_id:
-        return ("id", record.task_id, record.source, record.record_id)
-    return tuple(record.canonical_identity)
+    signature = _projection_signature(record)
+    record_id = str(signature.get("record_id") or "")
+    if record_id:
+        return (
+            "id",
+            str(signature.get("task_id") or ""),
+            str(signature.get("source") or "worker"),
+            record_id,
+        )
+    # Without a stable source ID, use only the identity-bearing topology
+    # fields.  Mutable state (lifecycle, active, trust, timestamps, …) is
+    # deliberately excluded so that a replay with changed state maps to the
+    # same key and is rejected as contradictory below.
+    return (
+        "semantic",
+        str(signature.get("sequence", "")),
+        str(signature.get("task_id", "")),
+        str(signature.get("kind", "")),
+        str(signature.get("lineage_id", "")),
+        str(signature.get("evidence_id", "")),
+        str(signature.get("worker_id", "")),
+        str(signature.get("source", "worker")),
+        str(signature.get("source_outcome_id", "")),
+        str(signature.get("trace_id", "")),
+        str(signature.get("exposure_id", "")),
+    )
 
 
 def _validate_snapshot_records(records: Sequence[Any]) -> None:
@@ -572,14 +713,15 @@ def _validate_snapshot_records(records: Sequence[Any]) -> None:
     provide a causal snapshot and must fail closed.
     """
 
-    seen: dict[tuple[str, ...], TraceProjectionRecord] = {}
+    seen: dict[tuple[str, ...], dict[str, Any]] = {}
     for raw in records:
         record = _projection_record(raw)
         identity = _projection_record_identity(record)
         previous = seen.get(identity)
-        if previous is not None and previous != record:
+        signature = _projection_signature(record)
+        if previous is not None and previous != signature:
             raise ValueError("snapshot contains contradictory duplicate records")
-        seen[identity] = record
+        seen[identity] = signature
 
 
 def _record_task_id(record: Any) -> str:
@@ -589,14 +731,18 @@ def _record_task_id(record: Any) -> str:
 
 
 def _trace_references(
-    task_ids: Sequence[str], records: Sequence[Any]
+    task_ids: Sequence[str],
+    records: Sequence[Any],
+    ordinary_outcome_ids: Iterable[str] = (),
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
     by_task: dict[str, set[str]] = {task_id: set() for task_id in task_ids}
+    ordinary = {str(value).strip() for value in ordinary_outcome_ids if str(value).strip()}
     for record in records:
         task_id = _record_task_id(record)
+        trace_id = _record_trace_id(record)
         evidence_id = _record_evidence_id(record)
-        if task_id in by_task and evidence_id:
-            by_task[task_id].add(evidence_id[:512])
+        if task_id in by_task and trace_id and trace_id not in ordinary and evidence_id not in ordinary:
+            by_task[task_id].add(trace_id[:512])
     return tuple(
         (task_id, tuple(sorted(by_task[task_id])[:100]))
         for task_id in task_ids
@@ -621,6 +767,12 @@ def _legacy_batch_is_complete(batch: TraceProjectionRecordBatch) -> bool:
     # returned row.
     if batch.complete is not True:
         return False
+    # A native source can explicitly attest a pinned full snapshot.  Its
+    # sequence values need not be globally unique (siblings may share an
+    # event sequence), and legacy cursor rules must not reject that valid
+    # topology.  Contradictory stable IDs are still rejected by the caller.
+    if str(getattr(batch, "snapshot_id", "") or "").strip():
+        return True
     sequences: list[int] = []
     identities: set[tuple[str, ...]] = set()
     for item in batch.records:
@@ -663,19 +815,40 @@ def _project_complete_records(
 
     full_project = getattr(adapter, "project_full_records", None)
     if callable(full_project):
-        return full_project(
-            task_ids,
-            records,
-            ordinary_outcome_ids=ordinary_outcome_ids,
-            source_watermark=source_watermark,
-            snapshot_id=snapshot_id,
-            reference_time=reference_time,
+        kwargs: dict[str, Any] = {
+            "ordinary_outcome_ids": ordinary_outcome_ids,
+            "source_watermark": source_watermark,
+        }
+        # Keep compatibility with the original adapter while forwarding the
+        # full-state attestation fields when the newer API is present.  The
+        # adapter is local and trusted, but signature filtering prevents a
+        # mixed-version worktree from turning harmless API drift into a
+        # runtime failure.
+        try:
+            parameters = inspect.signature(full_project).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepts_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
         )
+        if "snapshot_id" in parameters or accepts_kwargs:
+            kwargs["snapshot_id"] = snapshot_id
+        if "reference_time" in parameters or accepts_kwargs:
+            kwargs["reference_time"] = reference_time
+        return full_project(task_ids, records, **kwargs)
+    # The old incremental adapter only accepts integer watermarks.  A pinned
+    # snapshot's opaque trace watermark must not be coerced or compared as an
+    # integer; the source has already attested completeness, so omit it on the
+    # compatibility path.
+    legacy_source_watermark = (
+        source_watermark if isinstance(source_watermark, int) and not isinstance(source_watermark, bool) else None
+    )
     return adapter.project_records(
         task_ids,
         records,
         after_watermark=0,
-        source_watermark=source_watermark,
+        source_watermark=legacy_source_watermark,
         ordinary_outcome_ids=ordinary_outcome_ids,
     )
 
@@ -716,6 +889,7 @@ class TraceProjectionBridge:
         selection_runtime: Any | None = None,
         feedback_values: Mapping[str, Any] | None = None,
         ordinary_outcome_ids: Iterable[str] = (),
+        reference_time: float | None = None,
     ) -> AllocationTraceView:
         """Read one bounded projection at a single causal cut.
 
@@ -730,6 +904,15 @@ class TraceProjectionBridge:
         from different selector configurations.
         """
         ordered = _ordered_task_ids(task_ids, maximum=self.limits.max_tasks)
+        if reference_time is not None:
+            if isinstance(reference_time, bool):
+                return self.zero(ordered, reason="invalid_reference_time")
+            try:
+                reference_time = float(reference_time)
+            except (TypeError, ValueError, OverflowError):
+                return self.zero(ordered, reason="invalid_reference_time")
+            if not math.isfinite(reference_time):
+                return self.zero(ordered, reason="invalid_reference_time")
         ordinary_ids = tuple(
             sorted({str(value).strip() for value in ordinary_outcome_ids if str(value).strip()})
         )
@@ -771,6 +954,9 @@ class TraceProjectionBridge:
                 records: list[Any] = []
                 cursor = ""
                 as_of: str | None = None
+                snapshot_id: str = ""
+                page_reference_time: float | None = reference_time
+                source_watermark: int | str | None = None
                 seen_cursors: set[str] = set()
                 # A page can contain at most max_records records.  One extra
                 # empty page is enough to detect a non-terminating source while
@@ -789,6 +975,24 @@ class TraceProjectionBridge:
                         as_of = page.trace_watermark
                     elif page.trace_watermark != as_of:
                         raise ValueError("trace watermark changed during pagination")
+                    if page.snapshot_id:
+                        if snapshot_id and page.snapshot_id != snapshot_id:
+                            raise ValueError("snapshot identity changed during pagination")
+                        snapshot_id = page.snapshot_id
+                    if page.reference_time is not None:
+                        if (
+                            page_reference_time is not None
+                            and page.reference_time != page_reference_time
+                        ):
+                            raise ValueError("reference time changed during pagination")
+                        page_reference_time = page.reference_time
+                    if page.source_watermark is not None:
+                        if (
+                            source_watermark is not None
+                            and page.source_watermark != source_watermark
+                        ):
+                            raise ValueError("source watermark changed during pagination")
+                        source_watermark = page.source_watermark
                     records.extend(page.records)
                     if len(records) > self.limits.max_records:
                         raise OverflowError("snapshot projection exceeds its record bound")
@@ -806,19 +1010,31 @@ class TraceProjectionBridge:
                             ordered,
                             records,
                             ordinary_outcome_ids=ordinary_ids,
-                            source_watermark=None,
-                            snapshot_id=as_of,
+                            source_watermark=(
+                                source_watermark
+                                if source_watermark is not None
+                                else (snapshot_id or as_of)
+                            ),
+                            snapshot_id=snapshot_id or as_of,
+                            reference_time=page_reference_time,
                         )
                         if batch.truncated:
                             raise OverflowError("snapshot projection is incomplete")
                         return AllocationTraceView(
                             batch=batch,
                             watermark="snapshot:" + _snapshot_identity(
-                                ordered, as_of, records, ordinary_ids
+                                ordered,
+                                as_of,
+                                records,
+                                ordinary_ids,
+                                snapshot_id=snapshot_id,
+                                reference_time=page_reference_time,
                             ),
                             source="selection_store_snapshot",
                             complete=True,
-                            trace_references=_trace_references(ordered, records),
+                            trace_references=_trace_references(
+                                ordered, records, ordinary_ids
+                            ),
                         )
                     next_cursor = page.next_cursor
                     if not next_cursor or next_cursor in seen_cursors:
@@ -845,7 +1061,8 @@ class TraceProjectionBridge:
                     raw_batch.records,
                     ordinary_outcome_ids=ordinary_ids,
                     source_watermark=raw_batch.watermark,
-                    snapshot_id=str(raw_batch.watermark),
+                    snapshot_id=str(getattr(raw_batch, "snapshot_id", "") or ""),
+                    reference_time=reference_time,
                 )
                 if batch.truncated:
                     raise OverflowError("store-native projection is incomplete")
@@ -856,10 +1073,14 @@ class TraceProjectionBridge:
                         str(raw_batch.watermark),
                         raw_batch.records,
                         ordinary_ids,
+                        snapshot_id=str(getattr(raw_batch, "snapshot_id", "") or ""),
+                        reference_time=reference_time,
                     ),
                     source="selection_store_protocol",
                     complete=True,
-                    trace_references=_trace_references(ordered, raw_batch.records),
+                    trace_references=_trace_references(
+                        ordered, raw_batch.records, ordinary_ids
+                    ),
                 )
             except Exception as exc:
                 return self.zero(ordered, reason=_bounded_reason(exc))
@@ -877,6 +1098,7 @@ class TraceProjectionBridge:
                 ordinary_outcome_ids=ordinary_ids,
                 source_watermark=len(records),
                 snapshot_id=watermark,
+                reference_time=reference_time,
             )
             if batch.truncated:
                 raise OverflowError("selection projection is incomplete")
@@ -895,6 +1117,7 @@ class TraceProjectionBridge:
                                     for record in records
                                     if record.get("task_id") == task_id
                                     and record.get("evidence_id")
+                                    and str(record.get("evidence_id")) not in ordinary_ids
                                 }
                             )[:100]
                         ),
