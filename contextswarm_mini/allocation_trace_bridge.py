@@ -644,7 +644,9 @@ def _project_complete_records(
     records: Sequence[Any],
     *,
     ordinary_outcome_ids: Iterable[str],
-    source_watermark: int | None = None,
+    source_watermark: int | str | None = None,
+    snapshot_id: str = "",
+    reference_time: float | None = None,
 ) -> TraceAllocationProjectionBatch:
     """Use the explicit full-state adapter when available.
 
@@ -660,6 +662,8 @@ def _project_complete_records(
             records,
             ordinary_outcome_ids=ordinary_outcome_ids,
             source_watermark=source_watermark,
+            snapshot_id=snapshot_id,
+            reference_time=reference_time,
         )
     return adapter.project_records(
         task_ids,
@@ -797,6 +801,7 @@ class TraceProjectionBridge:
                             records,
                             ordinary_outcome_ids=ordinary_ids,
                             source_watermark=None,
+                            snapshot_id=as_of,
                         )
                         if batch.truncated:
                             raise OverflowError("snapshot projection is incomplete")
@@ -834,6 +839,7 @@ class TraceProjectionBridge:
                     raw_batch.records,
                     ordinary_outcome_ids=ordinary_ids,
                     source_watermark=raw_batch.watermark,
+                    snapshot_id=str(raw_batch.watermark),
                 )
                 if batch.truncated:
                     raise OverflowError("store-native projection is incomplete")
@@ -864,6 +870,7 @@ class TraceProjectionBridge:
                 records,
                 ordinary_outcome_ids=ordinary_ids,
                 source_watermark=len(records),
+                snapshot_id=watermark,
             )
             if batch.truncated:
                 raise OverflowError("selection projection is incomplete")
