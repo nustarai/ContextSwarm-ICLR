@@ -31,6 +31,7 @@ _MAX_HTTP_BACKOFF_SECONDS = 30.0
 _JUDGE_CANCEL_TIMEOUT_SECONDS = 2.0
 _CANCEL_AWARE_LONG_POLL_MS = 250
 _CANCEL_AWARE_HTTP_TIMEOUT_SECONDS = 1.0
+_MAX_SETTLEMENT_POLL_PATHS = 32
 _MAX_WORKER_ERROR_BYTES = 1_200
 _MAX_WORKER_STATUS_BYTES = 120
 _MAX_WORKER_IDENTIFIER_BYTES = 256
@@ -471,11 +472,13 @@ class LeanEvaluator:
         normalized = sanitize_worker_identifier(job_id)
         if normalized is None:
             return False
+        if self._watcher_receipt_identity(response, normalized) != "matching":
+            return False
         paths = self._settlement_poll_paths(
             normalized,
             response,
             cancel_endpoint=cancel_endpoint,
-        )
+        )[:_MAX_SETTLEMENT_POLL_PATHS]
         if not paths:
             return False
         callback = on_settled if callable(on_settled) else None
@@ -507,15 +510,20 @@ class LeanEvaluator:
     def _settlement_watcher_loop(self, record: Mapping[str, Any]) -> None:
         job_id = str(record["job_id"])
         paths = list(record.get("paths") or ())
-        response = dict(record.get("response") or {})
+        path_index = 0
+        cancel_endpoint = record.get("cancel_endpoint")
+        tainted_paths: set[str] = set()
         deadline = time.monotonic() + max(
             0.1, float(self.deferred_settlement_timeout_seconds)
         )
         settled = False
         while paths and time.monotonic() < deadline:
+            active_paths = [path for path in paths if path not in tainted_paths]
+            if not active_paths:
+                break
             remaining = deadline - time.monotonic()
             wait_ms = max(1, min(1_000, int(remaining * 1_000)))
-            path = paths[0]
+            path = active_paths[path_index % len(active_paths)]
             separator = "&" if "?" in path else "?"
             try:
                 current = self._request(
@@ -526,10 +534,46 @@ class LeanEvaluator:
             except EvaluatorError:
                 current = None
             if isinstance(current, Mapping):
-                response = dict(current)
-                if self._authoritative_terminal_receipt(response, job_id):
+                identity = self._watcher_receipt_identity(current, job_id)
+                if identity == "invalid":
+                    # A capability which ever contradicts or malforms the job
+                    # identity is permanently unusable by this watcher.  In
+                    # particular, do not accept an id-less receipt from an
+                    # endpoint advertised by that response on a later poll.
+                    tainted_paths.add(path)
+                    bound = None
+                else:
+                    bound = self._bind_watcher_receipt(
+                        current,
+                        job_id,
+                        allow_idless=identity == "missing",
+                    )
+                if bound is not None:
+                    # Judge capabilities can rotate during cancellation, but
+                    # only an identity-valid receipt may delegate another
+                    # same-origin capability.  Bound the set so a degraded or
+                    # malicious Judge cannot grow watcher state indefinitely.
+                    advertised_cancel_endpoint = _nested_value(
+                        bound, "cancel_endpoint"
+                    )
+                    if advertised_cancel_endpoint is not None:
+                        cancel_endpoint = advertised_cancel_endpoint
+                    for candidate_path in self._settlement_poll_paths(
+                        job_id,
+                        bound,
+                        cancel_endpoint=cancel_endpoint,
+                    ):
+                        if candidate_path in paths:
+                            continue
+                        if len(paths) >= _MAX_SETTLEMENT_POLL_PATHS:
+                            break
+                        paths.append(candidate_path)
+                if bound is not None and self._authoritative_terminal_receipt(
+                    bound, job_id
+                ):
                     settled = True
                     break
+            path_index += 1
             time.sleep(min(self.poll_interval_seconds, max(0.0, deadline - time.monotonic())))
 
         # Publish an unresolved timeout before dropping the pending watcher.
@@ -556,6 +600,77 @@ class LeanEvaluator:
                 # callback failure must not turn a proven remote receipt into
                 # an unsafe release or crash the watcher thread.
                 continue
+
+    @staticmethod
+    def _bind_watcher_receipt(
+        response: Mapping[str, Any],
+        job_id: Any,
+        *,
+        allow_idless: bool,
+    ) -> dict[str, Any] | None:
+        """Bind id-less responses from a job-scoped status capability.
+
+        The watcher only polls Judge-provided same-origin capabilities or the
+        canonical `/api/lean/jobs/<id>` fallback.  An omitted id is therefore
+        safely bound to the already authenticated job identity; a contradictory
+        id is rejected and can never be scored as this job.
+        """
+
+        identity = LeanEvaluator._watcher_receipt_identity(response, job_id)
+        if identity == "invalid" or (identity == "missing" and not allow_idless):
+            return None
+        expected = sanitize_worker_identifier(job_id)
+        if expected is None:
+            return None
+        bound = dict(response)
+        if identity == "missing":
+            bound["job_id"] = expected
+        return bound
+
+    @staticmethod
+    def _watcher_receipt_identity(
+        response: Mapping[str, Any],
+        job_id: Any,
+    ) -> str:
+        """Classify every explicit job identity in a watcher receipt.
+
+        ``missing`` means that the receipt truly omitted both supported job-id
+        fields.  An explicitly present but unsanitizable value is ``invalid``;
+        it must never be rewritten into an apparently authoritative receipt.
+        Wrapped receipt identities are checked together so an outer matching
+        id cannot conceal a contradictory nested one.
+        """
+
+        expected = sanitize_worker_identifier(job_id)
+        if expected is None:
+            return "invalid"
+        pending: list[Mapping[str, Any]] = [response]
+        visited: set[int] = set()
+        found = False
+        while pending and len(visited) < 16:
+            current = pending.pop()
+            marker = id(current)
+            if marker in visited:
+                continue
+            visited.add(marker)
+            for key in ("job_id", "id"):
+                if key not in current:
+                    continue
+                found = True
+                observed = sanitize_worker_identifier(current.get(key))
+                if observed is None or observed != expected:
+                    return "invalid"
+            for key in ("response", "canonical_verdict"):
+                nested = current.get(key)
+                if isinstance(nested, Mapping):
+                    pending.append(nested)
+        if pending:
+            # JSON receipts should never need this much envelope depth.  Do
+            # not accept a matching outer id while leaving deeper identities
+            # unchecked merely because an adversarial response exhausted the
+            # traversal bound.
+            return "invalid"
+        return "matching" if found else "missing"
 
     def _combined_cancel_event(self, cancel_event: Any | None) -> Any:
         if cancel_event is None or cancel_event is self._remote_settlement_event:

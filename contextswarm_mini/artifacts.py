@@ -5,9 +5,21 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import stat
 import threading
 from typing import Any, Mapping
 import uuid
+
+
+def _reject_symlink_target(path: Path) -> None:
+    """Refuse replacing a pre-existing symlink artifact pathname."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(metadata.st_mode):
+        raise OSError("artifact destination must not be a symlink")
 
 
 def _fsync_directory(path: Path) -> None:
@@ -26,6 +38,7 @@ def atomic_write_bytes(path: Path, payload: bytes, *, mode: int = 0o600) -> None
     """Publish bytes without exposing a partially written final pathname."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_target(path)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -43,6 +56,11 @@ def atomic_write_bytes(path: Path, payload: bytes, *, mode: int = 0o600) -> None
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        # Recheck immediately before publication so an attacker cannot plant
+        # a symlink after the initial validation and have it silently replaced.
+        # Atomic replacement would not follow the link, but preserving the
+        # hostile pathname masks tampering and violates the artifact contract.
+        _reject_symlink_target(path)
         os.replace(temporary, path)
         _fsync_directory(path.parent)
     finally:
@@ -75,6 +93,7 @@ def append_jsonl(
 
     def write() -> None:
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(path, flags, mode)
         try:
             view = memoryview(row)

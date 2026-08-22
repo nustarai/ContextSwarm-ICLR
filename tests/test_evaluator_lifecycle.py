@@ -671,6 +671,192 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(evaluator.pending_settlement_watchers, 0)
         self.assertEqual(evaluator.remote_unsettled_jobs, 1)
 
+    def test_peer_cancel_watcher_rotates_capabilities_and_binds_idless_terminal(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 1.0
+        released = threading.Event()
+        calls: list[str] = []
+
+        def request(
+            method: str,
+            path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            calls.append(f"{method} {path}")
+            if method == "DELETE":
+                return {
+                    "job_id": "job-1",
+                    "status": "cancel_requested",
+                    "status_endpoint": "/status/first",
+                }
+            if path.startswith("/status/first"):
+                return {
+                    "job_id": "job-1",
+                    "status": "running",
+                    "status_endpoint": "/status/rotated",
+                }
+            if path.startswith("/status/rotated"):
+                # A successful response from this job-scoped same-origin
+                # capability may omit the redundant job id.
+                return {"status": "cancelled"}
+            return {"job_id": "job-1", "status": "running"}
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={
+                    "job_id": "job-1",
+                    "status": "running",
+                    "status_endpoint": "/status/first",
+                },
+                cancellation_reason="task_solved_by_peer",
+                on_settled=released.set,
+            )
+            self.assertTrue(summary["deferred"])
+            self.assertTrue(released.wait(timeout=1))
+
+        self.assertTrue(any("/status/rotated" in call for call in calls))
+        self.assertEqual(evaluator.pending_settlement_watchers, 0)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+
+    def test_peer_cancel_watcher_rejects_contradictory_terminal_job(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 0.05
+        released = threading.Event()
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            if method == "DELETE":
+                return {"job_id": "job-1", "status": "cancel_requested"}
+            return {"job_id": "job-other", "status": "cancelled"}
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={"job_id": "job-1", "status": "running"},
+                cancellation_reason="task_solved_by_peer",
+                on_settled=released.set,
+            )
+            self.assertTrue(summary["deferred"])
+            self.assertTrue(evaluator.remote_settlement_event.wait(timeout=1))
+
+        self.assertFalse(released.is_set())
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+
+    def test_peer_cancel_watcher_does_not_follow_endpoint_from_contradictory_receipt(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.005,
+            cancel_grace_seconds=0.02,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 0.08
+        released = threading.Event()
+        calls: list[str] = []
+
+        def request(
+            method: str,
+            path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            calls.append(f"{method} {path}")
+            if method == "DELETE":
+                return {
+                    "job_id": "job-1",
+                    "status": "cancel_requested",
+                    "status_endpoint": "/status/first",
+                }
+            if path.startswith("/status/first"):
+                return {
+                    "job_id": "job-other",
+                    "status": "running",
+                    "status_endpoint": "/status/evil",
+                }
+            if path.startswith("/status/evil"):
+                # This is the endpoint an untrusted receipt tried to inject.
+                return {"status": "cancelled"}
+            return {"job_id": "job-1", "status": "running"}
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={
+                    "job_id": "job-1",
+                    "status": "running",
+                    "status_endpoint": "/status/first",
+                },
+                cancellation_reason="task_solved_by_peer",
+                on_settled=released.set,
+            )
+            self.assertTrue(summary["deferred"])
+            self.assertTrue(evaluator.remote_settlement_event.wait(timeout=1))
+
+        self.assertFalse(released.is_set())
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+        self.assertFalse(any("/status/evil" in call for call in calls))
+
+    def test_peer_cancel_watcher_rejects_malformed_nested_job_identity(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.005,
+            cancel_grace_seconds=0.02,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 0.08
+        released = threading.Event()
+
+        def request(
+            method: str,
+            path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            if method == "DELETE":
+                return {
+                    "job_id": "job-1",
+                    "status": "cancel_requested",
+                    "status_endpoint": "/status/malformed",
+                }
+            if path.startswith("/status/malformed"):
+                return {
+                    "status": "cancelled",
+                    "response": {"job_id": "not a valid job id"},
+                }
+            return {"job_id": "job-1", "status": "running"}
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={
+                    "job_id": "job-1",
+                    "status": "running",
+                    "status_endpoint": "/status/malformed",
+                },
+                cancellation_reason="task_solved_by_peer",
+                on_settled=released.set,
+            )
+            self.assertTrue(summary["deferred"])
+            self.assertTrue(evaluator.remote_settlement_event.wait(timeout=1))
+
+        self.assertFalse(released.is_set())
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+
     def test_global_latch_wakes_and_settles_an_inflight_evaluation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

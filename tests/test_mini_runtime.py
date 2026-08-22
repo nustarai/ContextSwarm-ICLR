@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import patch
 
 from contextswarm_mini.config import ConfigError, load_config
+from contextswarm_mini.artifacts import append_jsonl, atomic_write_text
 from contextswarm_mini.allocation import AgentAllocationPolicy
 from contextswarm_mini.cps import CPSStore, make_policy
 from contextswarm_mini.elastic_scheduler import ElasticScheduler
@@ -24,6 +25,7 @@ from contextswarm_mini.evaluator import LeanEvaluator, MockEvaluator, _is_proved
 from contextswarm_mini.judge_broker import JudgeBroker, JudgeBrokerDrainError
 from contextswarm_mini.launch_contract import manifest_closure_sha256
 from contextswarm_mini.runner import (
+    _AnyCancelEvent,
     _atomic_promote_candidate,
     _enforce_verdict_provenance,
     _has_authoritative_provenance,
@@ -232,6 +234,26 @@ class _ProbeAndFinalProofEvaluator:
 
 
 class MiniRuntimeTests(unittest.TestCase):
+    def test_artifact_writers_reject_symlink_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.symlink_to(root / "outside")
+            with self.assertRaises(OSError):
+                atomic_write_text(target, "secret")
+            with self.assertRaises(OSError):
+                append_jsonl(target, {"secret": True})
+
+    def test_any_cancel_event_preserves_reason_when_none_source_is_filtered(self) -> None:
+        active = threading.Event()
+        combined = _AnyCancelEvent(
+            None,
+            active,
+            reasons=("missing_source", "task_solved_by_peer"),
+        )
+        active.set()
+        self.assertEqual(combined.cancellation_reason(), "task_solved_by_peer")
+
     def test_run_health_degrades_on_stable_judge_control_failures_only(self) -> None:
         failure_statuses = (
             "BROKER_ERROR",

@@ -188,18 +188,18 @@ class _AnyCancelEvent:
     """Small Event-compatible OR view used across runner-owned lifecycles."""
 
     def __init__(self, *events: Any, reasons: tuple[str | None, ...] | None = None):
-        self._events = tuple(event for event in events if event is not None)
+        paired = tuple(
+            (event, reasons[index] if reasons is not None and index < len(reasons) else None)
+            for index, event in enumerate(events)
+            if event is not None
+        )
+        self._events = tuple(event for event, _reason in paired)
         if reasons is None:
             self._reasons = (None,) * len(self._events)
         else:
-            # Keep the event/reason pairing total even for callers which pass
-            # an event list containing ``None``.  Reasons are diagnostic
-            # metadata only; cancellation remains fail-closed by default.
-            normalized = tuple(reasons)
-            self._reasons = tuple(
-                normalized[index] if index < len(normalized) else None
-                for index in range(len(self._events))
-            )
+            # Filter event/reason pairs together.  Dropping a ``None`` event
+            # must not shift a later event onto the wrong reason.
+            self._reasons = tuple(reason for _event, reason in paired)
 
     def is_set(self) -> bool:
         return any(bool(event.is_set()) for event in self._events)
