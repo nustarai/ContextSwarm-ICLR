@@ -122,6 +122,41 @@ class ContainerContractTests(unittest.TestCase):
         self.assertTrue(
             any(value.startswith("<CONTEXTSWARM_MANIFEST_SHA256=") for value in arguments)
         )
+        self.assertIn("<CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED=1>", arguments)
+        self.assertIn("<CONTEXTSWARM_MANIFEST_PATH=configs/smoke.toml>", arguments)
+
+    def test_entrypoint_rejects_incomplete_manifest_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temporary:
+            temporary = Path(raw_temporary)
+            base_env = dict(os.environ)
+            base_env.update(
+                {
+                    "MINI_SWARM_RUNTIME_ROOT": str(temporary / "runtime"),
+                    "MINI_SWARM_HOME": str(temporary / "runtime" / "home"),
+                    "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED": "1",
+                }
+            )
+            base_env.pop("CONTEXTSWARM_MANIFEST_PATH", None)
+            base_env.pop("CONTEXTSWARM_MANIFEST_SHA256", None)
+            cases = (
+                {},
+                {"CONTEXTSWARM_MANIFEST_PATH": "configs/smoke.toml"},
+                {"CONTEXTSWARM_MANIFEST_SHA256": "0" * 64},
+            )
+            for additions in cases:
+                with self.subTest(keys=sorted(additions)):
+                    env = {**base_env, **additions}
+                    completed = subprocess.run(
+                        ["/bin/bash", str(ROOT / "docker-entrypoint.sh"), "--help"],
+                        cwd=ROOT,
+                        env=env,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertIn("binding is incomplete", completed.stderr)
 
     def test_launch_rejects_zero_padded_root_identity(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temporary:

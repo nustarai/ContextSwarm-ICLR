@@ -395,6 +395,10 @@ def audit_canary(run_dir: Path) -> dict[str, Any]:
                 audit.add("runtime_source_commit_invalid")
             if IMAGE_ID_RE.fullmatch(str(provenance.get("image_id") or "")) is None:
                 audit.add("runtime_image_id_invalid")
+            if provenance.get("manifest_path") != "configs/canary.toml":
+                audit.add("runtime_manifest_path_invalid")
+            if not _valid_sha256(provenance.get("manifest_sha256")):
+                audit.add("runtime_manifest_sha256_invalid")
             if provenance.get("test_only") is True:
                 audit.add("mock_runtime_provenance_present")
 

@@ -68,6 +68,8 @@ def _stage(root: Path) -> Path:
             "runtime_provenance": {
                 "source_commit": "c" * 40,
                 "image_id": "sha256:" + "d" * 64,
+                "manifest_path": "configs/canary.toml",
+                "manifest_sha256": "e" * 64,
             },
         },
     )

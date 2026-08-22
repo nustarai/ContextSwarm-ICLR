@@ -202,6 +202,8 @@ class PiAgent:
                 key == "LEAN_AUTH_TOKEN"
                 or key.startswith("CONTEXTSWARM_JUDGE_")
                 or key.startswith("CONTEXTSWARM_LEAN_")
+                or key.startswith("CONTEXTSWARM_MANIFEST_")
+                or key == "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED"
                 or key == "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"
             ):
                 env.pop(key, None)

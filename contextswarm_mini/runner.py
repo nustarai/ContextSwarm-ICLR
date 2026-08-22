@@ -12,7 +12,7 @@ import json
 import math
 import os
 from queue import Empty, Queue
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import threading
@@ -36,6 +36,7 @@ from .cps import CPSStore, CommunicationPolicy, make_policy
 from .evaluator import LeanEvaluator, MockEvaluator, sanitize_worker_text
 from .elastic_scheduler import AgentAssignment, ElasticScheduler
 from .judge_broker import CandidateSnapshot, JudgeBroker, JudgeBrokerDrainError
+from .launch_contract import LaunchContractError, verify_manifest_binding
 from .models import AgentResult, Task, Verdict
 from .pi_agent import PiAgent
 from .preflight import PreflightError, run_preflight
@@ -505,6 +506,8 @@ _NONTERMINAL_VERDICT_STATUSES = frozenset(
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_MANIFEST_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_MANIFEST_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+\.toml")
 
 
 def _is_infrastructure_verdict(verdict: Verdict) -> bool:
@@ -518,7 +521,11 @@ def _is_infrastructure_verdict(verdict: Verdict) -> bool:
     )
 
 
-def _runtime_provenance(*, mock_agent: bool) -> dict[str, str | bool]:
+def _runtime_provenance(
+    config: ExperimentConfig,
+    *,
+    mock_agent: bool,
+) -> dict[str, str | bool]:
     """Bind formal artifacts to the immutable image that executed them."""
 
     image_revision = str(
@@ -528,13 +535,53 @@ def _runtime_provenance(*, mock_agent: bool) -> dict[str, str | bool]:
         os.environ.get("CONTEXTSWARM_SOURCE_COMMIT") or ""
     ).strip()
     image_id = str(os.environ.get("CONTEXTSWARM_IMAGE_ID") or "").strip()
+    manifest_path = str(
+        os.environ.get("CONTEXTSWARM_MANIFEST_PATH") or ""
+    ).strip()
+    manifest_sha256 = str(
+        os.environ.get("CONTEXTSWARM_MANIFEST_SHA256") or ""
+    ).strip()
+    path = PurePosixPath(manifest_path)
+    manifest_bound = bool(
+        _MANIFEST_PATH_RE.fullmatch(manifest_path)
+        and not path.is_absolute()
+        and path.parts
+        and all(part not in {"", ".", ".."} for part in path.parts)
+        and _MANIFEST_SHA256_RE.fullmatch(manifest_sha256)
+    )
+    if manifest_bound:
+        try:
+            canonical_manifest_path = (
+                config.manifest_path.resolve()
+                .relative_to(config.repo_root.resolve())
+                .as_posix()
+            )
+        except (OSError, ValueError):
+            manifest_bound = False
+        else:
+            manifest_bound = manifest_path == canonical_manifest_path
+        if manifest_bound:
+            try:
+                verify_manifest_binding(
+                    manifest_path,
+                    config.repo_root,
+                    manifest_sha256,
+                )
+            except (LaunchContractError, OSError, ValueError):
+                manifest_bound = False
     if (
         _SOURCE_COMMIT_RE.fullmatch(image_revision)
         and _SOURCE_COMMIT_RE.fullmatch(baked_source_commit)
         and image_revision == baked_source_commit
         and _IMAGE_ID_RE.fullmatch(image_id)
+        and manifest_bound
     ):
-        return {"source_commit": image_revision, "image_id": image_id}
+        return {
+            "source_commit": image_revision,
+            "image_id": image_id,
+            "manifest_path": manifest_path,
+            "manifest_sha256": manifest_sha256,
+        }
     if mock_agent:
         return {
             "source_commit": "test-only-mock-source",
@@ -542,8 +589,8 @@ def _runtime_provenance(*, mock_agent: bool) -> dict[str, str | bool]:
             "test_only": True,
         }
     raise ConfigError(
-        "formal runs require a valid immutable image revision and image ID, "
-        "with the image revision matching the baked source commit"
+        "formal runs require a valid immutable image revision and image ID, plus "
+        "a valid manifest binding, with the image revision matching the baked source commit"
     )
 
 
@@ -1052,7 +1099,7 @@ def run_experiment(
         raise ConfigError(
             "CONTEXTSWARM_JUDGE_URL must be set for a real experiment run"
         )
-    runtime_provenance = _runtime_provenance(mock_agent=mock_agent)
+    runtime_provenance = _runtime_provenance(config, mock_agent=mock_agent)
     tasks = load_tasks(config)
     run_id = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     output_root = output_override or config.resolved_output_root
@@ -3143,7 +3190,13 @@ def _evaluate_closeout_candidate(
     evaluator_unsettled_before = _evaluator_remote_unsettled_jobs(evaluator)
     release_gate = True
     try:
-        verdict = evaluator.evaluate(task, candidate.path, deadline_monotonic=None)
+        # Production closeout must create an independently observable Judge
+        # receipt even when the same candidate was probed during the horizon.
+        # Narrow test doubles and the cache-free MockEvaluator retain the
+        # legacy evaluate interface.
+        evaluate_fresh = getattr(evaluator, "evaluate_fresh", None)
+        evaluate = evaluate_fresh if callable(evaluate_fresh) else evaluator.evaluate
+        verdict = evaluate(task, candidate.path, deadline_monotonic=None)
         verdict = _bind_legacy_test_mock_verdict(
             evaluator,
             task,

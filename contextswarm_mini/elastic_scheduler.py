@@ -187,7 +187,9 @@ class ElasticScheduler:
         """Whether an unsolved task has not yet received its initial quota."""
         with self._lock:
             return any(
-                not state.solved and state.initial_admitted < state.initial_agents
+                not state.solved
+                and state.retired_reason is None
+                and state.initial_admitted < state.initial_agents
                 for state in self._tasks.values()
             )
 
