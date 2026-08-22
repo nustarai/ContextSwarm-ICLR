@@ -207,38 +207,62 @@ class Figure4RuntimeTests(unittest.TestCase):
 
     def test_llm_global_state_change_is_stale_and_not_admitted(self) -> None:
         original_choose = ReadOnlyLLMSchedulerPolicy.choose
-        original_finish = ElasticScheduler.finish
         first_call_started = threading.Event()
         allow_first_call = threading.Event()
-        finish_count = 0
-        finish_lock = threading.Lock()
+        mutation_scheduler: list[ElasticScheduler] = []
+        first_snapshot_tasks: list[str] = []
 
         def block_first_choose(policy, snapshot):
             if snapshot.decision_index == 1:
+                first_snapshot_tasks[:] = list(snapshot.eligible_task_ids)
                 first_call_started.set()
-                self.assertTrue(allow_first_call.wait(timeout=2.0))
+                if not allow_first_call.wait(timeout=2.0):
+                    raise RuntimeError("timed out waiting for global stale mutation")
             return original_choose(policy, snapshot)
 
-        def release_after_peer_state_change(scheduler, assignment, *, solved=False, now=None):
-            nonlocal finish_count
-            result = original_finish(scheduler, assignment, solved=solved, now=now)
-            with finish_lock:
-                finish_count += 1
-                if finish_count == 2:
-                    allow_first_call.set()
-            return result
+        original_init = ElasticScheduler.__init__
+
+        def remember_scheduler(scheduler, *args, **kwargs):
+            original_init(scheduler, *args, **kwargs)
+            mutation_scheduler.append(scheduler)
 
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         with (
             patch.object(ReadOnlyLLMSchedulerPolicy, "choose", block_first_choose),
-            patch.object(ElasticScheduler, "finish", release_after_peer_state_change),
+            patch.object(ElasticScheduler, "__init__", remember_scheduler),
         ):
-            run_dir = run_experiment(
-                _config("llm_scheduler", attempts=2),
-                mock_agent=True,
-                output_override=Path(temporary.name),
-            )
+            result: list[Path] = []
+            failure: list[BaseException] = []
+
+            def run() -> None:
+                try:
+                    result.append(
+                        run_experiment(
+                            _config("llm_scheduler", attempts=2),
+                            mock_agent=True,
+                            output_override=Path(temporary.name),
+                        )
+                    )
+                except BaseException as exc:  # surfaced below with context
+                    failure.append(exc)
+
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(first_call_started.wait(timeout=2.0))
+            self.assertTrue(mutation_scheduler)
+            # Mutate the non-selected competitor while decision 1 is still in
+            # flight.  This is a global-state change that selected-task-only
+            # revalidation cannot observe.
+            self.assertGreaterEqual(len(first_snapshot_tasks), 2)
+            competitor = first_snapshot_tasks[-1]
+            self.assertTrue(mutation_scheduler[0].task_solved(competitor))
+            allow_first_call.set()
+            worker.join(timeout=5.0)
+            if failure:
+                raise failure[0]
+            self.assertFalse(worker.is_alive())
+            run_dir = result[0]
 
         self.assertTrue(first_call_started.is_set())
         decisions = _rows(run_dir / "allocation_decisions.jsonl")

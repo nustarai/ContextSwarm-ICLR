@@ -1123,7 +1123,8 @@ def _core_snapshot_from_legacy(
     snapshot: TaskProgressSnapshot,
     config: ExperimentConfig,
     *,
-    scheduler_reserved_slots: int = 0,
+    scheduler_reserved_slots: int | None = None,
+    owned_scheduler_reservation_slots: int = 0,
 ) -> AllocationStateSnapshot:
     """Project the legacy runner snapshot into the issue #39 immutable API.
 
@@ -1173,6 +1174,28 @@ def _core_snapshot_from_legacy(
         ).encode("utf-8")
     ).hexdigest()
     active_solver_slots = sum(task.active_allocations for task in tasks)
+    # ``TaskProgressSnapshot.free_slots`` is sourced from the elastic
+    # scheduler's *occupied* capacity.  When callers do not pass the explicit
+    # reservation count, recover it from the immutable capacity equation so a
+    # concurrent LLM reservation cannot silently disappear from the core
+    # snapshot.  Explicit values are used for the invoking reservation because
+    # they also carry the owned-slot marker consumed by the LLM gate.
+    if scheduler_reserved_slots is None:
+        scheduler_reserved_slots = max(
+            0,
+            config.max_parallel - active_solver_slots - snapshot.free_slots,
+        )
+    scheduler_reserved_slots = int(scheduler_reserved_slots)
+    owned_scheduler_reservation_slots = int(owned_scheduler_reservation_slots)
+    if scheduler_reserved_slots < 0 or owned_scheduler_reservation_slots < 0:
+        raise ValueError("scheduler reservation counts must be non-negative")
+    free_slots = int(snapshot.free_slots)
+    if active_solver_slots + scheduler_reserved_slots + free_slots != config.max_parallel:
+        # Keep the projection deterministic even when a legacy caller supplied
+        # a stale free-slot count.  The scheduler is authoritative for the
+        # physical reservation count; deriving free capacity here preserves
+        # the core snapshot's conservation invariant.
+        free_slots = max(0, config.max_parallel - active_solver_slots - scheduler_reserved_slots)
     return AllocationStateSnapshot(
         decision_id=f"decision-{snapshot.decision_index:08d}",
         decision_index=snapshot.decision_index,
@@ -1181,14 +1204,53 @@ def _core_snapshot_from_legacy(
         total_capacity=config.max_parallel,
         active_solver_slots=active_solver_slots,
         scheduler_reserved_slots=scheduler_reserved_slots,
-        free_slots=max(
-            0,
-            config.max_parallel - active_solver_slots - scheduler_reserved_slots,
-        ),
+        free_slots=free_slots,
         tasks=tasks,
+        owned_scheduler_reservation_slots=owned_scheduler_reservation_slots,
         allocation_config_sha256=allocation_config_sha256,
         allocation_parameters=parameters,
     )
+
+
+def _core_state_causal_fingerprint(snapshot: AllocationStateSnapshot) -> str:
+    """Hash all global decision state while ignoring clock-only drift.
+
+    ``elapsed_seconds``/``remaining_seconds`` and the normalized recency and
+    starvation values derived solely from wall-clock age naturally move while
+    a provider reasons.  Treating those fields as stale would reject every
+    otherwise unchanged LLM result.  All other task, trace, watermark,
+    capacity, and manifest fields are causal inputs and therefore remain in
+    this fingerprint, including ineligible tasks.
+    """
+
+    task_rows: list[dict[str, Any]] = []
+    for task in snapshot.tasks:
+        row = task.public_dict(include_trace=True)
+        row.pop("recent_progress", None)
+        row.pop("starvation", None)
+        task_rows.append(row)
+    canonical = {
+        "schema_version": AllocationStateSnapshot.SCHEMA_VERSION,
+        "total_capacity": snapshot.total_capacity,
+        "active_solver_slots": snapshot.active_solver_slots,
+        "scheduler_reserved_slots": snapshot.scheduler_reserved_slots,
+        "owned_scheduler_reservation_slots": snapshot.owned_scheduler_reservation_slots,
+        "free_slots": snapshot.free_slots,
+        "trace_watermark": snapshot.trace_watermark,
+        "allocation_config_sha256": snapshot.allocation_config_sha256,
+        "allocation_parameters": snapshot.public_dict()["allocation_parameters"],
+        "task_order": [task.task_id for task in snapshot.tasks],
+        "tasks": task_rows,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _legacy_decision_from_core(core: Any) -> AllocationDecision:
@@ -2335,8 +2397,19 @@ def _run_elastic_cps(
             self.core_policy = core_policy
             self.decisions: list[Any] = []
 
-        def choose(self, legacy_snapshot: TaskProgressSnapshot) -> AllocationDecision:
-            core_snapshot = _core_snapshot_from_legacy(legacy_snapshot, config)
+        def choose(
+            self,
+            legacy_snapshot: TaskProgressSnapshot,
+            *,
+            scheduler_reserved_slots: int | None = None,
+            owned_scheduler_reservation_slots: int = 0,
+        ) -> AllocationDecision:
+            core_snapshot = _core_snapshot_from_legacy(
+                legacy_snapshot,
+                config,
+                scheduler_reserved_slots=scheduler_reserved_slots,
+                owned_scheduler_reservation_slots=owned_scheduler_reservation_slots,
+            )
             core_decision = self.core_policy.choose(core_snapshot)
             self.decisions.append(core_decision)
             core_decisions[core_decision.decision_index] = (core_snapshot, core_decision)
@@ -2663,8 +2736,8 @@ def _run_elastic_cps(
                     return accept_assignment(assignment, phase="initial")
 
                 decision_index += 1
-                snapshot = build_snapshot(decision_index)
-                if not snapshot.eligible_task_ids:
+                pre_reservation_snapshot = build_snapshot(decision_index)
+                if not pre_reservation_snapshot.eligible_task_ids:
                     return None
                 scheduler_reservation = None
                 if config.allocation.policy == "llm_scheduler":
@@ -2674,6 +2747,13 @@ def _run_elastic_cps(
                     )
                     if scheduler_reservation is None:
                         return None
+                    # Rebuild after acquiring the physical slot.  The prompt
+                    # reports every live reservation and marks exactly the
+                    # invoking slot as owned, so capacity stays conserved even
+                    # when this is the last free slot.
+                    snapshot = build_snapshot(decision_index)
+                else:
+                    snapshot = pre_reservation_snapshot
                 if config.allocation.policy in {"agent", "llm_scheduler"}:
                     # A released solver slot can run its own read-only scheduler
                     # call.  Release only the orchestration lock while the model
@@ -2681,7 +2761,14 @@ def _run_elastic_cps(
                     # occupied; index/snapshot and final admission remain atomic.
                     allocation_lock.release()
                     try:
-                        decision = allocator.choose(snapshot)
+                        if config.allocation.policy == "llm_scheduler":
+                            decision = allocator.choose(
+                                snapshot,
+                                scheduler_reserved_slots=scheduler.reservation_slots,
+                                owned_scheduler_reservation_slots=1,
+                            )
+                        else:
+                            decision = allocator.choose(snapshot)
                     except BaseException:
                         if scheduler_reservation is not None:
                             scheduler.release_reservation(
@@ -2698,6 +2785,7 @@ def _run_elastic_cps(
                 retire_exhausted_tasks()
                 assignment = None
                 execution_snapshot: TaskProgressSnapshot | None = None
+                llm_execution_core_snapshot: AllocationStateSnapshot | None = None
                 if decision.agent_run_horizon_reached:
                     if scheduler_reservation is not None:
                         scheduler.release_reservation(
@@ -2711,6 +2799,53 @@ def _run_elastic_cps(
                         disposition="not_admitted_horizon",
                     )
                     return None
+                if config.allocation.policy == "llm_scheduler":
+                    if time.monotonic() >= deadline or scheduler.horizon_reached:
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="horizon_reached",
+                        )
+                        record_decision(
+                            decision,
+                            snapshot,
+                            None,
+                            disposition="not_admitted_horizon",
+                        )
+                        return None
+                    # Revalidate the entire immutable decision state while the
+                    # same capacity slot remains physically held.  Stale model
+                    # output is never silently recomputed or admitted.
+                    execution_snapshot = build_snapshot(snapshot.decision_index)
+                    llm_execution_core_snapshot = _core_snapshot_from_legacy(
+                        execution_snapshot,
+                        config,
+                        scheduler_reserved_slots=scheduler.reservation_slots,
+                        owned_scheduler_reservation_slots=1,
+                    )
+                    core_record = core_decisions.get(decision.decision_index)
+                    invocation_core_snapshot = core_record[0] if core_record is not None else None
+                    if (
+                        invocation_core_snapshot is None
+                        or _core_state_causal_fingerprint(invocation_core_snapshot)
+                        != _core_state_causal_fingerprint(llm_execution_core_snapshot)
+                    ):
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="stale_decision",
+                        )
+                        record_decision(
+                            decision,
+                            snapshot,
+                            None,
+                            execution_snapshot=execution_snapshot,
+                            disposition="not_admitted_stale",
+                        )
+                        if (
+                            execution_snapshot.eligible_task_ids
+                            and scheduler.remaining_slots > 0
+                        ):
+                            continue
+                        return None
                 valid_agent_decision = (
                     config.allocation.policy == "agent"
                     and decision.agent_result_valid is True
@@ -2750,10 +2885,17 @@ def _run_elastic_cps(
                     assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 elif time.monotonic() < deadline and decision.selected_task_id:
                     if scheduler_reservation is not None:
-                        assignment = scheduler.admit_reserved(
-                            scheduler_reservation,
-                            decision.selected_task_id,
-                        )
+                        try:
+                            assignment = scheduler.admit_reserved(
+                                scheduler_reservation,
+                                decision.selected_task_id,
+                            )
+                        except BaseException:
+                            scheduler.release_reservation(
+                                scheduler_reservation,
+                                reason="admission_exception",
+                            )
+                            raise
                     else:
                         assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 if assignment is None and time.monotonic() < deadline:
@@ -2822,8 +2964,16 @@ def _run_elastic_cps(
                             execution_snapshot=execution_snapshot,
                             disposition="not_admitted_stale",
                         )
+                        if scheduler_reservation is not None:
+                            scheduler.release_reservation(
+                                scheduler_reservation,
+                                reason="no_eligible_tasks",
+                            )
                         return None
-                    if execution_snapshot.eligible_task_ids:
+                    if (
+                        execution_snapshot.eligible_task_ids
+                        and config.allocation.policy != "llm_scheduler"
+                    ):
                         decision = allocator.fallback(
                             execution_snapshot,
                             "selected task became ineligible before admission",
