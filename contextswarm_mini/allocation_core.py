@@ -1750,8 +1750,16 @@ class ReadOnlyLLMSchedulerPolicy:
         invalid_output = False
         recoverable_error = bool(response.recoverable_invocation_error)
         if error:
-            fallback = self._fallback.choose(snapshot)
-            selected = fallback.selected_task_id
+            # The runner acquires the scheduler's physical reservation before
+            # invoking this policy.  Consequently ``snapshot.free_slots`` is
+            # often zero while ``owned_scheduler_reservation_slots`` is one.
+            # Calling the ordinary Task-State policy would reject the fallback
+            # on its capacity gate and return an empty task, causing the runner
+            # to spin through stale decisions until the horizon.  A fallback is
+            # still a Task-State choice: score the immutable snapshot directly
+            # while retaining the caller-owned reservation for admission.
+            fallback_scores = self._fallback.scorer.score_snapshot(snapshot)
+            selected = _highest_score(fallback_scores)
             reason = "scheduler decision rejected; deterministic task-state fallback"
             if recoverable_error or invocation_exception:
                 outcome = "provider_error"

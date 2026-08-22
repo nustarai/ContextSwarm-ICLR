@@ -3654,9 +3654,24 @@ def _run_elastic_cps(
         """Claim one lease; only post-initial claims invoke the treatment policy."""
         nonlocal decision_index
         nonlocal adaptive_assignments
+        # A scheduler reservation belongs to this claim until admission
+        # converts it or an explicit branch releases it.  Keep the handle at
+        # claim scope so exceptions in snapshot/projection/audit code cannot
+        # leak physical capacity.
+        scheduler_reservation = None
         allocation_lock.acquire()
         try:
             while time.monotonic() < deadline:
+                if scheduler_reservation is not None:
+                    # Expected stale/horizon branches release their own
+                    # reservation.  This idempotent guard covers a continue
+                    # or a newly added branch that otherwise carries an old
+                    # handle into the next decision iteration.
+                    scheduler.release_reservation(
+                        scheduler_reservation,
+                        reason="claim_iteration_cleanup",
+                    )
+                    scheduler_reservation = None
                 if _evaluator_remote_unsettled_jobs(evaluator) > 0:
                     record_run_failure()
                     return None
@@ -3680,7 +3695,6 @@ def _run_elastic_cps(
                 pre_reservation_snapshot = build_snapshot(decision_index)
                 if not pre_reservation_snapshot.eligible_task_ids:
                     return None
-                scheduler_reservation = None
                 if config.allocation.policy == "llm_scheduler":
                     scheduler_reservation = scheduler.acquire_reservation(
                         slots=1,
@@ -3991,7 +4005,14 @@ def _run_elastic_cps(
                 return assignment
             return None
         finally:
-            allocation_lock.release()
+            try:
+                if scheduler_reservation is not None:
+                    scheduler.release_reservation(
+                        scheduler_reservation,
+                        reason="claim_exit_cleanup",
+                    )
+            finally:
+                allocation_lock.release()
 
     def prepare_workspace(state: _ElasticTaskState, assignment: AgentAssignment) -> tuple[Path, Path]:
         workdir = state.task_root / "agents" / assignment.agent_id
@@ -5993,6 +6014,7 @@ def _run_health(
     assigned_count = finished_count = evaluated_count = 0
     scheduler_invalid_outputs = 0
     scheduler_fallbacks = 0
+    scheduler_provider_errors = 0
     scheduler_summary_agent_calls: int | None = None
     scheduler_charged_decisions = 0
     scheduler_active_slots: int | None = None
@@ -6081,6 +6103,30 @@ def _run_health(
             )
             llm_cost_errors = 0
             llm_outcome_errors = 0
+            # The core LLM arm does not use the legacy ``agent`` policy's
+            # result-valid bit.  Its charged decision ledger is therefore the
+            # authoritative source for fallback/invalid/provider counters in
+            # run health.  These are bounded arm outcomes, not infrastructure
+            # issues, because the policy records a deterministic fallback.
+            llm_charged_decisions = [
+                row
+                for row in decisions
+                if str(row.get("policy") or "") == "llm_scheduler"
+                and row.get("scheduler_cost") is not None
+            ]
+            scheduler_invalid_outputs = sum(
+                bool(row.get("invalid_output"))
+                or str(row.get("scheduler_outcome") or "") == "invalid_output"
+                for row in llm_charged_decisions
+            )
+            scheduler_fallbacks = sum(
+                bool(row.get("fallback")) for row in llm_charged_decisions
+            )
+            scheduler_provider_errors = sum(
+                str(row.get("scheduler_outcome") or "") == "provider_error"
+                or bool(row.get("recoverable_invocation_error"))
+                for row in llm_charged_decisions
+            )
             for row in decisions:
                 if str(row.get("policy") or "") != "llm_scheduler":
                     continue
@@ -6291,6 +6337,7 @@ def _run_health(
         "allocation_scheduler_oom_or_exit_137_count": scheduler_oom_or_137,
         "allocation_scheduler_invalid_output_count": scheduler_invalid_outputs,
         "allocation_scheduler_fallback_count": scheduler_fallbacks,
+        "allocation_scheduler_provider_error_count": scheduler_provider_errors,
         "allocation_scheduler_charged_decision_count": scheduler_charged_decisions,
         "allocation_scheduler_summary_agent_calls": scheduler_summary_agent_calls,
         "judge_probe_count": len(probe_rows),
