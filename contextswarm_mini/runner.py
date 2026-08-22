@@ -48,6 +48,12 @@ from .allocation_audit import (
     canonical_json_sha256,
     write_figure4_run_summary,
 )
+from .allocation_trace_bridge import (
+    AllocationTraceView,
+    TraceProjectionBridge,
+    feedback_values_from_config,
+    policy_reads_trace,
+)
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
 from .evaluator import CodingEvaluator, LeanEvaluator, MockEvaluator, sanitize_worker_text
@@ -1177,12 +1183,13 @@ def _core_snapshot_from_legacy(
     *,
     scheduler_reserved_slots: int | None = None,
     owned_scheduler_reservation_slots: int = 0,
+    trace_view: AllocationTraceView | None = None,
 ) -> AllocationStateSnapshot:
     """Project the legacy runner snapshot into the issue #39 immutable API.
 
-    Until the Figure 3 selector bridge is installed, trace values are an
-    explicit zero projection. This keeps the development arm runnable and
-    makes Trace-State exactly reproduce Task-State on the same state.
+    Task-State callers must omit ``trace_view`` and therefore receive an exact
+    zero projection. Trace-State/LLM callers may supply one already-bounded,
+    immutable view from :mod:`allocation_trace_bridge`.
     """
 
     tasks = tuple(
@@ -1205,7 +1212,21 @@ def _core_snapshot_from_legacy(
                 max(0, task.consecutive_failures)
                 / max(1.0, config.allocation.normalization["failure_saturation"]),
             ),
-            trace=TraceFeatures(),
+            trace=(
+                TraceFeatures(**trace_view.for_task(task.task_id).as_core_kwargs())
+                if trace_view is not None
+                else TraceFeatures()
+            ),
+            trace_reference_ids=(
+                trace_view.references_for_task(task.task_id)
+                if trace_view is not None
+                else ()
+            ),
+            trace_source_outcome_ids=(
+                trace_view.for_task(task.task_id).source_outcome_ids
+                if trace_view is not None
+                else ()
+            ),
         )
         for task in snapshot.tasks
     )
@@ -1259,6 +1280,7 @@ def _core_snapshot_from_legacy(
         free_slots=free_slots,
         tasks=tasks,
         owned_scheduler_reservation_slots=owned_scheduler_reservation_slots,
+        trace_watermark=trace_view.watermark if trace_view is not None else "",
         allocation_config_sha256=allocation_config_sha256,
         allocation_parameters=parameters,
     )
@@ -2443,6 +2465,19 @@ def _run_elastic_cps(
         )
 
     core_decisions: dict[int, tuple[AllocationStateSnapshot, Any]] = {}
+    trace_projection_bridge = TraceProjectionBridge()
+
+    def allocation_trace_view(task_ids: Iterable[str]) -> AllocationTraceView | None:
+        """Read trace state only for the two registered trace-aware arms."""
+
+        if not policy_reads_trace(config.allocation.policy):
+            return None
+        selection_path = run_dir / "selection.sqlite3"
+        return trace_projection_bridge.read(
+            task_ids,
+            store=selection_path if selection_path.is_file() else None,
+            feedback_values=feedback_values_from_config(config),
+        )
 
     class _CoreAllocatorAdapter:
         def __init__(self, core_policy: Any) -> None:
@@ -2456,11 +2491,15 @@ def _run_elastic_cps(
             scheduler_reserved_slots: int | None = None,
             owned_scheduler_reservation_slots: int = 0,
         ) -> AllocationDecision:
+            trace_view = allocation_trace_view(
+                item.task_id for item in legacy_snapshot.tasks
+            )
             core_snapshot = _core_snapshot_from_legacy(
                 legacy_snapshot,
                 config,
                 scheduler_reserved_slots=scheduler_reserved_slots,
                 owned_scheduler_reservation_slots=owned_scheduler_reservation_slots,
+                trace_view=trace_view,
             )
             core_decision = self.core_policy.choose(core_snapshot)
             self.decisions.append(core_decision)
