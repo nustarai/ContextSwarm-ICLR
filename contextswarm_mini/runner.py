@@ -62,7 +62,13 @@ from .allocation_trace_bridge import (
 )
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
-from .evaluator import CodingEvaluator, LeanEvaluator, MockEvaluator, sanitize_worker_text
+from .evaluator import (
+    CodingEvaluator,
+    LeanEvaluator,
+    MockEvaluator,
+    sanitize_worker_identifier,
+    sanitize_worker_text,
+)
 from .elastic_scheduler import AgentAssignment, ElasticScheduler
 from .formal_tools import (
     DeclarationIndex,
@@ -731,8 +737,38 @@ def _is_authoritative_proved(verdict: Verdict) -> bool:
         and float(verdict.score) >= 1.0
         and _normalized_sha256(verdict.candidate_sha256) is not None
         and _normalized_sha256(verdict.task_contract_sha256) is not None
-        and str(verdict.judge_job_id or "").strip()
+        and _bound_judge_job_id(verdict.judge_job_id) is not None
     )
+
+
+def _bound_judge_job_id(value: Any) -> str | None:
+    """Accept only a redacted-safe remote Judge identifier.
+
+    A truthy value is not sufficient provenance: URLs, filesystem paths,
+    whitespace-containing strings, and non-string objects can otherwise be
+    mistaken for a job identity and leak into candidate-attempt accounting.
+    Keep the same bounded identifier grammar used at the broker boundary.
+    """
+
+    if not isinstance(value, str):
+        return None
+    return sanitize_worker_identifier(value)
+
+
+def _has_job_or_mock_provenance(
+    value: Any,
+    response: Mapping[str, Any],
+    *,
+    allow_mock_provenance: bool,
+) -> bool:
+    """Allow the explicit test-only mock exception without masking bad IDs."""
+
+    if value is None:
+        return bool(
+            allow_mock_provenance
+            and _response_value(response, "mock") is True
+        )
+    return _bound_judge_job_id(value) is not None
 
 
 def _prior_authoritative_proof(
@@ -783,11 +819,16 @@ def _prior_authoritative_proof(
 def _authoritative_proof_matches(
     verdict: Verdict,
     *,
+    expected_task_id: str | None = None,
     candidate_sha256: str,
     task_contract_sha256: str,
 ) -> bool:
     return bool(
         _is_authoritative_proved(verdict)
+        and (
+            expected_task_id is None
+            or verdict.task_id == str(expected_task_id).strip()
+        )
         and _normalized_sha256(verdict.candidate_sha256) == candidate_sha256
         and _normalized_sha256(verdict.task_contract_sha256) == task_contract_sha256
     )
@@ -840,12 +881,10 @@ def _is_bound_terminal_candidate_failure(
     # infrastructure noise.  Explicitly marked legacy mock evaluators have no
     # remote job id, but their mock marker is the test-only equivalent of that
     # receipt binding.
-    return bool(
-        str(verdict.judge_job_id or "").strip()
-        or (
-            _allows_mock_provenance(evaluator)
-            and _response_value(verdict.response, "mock") is True
-        )
+    return _has_job_or_mock_provenance(
+        verdict.judge_job_id,
+        verdict.response,
+        allow_mock_provenance=_allows_mock_provenance(evaluator),
     )
 
 
@@ -1180,6 +1219,7 @@ def _has_authoritative_provenance(
     verdict: Verdict,
     candidate: Path,
     *,
+    expected_task_id: str,
     expected_task_contract_sha256: str,
     allow_mock_provenance: bool,
 ) -> bool:
@@ -1189,6 +1229,7 @@ def _has_authoritative_provenance(
         and _has_candidate_attempt_provenance(
             verdict,
             candidate,
+            expected_task_id=expected_task_id,
             expected_task_contract_sha256=expected_task_contract_sha256,
             allow_mock_provenance=allow_mock_provenance,
         )
@@ -1199,6 +1240,7 @@ def _has_candidate_attempt_provenance(
     verdict: Verdict,
     candidate: Path,
     *,
+    expected_task_id: str,
     expected_task_contract_sha256: str,
     allow_mock_provenance: bool,
 ) -> bool:
@@ -1206,13 +1248,17 @@ def _has_candidate_attempt_provenance(
 
     candidate_hash = str(verdict.candidate_sha256 or "").lower()
     contract_hash = str(verdict.task_contract_sha256 or "").lower()
+    expected_id = str(expected_task_id).strip()
     return bool(
         normalize_verdict_status(verdict.status) in _CANDIDATE_ATTEMPT_STATUSES
+        and expected_id
+        and verdict.task_id == expected_id
         and _SHA256_RE.fullmatch(candidate_hash)
         and contract_hash == expected_task_contract_sha256
-        and (
-            verdict.judge_job_id
-            or (allow_mock_provenance and verdict.response.get("mock") is True)
+        and _has_job_or_mock_provenance(
+            verdict.judge_job_id,
+            verdict.response,
+            allow_mock_provenance=allow_mock_provenance,
         )
         and _file_sha256(candidate) == candidate_hash
     )
@@ -1222,6 +1268,7 @@ def _has_authoritative_snapshot_provenance(
     verdict: Verdict,
     snapshot: CandidateSnapshot,
     *,
+    expected_task_id: str,
     expected_task_contract_sha256: str,
     allow_mock_provenance: bool,
 ) -> bool:
@@ -1232,11 +1279,14 @@ def _has_authoritative_snapshot_provenance(
     return bool(
         normalize_verdict_status(verdict.status) == "PROVED"
         and float(verdict.score) >= 1.0
+        and str(expected_task_id).strip()
+        and verdict.task_id == str(expected_task_id).strip()
         and _SHA256_RE.fullmatch(candidate_hash)
         and contract_hash == expected_task_contract_sha256
-        and (
-            verdict.judge_job_id
-            or (allow_mock_provenance and verdict.response.get("mock") is True)
+        and _has_job_or_mock_provenance(
+            verdict.judge_job_id,
+            verdict.response,
+            allow_mock_provenance=allow_mock_provenance,
         )
         and candidate_hash == snapshot.sha256
     )
@@ -1246,6 +1296,7 @@ def _enforce_verdict_provenance(
     verdict: Verdict,
     candidate: Path,
     *,
+    expected_task_id: str,
     expected_task_contract_sha256: str,
     allow_mock_provenance: bool,
 ) -> Verdict:
@@ -1258,6 +1309,7 @@ def _enforce_verdict_provenance(
     if not requires_provenance or _has_candidate_attempt_provenance(
         verdict,
         candidate,
+        expected_task_id=expected_task_id,
         expected_task_contract_sha256=expected_task_contract_sha256,
         allow_mock_provenance=allow_mock_provenance,
     ):
@@ -2651,6 +2703,7 @@ def _run_mono(
             if not _has_authoritative_snapshot_provenance(
                 verdict,
                 snapshot,
+                expected_task_id=task.slug,
                 expected_task_contract_sha256=expected_contracts[task.slug],
                 allow_mock_provenance=allow_mock_provenance,
             ):
@@ -2872,6 +2925,7 @@ def _run_mono(
             verdict = _enforce_verdict_provenance(
                 verdict,
                 candidate,
+                expected_task_id=task.slug,
                 expected_task_contract_sha256=expected_contracts[task.slug],
                 allow_mock_provenance=allow_mock_provenance,
             )
@@ -3992,6 +4046,7 @@ def _run_elastic_cps(
                 if proved_task.slug != task.slug or not _has_authoritative_snapshot_provenance(
                     verdict,
                     snapshot,
+                    expected_task_id=task.slug,
                     expected_task_contract_sha256=expected_contracts[task.slug],
                     allow_mock_provenance=allow_mock_provenance,
                 ):
@@ -4204,6 +4259,7 @@ def _run_elastic_cps(
             verdict = _enforce_verdict_provenance(
                 verdict,
                 candidate_path,
+                expected_task_id=task.slug,
                 expected_task_contract_sha256=expected_contracts[task.slug],
                 allow_mock_provenance=allow_mock_provenance,
             )
@@ -4211,6 +4267,7 @@ def _run_elastic_cps(
         candidate_attempt_is_bound = _has_candidate_attempt_provenance(
             verdict,
             candidate_path,
+            expected_task_id=task.slug,
             expected_task_contract_sha256=expected_contracts[task.slug],
             allow_mock_provenance=allow_mock_provenance,
         )
@@ -4648,6 +4705,7 @@ def _run_task_workers(
                 if proved_task.slug != task.slug or not _has_authoritative_snapshot_provenance(
                     verdict,
                     snapshot,
+                    expected_task_id=task.slug,
                     expected_task_contract_sha256=expected_contract,
                     allow_mock_provenance=allow_mock_provenance,
                 ):
@@ -4904,6 +4962,7 @@ def _run_task_workers(
                 verdict = _enforce_verdict_provenance(
                     verdict,
                     candidate_path,
+                    expected_task_id=task.slug,
                     expected_task_contract_sha256=expected_contract,
                     allow_mock_provenance=allow_mock_provenance,
                 )
@@ -5305,6 +5364,7 @@ def _evaluate_closeout_candidate(
     return _enforce_verdict_provenance(
         verdict,
         candidate.path,
+        expected_task_id=task.slug,
         expected_task_contract_sha256=_expected_task_contract(evaluator, task),
         allow_mock_provenance=_allows_mock_provenance(evaluator),
     )
@@ -5404,6 +5464,7 @@ def _run_closeout(
         assert candidate_sha is not None and contract_sha is not None
         if _authoritative_proof_matches(
             observed,
+            expected_task_id=task.slug,
             candidate_sha256=candidate_sha,
             task_contract_sha256=contract_sha,
         ):

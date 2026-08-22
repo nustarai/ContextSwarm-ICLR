@@ -29,6 +29,7 @@ from contextswarm_mini.runner import (
     _atomic_promote_candidate,
     _enforce_verdict_provenance,
     _has_authoritative_provenance,
+    _has_candidate_attempt_provenance,
     _run_health,
     _score_time_metrics,
     _verdict_priority,
@@ -1354,6 +1355,7 @@ class MiniRuntimeTests(unittest.TestCase):
                 _has_authoritative_provenance(
                     verdict,
                     candidate,
+                    expected_task_id="task",
                     expected_task_contract_sha256="a" * 64,
                     allow_mock_provenance=False,
                 )
@@ -1366,6 +1368,7 @@ class MiniRuntimeTests(unittest.TestCase):
                 _has_authoritative_provenance(
                     verdict,
                     candidate,
+                    expected_task_id="task",
                     expected_task_contract_sha256="a" * 64,
                     allow_mock_provenance=False,
                 )
@@ -1391,6 +1394,7 @@ class MiniRuntimeTests(unittest.TestCase):
             rejected = _enforce_verdict_provenance(
                 mismatched,
                 candidate,
+                expected_task_id="task",
                 expected_task_contract_sha256=expected_contract,
                 allow_mock_provenance=True,
             )
@@ -1409,6 +1413,7 @@ class MiniRuntimeTests(unittest.TestCase):
                 _enforce_verdict_provenance(
                     authoritative_failure,
                     candidate,
+                    expected_task_id="task",
                     expected_task_contract_sha256=expected_contract,
                     allow_mock_provenance=True,
                 ).status,
@@ -1419,11 +1424,102 @@ class MiniRuntimeTests(unittest.TestCase):
                 _enforce_verdict_provenance(
                     unscored,
                     candidate,
+                    expected_task_id="task",
                     expected_task_contract_sha256=expected_contract,
                     allow_mock_provenance=False,
                 ),
                 unscored,
             )
+
+    def test_terminal_limit_provenance_rejects_wrong_task_and_malformed_job(self) -> None:
+        """Resource/timeout feedback must be bound to the exact Judge job."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary) / "result.lean"
+            candidate.write_text("theorem t : True := by trivial\n", encoding="utf-8")
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            contract = "c" * 64
+            for status in ("RESOURCE_LIMIT", "EXECUTION_TIMEOUT"):
+                for job_id in (
+                    "bad job id",
+                    "https://judge.invalid/job",
+                    "/tmp/job",
+                    "",
+                    123,
+                ):
+                    with self.subTest(status=status, job_id=job_id):
+                        verdict = Verdict(
+                            "task",
+                            status,
+                            0.0,
+                            0.0,
+                            candidate_sha256=digest,
+                            task_contract_sha256=contract,
+                            judge_job_id=job_id,  # type: ignore[arg-type]
+                        )
+                        self.assertFalse(
+                            _has_candidate_attempt_provenance(
+                                verdict,
+                                candidate,
+                                expected_task_id="task",
+                                expected_task_contract_sha256=contract,
+                                allow_mock_provenance=False,
+                            )
+                        )
+                        rejected = _enforce_verdict_provenance(
+                            verdict,
+                            candidate,
+                            expected_task_id="task",
+                            expected_task_contract_sha256=contract,
+                            allow_mock_provenance=False,
+                        )
+                        self.assertEqual(rejected.status, "PROVENANCE_INVALID")
+
+                valid = Verdict(
+                    "task",
+                    status,
+                    0.0,
+                    0.0,
+                    candidate_sha256=digest,
+                    task_contract_sha256=contract,
+                    judge_job_id="judge-job:attempt_1",
+                )
+                self.assertTrue(
+                    _has_candidate_attempt_provenance(
+                        valid,
+                        candidate,
+                        expected_task_id="task",
+                        expected_task_contract_sha256=contract,
+                        allow_mock_provenance=False,
+                    )
+                )
+
+                wrong_task = Verdict(
+                    "other-task",
+                    status,
+                    0.0,
+                    0.0,
+                    candidate_sha256=digest,
+                    task_contract_sha256=contract,
+                    judge_job_id="job-bound-1",
+                )
+                self.assertFalse(
+                    _has_candidate_attempt_provenance(
+                        wrong_task,
+                        candidate,
+                        expected_task_id="task",
+                        expected_task_contract_sha256=contract,
+                        allow_mock_provenance=False,
+                    )
+                )
+                rejected = _enforce_verdict_provenance(
+                    wrong_task,
+                    candidate,
+                    expected_task_id="task",
+                    expected_task_contract_sha256=contract,
+                    allow_mock_provenance=False,
+                )
+                self.assertEqual(rejected.status, "PROVENANCE_INVALID")
 
     def test_valid_sha256_with_wrong_expected_task_contract_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1442,6 +1538,7 @@ class MiniRuntimeTests(unittest.TestCase):
             rejected = _enforce_verdict_provenance(
                 verdict,
                 candidate,
+                expected_task_id="task",
                 expected_task_contract_sha256="2" * 64,
                 allow_mock_provenance=False,
             )
