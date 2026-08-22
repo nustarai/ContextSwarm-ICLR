@@ -1189,6 +1189,8 @@ class ReadOnlyLLMSchedulerPolicy:
     ) -> None:
         if not callable(invoke):
             raise TypeError("invoke must be callable")
+        if not isinstance(trace_weights, TraceScoreWeights):
+            raise TypeError("trace_weights must be TraceScoreWeights")
         self._invoke = invoke
         self._fallback = fallback_policy or TaskStateAllocationPolicy()
         if not isinstance(trace_weights, TraceScoreWeights):

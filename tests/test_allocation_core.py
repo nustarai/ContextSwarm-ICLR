@@ -251,6 +251,20 @@ class AllocationCoreTests(unittest.TestCase):
                 self.assertEqual(decision.scheduler_cost.calls, 1)
                 self.assertNotIn("transcript", decision.fallback_reason.lower())
 
+    def test_llm_fallback_audit_uses_manifest_trace_weights(self) -> None:
+        snap = snapshot(
+            task("a", active=0, trace=TraceFeatures(actionability=0.5)),
+            task("b", active=0),
+        )
+        policy = create_allocation_policy(
+            "llm_scheduler",
+            llm_invoker=lambda _current, _prompt: LLMSchedulerResponse("{}"),
+            trace_weights=TraceScoreWeights(actionability=3.0),
+        )
+        decision = policy.choose(snap)
+        self.assertTrue(decision.fallback)
+        self.assertEqual(decision.trace_increments["a"], 1.5)
+
     def test_allocation_parameters_are_bounded_before_state_hashing(self) -> None:
         deep: object = 1
         for _ in range(32):
