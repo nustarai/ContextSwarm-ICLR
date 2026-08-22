@@ -1,0 +1,329 @@
+{
+  "schema_version": "contextswarm_allocation_contract_fixture_v1",
+  "canonical_policy_names": [
+    "uniform_refill",
+    "task_state",
+    "trace_state",
+    "llm_scheduler"
+  ],
+  "snapshot": {
+    "schema_version": "contextswarm_allocation_state_v1",
+    "state_id": "a1e4e974282397121b37e32d07f4c13f4255d1bac011897b6e453625d941d87a",
+    "decision_id": "paired-007/decision-000042",
+    "repeat_id": "paired-007",
+    "decision_index": 42,
+    "elapsed_seconds": 120.0,
+    "remaining_seconds": 3480.0,
+    "total_capacity": 4,
+    "active_solver_slots": 3,
+    "scheduler_reserved_slots": 0,
+    "free_slots": 1,
+    "task_order": [
+      "task-c",
+      "task-a",
+      "task-b"
+    ],
+    "eligible_task_ids": [
+      "task-a",
+      "task-b",
+      "task-c"
+    ],
+    "allocation_config_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "parameters": {
+      "task_state": {
+        "quality_weight": 1.0,
+        "progress_recency_weight": 1.0,
+        "starvation_weight": 1.0,
+        "failure_penalty": 1.0
+      },
+      "trace_state": {
+        "frontier_weight": 1.0,
+        "association_weight": 1.0,
+        "positive_feedback_weight": 1.0,
+        "negative_feedback_weight": 1.0,
+        "density_penalty_weight": 1.0,
+        "duplicate_component_weight": 1.0,
+        "refutation_component_weight": 1.0,
+        "staleness_component_weight": 1.0,
+        "lineage_stagnation_component_weight": 1.0
+      },
+      "normalization": {
+        "progress_window_seconds": 600.0,
+        "starvation_window_seconds": 600.0,
+        "failure_saturation": 3.0,
+        "frontier_saturation": 3.0,
+        "association_saturation": 3.0,
+        "feedback_exposure_floor": 1.0,
+        "duplicate_saturation": 3.0,
+        "refutation_saturation": 3.0,
+        "staleness_window_seconds": 600.0,
+        "lineage_stagnation_window_seconds": 600.0
+      }
+    },
+    "tasks": {
+      "task-a": {
+        "eligible": true,
+        "resolved": false,
+        "active_leases": 1,
+        "ordinary": {
+          "checker_quality": 0.2,
+          "improvement_recency": 0.2,
+          "starvation": 0.2,
+          "failure_no_improvement": 0.2,
+          "checker_outcome_ids": [
+            "receipt-a-1"
+          ]
+        },
+        "trace": {
+          "frontier": 0.8,
+          "evidence_association": 0.3,
+          "positive_feedback": 0.2,
+          "negative_feedback": 0.1,
+          "duplication": 0.05,
+          "refutation": 0.02,
+          "staleness": 0.02,
+          "lineage_stagnation": 0.01,
+          "source_outcome_ids": [
+            "trace-outcome-a-2"
+          ]
+        }
+      },
+      "task-b": {
+        "eligible": true,
+        "resolved": false,
+        "active_leases": 1,
+        "ordinary": {
+          "checker_quality": 0.5,
+          "improvement_recency": 0.4,
+          "starvation": 0.3,
+          "failure_no_improvement": 0.1,
+          "checker_outcome_ids": [
+            "receipt-b-1"
+          ]
+        },
+        "trace": {
+          "frontier": 0.0,
+          "evidence_association": 0.0,
+          "positive_feedback": 0.0,
+          "negative_feedback": 0.0,
+          "duplication": 0.0,
+          "refutation": 0.0,
+          "staleness": 0.0,
+          "lineage_stagnation": 0.0,
+          "source_outcome_ids": []
+        }
+      },
+      "task-c": {
+        "eligible": true,
+        "resolved": false,
+        "active_leases": 1,
+        "ordinary": {
+          "checker_quality": 0.6,
+          "improvement_recency": 0.5,
+          "starvation": 0.2,
+          "failure_no_improvement": 0.1,
+          "checker_outcome_ids": [
+            "receipt-c-1"
+          ]
+        },
+        "trace": {
+          "frontier": 0.0,
+          "evidence_association": 0.0,
+          "positive_feedback": 0.0,
+          "negative_feedback": 0.0,
+          "duplication": 0.0,
+          "refutation": 0.0,
+          "staleness": 0.0,
+          "lineage_stagnation": 0.0,
+          "source_outcome_ids": []
+        }
+      }
+    }
+  },
+  "expected": {
+    "uniform_refill_selected_task_id": "task-a",
+    "task_state_selected_task_id": "task-c",
+    "trace_state_selected_task_id": "task-a",
+    "task_only_scores": {
+      "task-a": 0.2,
+      "task-b": 0.55,
+      "task-c": 0.6
+    },
+    "trace_increments": {
+      "task-a": 0.55,
+      "task-b": 0.0,
+      "task-c": 0.0
+    },
+    "trace_total_scores": {
+      "task-a": 0.75,
+      "task-b": 0.55,
+      "task-c": 0.6
+    },
+    "zero_increment_selected_task_id": "task-c",
+    "allocation_audit": {
+      "schema_version": "contextswarm_allocation_audit_v1",
+      "state_id": "a1e4e974282397121b37e32d07f4c13f4255d1bac011897b6e453625d941d87a",
+      "decision_id": "paired-007/decision-000042",
+      "eligible_task_ids": [
+        "task-a",
+        "task-b",
+        "task-c"
+      ],
+      "allocation_config_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "task_only_scores": {
+        "task-a": 0.2,
+        "task-b": 0.55,
+        "task-c": 0.6
+      },
+      "trace_increments": {
+        "task-a": 0.55,
+        "task-b": 0.0,
+        "task-c": 0.0
+      },
+      "trace_total_scores": {
+        "task-a": 0.75,
+        "task-b": 0.55,
+        "task-c": 0.6
+      },
+      "allocation_before": {
+        "task-a": 1,
+        "task-b": 1,
+        "task-c": 1
+      },
+      "trace_state_allocation_after": {
+        "task-a": 2,
+        "task-b": 1,
+        "task-c": 1
+      },
+      "task_state_allocation_after": {
+        "task-a": 1,
+        "task-b": 1,
+        "task-c": 2
+      },
+      "trace_state_selected_task_id": "task-a",
+      "task_state_selected_task_id": "task-c",
+      "admitted_task_id": "task-a",
+      "fallback_reason": "",
+      "active_slots_before": 3,
+      "active_slots_after": 4,
+      "free_slots_before": 1,
+      "free_slots_after": 0,
+      "scheduler_reserved_slots_before": 0,
+      "scheduler_reserved_slots_after": 0,
+      "total_capacity": 4,
+      "capacity_delta_sum": 0,
+      "capacity_conserved": true
+    }
+  },
+  "llm_scheduler_cost": {
+    "calls": 1,
+    "input_tokens": 256,
+    "output_tokens": 24,
+    "latency_seconds": 1.25,
+    "capacity_reservations": 1,
+    "occupied_capacity_slot_seconds": 1.25,
+    "invalid_outputs": 0,
+    "fallback_count": 0
+  },
+  "artifact_schemas": {
+    "allocation_decisions.jsonl": "contextswarm_allocation_decision_v2",
+    "allocation_audit.jsonl": "contextswarm_allocation_audit_v1",
+    "figure4_run_summary.json": "contextswarm_figure4_run_summary_v1",
+    "figure4_paired_repeats.jsonl": "contextswarm_figure4_paired_repeat_v1"
+  },
+  "artifact_required_fields": {
+    "contextswarm_allocation_decision_v2": [
+      "schema_version",
+      "decision_id",
+      "state_id",
+      "policy",
+      "eligible_task_ids",
+      "requested_task_id",
+      "admitted_task_id",
+      "fallback",
+      "fallback_reason",
+      "task_only_scores",
+      "trace_increments",
+      "total_scores",
+      "allocation_config_sha256",
+      "scheduler_cost"
+    ],
+    "contextswarm_allocation_audit_v1": [
+      "schema_version",
+      "decision_id",
+      "state_id",
+      "eligible_task_ids",
+      "allocation_config_sha256",
+      "task_only_scores",
+      "trace_increments",
+      "trace_total_scores",
+      "allocation_before",
+      "trace_state_allocation_after",
+      "task_state_allocation_after",
+      "trace_state_selected_task_id",
+      "task_state_selected_task_id",
+      "admitted_task_id",
+      "fallback_reason",
+      "active_slots_before",
+      "active_slots_after",
+      "free_slots_before",
+      "free_slots_after",
+      "scheduler_reserved_slots_before",
+      "scheduler_reserved_slots_after",
+      "total_capacity",
+      "capacity_delta_sum",
+      "capacity_conserved"
+    ],
+    "contextswarm_figure4_run_summary_v1": [
+      "schema_version",
+      "run_id",
+      "paired_repeat_id",
+      "policy",
+      "accepted_score_history",
+      "final_accepted_score",
+      "max_score",
+      "horizon_seconds",
+      "time_to_k_seconds",
+      "nauc",
+      "solver_usage",
+      "evaluator_usage",
+      "llm_scheduler_cost",
+      "allocation_decisions",
+      "fallback_decisions",
+      "fallback_rate",
+      "allocation_parameters",
+      "allocation_config_sha256",
+      "comparison_contract",
+      "comparison_contract_sha256"
+    ],
+    "contextswarm_figure4_paired_repeat_v1": [
+      "schema_version",
+      "paired_repeat_id",
+      "paired_seed",
+      "comparison_contract",
+      "comparison_contract_sha256",
+      "arms",
+      "registered_contrasts"
+    ]
+  },
+  "fixed_arm_comparison_fields": [
+    "dataset",
+    "ordered_task_ids",
+    "paired_repeat_id",
+    "paired_seed",
+    "selector_identity",
+    "selector_config_sha256",
+    "trace_visibility",
+    "model",
+    "inference_settings",
+    "evaluator_contract_sha256",
+    "runtime_limits",
+    "horizon_seconds",
+    "total_capacity",
+    "initial_allocation",
+    "candidate_transfer",
+    "stopping_rule",
+    "communication",
+    "direct_messages_enabled"
+  ]
+}

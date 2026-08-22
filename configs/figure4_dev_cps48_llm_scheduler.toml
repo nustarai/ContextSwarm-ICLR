@@ -1,0 +1,8 @@
+extends = ["figure4_dev_cps48.toml"]
+
+[experiment]
+name = "mobench-figure4-dev-cps48-llm-scheduler"
+output_root = "runs/figure4_dev/llm_scheduler"
+
+[allocation]
+policy = "llm_scheduler"

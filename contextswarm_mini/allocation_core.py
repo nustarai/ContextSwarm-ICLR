@@ -1,0 +1,1333 @@
+"""Pure, auditable allocation policies for the registered allocation arms.
+
+This module deliberately has no dependency on the runner, configuration loader,
+or CPS projection implementation.  Callers construct one immutable snapshot per
+decision and policies return a decision without mutating run state.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+import hashlib
+import json
+import math
+import re
+import time
+import unicodedata
+from types import MappingProxyType
+from typing import Any, Callable, ClassVar, Mapping
+
+
+POLICY_UNIFORM_REFILL = "uniform_refill"
+POLICY_TASK_STATE = "task_state"
+POLICY_TRACE_STATE = "trace_state"
+POLICY_LLM_SCHEDULER = "llm_scheduler"
+MAX_SNAPSHOT_TASKS = 512
+MAX_TRACE_REFERENCES_PER_TASK = 100
+MAX_IDENTIFIER_CHARS = 512
+# The scheduler receives a bounded UTF-8 wire prompt.  The limit is a policy
+# input (and is therefore configurable by the runner), while this default keeps
+# direct users of the pure core safe when they do not have a manifest object.
+LLM_SCHEDULER_PROMPT_MAX_BYTES = 64 * 1024
+LLM_SCHEDULER_PROMPT_MAX_TOKENS = 64 * 1024
+
+
+class _SchedulerPromptError(ValueError):
+    """Internal bounded-prompt rejection with a non-sensitive stable kind."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+def _finite(name: str, value: float, *, minimum: float | None = None) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    if minimum is not None and result < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return 0.0 if result == 0.0 else result
+
+
+def _unit_interval(name: str, value: float) -> float:
+    result = _finite(name, value)
+    if result > 1.0 or result < 0.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return result
+
+
+def _nonnegative_int(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _weight_dict(instance: object) -> dict[str, float]:
+    return {item.name: float(getattr(instance, item.name)) for item in fields(instance)}
+
+
+def _freeze_json(value: Any) -> Any:
+    """Detach and deeply freeze a JSON-compatible manifest fragment."""
+
+    try:
+        detached = json.loads(json.dumps(value, allow_nan=False, sort_keys=True))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("allocation_parameters must be finite JSON data") from exc
+    if isinstance(detached, dict):
+        return MappingProxyType({str(key): _freeze_json(item) for key, item in detached.items()})
+    if isinstance(detached, list):
+        return tuple(_freeze_json(item) for item in detached)
+    return detached
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+def _scheduler_identifier_is_safe(
+    value: str,
+    *,
+    allow_empty: bool = True,
+    allow_structured_decision: bool = False,
+) -> bool:
+    """Return whether an opaque ID can be shown to the read-only scheduler.
+
+    Task and trace IDs are needed verbatim in the scheduler response, so they
+    cannot be replaced with a redaction token.  Reject obvious path/URI and
+    multiline values instead; a rejected snapshot takes the deterministic
+    fallback path and never reaches the model.
+    """
+
+    if not isinstance(value, str) or (not value and not allow_empty) or len(value) > MAX_IDENTIFIER_CHARS:
+        return False
+    if any(
+        ord(char) < 0x20
+        or ord(char) == 0x7F
+        or unicodedata.category(char) == "Cf"
+        for char in value
+    ):
+        return False
+    # Canonical paired decision IDs may contain one slash (for example
+    # ``paired-007/decision-000042``).  Permit only that registered shape;
+    # absolute/relative paths and arbitrary path-like IDs fail closed.
+    if "\\" in value or re.match(r"^[A-Za-z]:[\\/]", value):
+        return False
+    if "/" in value:
+        if not allow_structured_decision or re.fullmatch(
+            r"paired-[A-Za-z0-9_.-]+/decision-[A-Za-z0-9_.-]+",
+            value,
+        ) is None:
+            return False
+    if "://" in value or value.startswith(("file:", "path:", "./", "../")):
+        return False
+    return True
+
+
+def _scheduler_parameter_key_is_safe(value: str) -> bool:
+    lowered = value.strip().lower()
+    if not lowered or len(lowered) > MAX_IDENTIFIER_CHARS:
+        return False
+    # Manifest parameter names are normally simple identifiers.  A future
+    # caller may attach arbitrary metadata to ``allocation_parameters``; those
+    # fields must not become a covert path/transcript channel.
+    sensitive = (
+        "path",
+        "transcript",
+        "secret",
+        "token",
+        "endpoint",
+        "private",
+        "payload",
+        "raw",
+        "content",
+    )
+    return not any(fragment in lowered for fragment in sensitive)
+
+
+def _scheduler_parameter_value(value: Any, *, key: str = "") -> Any:
+    """Copy manifest parameters into a JSON-safe, non-sensitive view.
+
+    Allocation parameters are expected to be numeric tables.  We retain
+    bounded scalar labels for forward compatibility, but redact suspicious
+    keys/values rather than serializing arbitrary caller-owned text.  The
+    redaction token is deterministic and contains no source material.
+    """
+
+    if key and not _scheduler_parameter_key_is_safe(key):
+        return "<redacted>"
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for raw_key, raw_value in sorted(value.items(), key=lambda item: str(item[0])):
+            child_key = str(raw_key).strip()
+            if not _scheduler_parameter_key_is_safe(child_key):
+                # Keep the shape auditable without retaining the field name or
+                # value, either of which may disclose private provenance.
+                continue
+            result[child_key] = _scheduler_parameter_value(raw_value, key=child_key)
+        return result
+    if isinstance(value, (tuple, list)):
+        if len(value) > MAX_TRACE_REFERENCES_PER_TASK:
+            return "<redacted>"
+        return [_scheduler_parameter_value(item) for item in value]
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if not math.isfinite(number):
+            return "<redacted>"
+        # Preserve integer JSON spelling for manifest hashes and exact state
+        # comparisons where possible.
+        return value
+    if isinstance(value, str):
+        # Registered allocation parameters are numeric tables.  Do not carry
+        # any caller-owned string into a model prompt, even when it happens to
+        # look identifier-like: a transcript/path can be encoded without
+        # whitespace or a URI marker.
+        return "<redacted>"
+    return "<redacted>"
+
+
+def _scheduler_state_dict(snapshot: "AllocationStateSnapshot") -> dict[str, Any]:
+    """Build the exact bounded state view allowed in an LLM prompt.
+
+    This intentionally mirrors :meth:`AllocationStateSnapshot.public_dict`
+    field-for-field for the core state and task/trace records.  It does not
+    include arbitrary Python objects or caller-owned raw payloads.  Unsafe IDs
+    fail closed because the scheduler must return the original ID verbatim.
+    """
+
+    def safe_id(
+        value: str,
+        field_name: str,
+        *,
+        allow_empty: bool = False,
+        allow_structured_decision: bool = False,
+    ) -> str:
+        if not _scheduler_identifier_is_safe(
+            value,
+            allow_empty=allow_empty,
+            allow_structured_decision=allow_structured_decision,
+        ):
+            raise ValueError(f"scheduler snapshot contains an unsafe {field_name}")
+        return value
+
+    # Start with the exact immutable snapshot projection.  This keeps the LLM
+    # arm's causal input identical to Trace-State; only unsafe caller-owned
+    # strings are replaced/removed from the wire representation.
+    public = snapshot.public_dict()
+    for task in snapshot.tasks:
+        safe_id(task.task_id, "task identifier", allow_empty=False)
+        for value in task.trace_reference_ids:
+            safe_id(value, "trace reference", allow_empty=False)
+    safe_id(
+        snapshot.decision_id,
+        "decision identifier",
+        allow_empty=False,
+        allow_structured_decision=True,
+    )
+
+    # Opaque watermarks and outcome IDs are useful for audit identity but are
+    # never echoed by the scheduler.  Keep their shape while removing path,
+    # URI, control-character, and overlong values.
+    public["trace_watermark"] = (
+        snapshot.trace_watermark
+        if _scheduler_identifier_is_safe(snapshot.trace_watermark)
+        else "<opaque>"
+    )
+    public["allocation_config_sha256"] = (
+        snapshot.allocation_config_sha256
+        if _scheduler_identifier_is_safe(snapshot.allocation_config_sha256)
+        else "<opaque>"
+    )
+    for task in public.get("tasks", []):
+        if not isinstance(task, dict):
+            raise ValueError("scheduler snapshot task projection is malformed")
+        for key in (
+            "trace_source_outcome_ids",
+            "checker_outcome_ids",
+        ):
+            values = task.get(key, [])
+            if not isinstance(values, list):
+                raise ValueError("scheduler snapshot identifier projection is malformed")
+            task[key] = [
+                value if _scheduler_identifier_is_safe(value) else "<opaque>"
+                for value in values
+            ]
+    public["allocation_parameters"] = _scheduler_parameter_value(
+        _thaw_json(snapshot.allocation_parameters)
+    )
+    return public
+
+
+def _resolve_prompt_bytes(
+    *,
+    prompt_max_bytes: int | None = None,
+    max_prompt_bytes: int | None = None,
+    llm_scheduler_prompt_max_bytes: int | None = None,
+) -> int:
+    """Resolve compatibility aliases to one positive prompt bound."""
+
+    provided = [
+        value
+        for value in (
+            prompt_max_bytes,
+            max_prompt_bytes,
+            llm_scheduler_prompt_max_bytes,
+        )
+        if value is not None
+    ]
+    for value in provided:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("LLM scheduler prompt max bytes must be a positive integer")
+    if provided and any(value != provided[0] for value in provided[1:]):
+        raise ValueError("LLM scheduler prompt byte limits disagree")
+    value = provided[0] if provided else LLM_SCHEDULER_PROMPT_MAX_BYTES
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("LLM scheduler prompt max bytes must be a positive integer")
+    return value
+
+
+def _prompt_token_count(prompt: str) -> int:
+    """Deterministic tokenizer-independent upper bound for prompt tokens."""
+
+    # Provider tokenizers differ and are not available in the pure policy core.
+    # A four-byte UTF-8 chunk is a conservative *budget estimate* for ordinary
+    # JSON text.  The byte limit remains the hard transport bound; this second
+    # guard prevents a caller from selecting an unbounded provider context.
+    # A provider tokenizer is intentionally unavailable in this pure module.
+    # One token per UTF-8 byte is a conservative provider-independent budget
+    # ceiling (and makes the optional token guard fail closed rather than
+    # undercounting punctuation-heavy prompts).
+    return len(prompt.encode("utf-8"))
+
+
+def _resolve_prompt_tokens(
+    *,
+    prompt_max_tokens: int | None = None,
+    max_prompt_tokens: int | None = None,
+    llm_scheduler_prompt_max_tokens: int | None = None,
+) -> int:
+    provided = [
+        value
+        for value in (
+            prompt_max_tokens,
+            max_prompt_tokens,
+            llm_scheduler_prompt_max_tokens,
+        )
+        if value is not None
+    ]
+    for value in provided:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("LLM scheduler prompt max tokens must be a positive integer")
+    if provided and any(value != provided[0] for value in provided[1:]):
+        raise ValueError("LLM scheduler prompt token limits disagree")
+    value = provided[0] if provided else LLM_SCHEDULER_PROMPT_MAX_TOKENS
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("LLM scheduler prompt max tokens must be a positive integer")
+    return value
+
+
+@dataclass(frozen=True)
+class TraceFeatures:
+    """Normalized trace-only evidence; zero is a neutral/absent projection.
+
+    ``evidence_association`` is the registered ``V`` term.  It is deliberately
+    not named validation: authoritative checker outcomes belong only in
+    :class:`TaskState` and must not be counted a second time through the trace.
+    """
+
+    actionability: float = 0.0
+    evidence_association: float = 0.0
+    positive_feedback: float = 0.0
+    negative_feedback: float = 0.0
+    drag: float = 0.0
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            object.__setattr__(
+                self,
+                item.name,
+                _unit_interval(f"trace.{item.name}", getattr(self, item.name)),
+            )
+
+    def public_dict(self) -> dict[str, float]:
+        return _weight_dict(self)
+
+    as_dict = public_dict
+
+
+@dataclass(frozen=True)
+class TaskState:
+    """One task's normalized, causal state at an allocation decision."""
+
+    task_id: str
+    eligible: bool
+    active_allocations: int
+    checker_quality: float = 0.0
+    recent_progress: float = 0.0
+    starvation: float = 0.0
+    failure_no_progress: float = 0.0
+    trace: TraceFeatures = field(default_factory=TraceFeatures)
+    trace_reference_ids: tuple[str, ...] = ()
+    checker_outcome_ids: tuple[str, ...] = ()
+    trace_source_outcome_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        task_id = str(self.task_id).strip()
+        if not task_id:
+            raise ValueError("task_id must be non-empty")
+        if len(task_id) > MAX_IDENTIFIER_CHARS:
+            raise ValueError(f"task_id must be at most {MAX_IDENTIFIER_CHARS} characters")
+        if not isinstance(self.eligible, bool):
+            raise ValueError("eligible must be a boolean")
+        if not isinstance(self.trace, TraceFeatures):
+            raise ValueError("trace must be TraceFeatures")
+        identifier_fields: dict[str, tuple[str, ...]] = {}
+        for name in (
+            "trace_reference_ids",
+            "checker_outcome_ids",
+            "trace_source_outcome_ids",
+        ):
+            values = tuple(str(value).strip() for value in getattr(self, name))
+            if any(not value for value in values):
+                raise ValueError(f"{name} must contain non-empty strings")
+            if len(set(values)) != len(values):
+                raise ValueError(f"{name} must be unique")
+            if len(values) > MAX_TRACE_REFERENCES_PER_TASK:
+                raise ValueError(
+                    f"{name} must contain at most {MAX_TRACE_REFERENCES_PER_TASK} values"
+                )
+            if any(len(value) > MAX_IDENTIFIER_CHARS for value in values):
+                raise ValueError(f"{name} values must be at most {MAX_IDENTIFIER_CHARS} characters")
+            identifier_fields[name] = values
+        if set(identifier_fields["checker_outcome_ids"]) & set(
+            identifier_fields["trace_source_outcome_ids"]
+        ):
+            raise ValueError("checker_outcome_ids and trace_source_outcome_ids must be disjoint")
+        object.__setattr__(self, "task_id", task_id)
+        object.__setattr__(
+            self,
+            "active_allocations",
+            _nonnegative_int("active_allocations", self.active_allocations),
+        )
+        for name in (
+            "checker_quality",
+            "recent_progress",
+            "starvation",
+            "failure_no_progress",
+        ):
+            object.__setattr__(self, name, _unit_interval(name, getattr(self, name)))
+        for name, values in identifier_fields.items():
+            object.__setattr__(self, name, values)
+
+    def public_dict(self, *, include_trace: bool = True) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "task_id": self.task_id,
+            "eligible": self.eligible,
+            "active_allocations": self.active_allocations,
+            "checker_quality": self.checker_quality,
+            "recent_progress": self.recent_progress,
+            "starvation": self.starvation,
+            "failure_no_progress": self.failure_no_progress,
+        }
+        if include_trace:
+            result["trace"] = self.trace.public_dict()
+            result["trace_reference_ids"] = list(self.trace_reference_ids)
+            result["trace_source_outcome_ids"] = list(self.trace_source_outcome_ids)
+        result["checker_outcome_ids"] = list(self.checker_outcome_ids)
+        return result
+
+    as_dict = public_dict
+
+
+@dataclass(frozen=True)
+class AllocationStateSnapshot:
+    """Immutable common state supplied to every registered allocation arm."""
+
+    SCHEMA_VERSION: ClassVar[str] = "contextswarm_allocation_state_v1"
+
+    decision_id: str
+    decision_index: int
+    elapsed_seconds: float
+    remaining_seconds: float
+    total_capacity: int
+    active_solver_slots: int
+    scheduler_reserved_slots: int
+    free_slots: int
+    tasks: tuple[TaskState, ...]
+    owned_scheduler_reservation_slots: int = 0
+    trace_watermark: str = ""
+    allocation_config_sha256: str = ""
+    allocation_parameters: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        decision_id = str(self.decision_id).strip()
+        if not decision_id:
+            raise ValueError("decision_id must be non-empty")
+        tasks = tuple(self.tasks)
+        if any(not isinstance(task, TaskState) for task in tasks):
+            raise ValueError("tasks must contain only TaskState records")
+        if len(tasks) > MAX_SNAPSHOT_TASKS:
+            raise ValueError(f"snapshot must contain at most {MAX_SNAPSHOT_TASKS} tasks")
+        task_ids = [task.task_id for task in tasks]
+        if len(set(task_ids)) != len(task_ids):
+            raise ValueError("task IDs must be unique within a snapshot")
+        object.__setattr__(self, "decision_id", decision_id)
+        object.__setattr__(
+            self, "decision_index", _nonnegative_int("decision_index", self.decision_index)
+        )
+        object.__setattr__(
+            self, "elapsed_seconds", _finite("elapsed_seconds", self.elapsed_seconds, minimum=0.0)
+        )
+        object.__setattr__(
+            self,
+            "remaining_seconds",
+            _finite("remaining_seconds", self.remaining_seconds, minimum=0.0),
+        )
+        object.__setattr__(
+            self, "total_capacity", _nonnegative_int("total_capacity", self.total_capacity)
+        )
+        object.__setattr__(
+            self,
+            "active_solver_slots",
+            _nonnegative_int("active_solver_slots", self.active_solver_slots),
+        )
+        object.__setattr__(
+            self,
+            "scheduler_reserved_slots",
+            _nonnegative_int("scheduler_reserved_slots", self.scheduler_reserved_slots),
+        )
+        object.__setattr__(
+            self,
+            "owned_scheduler_reservation_slots",
+            _nonnegative_int(
+                "owned_scheduler_reservation_slots",
+                self.owned_scheduler_reservation_slots,
+            ),
+        )
+        object.__setattr__(self, "free_slots", _nonnegative_int("free_slots", self.free_slots))
+        object.__setattr__(self, "tasks", tasks)
+        if self.owned_scheduler_reservation_slots > 1:
+            raise ValueError("owned_scheduler_reservation_slots must be at most 1")
+        if self.owned_scheduler_reservation_slots > self.scheduler_reserved_slots:
+            raise ValueError(
+                "owned_scheduler_reservation_slots must not exceed scheduler_reserved_slots"
+            )
+        if sum(task.active_allocations for task in tasks) != self.active_solver_slots:
+            raise ValueError("active_solver_slots must equal the sum of task active_allocations")
+        if (
+            self.active_solver_slots + self.scheduler_reserved_slots + self.free_slots
+            != self.total_capacity
+        ):
+            raise ValueError(
+                "active_solver_slots + scheduler_reserved_slots + free_slots must equal total_capacity"
+            )
+        for name in ("trace_watermark", "allocation_config_sha256"):
+            value = str(getattr(self, name)).strip()
+            if len(value) > MAX_IDENTIFIER_CHARS:
+                raise ValueError(f"{name} must be at most {MAX_IDENTIFIER_CHARS} characters")
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "allocation_parameters", _freeze_json(self.allocation_parameters))
+
+    @property
+    def state_id(self) -> str:
+        """Canonical identity for the entire same-state counterfactual input."""
+
+        canonical = {
+            "schema_version": self.SCHEMA_VERSION,
+            "decision_id": self.decision_id,
+            "decision_index": self.decision_index,
+            "elapsed_seconds": self.elapsed_seconds,
+            "remaining_seconds": self.remaining_seconds,
+            "total_capacity": self.total_capacity,
+            "active_solver_slots": self.active_solver_slots,
+            "scheduler_reserved_slots": self.scheduler_reserved_slots,
+            "owned_scheduler_reservation_slots": self.owned_scheduler_reservation_slots,
+            "free_slots": self.free_slots,
+            "trace_watermark": self.trace_watermark,
+            "allocation_config_sha256": self.allocation_config_sha256,
+            "allocation_parameters": _thaw_json(self.allocation_parameters),
+            "task_order": [task.task_id for task in self.tasks],
+            "eligible_task_ids": list(self.eligible_task_ids),
+            "tasks": [task.public_dict() for task in self.tasks],
+        }
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def capacity(self) -> int:
+        """Compatibility alias for callers using the early core API sketch."""
+
+        return self.total_capacity
+
+    @property
+    def eligible_tasks(self) -> tuple[TaskState, ...]:
+        return tuple(sorted((task for task in self.tasks if task.eligible), key=lambda task: task.task_id))
+
+    @property
+    def eligible_task_ids(self) -> tuple[str, ...]:
+        return tuple(task.task_id for task in self.eligible_tasks)
+
+    @property
+    def trace_reference_ids(self) -> frozenset[str]:
+        return frozenset(
+            reference
+            for task in self.eligible_tasks
+            for reference in task.trace_reference_ids
+        )
+
+    def public_dict(self, *, include_trace: bool = True) -> dict[str, Any]:
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "decision_id": self.decision_id,
+            "state_id": self.state_id,
+            "decision_index": self.decision_index,
+            "elapsed_seconds": self.elapsed_seconds,
+            "remaining_seconds": self.remaining_seconds,
+            "total_capacity": self.total_capacity,
+            "active_solver_slots": self.active_solver_slots,
+            "scheduler_reserved_slots": self.scheduler_reserved_slots,
+            "owned_scheduler_reservation_slots": self.owned_scheduler_reservation_slots,
+            "free_slots": self.free_slots,
+            "trace_watermark": self.trace_watermark,
+            "allocation_config_sha256": self.allocation_config_sha256,
+            "allocation_parameters": _thaw_json(self.allocation_parameters),
+            "task_order": [task.task_id for task in self.tasks],
+            "eligible_task_ids": list(self.eligible_task_ids),
+            "tasks": [task.public_dict(include_trace=include_trace) for task in self.tasks],
+        }
+
+    as_dict = public_dict
+
+
+@dataclass(frozen=True)
+class TaskScoreWeights:
+    """Manifest-owned coefficients for ``(vQ*Q+vDelta*Delta+vX*X-vG*G)/(1+n)``."""
+
+    checker_quality: float = 1.0
+    recent_progress: float = 1.0
+    starvation: float = 1.0
+    failure_no_progress: float = 1.0
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            object.__setattr__(
+                self,
+                item.name,
+                _finite(item.name, getattr(self, item.name), minimum=0.0),
+            )
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, float] | None = None) -> TaskScoreWeights:
+        values = values or {}
+        allowed = {item.name for item in fields(cls)}
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError("unknown task score weights: " + ", ".join(sorted(unknown)))
+        return cls(**{key: float(value) for key, value in values.items()})
+
+    def public_dict(self) -> dict[str, float]:
+        return _weight_dict(self)
+
+    as_dict = public_dict
+
+
+@dataclass(frozen=True)
+class TraceScoreWeights:
+    """Manifest-owned coefficients for the registered ``A/V/F+/F-/D`` terms."""
+
+    actionability: float = 1.0
+    evidence_association: float = 1.0
+    positive_feedback: float = 1.0
+    negative_feedback: float = 1.0
+    drag: float = 1.0
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            object.__setattr__(
+                self,
+                item.name,
+                _finite(item.name, getattr(self, item.name), minimum=0.0),
+            )
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, float] | None = None) -> TraceScoreWeights:
+        values = values or {}
+        allowed = {item.name for item in fields(cls)}
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError("unknown trace score weights: " + ", ".join(sorted(unknown)))
+        return cls(**{key: float(value) for key, value in values.items()})
+
+    def public_dict(self) -> dict[str, float]:
+        return _weight_dict(self)
+
+    as_dict = public_dict
+
+
+DEFAULT_TASK_SCORE_WEIGHTS = TaskScoreWeights()
+DEFAULT_TRACE_SCORE_WEIGHTS = TraceScoreWeights()
+
+
+class TaskStateScorer:
+    """Score only ordinary task/checker state; trace fields are never read."""
+
+    def __init__(self, weights: TaskScoreWeights = DEFAULT_TASK_SCORE_WEIGHTS) -> None:
+        if not isinstance(weights, TaskScoreWeights):
+            raise TypeError("weights must be TaskScoreWeights")
+        self.weights = weights
+
+    def score_task(self, task: TaskState) -> float:
+        weights = self.weights
+        numerator = (
+            weights.checker_quality * task.checker_quality
+            + weights.recent_progress * task.recent_progress
+            + weights.starvation * task.starvation
+            - weights.failure_no_progress * task.failure_no_progress
+        )
+        return numerator / (1.0 + task.active_allocations)
+
+    def score_snapshot(self, snapshot: AllocationStateSnapshot) -> dict[str, float]:
+        return {task.task_id: self.score_task(task) for task in snapshot.eligible_tasks}
+
+
+class TraceStateScorer:
+    """Add normalized trace evidence to the shared task-only scorer."""
+
+    def __init__(
+        self,
+        task_scorer: TaskStateScorer | None = None,
+        weights: TraceScoreWeights = DEFAULT_TRACE_SCORE_WEIGHTS,
+    ) -> None:
+        if not isinstance(weights, TraceScoreWeights):
+            raise TypeError("weights must be TraceScoreWeights")
+        self.task_scorer = task_scorer or TaskStateScorer()
+        self.weights = weights
+
+    def trace_increment(self, task: TaskState) -> float:
+        weights = self.weights
+        trace = task.trace
+        numerator = (
+            weights.actionability * trace.actionability
+            + weights.evidence_association * trace.evidence_association
+            + weights.positive_feedback * trace.positive_feedback
+            - weights.negative_feedback * trace.negative_feedback
+            - weights.drag * trace.drag
+        )
+        return numerator / (1.0 + task.active_allocations)
+
+    def score_task(self, task: TaskState) -> float:
+        return self.task_scorer.score_task(task) + self.trace_increment(task)
+
+    def score_snapshot(self, snapshot: AllocationStateSnapshot) -> dict[str, float]:
+        return {task.task_id: self.score_task(task) for task in snapshot.eligible_tasks}
+
+    def increments(self, snapshot: AllocationStateSnapshot) -> dict[str, float]:
+        return {task.task_id: self.trace_increment(task) for task in snapshot.eligible_tasks}
+
+
+def _immutable_scores(values: Mapping[str, float]) -> Mapping[str, float]:
+    return MappingProxyType(
+        {
+            str(key): _finite(f"score[{key!r}]", value)
+            for key, value in sorted(values.items())
+        }
+    )
+
+
+@dataclass(frozen=True)
+class LLMSchedulerCost:
+    """One scheduler call's explicit contribution to the common cost ledger."""
+
+    calls: int = 1
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_seconds: float = 0.0
+    reservation_slots: int = 1
+    occupied_slot_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("calls", "input_tokens", "output_tokens", "reservation_slots"):
+            object.__setattr__(self, name, _nonnegative_int(name, getattr(self, name)))
+        latency = _finite("latency_seconds", self.latency_seconds, minimum=0.0)
+        if self.calls != 1:
+            raise ValueError("one scheduler-call cost record must have calls=1")
+        if self.reservation_slots != 1:
+            raise ValueError("one scheduler call must reserve exactly one capacity slot")
+        occupied = self.occupied_slot_seconds
+        if occupied is None:
+            occupied = latency * self.reservation_slots
+        occupied = _finite("occupied_slot_seconds", occupied, minimum=0.0)
+        object.__setattr__(self, "latency_seconds", latency)
+        object.__setattr__(self, "occupied_slot_seconds", occupied)
+
+    def public_dict(self) -> dict[str, int | float]:
+        return {
+            "calls": self.calls,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "latency_seconds": self.latency_seconds,
+            "reservation_slots": self.reservation_slots,
+            "occupied_slot_seconds": float(self.occupied_slot_seconds or 0.0),
+            "total_tokens": self.input_tokens + self.output_tokens,
+            "reserved_slot_seconds": float(self.occupied_slot_seconds or 0.0),
+        }
+
+    as_dict = public_dict
+
+
+@dataclass(frozen=True)
+class LLMSchedulerResponse:
+    """Transport-neutral result returned by a runner-owned model invoker."""
+
+    output: str
+    returncode: int = 0
+    timed_out: bool = False
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_seconds: float = 0.0
+    reservation_slots: int = 1
+    occupied_slot_seconds: float | None = None
+    # True means the provider call was truncated by the fixed experiment
+    # horizon (as opposed to an ordinary provider timeout).  The runner uses
+    # this bit to record ``not_admitted_horizon`` without charging a
+    # deterministic policy fallback or admitting a late assignment.
+    run_horizon_reached: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.output, str):
+            raise ValueError("output must be a string")
+        if isinstance(self.returncode, bool) or not isinstance(self.returncode, int):
+            raise ValueError("returncode must be an integer")
+        if not isinstance(self.timed_out, bool):
+            raise ValueError("timed_out must be a boolean")
+        if not isinstance(self.run_horizon_reached, bool):
+            raise ValueError("run_horizon_reached must be a boolean")
+        LLMSchedulerCost(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            latency_seconds=self.latency_seconds,
+            reservation_slots=self.reservation_slots,
+            occupied_slot_seconds=self.occupied_slot_seconds,
+        )
+
+    @property
+    def cost(self) -> LLMSchedulerCost:
+        return LLMSchedulerCost(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            latency_seconds=self.latency_seconds,
+            reservation_slots=self.reservation_slots,
+            occupied_slot_seconds=self.occupied_slot_seconds,
+        )
+
+
+@dataclass(frozen=True)
+class AllocationDecision:
+    """Immutable and JSON-friendly result of one pure allocation decision."""
+
+    SCHEMA_VERSION: ClassVar[str] = "contextswarm_allocation_core_decision_v1"
+
+    decision_id: str
+    state_id: str
+    decision_index: int
+    policy: str
+    selected_task_id: str
+    reason: str
+    scores: Mapping[str, float] = field(default_factory=dict)
+    task_scores: Mapping[str, float] = field(default_factory=dict)
+    trace_increments: Mapping[str, float] = field(default_factory=dict)
+    trace_reference_ids: tuple[str, ...] = ()
+    fallback: bool = False
+    fallback_reason: str = ""
+    scheduler_cost: LLMSchedulerCost | None = None
+    # Kept in the legacy runner's terminology so the adapter can propagate a
+    # horizon-truncated scheduler result without manufacturing a fallback.
+    agent_run_horizon_reached: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "scores", _immutable_scores(self.scores))
+        object.__setattr__(self, "task_scores", _immutable_scores(self.task_scores))
+        object.__setattr__(self, "trace_increments", _immutable_scores(self.trace_increments))
+        object.__setattr__(self, "trace_reference_ids", tuple(self.trace_reference_ids))
+        if not isinstance(self.agent_run_horizon_reached, bool):
+            raise ValueError("agent_run_horizon_reached must be a boolean")
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.SCHEMA_VERSION,
+            "decision_id": self.decision_id,
+            "state_id": self.state_id,
+            "decision_index": self.decision_index,
+            "policy": self.policy,
+            "selected_task_id": self.selected_task_id,
+            "reason": self.reason,
+            "scores": dict(self.scores),
+            "task_scores": dict(self.task_scores),
+            "trace_increments": dict(self.trace_increments),
+            "trace_reference_ids": list(self.trace_reference_ids),
+            "fallback": self.fallback,
+            "fallback_reason": self.fallback_reason,
+            "agent_run_horizon_reached": self.agent_run_horizon_reached,
+            "scheduler_cost": self.scheduler_cost.public_dict() if self.scheduler_cost else None,
+        }
+
+    as_dict = public_dict
+
+
+def _highest_score(scores: Mapping[str, float]) -> str:
+    return min(scores, key=lambda task_id: (-scores[task_id], task_id)) if scores else ""
+
+
+class UniformRefillAllocationPolicy:
+    """Refill the eligible task with the fewest current active leases."""
+
+    name = POLICY_UNIFORM_REFILL
+
+    def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
+        active = {task.task_id: float(task.active_allocations) for task in snapshot.eligible_tasks}
+        selected = min(active, key=lambda task_id: (active[task_id], task_id)) if active else ""
+        return AllocationDecision(
+            decision_id=snapshot.decision_id,
+            state_id=snapshot.state_id,
+            decision_index=snapshot.decision_index,
+            policy=self.name,
+            selected_task_id=selected,
+            reason="fewest active allocations; task-ID tie break" if selected else "no eligible task",
+            scores={task_id: -count for task_id, count in active.items()},
+        )
+
+
+class TaskStateAllocationPolicy:
+    name = POLICY_TASK_STATE
+
+    def __init__(self, scorer: TaskStateScorer | None = None) -> None:
+        self.scorer = scorer or TaskStateScorer()
+
+    def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
+        scores = self.scorer.score_snapshot(snapshot)
+        selected = _highest_score(scores)
+        return AllocationDecision(
+            decision_id=snapshot.decision_id,
+            state_id=snapshot.state_id,
+            decision_index=snapshot.decision_index,
+            policy=self.name,
+            selected_task_id=selected,
+            reason="highest task-state utility; task-ID tie break" if selected else "no eligible task",
+            scores=scores,
+            task_scores=scores,
+        )
+
+
+class TraceStateAllocationPolicy:
+    name = POLICY_TRACE_STATE
+
+    def __init__(self, scorer: TraceStateScorer | None = None) -> None:
+        self.scorer = scorer or TraceStateScorer()
+
+    def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
+        task_scores = self.scorer.task_scorer.score_snapshot(snapshot)
+        increments = self.scorer.increments(snapshot)
+        scores = {task_id: task_scores[task_id] + increments[task_id] for task_id in task_scores}
+        selected = _highest_score(scores)
+        return AllocationDecision(
+            decision_id=snapshot.decision_id,
+            state_id=snapshot.state_id,
+            decision_index=snapshot.decision_index,
+            policy=self.name,
+            selected_task_id=selected,
+            reason="highest task-plus-trace utility; task-ID tie break" if selected else "no eligible task",
+            scores=scores,
+            task_scores=task_scores,
+            trace_increments=increments,
+        )
+
+
+def parse_llm_scheduler_output(
+    raw_output: str,
+    snapshot: AllocationStateSnapshot,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Parse the exact, non-Markdown scheduler wire shape or raise ValueError."""
+
+    def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("scheduler JSON contains duplicate keys")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(
+            raw_output.strip(),
+            object_pairs_hook=_pairs,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid JSON constant {value}")),
+        )
+    # ``object_pairs_hook`` and ``parse_constant`` intentionally raise
+    # ``ValueError`` for duplicate keys and non-finite JSON constants.  Keep
+    # those wire-level failures inside the parser boundary so the caller can
+    # apply its deterministic fallback instead of leaking an exception from
+    # an untrusted provider payload.
+    except (AttributeError, TypeError, ValueError) as exc:
+        detail = str(exc).strip()
+        message = "scheduler output must be exactly one JSON object"
+        if detail:
+            message += f": {detail}"
+        raise ValueError(message) from exc
+    required = {"decision_id", "task_id", "reason", "trace_reference_ids"}
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("scheduler JSON must contain exactly decision_id, task_id, reason, trace_reference_ids")
+    if payload["decision_id"] != snapshot.decision_id:
+        raise ValueError("scheduler decision_id is stale or mismatched")
+    task_id = payload["task_id"]
+    if not isinstance(task_id, str) or task_id not in snapshot.eligible_task_ids:
+        raise ValueError("scheduler task_id is not eligible")
+    reason = payload["reason"]
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1_000:
+        raise ValueError("scheduler reason must be non-empty and at most 1000 characters")
+    references = payload["trace_reference_ids"]
+    if (
+        not isinstance(references, list)
+        or len(references) > 20
+        or any(not isinstance(reference, str) for reference in references)
+        or len(set(references)) != len(references)
+        or not set(references).issubset(
+            next(task for task in snapshot.tasks if task.task_id == task_id).trace_reference_ids
+        )
+    ):
+        raise ValueError("scheduler trace_reference_ids are invalid")
+    return task_id, reason.strip(), tuple(references)
+
+
+LLMSchedulerInvoker = Callable[[AllocationStateSnapshot, str], LLMSchedulerResponse]
+
+
+class ReadOnlyLLMSchedulerPolicy:
+    """Model-selected task with strict output validation and deterministic fallback."""
+
+    name = POLICY_LLM_SCHEDULER
+
+    def __init__(
+        self,
+        invoke: LLMSchedulerInvoker,
+        fallback_policy: TaskStateAllocationPolicy | None = None,
+        *,
+        prompt_max_bytes: int | None = None,
+        max_prompt_bytes: int | None = None,
+        llm_scheduler_prompt_max_bytes: int | None = None,
+        prompt_max_tokens: int | None = None,
+        max_prompt_tokens: int | None = None,
+        llm_scheduler_prompt_max_tokens: int | None = None,
+    ) -> None:
+        if not callable(invoke):
+            raise TypeError("invoke must be callable")
+        self._invoke = invoke
+        self._fallback = fallback_policy or TaskStateAllocationPolicy()
+        self._prompt_max_bytes = _resolve_prompt_bytes(
+            prompt_max_bytes=prompt_max_bytes,
+            max_prompt_bytes=max_prompt_bytes,
+            llm_scheduler_prompt_max_bytes=llm_scheduler_prompt_max_bytes,
+        )
+        self._prompt_max_tokens = _resolve_prompt_tokens(
+            prompt_max_tokens=prompt_max_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            llm_scheduler_prompt_max_tokens=llm_scheduler_prompt_max_tokens,
+        )
+
+    @property
+    def prompt_max_bytes(self) -> int:
+        """Manifest-owned UTF-8 byte ceiling for one scheduler prompt."""
+
+        return self._prompt_max_bytes
+
+    @property
+    def prompt_max_tokens(self) -> int:
+        """Manifest-owned conservative token ceiling for one prompt."""
+
+        return self._prompt_max_tokens
+
+    @staticmethod
+    def prompt(
+        snapshot: AllocationStateSnapshot,
+        *,
+        max_bytes: int | None = None,
+        prompt_max_bytes: int | None = None,
+        max_prompt_bytes: int | None = None,
+        llm_scheduler_prompt_max_bytes: int | None = None,
+        prompt_max_tokens: int | None = None,
+        max_prompt_tokens: int | None = None,
+        llm_scheduler_prompt_max_tokens: int | None = None,
+    ) -> str:
+        """Render a bounded, read-only scheduler prompt.
+
+        The entire UTF-8 prompt is measured.  JSON is never sliced: callers
+        receive a ``ValueError`` when the complete causal snapshot cannot fit,
+        allowing the policy to record a charged deterministic fallback.
+        """
+
+        # ``max_bytes`` is the short spelling used by direct callers while
+        # the other names are compatibility aliases.  Resolve all spellings,
+        # including both long byte aliases, before validating agreement.
+        if (
+            prompt_max_bytes is not None
+            and max_prompt_bytes is not None
+            and prompt_max_bytes != max_prompt_bytes
+        ):
+            raise ValueError("LLM scheduler prompt byte limits disagree")
+        limit = _resolve_prompt_bytes(
+            prompt_max_bytes=max_bytes,
+            max_prompt_bytes=(
+                prompt_max_bytes
+                if prompt_max_bytes is not None
+                else max_prompt_bytes
+            ),
+            llm_scheduler_prompt_max_bytes=llm_scheduler_prompt_max_bytes,
+        )
+        token_limit = _resolve_prompt_tokens(
+            prompt_max_tokens=prompt_max_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            llm_scheduler_prompt_max_tokens=llm_scheduler_prompt_max_tokens,
+        )
+        state = json.dumps(
+            _scheduler_state_dict(snapshot),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        rendered = (
+            "You are a read-only allocation scheduler. Decide only from SNAPSHOT; do not call "
+            "tools or change state. Return exactly one JSON object with keys decision_id, task_id, "
+            "reason, trace_reference_ids. task_id must be eligible; trace references must appear in "
+            "the snapshot. No Markdown or extra keys.\nSNAPSHOT:\n" + state
+        )
+        prompt_bytes = len(rendered.encode("utf-8"))
+        if prompt_bytes > limit:
+            raise _SchedulerPromptError(
+                "size_limit",
+                f"scheduler prompt exceeds max bytes ({prompt_bytes}>{limit})",
+            )
+        prompt_tokens = _prompt_token_count(rendered)
+        if prompt_tokens > token_limit:
+            raise _SchedulerPromptError(
+                "token_limit",
+                f"scheduler prompt exceeds max tokens ({prompt_tokens}>{token_limit})",
+            )
+        return rendered
+
+    def _prompt(self, snapshot: AllocationStateSnapshot) -> str:
+        return self.prompt(
+            snapshot,
+            max_bytes=self._prompt_max_bytes,
+            max_prompt_tokens=self._prompt_max_tokens,
+        )
+
+    @staticmethod
+    def _charged_fallback_response(
+        *,
+        error: str,
+        latency_seconds: float = 0.0,
+    ) -> LLMSchedulerResponse:
+        """Represent a skipped/failed call as one auditable scheduler attempt."""
+
+        # The runner reserves capacity before invoking this policy.  A prompt
+        # construction failure still consumes that decision's scheduler call
+        # budget, but has no model tokens and no model wall time to charge.
+        del error  # The human-readable reason is stored on AllocationDecision.
+        return LLMSchedulerResponse(
+            "",
+            returncode=1,
+            latency_seconds=max(0.0, latency_seconds),
+            occupied_slot_seconds=max(0.0, latency_seconds),
+        )
+
+    def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
+        if not snapshot.eligible_task_ids or (
+            snapshot.free_slots == 0
+            and snapshot.owned_scheduler_reservation_slots == 0
+        ):
+            return AllocationDecision(
+                decision_id=snapshot.decision_id,
+                state_id=snapshot.state_id,
+                decision_index=snapshot.decision_index,
+                policy=self.name,
+                selected_task_id="",
+                reason="no eligible admission capacity",
+            )
+        started = time.monotonic()
+        invocation_error = ""
+        response: LLMSchedulerResponse
+        try:
+            prompt = self._prompt(snapshot)
+        except _SchedulerPromptError as exc:
+            # Snapshot privacy/bounds failures are deterministic candidate
+            # outcomes.  Do not leak exception text, paths, or transcripts to
+            # artifacts; retain only a stable category.
+            invocation_error = f"scheduler prompt rejected: {exc.kind}"
+            response = self._charged_fallback_response(error=invocation_error)
+        except Exception:
+            invocation_error = "scheduler prompt rejected: unsafe_snapshot"
+            response = self._charged_fallback_response(error=invocation_error)
+        else:
+            try:
+                response = self._invoke(snapshot, prompt)
+            except Exception as exc:  # provider/coordinator noise is recoverable
+                invocation_error = f"scheduler invocation failed: {type(exc).__name__}"
+                response = self._charged_fallback_response(
+                    error=invocation_error,
+                    latency_seconds=max(0.0, time.monotonic() - started),
+                )
+        if not isinstance(response, LLMSchedulerResponse):
+            invocation_error = "scheduler invocation returned invalid response"
+            response = self._charged_fallback_response(
+                error=invocation_error,
+                latency_seconds=max(0.0, time.monotonic() - started),
+            )
+        # A call that crossed the fixed experiment horizon is a lifecycle
+        # truncation, not a malformed model decision.  Preserve its one-call
+        # cost, but do not invoke the deterministic fallback: the runner will
+        # release the reservation and record ``not_admitted_horizon``.
+        if response.run_horizon_reached:
+            return AllocationDecision(
+                decision_id=snapshot.decision_id,
+                state_id=snapshot.state_id,
+                decision_index=snapshot.decision_index,
+                policy=self.name,
+                selected_task_id="",
+                reason="scheduler call was truncated by the fixed run horizon",
+                scheduler_cost=response.cost,
+                agent_run_horizon_reached=True,
+            )
+        error = invocation_error
+        selected = ""
+        reason = ""
+        references: tuple[str, ...] = ()
+        if not error:
+            if response.returncode != 0:
+                error = f"scheduler returned {response.returncode}"
+            elif response.timed_out:
+                error = "scheduler timed out"
+            else:
+                try:
+                    selected, reason, references = parse_llm_scheduler_output(
+                        response.output, snapshot
+                    )
+                except ValueError as exc:
+                    error = str(exc)
+        if error:
+            fallback = self._fallback.choose(snapshot)
+            selected = fallback.selected_task_id
+            reason = "scheduler decision rejected; deterministic task-state fallback"
+        trace_scorer = TraceStateScorer(self._fallback.scorer)
+        task_scores = trace_scorer.task_scorer.score_snapshot(snapshot)
+        trace_increments = trace_scorer.increments(snapshot)
+        scores = {
+            task_id: task_scores[task_id] + trace_increments[task_id]
+            for task_id in task_scores
+        }
+        return AllocationDecision(
+            decision_id=snapshot.decision_id,
+            state_id=snapshot.state_id,
+            decision_index=snapshot.decision_index,
+            policy=self.name,
+            selected_task_id=selected,
+            reason=reason,
+            scores=scores,
+            task_scores=task_scores,
+            trace_increments=trace_increments,
+            trace_reference_ids=references,
+            fallback=bool(error),
+            fallback_reason=error,
+            scheduler_cost=response.cost,
+        )
+
+
+ALLOCATION_POLICY_REGISTRY: Mapping[str, type[Any]] = MappingProxyType(
+    {
+        POLICY_UNIFORM_REFILL: UniformRefillAllocationPolicy,
+        POLICY_TASK_STATE: TaskStateAllocationPolicy,
+        POLICY_TRACE_STATE: TraceStateAllocationPolicy,
+        POLICY_LLM_SCHEDULER: ReadOnlyLLMSchedulerPolicy,
+    }
+)
+
+
+def create_allocation_policy(
+    policy: str,
+    *,
+    task_weights: TaskScoreWeights = DEFAULT_TASK_SCORE_WEIGHTS,
+    trace_weights: TraceScoreWeights = DEFAULT_TRACE_SCORE_WEIGHTS,
+    llm_invoker: LLMSchedulerInvoker | None = None,
+    prompt_max_bytes: int | None = None,
+    max_prompt_bytes: int | None = None,
+    llm_scheduler_prompt_max_bytes: int | None = None,
+    prompt_max_tokens: int | None = None,
+    max_prompt_tokens: int | None = None,
+    llm_scheduler_prompt_max_tokens: int | None = None,
+) -> Any:
+    """Construct one registered policy from explicit manifest-owned settings."""
+
+    name = str(policy).strip().lower()
+    if name == POLICY_UNIFORM_REFILL:
+        return UniformRefillAllocationPolicy()
+    task_scorer = TaskStateScorer(task_weights)
+    if name == POLICY_TASK_STATE:
+        return TaskStateAllocationPolicy(task_scorer)
+    if name == POLICY_TRACE_STATE:
+        return TraceStateAllocationPolicy(TraceStateScorer(task_scorer, trace_weights))
+    if name == POLICY_LLM_SCHEDULER:
+        if llm_invoker is None:
+            raise ValueError("llm_scheduler requires llm_invoker")
+        return ReadOnlyLLMSchedulerPolicy(
+            llm_invoker,
+            TaskStateAllocationPolicy(task_scorer),
+            prompt_max_bytes=prompt_max_bytes,
+            max_prompt_bytes=max_prompt_bytes,
+            llm_scheduler_prompt_max_bytes=llm_scheduler_prompt_max_bytes,
+            prompt_max_tokens=prompt_max_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            llm_scheduler_prompt_max_tokens=llm_scheduler_prompt_max_tokens,
+        )
+    raise ValueError(f"unknown allocation policy: {policy}")
+
+
+__all__ = [
+    "ALLOCATION_POLICY_REGISTRY",
+    "DEFAULT_TASK_SCORE_WEIGHTS",
+    "DEFAULT_TRACE_SCORE_WEIGHTS",
+    "LLM_SCHEDULER_PROMPT_MAX_BYTES",
+    "LLM_SCHEDULER_PROMPT_MAX_TOKENS",
+    "POLICY_LLM_SCHEDULER",
+    "POLICY_TASK_STATE",
+    "POLICY_TRACE_STATE",
+    "POLICY_UNIFORM_REFILL",
+    "AllocationDecision",
+    "AllocationStateSnapshot",
+    "LLMSchedulerCost",
+    "LLMSchedulerInvoker",
+    "LLMSchedulerResponse",
+    "ReadOnlyLLMSchedulerPolicy",
+    "TaskScoreWeights",
+    "TaskState",
+    "TaskStateAllocationPolicy",
+    "TaskStateScorer",
+    "TraceFeatures",
+    "TraceScoreWeights",
+    "TraceStateAllocationPolicy",
+    "TraceStateScorer",
+    "UniformRefillAllocationPolicy",
+    "create_allocation_policy",
+    "parse_llm_scheduler_output",
+]

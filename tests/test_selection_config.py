@@ -41,7 +41,6 @@ candidate_transfer = false
 sample_without_replacement = true
 weights = {{ interaction = 1.25, evidence = 0.75 }}
 kinds = ["useful", "not_useful"]
-
 [experiment]
 seed = 17
 """
@@ -76,6 +75,7 @@ class SelectionConfigTests(unittest.TestCase):
             with self.subTest(selector_name=selector_name):
                 config = self._load(_selection_table(selector_name))
                 self.assertTrue(config.selection.enabled)
+                self.assertTrue(config.selection.identity_frozen)
                 self.assertEqual(config.selection.selector_name, selector_name)
 
     def test_enabled_selection_requires_every_common_and_isolation_field(self) -> None:
@@ -210,6 +210,41 @@ class SelectionConfigTests(unittest.TestCase):
         )
         self.assertNotIn("selector_name", random_config.comparison_hash_inputs())
         self.assertNotIn("policy_params", random_config.comparison_hash_inputs())
+
+    def test_explicit_formal_figure4_requires_frozen_enabled_selector(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "one of the four registered"):
+            self._load("[experiment]\nfigure4_phase = \"formal\"\n")
+
+        with self.assertRaisesRegex(ConfigError, "complete frozen enabled selector"):
+            self._load(
+                "[experiment]\nfigure4_phase = \"formal\"\n"
+                "\n[allocation]\npolicy = \"trace_state\"\n"
+            )
+
+        config = self._load(
+            _selection_table("nustigmergy").replace(
+                "candidate_transfer = false", "candidate_transfer = true"
+            )
+            + "\n[experiment]\nfigure4_phase = \"formal\"\n"
+            + "\n[allocation]\npolicy = \"trace_state\"\n"
+        )
+        self.assertEqual(config.figure4_phase, "formal")
+        self.assertTrue(config.selection.identity_frozen)
+
+    def test_explicit_development_figure4_requires_disabled_selector(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "selection.enabled = false"):
+            self._load(
+                _selection_table()
+                + "\n[experiment]\nfigure4_phase = \"development\"\n"
+                + "\n[allocation]\npolicy = \"trace_state\"\n"
+            )
+
+    def test_figure4_phase_rejects_legacy_allocation_policy(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "one of the four registered"):
+            self._load(
+                "[experiment]\nfigure4_phase = \"development\"\n"
+                "\n[allocation]\npolicy = \"formula\"\n"
+            )
 
 
 if __name__ == "__main__":

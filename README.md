@@ -36,6 +36,8 @@ elastic_assignments.jsonl  # CPS 动态 agent 分配
 elastic_scheduler_state.json # CPS 调度器收尾状态
 allocation_decisions.jsonl   # 自适应分配决策及当时的因果快照
 allocation_summary.json      # policy 延迟、fallback、token 与 slot 利用率
+allocation_audit.jsonl       # Trace-State 同状态 Task-State 反事实与容量守恒
+figure4_run_summary.json     # Figure 4 单次运行的 score-time、成本与合同摘要
 closeout_candidates.json   # 三种模式统一的冻结候选索引与 SHA-256
 closeout_candidates/<task>/result.lean # feedback-free 最终评分快照
 formal_tool_calls.jsonl  # formal helper 调用审计
@@ -165,6 +167,26 @@ agent_timeout_seconds = 120 # 只约束中央 Agent scheduler 的单次判断
 normalized score-time AUC。`solver_slot_utilization` 只统计实际解题时间；
 `compute_slot_utilization` 还会把释放 slot 上的 scheduler 判断时间计入计算占用。
 `scripts/compare_runs.py` 同时报告两者，避免把调度占用误读为解题吞吐。
+
+Issue #39 的 Figure 4 路径使用四个独立的新 policy 名，旧三臂及其产物语义保持
+兼容：
+
+- `uniform_refill`：选择当前 active lease 最少的 eligible 题，按 task ID 破平局；
+- `task_state`：只读取 candidate/Checker、进展、饥饿与失败状态；
+- `trace_state`：在完全相同的 Task-State 分数上只增加有界 trace projection；
+- `llm_scheduler`：读取与 Trace-State 相同的只读 snapshot，严格校验 JSON，并把
+  调度调用的 token、延迟和同一固定容量中的 reservation 计入成本。
+
+开发用的 `configs/figure4_dev_cps48_*.toml` 四臂固定 MathOlympiadBench、12×4
+初始池、180 秒 horizon 和同一参数合同，仅 policy、运行名称和输出目录不同。
+其中 selector 明确保持 disabled，且 `experiment.figure4_phase = "development"`；
+该哨兵身份如实记录 legacy refill 会继承题内 best candidate，因此
+`candidate_transfer = true`。这批运行只用于实现验证，不能当作正式 Figure 4
+结果。正式 repeats 必须标记 `figure4_phase = "formal"`；配置加载器会拒绝未启用、
+身份不完整、允许 direct messages 或禁用 task-local candidate transfer 的 selector，
+确保只能使用 Figure 3 冻结的同一 identity/config，同时固定 RQ3 的题内解答传递。
+Trace-State 额外产生 `allocation_audit.jsonl`，从每个实际 dispatch 的同一个
+immutable snapshot 计算不 dispatch 的 Task-State counterfactual。
 
 每次尝试使用独立 workspace，完成后把较强 candidate 合并到
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS

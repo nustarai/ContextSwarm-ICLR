@@ -110,6 +110,13 @@ AUTHORITATIVE_VERDICT_STATUSES = {
     "COMPILES_WITH_SORRY",
     "VERIFY_FAIL",
 }
+JOB_BOUND_CANDIDATE_FAILURE_STATUSES = {
+    "EXECUTION_TIMEOUT",
+    "RESOURCE_LIMIT",
+}
+PROVENANCE_REQUIRED_VERDICT_STATUSES = (
+    AUTHORITATIVE_VERDICT_STATUSES | JOB_BOUND_CANDIDATE_FAILURE_STATUSES
+)
 
 ENDPOINT_VALUE_RE = re.compile(r"(?:https?|wss?)://", re.IGNORECASE)
 HOST_PORT_RE = re.compile(r"^[A-Za-z0-9_.-]+:\d+(?:/|$)")
@@ -159,15 +166,22 @@ DIAGNOSTIC_TEXT_FIELDS = {
     "terminal_reason",
     "verdict",
 }
-RETRYABLE_RESOURCE_STATUSES = {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
 RETRYABLE_CLOSEOUT_INFRA_STATUSES = {
     "EVALUATOR_ERROR",
     "EVALUATOR_TIMEOUT",
-    "EXECUTION_TIMEOUT",
     "INFRASTRUCTURE_ERROR",
     "REJECTED_OVERLOADED",
-    "RESOURCE_LIMIT",
 }
+# Historical bundles could explicitly preserve an earlier proof when a fresh
+# closeout returned one of these statuses.  Keep that read-only compatibility
+# in the legacy disposition branch below, but never infer infrastructure from
+# a resource/timeout status and a provider-supplied ``retryable`` bit.
+LEGACY_RETRYABLE_CLOSEOUT_INFRA_STATUSES = (
+    RETRYABLE_CLOSEOUT_INFRA_STATUSES | JOB_BOUND_CANDIDATE_FAILURE_STATUSES
+)
+LEGACY_REUSED_CLOSEOUT_FINAL_STATUSES = (
+    RETRYABLE_CLOSEOUT_INFRA_STATUSES | {"PROVED"}
+)
 CLOSEOUT_LIFECYCLE_EVENTS = (
     "horizon_closed",
     "candidates_frozen",
@@ -472,24 +486,6 @@ def _oom_observed(value: Any) -> bool:
         if _mapping_has_oom_text(item):
             return True
     return False
-
-
-def _nested_response_value(payload: Mapping[str, Any], name: str) -> Any:
-    current: Any = payload
-    for _depth in range(4):
-        if not isinstance(current, Mapping):
-            return None
-        if name in current:
-            return current.get(name)
-        current = current.get("response")
-    return None
-
-
-def _retryable_resource_failure(payload: Mapping[str, Any]) -> bool:
-    return bool(
-        _normalize_status(payload.get("status")) in RETRYABLE_RESOURCE_STATUSES
-        and _nested_response_value(payload, "retryable") is True
-    )
 
 
 def _tool_records(value: Any) -> Iterator[tuple[str, str, Any, str]]:
@@ -1298,11 +1294,7 @@ def _check_judge_checks(
         )
     for row in rows:
         status = _normalize_status(row.get("status"))
-        if (
-            status in BAD_JUDGE_STATUSES
-            or _judge_row_has_429(row)
-            or _retryable_resource_failure(row)
-        ):
+        if status in BAD_JUDGE_STATUSES or _judge_row_has_429(row):
             _add_issue(issues, "judge_check_failure_status")
         control_class = _broker_control_class(row, status)
         if control_class == "hard":
@@ -1391,7 +1383,7 @@ def _final_provenance_keys(
         if raw_verdict.get("task_id") not in (None, task_id):
             _add_issue(issues, "final_verdict_task_mismatch")
         status = _normalize_status(raw_verdict.get("status"))
-        if status not in AUTHORITATIVE_VERDICT_STATUSES:
+        if status not in PROVENANCE_REQUIRED_VERDICT_STATUSES:
             continue
         key = _provenance_key(raw_verdict, fallback_task_id=task_id)
         if key is None:
@@ -1425,7 +1417,7 @@ def _evaluation_provenance_keys(
         if row.get("event") != "evaluation_finished":
             continue
         status = _normalize_status(row.get("status"))
-        if status not in AUTHORITATIVE_VERDICT_STATUSES:
+        if status not in PROVENANCE_REQUIRED_VERDICT_STATUSES:
             continue
         key = _provenance_key(row, fallback_task_id=row.get("task_id"))
         if key is None:
@@ -1757,9 +1749,14 @@ def _check_closeout_lifecycle(
         elif flags == (False, False, True, False, False):
             disposition = "retryable_unconfirmed"
             valid = (
-                status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+                # This flag is an explicit legacy closeout disposition, not
+                # an inference from a status/retryable pair.  Accept the
+                # historical resource/timeout values here only so old
+                # bundles remain auditable; current candidate-attempt rows
+                # use the ordinary ``evaluated`` disposition.
+                status in LEGACY_RETRYABLE_CLOSEOUT_INFRA_STATUSES
                 and float(row.get("score", 0.0)) == 0.0
-                and observed_status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+                and observed_status in LEGACY_RETRYABLE_CLOSEOUT_INFRA_STATUSES
                 and row.get("reused_authoritative_verdict") is False
                 and row.get("prior_authoritative_proof_available") is True
                 and row.get("fresh_closeout_confirmed") is False
@@ -1773,11 +1770,11 @@ def _check_closeout_lifecycle(
             # run contract while allowing historical bundles to be audited.
             disposition = "retryable_reused"
             valid = (
-                status == "PROVED"
+                status in LEGACY_REUSED_CLOSEOUT_FINAL_STATUSES
                 and isinstance(row.get("score"), (int, float))
                 and not isinstance(row.get("score"), bool)
                 and float(row.get("score")) == 1.0
-                and observed_status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+                and observed_status in LEGACY_RETRYABLE_CLOSEOUT_INFRA_STATUSES
                 and row.get("reused_authoritative_verdict") is True
             )
         elif flags == (False, False, False, True, True):
@@ -1813,7 +1810,7 @@ def _check_closeout_lifecycle(
             _add_issue(issues, "closeout_scoreboard_chain_mismatch")
 
         key = _provenance_key(row, fallback_task_id=task_id)
-        if status in AUTHORITATIVE_VERDICT_STATUSES and key is None:
+        if status in PROVENANCE_REQUIRED_VERDICT_STATUSES and key is None:
             _add_issue(issues, "closeout_provenance_incomplete")
         if disposition == "evaluated" and key is not None:
             evidence.direct_keys.add(key)
@@ -2567,9 +2564,7 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
                 _serialized(verdict)
             ):
                 _add_issue(audit.errors, "evaluator_transport_error")
-            if _retryable_resource_failure(verdict):
-                _add_issue(audit.errors, "evaluator_infrastructure_error")
-            if verdict_status in AUTHORITATIVE_VERDICT_STATUSES:
+            if verdict_status in PROVENANCE_REQUIRED_VERDICT_STATUSES:
                 if not _valid_sha256(verdict.get("candidate_sha256")):
                     _add_issue(audit.errors, "final_candidate_hash_missing")
                 if not _valid_sha256(verdict.get("task_contract_sha256")):
@@ -2701,8 +2696,6 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
             or TRANSPORT_ERROR_RE.search(_serialized(event))
         ):
             _add_issue(audit.errors, "evaluator_transport_error")
-        if event_name == "evaluation_finished" and _retryable_resource_failure(event):
-            _add_issue(audit.errors, "evaluator_infrastructure_error")
         if (
             event_name == "evaluation_finished"
             and _normalize_status(event.get("status")) == "RUNNING"

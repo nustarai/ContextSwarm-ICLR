@@ -232,6 +232,47 @@ class _SolverProofThenConflictCloseout(_SolverProofThenRetryableCloseout):
         )
 
 
+class _SolverProofThenTerminalFailureCloseout(_SolverProofThenRetryableCloseout):
+    terminal_status = "RESOURCE_LIMIT"
+
+    def evaluate(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Verdict:
+        if deadline_monotonic is not None:
+            return super().evaluate(
+                task,
+                candidate,
+                deadline_monotonic=deadline_monotonic,
+            )
+        digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        return Verdict(
+            task.slug,
+            self.terminal_status,
+            0.0,
+            0.0,
+            {
+                "error_kind": (
+                    "memory_limit_exceeded"
+                    if self.terminal_status == "RESOURCE_LIMIT"
+                    else "timeout"
+                ),
+                "terminal_reason": (
+                    "resource_limit"
+                    if self.terminal_status == "RESOURCE_LIMIT"
+                    else "execution_timeout"
+                ),
+                "retryable": False,
+            },
+            candidate_sha256=digest,
+            task_contract_sha256=self.contract_sha256,
+            judge_job_id="closeout-terminal-failure",
+        )
+
+
 class _FixedCloseoutEvaluator:
     def __init__(self, verdict: Verdict, contract_sha256: str):
         self.verdict = verdict
@@ -345,7 +386,7 @@ class CloseoutLifecycleTests(unittest.TestCase):
         self.assertEqual(lifecycle["remote_unsettled_jobs"], 1)
         self.assertEqual(final["status"], "ERROR")
 
-    def test_retryable_closeout_infra_never_reuses_solver_authority(self) -> None:
+    def test_terminal_closeout_failure_is_candidate_feedback_and_never_reuses_solver_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _SolverProofThenRetryableCloseout.calls = []
             config = replace(
@@ -373,18 +414,12 @@ class CloseoutLifecycleTests(unittest.TestCase):
             # outer closeout failed retryably, so the run must not retain its
             # score or job id as final authority.
             self.assertEqual(final["score"], 0.0)
-            self.assertEqual(final["status"], "DEGRADED")
-            self.assertFalse(final["health"]["ok"])
+            self.assertEqual(final["status"], "COMPLETED")
+            self.assertTrue(final["health"]["ok"])
             self.assertEqual(verdict["status"], "RESOURCE_LIMIT")
             self.assertEqual(verdict["judge_job_id"], "closeout-infra")
-            self.assertTrue(
-                verdict["response"]["prior_authoritative_proof_available"]
-            )
-            self.assertFalse(verdict["response"]["fresh_closeout_confirmed"])
-            self.assertEqual(
-                verdict["response"]["closeout_infra_incomplete"]["observed_status"],
-                "RESOURCE_LIMIT",
-            )
+            self.assertNotIn("prior_authoritative_proof_available", verdict["response"])
+            self.assertNotIn("closeout_infra_incomplete", verdict["response"])
             self.assertEqual(
                 _SolverProofThenRetryableCloseout.calls,
                 ["solver", "closeout"],
@@ -395,24 +430,66 @@ class CloseoutLifecycleTests(unittest.TestCase):
             ]
             self.assertEqual(
                 sum(row["event"] == "closeout_infra_incomplete" for row in events),
-                1,
+                0,
             )
             closeout = next(
                 row for row in events if row["event"] == "closeout_evaluation_finished"
             )
             self.assertFalse(closeout["reused_authoritative_verdict"])
-            self.assertTrue(closeout["closeout_infra_incomplete"])
-            self.assertTrue(closeout["prior_authoritative_proof_available"])
+            self.assertFalse(closeout["closeout_infra_incomplete"])
+            self.assertFalse(closeout["prior_authoritative_proof_available"])
             self.assertFalse(closeout["fresh_closeout_confirmed"])
-            self.assertFalse(closeout["scoreboard_recorded"])
+            self.assertTrue(closeout["scoreboard_recorded"])
             scoreboard = [
                 json.loads(line)
                 for line in (run_dir / "scoreboard_history.jsonl").read_text(
                     encoding="utf-8"
                 ).splitlines()
             ]
-            self.assertEqual(len(scoreboard), 1)
+            self.assertEqual(len(scoreboard), 2)
             self.assertEqual(scoreboard[0]["judge_job_id"], "solver-authority")
+            self.assertEqual(scoreboard[1]["judge_job_id"], "closeout-infra")
+
+    def test_prior_proof_does_not_turn_terminal_resource_failure_into_conflict(self) -> None:
+        for status in ("RESOURCE_LIMIT", "EXECUTION_TIMEOUT"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                _SolverProofThenTerminalFailureCloseout.terminal_status = status
+                config = replace(
+                    load_config("configs/smoke.toml", ROOT),
+                    max_tasks=1,
+                    max_parallel=1,
+                    initial_agents_per_task=1,
+                    max_attempts_per_task=1,
+                    time_limit_seconds=2,
+                    lean_max_concurrent_evaluations=1,
+                )
+                with patch(
+                    "contextswarm_mini.runner.MockEvaluator",
+                    _SolverProofThenTerminalFailureCloseout,
+                ):
+                    run_dir = run_experiment(
+                        config,
+                        mock_agent=True,
+                        output_override=Path(temporary),
+                    )
+
+                final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+                verdict = final["verdicts"]["imo2024_p1"]
+                self.assertEqual(final["status"], "COMPLETED")
+                self.assertEqual(final["score"], 0.0)
+                self.assertEqual(verdict["status"], status)
+                self.assertEqual(verdict["judge_job_id"], "closeout-terminal-failure")
+                self.assertNotIn("closeout_authority_conflict", final["health"]["issues"])
+                self.assertNotIn("closeout_incomplete", final["health"]["issues"])
+                events = [
+                    json.loads(line)
+                    for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                ]
+                closeout = next(
+                    row for row in events if row["event"] == "closeout_evaluation_finished"
+                )
+                self.assertTrue(closeout["scoreboard_recorded"])
+                self.assertFalse(closeout["authority_conflict"])
 
     def test_confirmed_closeout_keeps_original_exact_once_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -839,7 +916,7 @@ class CloseoutLifecycleTests(unittest.TestCase):
             final["health"]["issues"],
         )
 
-    def test_retryable_resource_limit_keeps_closeout_incomplete(self) -> None:
+    def test_retryable_resource_limit_is_a_complete_zero_score(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with patch(
                 "contextswarm_mini.runner.MockEvaluator",
@@ -858,9 +935,10 @@ class CloseoutLifecycleTests(unittest.TestCase):
                 )
             final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(final["status"], "DEGRADED")
-        self.assertIn("closeout_incomplete", final["health"]["issues"])
-        self.assertIn(
+        self.assertEqual(final["status"], "COMPLETED")
+        self.assertEqual(final["score"], 0.0)
+        self.assertNotIn("closeout_incomplete", final["health"]["issues"])
+        self.assertNotIn(
             "evaluator_infrastructure_error",
             final["health"]["issues"],
         )
