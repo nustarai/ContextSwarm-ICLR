@@ -375,6 +375,16 @@ class Figure4RuntimeTests(unittest.TestCase):
                 self.assertEqual(scheduler_state["active_slots"], 0)
                 self.assertTrue(scheduler_state["tasks"]["imo2024_p1"]["retired"])
                 final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+                # A candidate-bound terminal receipt (even one carrying a
+                # provider-supplied retryable hint) is ordinary zero-progress
+                # feedback.  It must not downgrade the arm to infrastructure
+                # failure or force closeout-incomplete classification.
+                self.assertEqual(final["status"], "COMPLETED")
+                self.assertNotIn(
+                    "evaluator_infrastructure_error",
+                    final["health"]["issues"],
+                )
+                self.assertNotIn("closeout_incomplete", final["health"]["issues"])
                 self.assertEqual(final["verdicts"]["imo2024_p1"]["score"], 0.0)
                 self.assertEqual(
                     final["health"]["attempt_verdict_status_counts"][terminal_status],
