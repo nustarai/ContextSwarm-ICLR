@@ -92,3 +92,4 @@ require_result_cache_disabled = false
 image = "contextswarm-iclr-mini:latest"
 memory_mb = 16384
 internet = "online"
+network = "host"

@@ -93,6 +93,7 @@ except (LaunchContractError, OSError, ValueError) as exc:
 
 print(config.docker_image)
 print(config.docker_memory_mb)
+print(config.docker_network)
 print("1" if config.lean_require_result_cache_disabled else "0")
 print(contract.container_manifest)
 print(contract.manifest_sha256)
@@ -101,22 +102,27 @@ PY
   exit 2
 fi
 mapfile -t RESOLVED_RUNTIME_VALUES <<<"${RESOLVED_RUNTIME_CONFIG}"
-if [[ "${#RESOLVED_RUNTIME_VALUES[@]}" -ne 5 ]]; then
+if [[ "${#RESOLVED_RUNTIME_VALUES[@]}" -ne 6 ]]; then
   echo "runtime manifest resolution returned an invalid payload" >&2
   exit 2
 fi
 
 IMAGE="${CONTEXTSWARM_MINI_IMAGE:-${RESOLVED_RUNTIME_VALUES[0]}}"
 MEMORY="${CONTEXTSWARM_MINI_MEMORY:-${RESOLVED_RUNTIME_VALUES[1]}m}"
-CACHE_DISABLED_REQUIRED="${RESOLVED_RUNTIME_VALUES[2]}"
-CONFIG="${RESOLVED_RUNTIME_VALUES[3]}"
-MANIFEST_SHA256="${RESOLVED_RUNTIME_VALUES[4]}"
+NETWORK="${RESOLVED_RUNTIME_VALUES[2]}"
+CACHE_DISABLED_REQUIRED="${RESOLVED_RUNTIME_VALUES[3]}"
+CONFIG="${RESOLVED_RUNTIME_VALUES[4]}"
+MANIFEST_SHA256="${RESOLVED_RUNTIME_VALUES[5]}"
 if [[ "${#IMAGE}" -gt 512 || ! "${IMAGE}" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$ ]]; then
   echo "invalid Docker image from manifest or CONTEXTSWARM_MINI_IMAGE" >&2
   exit 2
 fi
 if [[ "${#MEMORY}" -gt 32 || ! "${MEMORY}" =~ ^[1-9][0-9]*([bBkKmMgG])?$ ]]; then
   echo "invalid Docker memory from manifest or CONTEXTSWARM_MINI_MEMORY" >&2
+  exit 2
+fi
+if [[ "${NETWORK}" != "host" && "${NETWORK}" != "bridge" ]]; then
+  echo "invalid Docker network from manifest" >&2
   exit 2
 fi
 
@@ -234,7 +240,6 @@ DOCKER_ARGS=(
   --rm
   --init
   --read-only
-  --network host
   --memory "${MEMORY}"
   --pids-limit "${PIDS_LIMIT}"
   --cap-drop ALL
@@ -255,6 +260,15 @@ DOCKER_ARGS=(
   -e "CONTEXTSWARM_MANIFEST_PATH=${CONFIG}"
   -e "CONTEXTSWARM_MANIFEST_SHA256=${MANIFEST_SHA256}"
 )
+
+if [[ "${NETWORK}" == "bridge" ]]; then
+  DOCKER_ARGS+=(
+    --network bridge
+    --add-host "host.docker.internal:host-gateway"
+  )
+else
+  DOCKER_ARGS+=(--network host)
+fi
 
 # Passing only the variable name keeps the private value out of docker's argv
 # and command summaries.  Xtrace is disabled above before the value is read.

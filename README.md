@@ -102,8 +102,10 @@ scripts/run_docker.sh --config configs/cps.toml
 cache-health capability 也只按变量名注入，只供 supervisor preflight 使用；其私有值
 不会交给 Solver，也不会写入 tracked manifest、preflight 证据或运行摘要。
 
-`run_docker.sh` 会从完整解析 `extends` 后的 `[docker]` 读取 `image` 和
-`memory_mb`。运维侧仍可用 `CONTEXTSWARM_MINI_IMAGE`、
+`run_docker.sh` 会从完整解析 `extends` 后的 `[docker]` 读取 `image`、
+`memory_mb` 和 `network`（`host` 或 `bridge`）。`bridge` 会配置
+`host.docker.internal`，用于让 runner 访问显式开放给 Docker bridge 的独立
+Judge，同时隔离容器内硬编码的宿主 `127.0.0.1` 端口。运维侧仍可用 `CONTEXTSWARM_MINI_IMAGE`、
 `CONTEXTSWARM_MINI_MEMORY` 覆盖，两者优先级高于 manifest。
 正式 run/preflight 的启动器拒绝有 tracked 修改的 worktree，并要求整条 manifest
 继承链都来自当前 commit 的 tracked 文件；`runs/` 下的本地 manifest 只允许用于
@@ -247,13 +249,13 @@ CONTEXTSWARM_CODEX_HOME=$HOME/.codex \
 scripts/run_docker.sh --config configs/cps.toml
 ```
 
-脚本通过 `--network host` 让容器访问 AISW coordinator 和环境变量注入的 Judge；
-AISW binary、node config 和可选 Codex home 都只读挂载，随后所需私有 metadata
-会复制到容器的临时 `/run`。容器使用宿主 UID/GID、只读根文件系统、受限 PID、
-`no-new-privileges` 和独立 tmpfs，因此新 run artifacts 不再由 root 创建。若服务不在
-宿主网络上，应把 `CONTEXTSWARM_JUDGE_URL` 设置为容器实际可达的地址，而不是修改
-tracked manifest。实验代码、Prompt、manifest 与 benchmark 均使用构建时写入镜像的
-冻结副本；运行时只挂载宿主 `runs/` 输出目录，避免一小时实验中途受到 worktree
+脚本按 manifest 选择 Docker 网络：默认 `host`；需要隔离宿主回环端口时使用
+`bridge`，并把 runner 的服务地址设为 `host.docker.internal` 上显式开放的独立
+端口。AISW binary、node config 和可选 Codex home 都只读挂载，随后所需私有
+metadata 会复制到容器的临时 `/run`。容器使用宿主 UID/GID、只读根文件系统、
+受限 PID、`no-new-privileges` 和独立 tmpfs，因此新 run artifacts 不再由 root
+创建。实验代码、Prompt、manifest 与 benchmark 均使用构建时写入镜像的冻结
+副本；运行时只挂载宿主 `runs/` 输出目录，避免一小时实验中途受到 worktree
 修改影响。
 
 `run_docker.sh` 会同时发现相邻的 `.nurouter-pi-launcher.json`（或旧

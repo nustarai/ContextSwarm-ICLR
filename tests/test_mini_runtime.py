@@ -1947,8 +1947,12 @@ class MiniRuntimeTests(unittest.TestCase):
             "CONTEXTSWARM_BEST_CANDIDATE_FILE": "/tmp/stale-result.lean",
             "CONTEXTSWARM_TASK_ROOT": "/tmp/stale-task",
             "CONTEXTSWARM_CPS_FUTURE_CAPABILITY": "stale",
+            "LEAN_AUTH_TOKEN": "ambient-token",
+            "JUDGE_URL": "http://ambient-judge.invalid",
+            "JUDGE_ENDPOINT": "http://ambient-endpoint.invalid",
             "CONTEXTSWARM_JUDGE_URL": "http://raw-judge.invalid",
             "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL": "http://cache.invalid",
+            "CONTEXTSWARMJUDGE_LEAN_ROUTER_URL": "http://ambient-router.invalid",
             "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "1",
             "CONTEXTSWARM_LEAN_SERVER_URL": "http://stale-route.invalid",
             "CONTEXTSWARM_LEAN_ENV_ID": "stale_env",
@@ -1972,6 +1976,17 @@ class MiniRuntimeTests(unittest.TestCase):
                     self.assertTrue(stale.keys().isdisjoint(env))
                     self.assertEqual(env["CONTEXTSWARM_TASK_ID"], "fresh-task")
                     self.assertEqual(env["CONTEXTSWARM_ACTOR_ID"], "fresh-actor")
+                    self.assertFalse(
+                        any(key.startswith("CONTEXTSWARM_LEAN_") for key in env)
+                    )
+                    self.assertTrue(
+                        {
+                            "LEAN_AUTH_TOKEN",
+                            "JUDGE_URL",
+                            "CONTEXTSWARM_JUDGE_URL",
+                            "CONTEXTSWARMJUDGE_LEAN_ROUTER_URL",
+                        }.isdisjoint(env)
+                    )
 
             with self.assertRaisesRegex(ValueError, "unsupported solver environment"):
                 PiAgent(load_config("configs/cps.toml", ROOT)).environment(
@@ -1985,8 +2000,11 @@ class MiniRuntimeTests(unittest.TestCase):
         config = load_config("configs/cps.toml", ROOT)
         stale = {
             "LEAN_AUTH_TOKEN": "private-token",
+            "JUDGE_URL": "http://ambient-judge.invalid",
+            "JUDGE_ENDPOINT": "http://ambient-endpoint.invalid",
             "CONTEXTSWARM_JUDGE_URL": "http://raw-judge.invalid",
             "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL": "http://cache.invalid",
+            "CONTEXTSWARMJUDGE_LEAN_ROUTER_URL": "http://ambient-router.invalid",
             "CONTEXTSWARM_LEAN_SERVER_URL": "http://stale-route.invalid",
             "CONTEXTSWARM_LEAN_ENV_ID": "stale_env",
             "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE": "stale_profile",
@@ -2021,6 +2039,14 @@ class MiniRuntimeTests(unittest.TestCase):
         self.assertFalse(any(key.startswith("CONTEXTSWARM_LEAN_") for key in env))
         self.assertFalse(any(key.startswith("CONTEXTSWARM_MANIFEST_") for key in env))
         self.assertNotIn("CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED", env)
+        self.assertTrue(
+            {
+                "LEAN_AUTH_TOKEN",
+                "JUDGE_URL",
+                "JUDGE_ENDPOINT",
+                "CONTEXTSWARMJUDGE_LEAN_ROUTER_URL",
+            }.isdisjoint(env)
+        )
 
         with self.assertRaisesRegex(ValueError, "unsupported solver environment"):
             PiAgent(config).environment(

@@ -59,6 +59,34 @@ _CPS_ENVIRONMENT_KEYS = frozenset(
         "CONTEXTSWARM_TASK_ROOT",
     }
 )
+_EVALUATOR_ENVIRONMENT_KEYS = frozenset(
+    {
+        "LEAN_AUTH_TOKEN",
+        "LEAN_SERVER_URL",
+        "LEAN_JUDGE_URL",
+        "JUDGE_URL",
+        "JUDGE_ENDPOINT",
+        "CONTEXTSWARM_JUDGE_URL",
+        "CONTEXTSWARM_JUDGE_ENDPOINT",
+        "CONTEXTSWARM_EVALUATOR_URL",
+        "EVALUATOR_URL",
+        "CONTEXTSWARM_LEAN_SERVER_URL",
+        "CONTEXTSWARM_LEAN_ENV_ID",
+        "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE",
+        "CONTEXTSWARM_LEAN_JUDGE_MODE",
+        "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS",
+        "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS",
+    }
+)
+
+
+def _is_evaluator_environment_key(key: str) -> bool:
+    normalized = str(key).strip().upper()
+    return (
+        normalized in _EVALUATOR_ENVIRONMENT_KEYS
+        or normalized.startswith("CONTEXTSWARM_LEAN_")
+        or normalized.startswith("CONTEXTSWARMJUDGE_")
+    )
 
 
 def now_iso() -> str:
@@ -199,9 +227,8 @@ class PiAgent:
         # session-scoped broker capability may be injected below via extra_env.
         for key in tuple(env):
             if (
-                key == "LEAN_AUTH_TOKEN"
+                _is_evaluator_environment_key(key)
                 or key.startswith("CONTEXTSWARM_JUDGE_")
-                or key.startswith("CONTEXTSWARM_LEAN_")
                 or key.startswith("CONTEXTSWARM_MANIFEST_")
                 or key == "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED"
                 or key == "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"

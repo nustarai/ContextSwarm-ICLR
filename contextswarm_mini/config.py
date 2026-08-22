@@ -182,6 +182,7 @@ class ExperimentConfig:
     docker_image: str
     docker_memory_mb: int
     docker_internet: str
+    docker_network: str
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -250,6 +251,7 @@ class ExperimentConfig:
             "docker_image": self.docker_image,
             "docker_memory_mb": self.docker_memory_mb,
             "docker_internet": self.docker_internet,
+            "docker_network": self.docker_network,
         }
 
 
@@ -441,6 +443,9 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     require_result_cache_disabled = bool(
         lean.get("require_result_cache_disabled", False)
     )
+    docker_network = _text(docker.get("network"), "host").lower()
+    if docker_network not in {"host", "bridge"}:
+        raise ConfigError("docker.network must be host or bridge")
 
     cfg = ExperimentConfig(
         manifest_path=manifest_path,
@@ -492,6 +497,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         docker_image=_text(docker.get("image"), "contextswarm-iclr-mini:latest"),
         docker_memory_mb=_positive_int(docker.get("memory_mb"), "docker.memory_mb", 16384),
         docker_internet=_text(docker.get("internet"), "online"),
+        docker_network=docker_network,
         extra={"raw": payload},
     )
     if cfg.uses_cps and cfg.episodes_per_task < 1:
