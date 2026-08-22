@@ -1,0 +1,14 @@
+extends = ["_base.toml"]
+
+[experiment]
+dataset_root = "benchmarks/matholympiadbench"
+problem_ids = "benchmarks/matholympiadbench/problem_ids.json"
+
+[judge]
+kind = "formal"
+env_id = "formal_matholympiadbench"
+verification_profile = "formal_proof"
+judge_mode = "fast"
+
+[formal_tools]
+enabled = true

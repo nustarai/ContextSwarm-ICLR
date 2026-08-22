@@ -234,6 +234,14 @@ session 进一步隔离在该 worker 的 `.pi/sessions/<session-id>/`，避免 C
 session 可能包含完整 prompt、工具输出和 provider 错误，仅用于本地诊断，公开
 artifact 或运行摘要前必须审查，不能提交到 Git。
 
+六数据集的一小时正式 Mono/Parallel 矩阵位于
+`configs/formal_1h_6datasets/`，包含 USACO、ICPC World Finals 2025、PutnamBench、
+MathOlympiadBench、Clever 和 Verina 的各一个 Mono 与 Parallel arm（共 12 个
+配置）。这些配置固定 12 道题、同一模型与四路 evaluator，使用 bridge Judge、
+禁用 result cache，并在一小时或全题满分时停止；Mono/Parallel 均保持
+`communication = "none"`。正式启动前需通过选定配置的 transport preflight，且
+形式化数据集需由运行环境提供 revision-matched declaration index。
+
 Scaling sweep manifests：
 
 ```text

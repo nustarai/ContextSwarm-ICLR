@@ -1,0 +1,9 @@
+extends = ["_matholympiadbench.toml"]
+
+[experiment]
+name = "formal-1h-6datasets-matholympiadbench-mono"
+output_root = "runs/formal_1h_6datasets/matholympiadbench/mono"
+mode = "mono"
+communication = "none"
+max_parallel = 1
+episodes_per_task = 1
