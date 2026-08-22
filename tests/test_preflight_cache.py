@@ -16,6 +16,7 @@ from contextswarm_mini.models import Verdict
 from contextswarm_mini.preflight import (
     PreflightError,
     _result_cache_health,
+    _kernel_probe,
     run_preflight,
 )
 
@@ -175,6 +176,37 @@ class PreflightResultCacheTests(unittest.TestCase):
         self.assertEqual(
             report["formal_tools"]["declaration_index"]["mathlib_revision"],
             "rev-1",
+        )
+
+    def test_kernel_probe_uses_theorem_shaped_contract(self) -> None:
+        class CaptureEvaluator:
+            def __init__(self) -> None:
+                self.task = None
+                self.source = None
+
+            def probe_source(self, task, source, **_kwargs):
+                self.task = task
+                self.source = source
+                return Verdict(
+                    task.slug,
+                    "PROVED",
+                    1.0,
+                    0.001,
+                    {"is_valid_no_sorry": True},
+                )
+
+        with tempfile.TemporaryDirectory() as raw:
+            evaluator = CaptureEvaluator()
+            verdict = _kernel_probe(evaluator, Path(raw) / "run")
+
+        self.assertEqual(verdict.status, "PROVED")
+        self.assertIsNotNone(evaluator.task)
+        self.assertIsNotNone(evaluator.source)
+        self.assertIn("theorem contextswarm_preflight_kernel", evaluator.source)
+        self.assertEqual(evaluator.task.baseline_code, evaluator.source)
+        self.assertEqual(
+            evaluator.task.metadata["theorem_name"],
+            "contextswarm_preflight_kernel",
         )
 
     def test_strict_formal_preflight_rejects_kernel_status_or_revision_drift(self) -> None:

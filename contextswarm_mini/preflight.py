@@ -233,13 +233,26 @@ def run_preflight(
 def _kernel_probe(evaluator: Any, output_dir: Path) -> Verdict:
     """Run one tiny real kernel probe, independent of any worker candidate."""
 
-    source = "import Mathlib\n#check Nat.succ\n"
+    # The formal Judge requires an authored theorem before it will emit a
+    # successful formal verdict.  A bare ``#check`` is useful to a human Lean
+    # session, but the Judge correctly classifies it as ``no_authored_theorem``
+    # (VERIFY_FAIL) even when elaboration succeeded.  Keep the probe
+    # deliberately tiny while giving the endpoint the same theorem-shaped
+    # contract as a real task.
+    source = (
+        "import Mathlib\n"
+        "theorem contextswarm_preflight_kernel : (0 : Nat) = 0 := by\n"
+        "  rfl\n"
+    )
     task = Task(
         slug="__contextswarm_preflight_kernel__",
         root=output_dir,
         problem_text="preflight kernel probe",
-        baseline_code="import Mathlib\n",
-        metadata={"problem_id": "preflight", "theorem_name": ""},
+        baseline_code=source,
+        metadata={
+            "problem_id": "preflight",
+            "theorem_name": "contextswarm_preflight_kernel",
+        },
     )
     probe_source = getattr(evaluator, "probe_source", None)
     if callable(probe_source):
