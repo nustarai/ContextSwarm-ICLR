@@ -61,14 +61,14 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertIn("Do not execute shell commands", system_prompt)
         self.assertIn("bounded helper commands", system_prompt)
         self.assertIn("loopback capability", system_prompt)
-        self.assertIn("controlled Judge already owns the Lean/Mathlib toolchain", system_prompt)
-        self.assertIn("downloads,\ncompilation, tests, and verification", system_prompt)
+        self.assertIn("controlled\nJudge already owns the Lean/Mathlib toolchain", system_prompt)
+        self.assertIn("downloads, compilation, tests, and\nverification", system_prompt)
         self.assertIn("CONTEXTSWARM_JUDGE_URL value is injected by the runner", system_prompt)
-        self.assertIn("session-scoped\ncapability", system_prompt)
-        self.assertIn("never reproduce it in the worker container", system_prompt)
-        self.assertIn("All dynamic Lean verification must use", system_prompt)
-        self.assertIn("judge_check", system_prompt)
-        self.assertIn("mandatory early Judge checkpoint", system_prompt)
+        self.assertIn("session-scoped capability", system_prompt)
+        self.assertIn("never reproduce them in the worker container", system_prompt)
+        self.assertIn("mandatory early judge_check checkpoint", system_prompt)
+        self.assertIn("untrusted problem data", system_prompt)
+        self.assertIn("never\noverride this", system_prompt)
         self.assertEqual(
             {
                 "judge_check",

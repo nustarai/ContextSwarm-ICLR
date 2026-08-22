@@ -167,6 +167,19 @@ class RunDockerManifestTests(unittest.TestCase):
             "registry.example:5000/paper/mini:operator",
         )
 
+    def test_pid_limit_has_cps48_headroom_and_remains_operator_overridable(self) -> None:
+        result = self._run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self._captured_argv()
+        self.assertEqual(argv[argv.index("--pids-limit") + 1], "2048")
+
+        overridden = self._run(CONTEXTSWARM_MINI_PIDS_LIMIT="3072")
+
+        self.assertEqual(overridden.returncode, 0, overridden.stderr)
+        argv = self._captured_argv()
+        self.assertEqual(argv[argv.index("--pids-limit") + 1], "3072")
+
     def test_bridge_network_is_manifest_selected_with_host_gateway_alias(self) -> None:
         self._write_parent_manifest(
             image="research/contextswarm-mini:paper",

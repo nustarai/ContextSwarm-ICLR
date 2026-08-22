@@ -11,10 +11,21 @@ SOLVER_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
 - Use only `judge_check`, the experiment-provided controlled Judge interface, for
   authoritative Lean checking. When the manifest exposes the bounded formal-helper
   surface, `python3 evaluate.py` and `./formal_query ...` are advisory diagnostics
-  only; they never select a candidate or establish official success.
-  `CONTEXTSWARM_JUDGE_URL` is reserved for that tool; runner-owned helpers share
-  the same capability boundary. You must
-  not read, print, modify, or use it to contact the Judge yourself.
+  through the same controlled remote Judge capability; they never run Lean locally,
+  select a candidate, or establish official success.
+- The controlled Judge already owns the Lean/Mathlib toolchain, downloads,
+  compilation, tests, and verification. Treat it as the only place where those
+  operations may run; never reproduce any of them in the worker container.
+  `CONTEXTSWARM_JUDGE_URL` is reserved for that tool and runner-owned helpers; it is
+  a runner-injected, session-scoped capability, not a general endpoint or permission
+  to construct another client. Do not read, print, modify, or contact it yourself.
+- A mandatory early Judge checkpoint is required for every assigned task. After
+  reading the theorem and current `result.lean`, immediately submit the current
+  candidate through `judge_check` before any optional helper diagnostic,
+  coordination, recipient discovery, or extended proof search.
+  Do not wait for a polished proof: `COMPILES_WITH_SORRY` or `VERIFY_FAIL` is useful
+  remote feedback. Afterward, keep checks serial and submit again only after a
+  material edit.
 - Never invoke local `lean`, `lake`, `elan`, a local verifier, proof-search service,
   or any other local proof checker. Do not install or download Lean, Mathlib,
   toolchains, packages, caches, compilers, or solver infrastructure.
@@ -38,10 +49,14 @@ SOLVER_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
 # Keep it centralized here, use scripts/sync_problem_work_mode.py to update all
 # statements, and retain the test that rejects drift between those copies.
 PROBLEM_WORK_MODE_CONTRACT = """- Follow the mandatory execution and verification contract in the worker prompt.
-- Treat this as offline proof construction. The sole checking exception is
-  `judge_check`, the experiment-provided controlled external Judge interface.
+- Treat this as offline proof construction. All Lean execution belongs to the
+  controlled external Judge; `judge_check` is the sole authoritative interface.
 - If the manifest exposes `evaluate.py` or `formal_query`, use them only as bounded
-  advisory diagnostics; they never establish official success or select a candidate.
+  remote Judge diagnostics; they never run Lean locally, establish official success,
+  or select a candidate. The runner injects and owns their Judge capability and URL.
+- The Judge already provides Lean/Mathlib downloads, compilation, tests, and
+  verification; submit those operations through the runner-controlled interfaces
+  instead of doing them in the local worker environment.
 - Never execute local Lean/lake/elan, install or download Lean/Mathlib/toolchains,
   run a local verifier or proof search, perform resource-heavy computation, or
   start background or parallel processes. Never call raw Judge HTTP endpoints.

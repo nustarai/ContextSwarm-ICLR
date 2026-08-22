@@ -36,10 +36,14 @@ holds for all integers n ≥ N.
         ## Work Mode
 
         - Follow the mandatory execution and verification contract in the worker prompt.
-        - Treat this as offline proof construction. The sole checking exception is
-          `judge_check`, the experiment-provided controlled external Judge interface.
+        - Treat this as offline proof construction. All Lean execution belongs to the
+          controlled external Judge; `judge_check` is the sole authoritative interface.
         - If the manifest exposes `evaluate.py` or `formal_query`, use them only as bounded
-          advisory diagnostics; they never establish official success or select a candidate.
+          remote Judge diagnostics; they never run Lean locally, establish official success,
+          or select a candidate. The runner injects and owns their Judge capability and URL.
+        - The Judge already provides Lean/Mathlib downloads, compilation, tests, and
+          verification; submit those operations through the runner-controlled interfaces
+          instead of doing them in the local worker environment.
         - Never execute local Lean/lake/elan, install or download Lean/Mathlib/toolchains,
           run a local verifier or proof search, perform resource-heavy computation, or
           start background or parallel processes. Never call raw Judge HTTP endpoints.

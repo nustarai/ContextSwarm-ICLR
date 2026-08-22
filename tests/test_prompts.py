@@ -69,6 +69,12 @@ class PromptContractTests(unittest.TestCase):
         required_phrases = (
             "Use only `judge_check`",
             "`CONTEXTSWARM_JUDGE_URL` is reserved for that tool",
+            "Judge already owns the Lean/Mathlib toolchain",
+            "toolchain, downloads,",
+            "compilation, tests, and verification",
+            "runner-injected, session-scoped capability",
+            "mandatory early Judge checkpoint",
+            "Do not wait for a polished proof",
             "Never invoke local `lean`, `lake`, `elan`",
             "Do not install or download Lean, Mathlib",
             "start background, detached, or",
@@ -82,6 +88,13 @@ class PromptContractTests(unittest.TestCase):
                 for phrase in required_phrases:
                     self.assertIn(phrase, prompt)
                 self.assertIsNone(re.search(r"https?://", prompt))
+
+    def test_cps_early_judge_checkpoint_precedes_communication(self) -> None:
+        prompt = self._all_solver_prompts()["cps"]
+        self.assertLess(
+            prompt.index("mandatory early Judge checkpoint"),
+            prompt.index("Before trying a route, use `cps_search`"),
+        )
 
     def test_only_cps_prompt_exposes_controlled_communication_tools(self) -> None:
         prompts = self._all_solver_prompts()
