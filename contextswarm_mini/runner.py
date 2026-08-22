@@ -4797,9 +4797,13 @@ def _run_elastic_cps(
     # staged scheduler process result disappear without a terminal runner
     # failure being recorded.
     lifecycle_failure = check_scheduler_result_lifecycle()
+    # Preserve the runner's stable worker/admission failure contract when a
+    # worker already latched the fatal bit.  The lifecycle probe above still
+    # observes and reports orphaned staged rows in the no-worker-error case;
+    # it must not mask the primary failure with a secondary cleanup message.
+    callback_failure.raise_if_failed()
     if lifecycle_failure is not None:
         raise lifecycle_failure
-    callback_failure.raise_if_failed()
 
     seen_tasks = {verdict.task_id for _, verdict in results}
     for task in tasks:

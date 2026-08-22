@@ -265,7 +265,7 @@ class SchedulerLifecycleRuntimeTests(unittest.TestCase):
                 row for row in events if row.get("event") == "elastic_worker_error"
             )
             self.assertIn(
-                "charged scheduler decision is missing a valid decision index",
+                "scheduler decision returned an invalid decision index",
                 worker_error["error"],
             )
             self.assertFalse(

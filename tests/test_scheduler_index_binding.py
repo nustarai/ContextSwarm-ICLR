@@ -53,7 +53,12 @@ class SchedulerIndexBindingTests(unittest.TestCase):
         output = tempfile.TemporaryDirectory()
         self.addCleanup(output.cleanup)
         with patch.object(ReadOnlyLLMSchedulerPolicy, "choose", corrupt):
-            with self.assertRaisesRegex(RuntimeError, "allocation scheduler"):
+            # The runner exposes one stable worker/admission exception after
+            # latching the malformed-policy failure; the detailed cause is
+            # retained in the worker event below.
+            with self.assertRaisesRegex(
+                RuntimeError, "runner worker/admission failure"
+            ):
                 run_experiment(
                     self._config(),
                     mock_agent=True,
