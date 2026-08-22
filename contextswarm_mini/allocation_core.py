@@ -1024,6 +1024,7 @@ class ReadOnlyLLMSchedulerPolicy:
         invoke: LLMSchedulerInvoker,
         fallback_policy: TaskStateAllocationPolicy | None = None,
         *,
+        trace_weights: TraceScoreWeights = DEFAULT_TRACE_SCORE_WEIGHTS,
         prompt_max_bytes: int | None = None,
         max_prompt_bytes: int | None = None,
         llm_scheduler_prompt_max_bytes: int | None = None,
@@ -1035,6 +1036,14 @@ class ReadOnlyLLMSchedulerPolicy:
             raise TypeError("invoke must be callable")
         self._invoke = invoke
         self._fallback = fallback_policy or TaskStateAllocationPolicy()
+        if not isinstance(trace_weights, TraceScoreWeights):
+            raise TypeError("trace_weights must be TraceScoreWeights")
+        # The LLM arm's deterministic fallback is task-state selection, but
+        # its auditable task/trace score view must remain the same manifest-
+        # selected projection as Trace-State.  Keep that scorer immutable and
+        # tied to the fallback policy's task scorer so ordinary weights cannot
+        # drift between the two arms.
+        self._trace_scorer = TraceStateScorer(self._fallback.scorer, trace_weights)
         self._prompt_max_bytes = _resolve_prompt_bytes(
             prompt_max_bytes=prompt_max_bytes,
             max_prompt_bytes=max_prompt_bytes,
@@ -1230,9 +1239,8 @@ class ReadOnlyLLMSchedulerPolicy:
             fallback = self._fallback.choose(snapshot)
             selected = fallback.selected_task_id
             reason = "scheduler decision rejected; deterministic task-state fallback"
-        trace_scorer = TraceStateScorer(self._fallback.scorer)
-        task_scores = trace_scorer.task_scorer.score_snapshot(snapshot)
-        trace_increments = trace_scorer.increments(snapshot)
+        task_scores = self._trace_scorer.task_scorer.score_snapshot(snapshot)
+        trace_increments = self._trace_scorer.increments(snapshot)
         scores = {
             task_id: task_scores[task_id] + trace_increments[task_id]
             for task_id in task_scores
@@ -1293,6 +1301,7 @@ def create_allocation_policy(
         return ReadOnlyLLMSchedulerPolicy(
             llm_invoker,
             TaskStateAllocationPolicy(task_scorer),
+            trace_weights=trace_weights,
             prompt_max_bytes=prompt_max_bytes,
             max_prompt_bytes=max_prompt_bytes,
             llm_scheduler_prompt_max_bytes=llm_scheduler_prompt_max_bytes,

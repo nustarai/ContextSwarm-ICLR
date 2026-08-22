@@ -13,8 +13,10 @@ from contextswarm_mini.allocation_core import (
     TaskStateAllocationPolicy,
     TaskStateScorer,
     TraceFeatures,
+    TraceScoreWeights,
     TraceStateAllocationPolicy,
     UniformRefillAllocationPolicy,
+    create_allocation_policy,
     parse_llm_scheduler_output,
 )
 
@@ -159,6 +161,34 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertTrue(wrong_type.fallback)
         self.assertEqual(wrong_type.selected_task_id, "b")
         self.assertEqual(wrong_type.scheduler_cost.calls, 1)
+
+    def test_llm_fallback_audit_uses_manifest_trace_weights(self) -> None:
+        snap = snapshot(
+            task(
+                "a",
+                active=1,
+                trace=TraceFeatures(actionability=0.5, drag=0.25),
+            ),
+            task("b", active=0, checker_quality=0.9),
+        )
+        weights = TraceScoreWeights(
+            actionability=2.0,
+            evidence_association=0.0,
+            positive_feedback=0.0,
+            negative_feedback=0.0,
+            drag=0.5,
+        )
+        policy = create_allocation_policy(
+            "llm_scheduler",
+            trace_weights=weights,
+            llm_invoker=lambda _snapshot, _prompt: LLMSchedulerResponse("{}"),
+        )
+        decision = policy.choose(snap)
+        # Malformed LLM output takes the deterministic task-state selection
+        # path, while the emitted trace increment must still use `weights`.
+        self.assertTrue(decision.fallback)
+        self.assertEqual(decision.selected_task_id, "b")
+        self.assertAlmostEqual(decision.trace_increments["a"], 0.4375)
 
     def test_llm_does_not_call_without_admission_capacity(self) -> None:
         calls = []
