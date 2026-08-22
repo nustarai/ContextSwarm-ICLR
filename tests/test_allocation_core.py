@@ -178,6 +178,18 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(decision.scheduler_cost.calls, 1)
         self.assertIn("invalid response", decision.fallback_reason)
 
+    def test_llm_horizon_truncation_is_not_a_policy_fallback(self) -> None:
+        snap = snapshot(task("a", checker_quality=0.1), task("b", checker_quality=0.9))
+        decision = ReadOnlyLLMSchedulerPolicy(
+            lambda _current, _prompt: LLMSchedulerResponse(
+                "", returncode=124, timed_out=True, run_horizon_reached=True
+            )
+        ).choose(snap)
+        self.assertTrue(decision.agent_run_horizon_reached)
+        self.assertFalse(decision.fallback)
+        self.assertEqual(decision.selected_task_id, "")
+        self.assertEqual(decision.scheduler_cost.calls, 1)
+
     def test_llm_can_use_its_owned_scheduler_reservation(self) -> None:
         calls = []
         snap = AllocationStateSnapshot(

@@ -202,8 +202,11 @@ class Figure4RuntimeTests(unittest.TestCase):
             (run_dir / "elastic_scheduler_state.json").read_text(encoding="utf-8")
         )
         self.assertEqual(scheduler_state["reservation_slots"], 0)
+        self.assertEqual(scheduler_state["occupied_slots"], 0)
         final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
         self.assertNotIn("runner_or_worker_error", final["health"]["issues"])
+        self.assertNotIn("scheduler_reservations_not_released", final["health"]["issues"])
+        self.assertNotIn("scheduler_occupied_slots_not_released", final["health"]["issues"])
 
     def test_llm_global_state_change_is_stale_and_not_admitted(self) -> None:
         original_choose = ReadOnlyLLMSchedulerPolicy.choose

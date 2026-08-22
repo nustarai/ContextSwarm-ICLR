@@ -542,6 +542,11 @@ class LLMSchedulerResponse:
     latency_seconds: float = 0.0
     reservation_slots: int = 1
     occupied_slot_seconds: float | None = None
+    # True means the provider call was truncated by the fixed experiment
+    # horizon (as opposed to an ordinary provider timeout).  The runner uses
+    # this bit to record ``not_admitted_horizon`` without charging a
+    # deterministic policy fallback or admitting a late assignment.
+    run_horizon_reached: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.output, str):
@@ -550,6 +555,8 @@ class LLMSchedulerResponse:
             raise ValueError("returncode must be an integer")
         if not isinstance(self.timed_out, bool):
             raise ValueError("timed_out must be a boolean")
+        if not isinstance(self.run_horizon_reached, bool):
+            raise ValueError("run_horizon_reached must be a boolean")
         LLMSchedulerCost(
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
@@ -588,12 +595,17 @@ class AllocationDecision:
     fallback: bool = False
     fallback_reason: str = ""
     scheduler_cost: LLMSchedulerCost | None = None
+    # Kept in the legacy runner's terminology so the adapter can propagate a
+    # horizon-truncated scheduler result without manufacturing a fallback.
+    agent_run_horizon_reached: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scores", _immutable_scores(self.scores))
         object.__setattr__(self, "task_scores", _immutable_scores(self.task_scores))
         object.__setattr__(self, "trace_increments", _immutable_scores(self.trace_increments))
         object.__setattr__(self, "trace_reference_ids", tuple(self.trace_reference_ids))
+        if not isinstance(self.agent_run_horizon_reached, bool):
+            raise ValueError("agent_run_horizon_reached must be a boolean")
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -610,6 +622,7 @@ class AllocationDecision:
             "trace_reference_ids": list(self.trace_reference_ids),
             "fallback": self.fallback,
             "fallback_reason": self.fallback_reason,
+            "agent_run_horizon_reached": self.agent_run_horizon_reached,
             "scheduler_cost": self.scheduler_cost.public_dict() if self.scheduler_cost else None,
         }
 
@@ -807,6 +820,21 @@ class ReadOnlyLLMSchedulerPolicy:
                 "",
                 returncode=1,
                 latency_seconds=max(0.0, time.monotonic() - started),
+            )
+        # A call that crossed the fixed experiment horizon is a lifecycle
+        # truncation, not a malformed model decision.  Preserve its one-call
+        # cost, but do not invoke the deterministic fallback: the runner will
+        # release the reservation and record ``not_admitted_horizon``.
+        if response.run_horizon_reached:
+            return AllocationDecision(
+                decision_id=snapshot.decision_id,
+                state_id=snapshot.state_id,
+                decision_index=snapshot.decision_index,
+                policy=self.name,
+                selected_task_id="",
+                reason="scheduler call was truncated by the fixed run horizon",
+                scheduler_cost=response.cost,
+                agent_run_horizon_reached=True,
             )
         error = invocation_error
         selected = ""

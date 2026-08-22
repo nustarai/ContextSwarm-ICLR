@@ -1365,6 +1365,9 @@ def _legacy_decision_from_core(core: Any) -> AllocationDecision:
                       "trace_increment": float(core.trace_increments.get(task_id, 0.0))}
             for task_id in core.scores
         },
+        agent_run_horizon_reached=bool(
+            getattr(core, "agent_run_horizon_reached", False)
+        ),
     )
 
 
@@ -2454,18 +2457,23 @@ def _run_elastic_cps(
         else:
             workdir = run_dir / "allocation_scheduler" / f"decision-{snapshot.decision_index:06d}"
             workdir.mkdir(parents=True, exist_ok=True)
+            policy_deadline = time.monotonic() + config.allocation.agent_timeout_seconds
+            scheduler_deadline = min(deadline, policy_deadline)
+            run_horizon_is_limiter = deadline <= policy_deadline
             result = pi_agent.run(
                 task_id="__allocation__",
                 actor_id=actor_id,
                 episode=snapshot.decision_index,
                 prompt=prompt,
                 workdir=workdir,
-                deadline_monotonic=min(
-                    deadline,
-                    time.monotonic() + config.allocation.agent_timeout_seconds,
-                ),
+                deadline_monotonic=scheduler_deadline,
                 isolated=True,
                 cancel_event=run_cancel_event,
+            )
+            result.run_horizon_reached = bool(
+                result.timed_out
+                and run_horizon_is_limiter
+                and time.monotonic() >= deadline
             )
         result.decision_index = snapshot.decision_index
         with scheduler_results_lock:
@@ -2478,6 +2486,7 @@ def _run_elastic_cps(
             timed_out=result.timed_out,
             latency_seconds=latency,
             occupied_slot_seconds=latency,
+            run_horizon_reached=result.run_horizon_reached,
         )
 
     core_decisions: dict[int, tuple[AllocationStateSnapshot, Any]] = {}
@@ -4859,6 +4868,9 @@ def _run_health(
     scheduler_fallbacks = 0
     scheduler_summary_agent_calls: int | None = None
     scheduler_active_slots: int | None = None
+    scheduler_reservation_slots: int | None = None
+    scheduler_occupied_slots: int | None = None
+    scheduler_remaining_slots: int | None = None
     if config.uses_cps:
         decisions, decisions_valid = _read_jsonl_objects(
             run_dir / "allocation_decisions.jsonl"
@@ -4951,6 +4963,9 @@ def _run_health(
                 (run_dir / "elastic_scheduler_state.json").read_text(encoding="utf-8")
             )
             scheduler_active_slots = int(scheduler_state["active_slots"])
+            scheduler_reservation_slots = int(scheduler_state["reservation_slots"])
+            scheduler_occupied_slots = int(scheduler_state["occupied_slots"])
+            scheduler_remaining_slots = int(scheduler_state["remaining_slots"])
             task_rows = scheduler_state.get("tasks") or {}
             if scheduler_active_slots != 0 or any(
                 int(row.get("active_agents") or 0) != 0
@@ -4958,6 +4973,16 @@ def _run_health(
                 if isinstance(row, Mapping)
             ):
                 issues.add("scheduler_not_closed")
+            # A scheduler reservation is physical capacity, even while no
+            # solver lease is active.  A successful closeout therefore proves
+            # both ledgers are empty; otherwise an orphaned reservation could
+            # silently reduce refill capacity or contaminate a paired arm.
+            if scheduler_reservation_slots != 0:
+                issues.add("scheduler_reservations_not_released")
+            if scheduler_occupied_slots != 0:
+                issues.add("scheduler_occupied_slots_not_released")
+            if scheduler_remaining_slots < 0:
+                issues.add("scheduler_capacity_invalid")
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             issues.add("scheduler_state_invalid_or_missing")
 
@@ -4991,6 +5016,9 @@ def _run_health(
         "finished_count": finished_count,
         "evaluated_count": evaluated_count,
         "scheduler_active_slots": scheduler_active_slots,
+        "scheduler_reservation_slots": scheduler_reservation_slots,
+        "scheduler_occupied_slots": scheduler_occupied_slots,
+        "scheduler_remaining_slots": scheduler_remaining_slots,
     }
 
 
