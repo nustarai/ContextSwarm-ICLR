@@ -99,15 +99,21 @@ class TraceProjectionSnapshotPage:
     reference_time: float | None = None
 
     def __post_init__(self) -> None:
-        watermark = str(self.trace_watermark or "").strip()
+        if not isinstance(self.trace_watermark, str):
+            raise ValueError("trace_watermark must be a string")
+        watermark = self.trace_watermark.strip()
         if not watermark or len(watermark) > 512:
             raise ValueError("trace_watermark must be non-empty and bounded")
         object.__setattr__(self, "trace_watermark", watermark)
-        cursor = str(self.next_cursor or "").strip()
+        if not isinstance(self.next_cursor, str):
+            raise ValueError("next_cursor must be a string")
+        cursor = self.next_cursor.strip()
         if len(cursor) > 512:
             raise ValueError("next_cursor must be at most 512 characters")
         object.__setattr__(self, "next_cursor", cursor)
-        snapshot_id = str(self.snapshot_id or "").strip()
+        if not isinstance(self.snapshot_id, str):
+            raise ValueError("snapshot_id must be a string")
+        snapshot_id = self.snapshot_id.strip()
         if len(snapshot_id) > 512:
             raise ValueError("snapshot_id must be at most 512 characters")
         object.__setattr__(self, "snapshot_id", snapshot_id)
@@ -174,6 +180,19 @@ def _snapshot_identity(
 ) -> str:
     """Hash only the bounded projection contract, never raw source metadata."""
 
+    if trace_watermark is not None and not isinstance(trace_watermark, str):
+        raise ValueError("trace_watermark must be a string")
+    if snapshot_id is not None and not isinstance(snapshot_id, str):
+        raise ValueError("snapshot_id must be a string")
+    if source_watermark is not None and (
+        isinstance(source_watermark, bool)
+        or not isinstance(source_watermark, (int, str))
+    ):
+        raise ValueError("source_watermark must be a bounded scalar")
+    ordinary_ids = _bounded_opaque_ids(
+        ordinary_outcome_ids, name="ordinary_outcome_id"
+    )
+
     # Keep this list deliberately explicit.  These are the scalar fields that
     # can affect the bounded allocator projection, including the newer
     # full-current-state topology fields.  Query/payload/body fields must
@@ -198,11 +217,9 @@ def _snapshot_identity(
             "source_watermark": (
                 None if source_watermark is None else str(source_watermark)
             ),
-            "snapshot_id": str(snapshot_id or "")[:512],
+            "snapshot_id": snapshot_id.strip()[:512],
             "reference_time": reference_time,
-            "ordinary_outcome_ids": sorted(
-                {str(value).strip() for value in ordinary_outcome_ids if str(value).strip()}
-            ),
+            "ordinary_outcome_ids": list(ordinary_ids),
             "records": normalized,
         }
     )
@@ -377,6 +394,22 @@ def _ordered_task_ids(task_ids: Iterable[str], *, maximum: int) -> tuple[str, ..
         seen.add(task_id)
         result.append(task_id)
     return tuple(result)
+
+
+def _bounded_opaque_ids(values: Iterable[str], *, name: str) -> tuple[str, ...]:
+    """Validate opaque identity inputs without lossy ``str(...)`` coercion."""
+
+    result: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"{name} values must be strings")
+        normalized = value.strip()
+        if not normalized:
+            continue
+        if len(normalized) > 512:
+            raise ValueError(f"{name} values must be bounded")
+        result.add(normalized)
+    return tuple(sorted(result))
 
 
 def _canonical_sha(value: Any) -> str:
@@ -630,7 +663,9 @@ class SelectionRuntimeTraceSource:
         records, watermark = self._source.read_complete_records(task_ids)
         if len(records) > limit:
             raise OverflowError("selection projection exceeds the requested bound")
-        if as_of_watermark is not None and str(as_of_watermark) != watermark:
+        if as_of_watermark is not None and (
+            not isinstance(as_of_watermark, str) or as_of_watermark != watermark
+        ):
             raise ValueError("requested selection projection snapshot is no longer available")
         return TraceProjectionSnapshotPage(
             records=records,
@@ -767,7 +802,9 @@ def _trace_references(
     ordinary_outcome_ids: Iterable[str] = (),
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
     by_task: dict[str, set[str]] = {task_id: set() for task_id in task_ids}
-    ordinary = {str(value).strip() for value in ordinary_outcome_ids if str(value).strip()}
+    ordinary = set(
+        _bounded_opaque_ids(ordinary_outcome_ids, name="ordinary_outcome_id")
+    )
     for record in records:
         task_id = _record_task_id(record)
         trace_id = _record_trace_id(record)
@@ -954,9 +991,12 @@ class TraceProjectionBridge:
                 return self.zero(ordered, reason="invalid_reference_time")
             if not math.isfinite(reference_time):
                 return self.zero(ordered, reason="invalid_reference_time")
-        ordinary_ids = tuple(
-            sorted({str(value).strip() for value in ordinary_outcome_ids if str(value).strip()})
-        )
+        try:
+            ordinary_ids = _bounded_opaque_ids(
+                ordinary_outcome_ids, name="ordinary_outcome_id"
+            )
+        except (TypeError, ValueError):
+            return self.zero(ordered, reason="invalid_ordinary_outcome_id")
         if self.synthetic_features is not None:
             selected = {task_id: self.synthetic_features.get(task_id, {}) for task_id in ordered}
             batch = build_synthetic_trace_projection(selected)
@@ -1107,7 +1147,7 @@ class TraceProjectionBridge:
                     raw_batch.records,
                     ordinary_outcome_ids=ordinary_ids,
                     source_watermark=raw_batch.watermark,
-                    snapshot_id=str(getattr(raw_batch, "snapshot_id", "") or ""),
+                    snapshot_id=getattr(raw_batch, "snapshot_id", ""),
                     reference_time=reference_time,
                 )
                 if batch.truncated:
@@ -1119,7 +1159,7 @@ class TraceProjectionBridge:
                         raw_batch.watermark,
                         raw_batch.records,
                         ordinary_ids,
-                        snapshot_id=str(getattr(raw_batch, "snapshot_id", "") or ""),
+                        snapshot_id=getattr(raw_batch, "snapshot_id", ""),
                         reference_time=reference_time,
                         trace_watermark=str(raw_batch.watermark),
                     ),

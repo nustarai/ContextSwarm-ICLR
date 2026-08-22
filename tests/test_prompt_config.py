@@ -49,6 +49,27 @@ class PromptConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(ConfigError, "must be positive"):
                     self._load(f"{key} = 0\n")
 
+    def test_trace_density_components_are_manifest_owned_and_drag_alias_is_canonicalized(self) -> None:
+        config = self._load()
+        self.assertIn(
+            "duplicate_component_weight", config.allocation.trace_state
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "legacy-drag.toml"
+            path.write_text(
+                f'extends = ["{ROOT / "configs" / "smoke.toml"}"]\n'
+                "\n[experiment]\nmode = \"cps\"\ncommunication = \"blackboard\"\n"
+                "max_parallel = 1\ninitial_agents_per_task = 1\nmax_tasks = 1\n"
+                "episodes_per_task = 1\ntime_limit_seconds = 1\n"
+                "\n[allocation]\npolicy = \"trace_state\"\n"
+                "[allocation.trace_state]\ndrag = 2.0\n",
+                encoding="utf-8",
+            )
+            legacy = load_config(path, ROOT)
+        self.assertEqual(legacy.allocation.trace_state["density_penalty_weight"], 2.0)
+        self.assertNotIn("drag", legacy.allocation.trace_state)
+
     def test_runner_passes_manifest_bounds_to_llm_policy(self) -> None:
         config = self._load(
             "prompt_max_bytes = 4096\nprompt_max_tokens = 2048\n"

@@ -162,6 +162,15 @@ class SchedulerLifecycleRuntimeTests(unittest.TestCase):
         first = min(final["allocation_scheduler_agents"], key=lambda row: int(row["decision_index"]))
         self.assertTrue(first["recoverable_invocation_error"])
         self.assertEqual(first["command"], ["<scheduler-invocation-failed>"])
+        first_decision = min(
+            (
+                row
+                for row in _rows(run_dir / "allocation_decisions.jsonl")
+                if row.get("scheduler_cost") is not None
+            ),
+            key=lambda row: int(row["decision_index"]),
+        )
+        self.assertFalse(first_decision["agent_result_valid"])
 
     def test_invalid_invoker_type_is_recoverable_and_joined(self) -> None:
         run_dir = self._run_first_invocation_failure(lambda *_args: object())
@@ -271,3 +280,26 @@ class SchedulerLifecycleRuntimeTests(unittest.TestCase):
             self.assertFalse(
                 any(row.get("event") == "allocation_scheduler_finished" for row in events)
             )
+
+    def test_charged_scheduler_call_id_must_match_decision_identity(self) -> None:
+        original_choose = ReadOnlyLLMSchedulerPolicy.choose
+
+        def forged_call_id(policy, snapshot):
+            decision = original_choose(policy, snapshot)
+            object.__setattr__(decision, "scheduler_call_id", "forged-call")
+            return decision
+
+        base = load_config("configs/smoke.toml", ROOT)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(ReadOnlyLLMSchedulerPolicy, "choose", forged_call_id):
+                run_dir = run_experiment(
+                    _llm_config(base),
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+            final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+
+        health = final["health"]
+        self.assertFalse(health["ok"])
+        self.assertIn("allocation_scheduler_closeout_mismatch", health["issues"])
+        self.assertGreater(health["allocation_scheduler_call_id_error_count"], 0)

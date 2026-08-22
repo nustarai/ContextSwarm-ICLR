@@ -73,6 +73,15 @@ I_trace(q) = (wA*A_q + wV*V_q + wPlus*Fplus_q
 U_trace(q) = U_task(q) + I_trace(q)
 ```
 
+The development manifest spells the density coefficients out as
+`duplicate_component_weight`, `refutation_component_weight`,
+`staleness_component_weight`, and `lineage_stagnation_component_weight`, with
+`density_penalty_weight` multiplying their sum. The older `drag` spelling is
+accepted only as a compatibility alias and is canonicalized before a run
+identity is hashed. Projection adapters expose the four normalized values
+individually; the historical aggregate `drag` field is retained solely for
+older callers and is never added a second time.
+
 `A` is frontier value, `V` is evidence association, and `Fplus`/`Fminus`
 are positive/negative feedback normalized by trace exposure.  `D` combines
 duplication, refutation, staleness, and lineage stagnation.  Every `v`, `w`,

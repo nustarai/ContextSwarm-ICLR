@@ -18,6 +18,7 @@ from contextswarm_mini.allocation_core import (
     TaskScoreWeights,
     TraceFeatures,
     TraceScoreWeights,
+    TraceStateScorer,
     TraceStateAllocationPolicy,
     UniformRefillAllocationPolicy,
     create_allocation_policy,
@@ -163,6 +164,14 @@ class AllocationCoreTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 self.scheduler_decision(**values)
 
+    def test_scheduler_call_id_is_bounded_and_bound_to_decision(self) -> None:
+        with self.assertRaisesRegex(ValueError, "scheduler_call_id must equal decision_id"):
+            self.scheduler_decision(scheduler_call_id="another-decision")
+        with self.assertRaisesRegex(ValueError, "scheduler_call_id must be a string"):
+            self.scheduler_decision(scheduler_call_id=123)  # type: ignore[arg-type]
+        with self.assertRaisesRegex(ValueError, "scheduler_call_id contains control"):
+            self.scheduler_decision(scheduler_call_id="decision-1\n")
+
     def test_uniform_refill_uses_live_count_and_lexical_tie(self) -> None:
         first = snapshot(task("z"), task("a"), free=1)
         second = snapshot(task("a"), task("z"), free=1)
@@ -198,6 +207,56 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(task_decision.selected_task_id, trace_decision.selected_task_id)
         self.assertEqual(dict(task_decision.scores), dict(trace_decision.scores))
         self.assertEqual(dict(trace_decision.trace_increments), {"a": 0.0, "b": 0.0})
+
+    def test_trace_drag_components_follow_registered_density_formula(self) -> None:
+        trace = TraceFeatures(
+            actionability=0.8,
+            evidence_association=0.3,
+            positive_feedback=0.2,
+            negative_feedback=0.1,
+            duplication=0.05,
+            refutation=0.02,
+            staleness=0.02,
+            lineage_stagnation=0.01,
+        )
+        task_state = task("a", active=1, trace=trace)
+        weights = TraceScoreWeights.from_mapping(
+            {
+                "actionability": 1.0,
+                "evidence_association": 1.0,
+                "positive_feedback": 1.0,
+                "negative_feedback": 1.0,
+                "density_penalty_weight": 1.0,
+                "duplicate_component_weight": 1.0,
+                "refutation_component_weight": 1.0,
+                "staleness_component_weight": 1.0,
+                "lineage_stagnation_component_weight": 1.0,
+            }
+        )
+        expected = (0.8 + 0.3 + 0.2 - 0.1 - (0.05 + 0.02 + 0.02 + 0.01)) / 2.0
+        self.assertAlmostEqual(
+            TraceStateScorer(weights=weights).trace_increment(task_state), expected
+        )
+        # A legacy aggregate must not be added on top of the four components.
+        legacy_drag = TraceFeatures(
+            actionability=0.8,
+            evidence_association=0.3,
+            positive_feedback=0.2,
+            negative_feedback=0.1,
+            drag=0.5,
+        )
+        self.assertAlmostEqual(
+            TraceStateScorer(weights=weights).trace_increment(
+                task("legacy", active=1, trace=legacy_drag)
+            ),
+            (0.8 + 0.3 + 0.2 - 0.1 - 0.5) / 2.0,
+        )
+
+    def test_trace_weight_aliases_cannot_disagree(self) -> None:
+        with self.assertRaisesRegex(ValueError, "contradict"):
+            TraceScoreWeights.from_mapping(
+                {"drag": 1.0, "density_penalty_weight": 2.0}
+            )
 
     def test_canonical_policies_fail_closed_at_capacity_and_horizon(self) -> None:
         # Deterministic arms must not manufacture a task when no physical

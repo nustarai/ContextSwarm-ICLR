@@ -40,12 +40,25 @@ actionability = 1.0
 evidence_association = 1.0
 positive_feedback = 1.0
 negative_feedback = 1.0
-drag = 1.0
+density_penalty_weight = 1.0
+duplicate_component_weight = 1.0
+refutation_component_weight = 1.0
+staleness_component_weight = 1.0
+lineage_stagnation_component_weight = 1.0
 
 [allocation.normalization]
 progress_window_seconds = 600.0
 starvation_window_seconds = 600.0
 failure_saturation = 3.0
+frontier_saturation = 4.0
+association_saturation = 4.0
+feedback_exposure_floor = 1.0
+duplicate_saturation = 4.0
+refutation_saturation = 4.0
+staleness_saturation = 4.0
+lineage_stagnation_saturation = 4.0
+staleness_window_seconds = 600.0
+lineage_stagnation_window_seconds = 600.0
 
 [pi]
 timeout_seconds = 180

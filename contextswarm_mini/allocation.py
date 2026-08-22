@@ -74,6 +74,10 @@ class TaskProgress:
     strategy_piece_count: int
     duplicate_piece_count: int
     recent_pieces: tuple[EvidencePiece, ...] = ()
+    # Stable Judge/verifier receipt identities are ordinary task outcomes.
+    # They are carried separately from trace pieces so a projection bridge can
+    # exclude an association that merely repeats checker state.
+    checker_outcome_ids: tuple[str, ...] = ()
 
     def causal_fingerprint(self) -> tuple[Any, ...]:
         """State whose change can invalidate a decision about this task.
@@ -104,6 +108,7 @@ class TaskProgress:
             self.validation_piece_count,
             self.strategy_piece_count,
             self.duplicate_piece_count,
+            tuple(sorted(self.checker_outcome_ids)),
             pieces,
         )
 
@@ -127,6 +132,7 @@ class TaskProgress:
             "strategy_piece_count": self.strategy_piece_count,
             "duplicate_piece_count": self.duplicate_piece_count,
             "recent_pieces": [piece.as_dict() for piece in self.recent_pieces],
+            "checker_outcome_ids": list(self.checker_outcome_ids),
         }
 
 

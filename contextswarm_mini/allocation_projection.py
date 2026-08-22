@@ -12,7 +12,7 @@ to the task-state score and must not be counted again here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timezone
 import math
 from types import MappingProxyType
@@ -125,6 +125,22 @@ def _text(value: Any, *, limit: int = 256) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _opaque_ids(values: Iterable[str], *, name: str) -> frozenset[str]:
+    """Normalize already-typed opaque IDs without accepting lossy aliases."""
+
+    result: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"{name} values must be strings")
+        normalized = value.strip()
+        if not normalized:
+            continue
+        if len(normalized) > 512:
+            raise ValueError(f"{name} values must be bounded")
+        result.add(normalized)
+    return frozenset(result)
+
+
 def _kind(value: Any) -> str:
     return _text(value, limit=64).lower().replace("-", "_").replace(" ", "_")
 
@@ -207,6 +223,16 @@ class TraceProjectionLimits:
     feedback_trust_default: float = 1.0
     feedback_values: Mapping[str, float] | None = None
     require_feedback_mapping: bool = False
+    # Optional age threshold for a current-state stale component.  Explicit
+    # stale lifecycle rows remain authoritative; the threshold is only used
+    # when a source supplies timestamps and no lifecycle decision.
+    staleness_window_seconds: float = 600.0
+    # Component-specific saturations are appended at the end so every
+    # historical positional constructor remains valid.
+    duplicate_saturation: int = 4
+    refutation_saturation: int = 4
+    staleness_saturation: int = 4
+    lineage_stagnation_saturation: int = 4
 
     def __post_init__(self) -> None:
         for name in (
@@ -216,8 +242,13 @@ class TraceProjectionLimits:
             "actionability_saturation",
             "association_saturation",
             "drag_saturation",
+            "duplicate_saturation",
+            "refutation_saturation",
+            "staleness_saturation",
+            "lineage_stagnation_saturation",
         ):
-            if getattr(self, name) <= 0:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be positive")
         for name in (
             "duplicate_weight",
@@ -232,6 +263,9 @@ class TraceProjectionLimits:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        stale_window = float(self.staleness_window_seconds)
+        if not math.isfinite(stale_window) or stale_window <= 0:
+            raise ValueError("staleness_window_seconds must be finite and positive")
         kappa = float(self.feedback_kappa)
         if not math.isfinite(kappa) or kappa < 0:
             raise ValueError("feedback_kappa must be finite and non-negative")
@@ -257,6 +291,7 @@ class TraceProjectionLimits:
         object.__setattr__(self, "stagnation_window_seconds", float(self.stagnation_window_seconds))
         object.__setattr__(self, "feedback_kappa", float(self.feedback_kappa))
         object.__setattr__(self, "feedback_trust_default", float(self.feedback_trust_default))
+        object.__setattr__(self, "staleness_window_seconds", stale_window)
         object.__setattr__(self, "feedback_values", {
             _kind(key): float(raw) for key, raw in mapping.items()
         })
@@ -446,9 +481,11 @@ class TraceProjectionRecordBatch:
             raise ValueError("watermark must not be negative")
         if not isinstance(self.complete, bool):
             raise ValueError("complete must be a boolean")
-        if len(str(self.snapshot_id or "")) > 512:
+        if not isinstance(self.snapshot_id, str):
+            raise ValueError("snapshot_id must be a string")
+        if len(self.snapshot_id.strip()) > 512:
             raise ValueError("snapshot_id must be at most 512 characters")
-        object.__setattr__(self, "snapshot_id", str(self.snapshot_id or "").strip())
+        object.__setattr__(self, "snapshot_id", self.snapshot_id.strip())
 
 
 @runtime_checkable
@@ -467,10 +504,12 @@ class TraceProjectionSource(Protocol):
 
 @dataclass(frozen=True)
 class TraceAllocationProjection:
-    """Immutable five-feature trace increment for one task.
+    """Immutable trace-feature projection for one task.
 
-    The first five fields are the public allocation interface.  Counts are
-    bounded audit diagnostics and never need to be consumed by the scorer.
+    The historical first five fields remain the compatibility allocation
+    interface.  New adapters additionally populate the four explicit density
+    components at the end of the record; aggregate ``drag`` is retained for
+    old consumers and is never added to a component-aware score.
     """
 
     task_id: str
@@ -501,6 +540,14 @@ class TraceAllocationProjection:
     drag_refutation_proportion: float = 0.0
     drag_stale_proportion: float = 0.0
     drag_stagnation_proportion: float = 0.0
+    # ``None`` means the projection was constructed through the legacy
+    # aggregate-only API.  Adapter-produced projections pass all four values,
+    # including zero, so the core can distinguish the two formulas.
+    duplication: float | None = None
+    refutation: float | None = None
+    staleness: float | None = None
+    lineage_stagnation: float | None = None
+    _component_mode: bool = dataclass_field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not self.task_id:
@@ -544,23 +591,60 @@ class TraceAllocationProjection:
                 raise ValueError(f"{name} must be finite and non-negative")
             if name.startswith("drag_") and value > 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
-        if len(self.source_outcome_ids) != len(set(self.source_outcome_ids)):
+        component_mode = False
+        for name in (
+            "duplication",
+            "refutation",
+            "staleness",
+            "lineage_stagnation",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                component_mode = True
+                value = _unit(value)
+            else:
+                value = 0.0
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_component_mode", component_mode)
+        if not isinstance(self.source_outcome_ids, (tuple, list)):
+            raise ValueError("source_outcome_ids must be a tuple or list of strings")
+        normalized_outcomes: list[str] = []
+        for value in self.source_outcome_ids:
+            if not isinstance(value, str) or not value.strip() or len(value.strip()) > 512:
+                raise ValueError("source_outcome_ids must contain bounded strings")
+            normalized_outcomes.append(value.strip())
+        if len(normalized_outcomes) != len(set(normalized_outcomes)):
             raise ValueError("source_outcome_ids must be unique")
+        object.__setattr__(self, "source_outcome_ids", tuple(normalized_outcomes))
 
     @property
     def is_zero(self) -> bool:
         return all(value == 0.0 for value in self.as_core_kwargs().values())
 
+    @property
+    def uses_drag_components(self) -> bool:
+        return self._component_mode
+
     def as_core_kwargs(self) -> dict[str, float]:
         """Return exactly the fields accepted by the allocation core."""
 
-        return {
+        result = {
             "actionability": self.actionability,
             "evidence_association": self.evidence_association,
             "positive_feedback": self.positive_feedback,
             "negative_feedback": self.negative_feedback,
             "drag": self.drag,
         }
+        if self._component_mode:
+            result.update(
+                {
+                    "duplication": self.duplication,
+                    "refutation": self.refutation,
+                    "staleness": self.staleness,
+                    "lineage_stagnation": self.lineage_stagnation,
+                }
+            )
+        return result
 
 
 @dataclass(frozen=True)
@@ -586,9 +670,11 @@ class TraceAllocationProjectionBatch:
             raise ValueError("records_used must not exceed records_seen")
         if not isinstance(self.complete, bool):
             raise ValueError("complete must be a boolean")
-        if len(str(self.snapshot_id or "")) > 512:
+        if not isinstance(self.snapshot_id, str):
+            raise ValueError("snapshot_id must be a string")
+        if len(self.snapshot_id.strip()) > 512:
             raise ValueError("snapshot_id must be at most 512 characters")
-        object.__setattr__(self, "snapshot_id", str(self.snapshot_id or "").strip())
+        object.__setattr__(self, "snapshot_id", self.snapshot_id.strip())
 
     def for_task(self, task_id: str) -> TraceAllocationProjection:
         for projection in self.projections:
@@ -734,9 +820,17 @@ class TraceAllocationProjectionAdapter:
         closed rather than call this method with a partial page.
         """
 
+        if not isinstance(snapshot_id, str):
+            raise ValueError("snapshot_id must be a string")
+        if source_watermark is not None and (
+            isinstance(source_watermark, bool)
+            or not isinstance(source_watermark, (int, str))
+        ):
+            raise ValueError("source_watermark must be a bounded scalar")
+
         ordered = _bounded_task_ids(task_ids, self.limits.max_tasks)
-        ordinary_ids = frozenset(
-            _text(value) for value in ordinary_outcome_ids if _text(value)
+        ordinary_ids = _opaque_ids(
+            ordinary_outcome_ids, name="ordinary_outcome_id"
         )
         converted: list[TraceProjectionRecord] = []
         for index, item in enumerate(records, start=1):
@@ -806,7 +900,7 @@ class TraceAllocationProjectionAdapter:
             records_used=used,
             truncated=False,
             complete=True,
-            snapshot_id=str(snapshot_id or source_watermark or "").strip(),
+            snapshot_id=(snapshot_id.strip() or (str(source_watermark) if source_watermark is not None else "")),
         )
 
     @staticmethod
@@ -1238,6 +1332,10 @@ class TraceAllocationProjectionAdapter:
             drag_refutation_proportion=refutation_prop,
             drag_stale_proportion=stale_prop,
             drag_stagnation_proportion=stagnation_prop,
+            duplication=duplicate_prop,
+            refutation=refutation_prop,
+            staleness=stale_prop,
+            lineage_stagnation=stagnation_prop,
         )
 
     def project_records(
@@ -1251,9 +1349,15 @@ class TraceAllocationProjectionAdapter:
     ) -> TraceAllocationProjectionBatch:
         if after_watermark < 0:
             raise ValueError("after_watermark must not be negative")
+        if source_watermark is not None and (
+            isinstance(source_watermark, bool) or not isinstance(source_watermark, int)
+        ):
+            raise ValueError("source_watermark must be a non-negative integer")
         ordered = _bounded_task_ids(task_ids, self.limits.max_tasks)
         allowed = frozenset(ordered)
-        ordinary_ids = frozenset(_text(value) for value in ordinary_outcome_ids if _text(value))
+        ordinary_ids = _opaque_ids(
+            ordinary_outcome_ids, name="ordinary_outcome_id"
+        )
         converted_list: list[TraceProjectionRecord] = []
         for index, item in enumerate(records, start=1):
             record = _record(item)
@@ -1416,6 +1520,18 @@ class TraceAllocationProjectionAdapter:
         stale_count = len(acc.stale)
         stagnation_count = len(acc.stagnation)
         drag_count = duplicate_count + refutation_count + stale_count + stagnation_count
+        duplication = _unit(
+            duplicate_count / self.limits.duplicate_saturation
+        )
+        refutation = _unit(
+            refutation_count / self.limits.refutation_saturation
+        )
+        staleness = _unit(
+            stale_count / self.limits.staleness_saturation
+        )
+        lineage_stagnation = _unit(
+            stagnation_count / self.limits.lineage_stagnation_saturation
+        )
         weighted_drag = (
             self.limits.duplicate_weight * duplicate_count
             + self.limits.refutation_weight * refutation_count
@@ -1449,6 +1565,10 @@ class TraceAllocationProjectionAdapter:
             watermark=watermark,
             source_outcome_ids=source_outcome_ids,
             zero_reason="no_trace_increment" if feature_zero else "",
+            duplication=duplication,
+            refutation=refutation,
+            staleness=staleness,
+            lineage_stagnation=lineage_stagnation,
         )
 
 
@@ -1508,6 +1628,10 @@ def build_synthetic_trace_projection(
         "positive_feedback",
         "negative_feedback",
         "drag",
+        "duplication",
+        "refutation",
+        "staleness",
+        "lineage_stagnation",
         "frontier_count",
         "association_count",
         "feedback_exposure_count",
@@ -1532,6 +1656,16 @@ def build_synthetic_trace_projection(
                 "drag",
             )
         }
+        component_fields = {
+            name: _unit(raw.get(name, 0.0))
+            for name in (
+                "duplication",
+                "refutation",
+                "staleness",
+                "lineage_stagnation",
+            )
+            if name in raw
+        }
         count_fields = {
             name: _nonnegative_int(raw.get(name, 0))
             for name in allowed
@@ -1541,6 +1675,7 @@ def build_synthetic_trace_projection(
             TraceAllocationProjection(
                 task_id=_text(task_id),
                 **unit_fields,
+                **component_fields,
                 **count_fields,
                 watermark=watermark,
                 zero_reason=(

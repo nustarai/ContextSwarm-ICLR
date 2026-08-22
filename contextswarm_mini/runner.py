@@ -57,6 +57,7 @@ from .allocation_audit import (
 from .allocation_trace_bridge import (
     AllocationTraceView,
     TraceProjectionBridge,
+    TraceProjectionLimits,
     feedback_values_from_config,
     policy_reads_trace,
 )
@@ -680,6 +681,7 @@ class _ElasticTaskState:
     last_progress_at: float = 0.0
     cancel_event: threading.Event = field(default_factory=threading.Event)
     early_proofs: dict[str, _EarlyProofCredit] = field(default_factory=dict)
+    checker_outcome_ids: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -753,6 +755,45 @@ def _bound_judge_job_id(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     return sanitize_worker_identifier(value)
+
+
+def _verdict_checker_outcome_ids(verdict: Verdict) -> tuple[str, ...]:
+    """Extract stable, bounded ordinary Judge receipt IDs from a verdict.
+
+    Trace allocation must not infer checker state from free-form feedback or
+    status labels.  Only explicit receipt/job identity fields are admitted,
+    and every value passes the same opaque-ID sanitizer used by Judge
+    provenance.  The result is deterministic and safe to persist in the
+    run-local task state.
+    """
+
+    response = verdict.response if isinstance(verdict.response, Mapping) else {}
+    candidates: list[Any] = [
+        verdict.judge_job_id,
+        response.get("judge_job_id"),
+        response.get("receipt_id"),
+        response.get("outcome_id"),
+        response.get("verifier_receipt_id"),
+        response.get("judge_receipt_id"),
+    ]
+    nested = response.get("response")
+    if isinstance(nested, Mapping):
+        candidates.extend(
+            nested.get(key)
+            for key in (
+                "judge_job_id",
+                "receipt_id",
+                "outcome_id",
+                "verifier_receipt_id",
+                "judge_receipt_id",
+            )
+        )
+    result = {
+        safe
+        for candidate in candidates
+        if (safe := _bound_judge_job_id(candidate)) is not None
+    }
+    return tuple(sorted(result))
 
 
 def _has_job_or_mock_provenance(
@@ -1555,6 +1596,74 @@ def _allocation_runtime_metrics(
     }
 
 
+def _scheduler_decision_ledger(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Derive LLM scheduler counters from the charged decision ledger.
+
+    ``scheduler_outcome`` describes the provider invocation, while
+    ``disposition`` describes the runner's admission lifecycle.  A valid call
+    can therefore finish with ``scheduler_outcome=accepted`` but
+    ``disposition=not_admitted_horizon`` when it crosses the fixed run
+    deadline during admission revalidation.  Figure 4 artifacts must count
+    that as a horizon truncation consistently across all summary layers.
+
+    Only rows carrying one scheduler-cost object are charged.  The helper is
+    deliberately literal about boolean fields so malformed artifact values do
+    not silently turn into valid counters; the closeout validator reports the
+    corresponding lifecycle mismatch separately.
+    """
+
+    charged = [
+        row
+        for row in rows
+        if str(row.get("policy") or "") == "llm_scheduler"
+        and row.get("scheduler_cost") is not None
+    ]
+    return {
+        "calls": len(charged),
+        "fallback_count": sum(row.get("fallback") is True for row in charged),
+        "invalid_outputs": sum(
+            row.get("invalid_output") is True
+            or str(row.get("scheduler_outcome") or "") == "invalid_output"
+            or (
+                row.get("fallback") is True
+                and "scheduler output" in str(row.get("fallback_reason") or "")
+            )
+            for row in charged
+        ),
+        "provider_errors": sum(
+            str(row.get("scheduler_outcome") or "") == "provider_error"
+            or row.get("recoverable_invocation_error") is True
+            for row in charged
+        ),
+        "policy_timeouts": sum(
+            str(row.get("scheduler_outcome") or "") == "policy_timeout"
+            for row in charged
+        ),
+        "horizon_truncations": sum(
+            str(row.get("scheduler_outcome") or "") == "horizon_truncated"
+            or row.get("agent_run_horizon_reached") is True
+            or row.get("run_horizon_reached") is True
+            or str(row.get("disposition") or "") == "not_admitted_horizon"
+            for row in charged
+        ),
+    }
+
+
+def _scheduler_call_id_is_valid(value: Any) -> bool:
+    """Validate the bounded textual shape used by scheduler lifecycle joins."""
+
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip()
+    if not normalized or len(normalized) > 512:
+        return False
+    return not any(
+        ord(char) < 0x20 or ord(char) == 0x7F for char in normalized
+    )
+
+
 def _pi_token_usage(
     trace_path: Path,
     *,
@@ -1671,6 +1780,7 @@ def _core_snapshot_from_legacy(
                 if trace_view is not None
                 else ()
             ),
+            checker_outcome_ids=tuple(task.checker_outcome_ids),
         )
         for task in snapshot.tasks
     )
@@ -1779,6 +1889,19 @@ def _core_state_causal_fingerprint(snapshot: AllocationStateSnapshot) -> str:
 def _legacy_decision_from_core(core: Any) -> AllocationDecision:
     """Keep existing runner/artifact consumers compatible with core decisions."""
 
+    scheduler_outcome = core.scheduler_outcome
+    if core.scheduler_cost is None or scheduler_outcome in {
+        "not_invoked",
+        "horizon_truncated",
+    } or core.agent_run_horizon_reached:
+        agent_result_valid: bool | None = None
+    else:
+        # ``agent_result_valid`` is a legacy projection of the scheduler
+        # outcome, not a claim that a fallback was a valid model response.
+        # Provider errors, policy timeouts, and malformed output are all
+        # failed scheduler attempts and therefore map to False.
+        agent_result_valid = scheduler_outcome == "accepted"
+
     return AllocationDecision(
         decision_index=core.decision_index,
         policy=core.policy,
@@ -1792,7 +1915,7 @@ def _legacy_decision_from_core(core: Any) -> AllocationDecision:
         ),
         fallback=core.fallback,
         fallback_reason=core.fallback_reason,
-        agent_result_valid=(not core.invalid_output if core.scheduler_cost is not None and not core.agent_run_horizon_reached else None),
+        agent_result_valid=agent_result_valid,
         agent_id=(f"allocation-scheduler-{core.decision_index}" if core.scheduler_cost is not None else ""),
         agent_task_id="__allocation__" if core.scheduler_cost is not None else "",
         agent_episode=core.decision_index if core.scheduler_cost is not None else None,
@@ -1806,7 +1929,7 @@ def _legacy_decision_from_core(core: Any) -> AllocationDecision:
             getattr(core, "agent_run_horizon_reached", False)
         ),
         scheduler_call_id=core.scheduler_call_id,
-        scheduler_outcome=core.scheduler_outcome,
+        scheduler_outcome=scheduler_outcome,
         invalid_output=core.invalid_output,
         recoverable_invocation_error=core.recoverable_invocation_error,
     )
@@ -3069,6 +3192,15 @@ def _run_elastic_cps(
         for task_state in states.values():
             task_state.cancel_event.set()
 
+    def record_checker_outcomes(state: _ElasticTaskState, verdict: Verdict) -> None:
+        """Persist only explicit Judge receipt IDs for future projections."""
+
+        outcome_ids = _verdict_checker_outcome_ids(verdict)
+        if not outcome_ids:
+            return
+        with state.lock:
+            state.checker_outcome_ids.update(outcome_ids)
+
     def record_scheduler_result(result: AgentResult) -> None:
         """Publish exactly one scheduler result/event for a charged decision."""
 
@@ -3351,7 +3483,29 @@ def _run_elastic_cps(
     # the live selector runtime.  Passing only the SQLite path would bypass
     # the runtime's pinned/causal snapshot protocol and (when a runtime is
     # present) fail the bridge's store-identity guard.
-    trace_projection_bridge = TraceProjectionBridge()
+    normalization = config.allocation.normalization
+    # The projection adapter consumes the same manifest-owned normalizers as
+    # the core scorer.  Constructing these limits once per run keeps all four
+    # comparison arms on one immutable contract while retaining the bridge's
+    # fail-closed behavior for unavailable stores.
+    trace_projection_bridge = TraceProjectionBridge(
+        limits=TraceProjectionLimits(
+            actionability_saturation=int(normalization["frontier_saturation"]),
+            association_saturation=int(normalization["association_saturation"]),
+            duplicate_saturation=int(normalization["duplicate_saturation"]),
+            refutation_saturation=int(normalization["refutation_saturation"]),
+            staleness_saturation=int(normalization["staleness_saturation"]),
+            lineage_stagnation_saturation=int(
+                normalization["lineage_stagnation_saturation"]
+            ),
+            feedback_kappa=float(normalization["feedback_exposure_floor"]),
+            recency_window_seconds=float(normalization["staleness_window_seconds"]),
+            staleness_window_seconds=float(normalization["staleness_window_seconds"]),
+            stagnation_window_seconds=float(
+                normalization["lineage_stagnation_window_seconds"]
+            ),
+        )
+    )
 
     # Trace rows may carry event timestamps.  Projection recency and
     # stagnation must be evaluated at the same fixed wall-clock cut for every
@@ -3388,11 +3542,16 @@ def _run_elastic_cps(
             at = trace_reference_epoch + max(
                 0.0, time.monotonic() - trace_reference_monotonic
             )
+        ordinary_outcome_ids: set[str] = set()
+        for state in states.values():
+            with state.lock:
+                ordinary_outcome_ids.update(state.checker_outcome_ids)
         return trace_projection_bridge.read(
             task_ids,
             selection_runtime=selection_runtime,
             store=None,
             feedback_values=feedback_values_from_config(config),
+            ordinary_outcome_ids=tuple(sorted(ordinary_outcome_ids)),
             reference_time=at,
         )
 
@@ -3550,6 +3709,7 @@ def _run_elastic_cps(
                 last_status = state.last_verdict_status
                 last_feedback = state.last_feedback
                 failures = state.consecutive_failures
+                checker_outcome_ids = tuple(sorted(state.checker_outcome_ids))
                 assignment_age = max(0.0, now_mono - state.last_assignment_at)
                 progress_age = max(0.0, now_mono - state.last_progress_at)
             piece_age = _seconds_since_cps_timestamp(str(stats["latest_created_at"]))
@@ -3585,6 +3745,7 @@ def _run_elastic_cps(
                     strategy_piece_count=int(stats["strategy_piece_count"]),
                     duplicate_piece_count=int(stats["duplicate_piece_count"]),
                     recent_pieces=pieces,
+                    checker_outcome_ids=checker_outcome_ids,
                 )
             )
         return TaskProgressSnapshot(
@@ -4164,6 +4325,7 @@ def _run_elastic_cps(
             a positive scoreboard row, and cancel peers.
             """
 
+            record_checker_outcomes(state, verdict)
             with allocation_lock:
                 with state.lock:
                     if state.solved:
@@ -4484,6 +4646,7 @@ def _run_elastic_cps(
                 expected_task_contract_sha256=expected_contracts[task.slug],
                 allow_mock_provenance=allow_mock_provenance,
             )
+            record_checker_outcomes(state, verdict)
 
         candidate_attempt_is_bound = _has_candidate_attempt_provenance(
             verdict,
@@ -4827,6 +4990,22 @@ def _run_elastic_cps(
         policy_latency_seconds=float(allocation_summary["total_latency_seconds"]),
     )
     allocation_summary.update(runtime_metrics)
+    # The charged allocation-decision log is the authoritative outcome
+    # ledger.  In particular, a provider call may be accepted but lose the
+    # fixed-horizon admission race; retain that lifecycle outcome in every
+    # public counter section instead of relying on the in-memory scheduler
+    # outcome alone.
+    decision_rows, decision_rows_valid = _read_jsonl_objects(decisions_path)
+    if decision_rows_valid and config.allocation.policy == "llm_scheduler":
+        scheduler_ledger = _scheduler_decision_ledger(decision_rows)
+        for key in (
+            "fallback_count",
+            "invalid_outputs",
+            "provider_errors",
+            "policy_timeouts",
+            "horizon_truncations",
+        ):
+            allocation_summary[key] = scheduler_ledger[key]
     # Keep the nested cost object and the top-level lifecycle metrics on one
     # ledger.  Per-call model latency is not a capacity measure; only the
     # reservation history determines occupied slot-seconds.
@@ -4846,6 +5025,19 @@ def _run_elastic_cps(
             ),
         }
     )
+    if decision_rows_valid and config.allocation.policy == "llm_scheduler":
+        scheduler_cost_summary.update(
+            {
+                key: scheduler_ledger[key]
+                for key in (
+                    "fallback_count",
+                    "invalid_outputs",
+                    "provider_errors",
+                    "policy_timeouts",
+                    "horizon_truncations",
+                )
+            }
+        )
     allocation_summary["scheduler_cost"] = scheduler_cost_summary
     allocation_summary.update(_scheduler_token_usage(run_dir / "pi_events.jsonl"))
     allocation_summary.update(_solver_token_usage(run_dir / "pi_events.jsonl"))
@@ -6147,6 +6339,7 @@ def _run_health(
     scheduler_summary_cost_policy_timeouts: int | None = None
     scheduler_summary_cost_horizon_truncations: int | None = None
     scheduler_charged_decisions = 0
+    llm_call_id_errors = 0
     scheduler_active_slots: int | None = None
     scheduler_reservation_slots: int | None = None
     scheduler_occupied_slots: int | None = None
@@ -6181,6 +6374,7 @@ def _run_health(
             and row.get("scheduler_cost") is not None
         )
         scheduler_charged_decisions = sum(llm_decision_indexes.values())
+        scheduler_ledger = _scheduler_decision_ledger(decisions)
         try:
             allocation_summary = json.loads(
                 (run_dir / "allocation_summary.json").read_text(encoding="utf-8")
@@ -6270,6 +6464,7 @@ def _run_health(
             )
             llm_cost_errors = 0
             llm_outcome_errors = 0
+            llm_call_id_errors = 0
             # The core LLM arm does not use the legacy ``agent`` policy's
             # result-valid bit.  Its charged decision ledger is therefore the
             # authoritative source for fallback/invalid/provider counters in
@@ -6281,27 +6476,15 @@ def _run_health(
                 if str(row.get("policy") or "") == "llm_scheduler"
                 and row.get("scheduler_cost") is not None
             ]
-            scheduler_invalid_outputs = sum(
-                bool(row.get("invalid_output"))
-                or str(row.get("scheduler_outcome") or "") == "invalid_output"
-                for row in llm_charged_decisions
-            )
-            scheduler_fallbacks = sum(
-                bool(row.get("fallback")) for row in llm_charged_decisions
-            )
-            scheduler_provider_errors = sum(
-                str(row.get("scheduler_outcome") or "") == "provider_error"
-                or bool(row.get("recoverable_invocation_error"))
-                for row in llm_charged_decisions
-            )
-            scheduler_policy_timeout_outcomes = sum(
-                str(row.get("scheduler_outcome") or "") == "policy_timeout"
-                for row in llm_charged_decisions
-            )
-            scheduler_horizon_outcomes = sum(
-                str(row.get("scheduler_outcome") or "") == "horizon_truncated"
-                for row in llm_charged_decisions
-            )
+            scheduler_invalid_outputs = scheduler_ledger["invalid_outputs"]
+            scheduler_fallbacks = scheduler_ledger["fallback_count"]
+            scheduler_provider_errors = scheduler_ledger["provider_errors"]
+            scheduler_policy_timeout_outcomes = scheduler_ledger["policy_timeouts"]
+            scheduler_horizon_outcomes = scheduler_ledger["horizon_truncations"]
+            # This health counter is the public horizon ledger, so it must
+            # include a late admission disposition even when the provider
+            # process itself returned successfully before the deadline.
+            scheduler_horizon_truncations = scheduler_horizon_outcomes
             for row in decisions:
                 if str(row.get("policy") or "") != "llm_scheduler":
                     continue
@@ -6311,6 +6494,14 @@ def _run_health(
                     if outcome not in {"not_invoked", None}:
                         llm_cost_errors += 1
                     continue
+                decision_id = row.get("decision_id")
+                scheduler_call_id = row.get("scheduler_call_id")
+                if (
+                    not _scheduler_call_id_is_valid(decision_id)
+                    or not _scheduler_call_id_is_valid(scheduler_call_id)
+                    or scheduler_call_id != decision_id
+                ):
+                    llm_call_id_errors += 1
                 if not isinstance(cost, Mapping) or cost.get("calls") != 1:
                     llm_cost_errors += 1
                 invalid = bool(row.get("invalid_output"))
@@ -6332,6 +6523,7 @@ def _run_health(
                 or any(not key for key in llm_result_call_ids)
                 or llm_cost_errors
                 or llm_outcome_errors
+                or llm_call_id_errors
                 or scheduler_summary_agent_calls != scheduler_charged_decisions
                 or scheduler_summary_cost_calls != scheduler_charged_decisions
                 or scheduler_summary_cost_calls != len(scheduler_agents)
@@ -6536,6 +6728,9 @@ def _run_health(
         "allocation_scheduler_invalid_output_count": scheduler_invalid_outputs,
         "allocation_scheduler_fallback_count": scheduler_fallbacks,
         "allocation_scheduler_provider_error_count": scheduler_provider_errors,
+        "allocation_scheduler_call_id_error_count": (
+            llm_call_id_errors if config.allocation.policy == "llm_scheduler" else 0
+        ),
         "allocation_scheduler_charged_decision_count": scheduler_charged_decisions,
         "allocation_scheduler_summary_agent_calls": scheduler_summary_agent_calls,
         "allocation_scheduler_summary_cost_calls": scheduler_summary_cost_calls,
@@ -6833,37 +7028,15 @@ def _write_figure4_summary(
         ),
     }
     decision_rows, _ = _read_jsonl_objects(run_dir / "allocation_decisions.jsonl")
-    llm_decisions = [
-        row
-        for row in decision_rows
-        if str(row.get("policy") or "") == "llm_scheduler"
-        and row.get("scheduler_cost") is not None
-    ]
     # The decision log is the canonical outcome ledger.  Derive all public
     # counter sections from these same charged rows so fallback/invalid/
     # horizon outcomes cannot diverge between nested cost and metrics.
-    fallback_count = sum(row.get("fallback") is True for row in llm_decisions)
-    invalid_output_count = sum(
-        row.get("invalid_output") is True
-        or str(row.get("scheduler_outcome") or "") == "invalid_output"
-        or (
-            row.get("fallback") is True
-            and "scheduler output" in str(row.get("fallback_reason") or "")
-        )
-        for row in llm_decisions
-    )
-    horizon_truncation_count = sum(
-        str(row.get("scheduler_outcome") or "") == "horizon_truncated"
-        or row.get("agent_run_horizon_reached") is True
-        or row.get("run_horizon_reached") is True
-        or str(row.get("disposition") or "") == "not_admitted_horizon"
-        for row in llm_decisions
-    )
-    raw_scheduler = dict(allocation.get("scheduler_cost") or {})
+    scheduler_ledger = _scheduler_decision_ledger(decision_rows)
+    fallback_count = scheduler_ledger["fallback_count"]
+    invalid_output_count = scheduler_ledger["invalid_outputs"]
+    horizon_truncation_count = scheduler_ledger["horizon_truncations"]
     scheduler_cost = {
-        "calls": int(
-            raw_scheduler.get("calls", len(scheduler_agents) if config.allocation.policy == "llm_scheduler" else 0)
-        ),
+        "calls": scheduler_ledger["calls"],
         "input_tokens": int(allocation.get("scheduler_input_tokens", 0)),
         "output_tokens": int(allocation.get("scheduler_output_tokens", 0)),
         "total_tokens": int(allocation.get("scheduler_total_tokens", 0)),
@@ -6879,8 +7052,8 @@ def _write_figure4_summary(
         ),
         "invalid_outputs": invalid_output_count,
         "fallback_count": fallback_count,
-        "provider_errors": int(raw_scheduler.get("provider_errors", allocation.get("provider_errors", 0))),
-        "policy_timeouts": int(raw_scheduler.get("policy_timeouts", allocation.get("policy_timeouts", 0))),
+        "provider_errors": scheduler_ledger["provider_errors"],
+        "policy_timeouts": scheduler_ledger["policy_timeouts"],
         "horizon_truncations": horizon_truncation_count,
     }
     allocation_metrics = {

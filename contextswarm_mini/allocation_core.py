@@ -593,6 +593,14 @@ class TraceFeatures:
     ``evidence_association`` is the registered ``V`` term.  It is deliberately
     not named validation: authoritative checker outcomes belong only in
     :class:`TaskState` and must not be counted a second time through the trace.
+
+    ``drag`` is the historical aggregate field.  New projections provide the
+    four explicit density components below and the scorer then evaluates the
+    registered ``D = dDup*duplication + dRef*refutation + dStale*staleness +
+    dLineage*lineage_stagnation`` expression.  Keeping the optional constructor
+    values as a private mode marker lets old callers which only provide
+    ``drag`` retain their exact behavior without ever adding both forms of
+    density to one increment.
     """
 
     actionability: float = 0.0
@@ -600,17 +608,76 @@ class TraceFeatures:
     positive_feedback: float = 0.0
     negative_feedback: float = 0.0
     drag: float = 0.0
+    duplication: float | None = None
+    refutation: float | None = None
+    staleness: float | None = None
+    lineage_stagnation: float | None = None
+    _component_mode: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        for item in fields(self):
+        for name in (
+            "actionability",
+            "evidence_association",
+            "positive_feedback",
+            "negative_feedback",
+            "drag",
+        ):
             object.__setattr__(
                 self,
-                item.name,
-                _unit_interval(f"trace.{item.name}", getattr(self, item.name)),
+                name,
+                _unit_interval(f"trace.{name}", getattr(self, name)),
             )
+        component_mode = False
+        for name in (
+            "duplication",
+            "refutation",
+            "staleness",
+            "lineage_stagnation",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                component_mode = True
+                value = _unit_interval(f"trace.{name}", value)
+            else:
+                # Keep the public/state representation JSON-shaped while the
+                # private mode marker remembers whether this was an old
+                # aggregate-only construction.
+                value = 0.0
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_component_mode", component_mode)
 
     def public_dict(self) -> dict[str, float]:
-        return _weight_dict(self)
+        return {
+            "actionability": self.actionability,
+            "evidence_association": self.evidence_association,
+            "positive_feedback": self.positive_feedback,
+            "negative_feedback": self.negative_feedback,
+            # Retain the compatibility aggregate in public snapshots.  The
+            # explicit fields are always emitted as well so state IDs and
+            # scheduler prompts expose the complete trace contract.
+            "drag": self.drag,
+            "duplication": self.duplication,
+            "refutation": self.refutation,
+            "staleness": self.staleness,
+            "lineage_stagnation": self.lineage_stagnation,
+        }
+
+    @property
+    def uses_drag_components(self) -> bool:
+        """Whether the instance was constructed with explicit D components."""
+
+        return self._component_mode
+
+    @property
+    def drag_components(self) -> tuple[float, float, float, float]:
+        """Return components in the registered duplication/refutation order."""
+
+        return (
+            self.duplication,
+            self.refutation,
+            self.staleness,
+            self.lineage_stagnation,
+        )
 
     as_dict = public_dict
 
@@ -898,21 +965,59 @@ class TaskScoreWeights:
 
 @dataclass(frozen=True)
 class TraceScoreWeights:
-    """Manifest-owned coefficients for the registered ``A/V/F+/F-/D`` terms."""
+    """Manifest-owned coefficients for the registered trace terms.
+
+    ``drag`` remains a compatibility alias for older manifests.  A new
+    manifest supplies ``density_penalty_weight`` and the four component
+    weights explicitly.  The latter are optional at the Python boundary so
+    old direct callers continue to work; ``from_mapping`` preserves whichever
+    contract the mapping actually declared.
+    """
 
     actionability: float = 1.0
     evidence_association: float = 1.0
     positive_feedback: float = 1.0
     negative_feedback: float = 1.0
     drag: float = 1.0
+    density_penalty_weight: float | None = None
+    duplication_component_weight: float | None = None
+    # ``duplicate_component_weight`` is the spelling frozen by the v1
+    # artifact fixture.  Keep ``duplication_component_weight`` as a source
+    # compatibility alias for early development manifests.
+    duplicate_component_weight: float | None = None
+    refutation_component_weight: float | None = None
+    staleness_component_weight: float | None = None
+    lineage_stagnation_component_weight: float | None = None
+    _component_mode: bool = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        for item in fields(self):
+        for name in (
+            "actionability",
+            "evidence_association",
+            "positive_feedback",
+            "negative_feedback",
+            "drag",
+        ):
             object.__setattr__(
                 self,
-                item.name,
-                _finite(item.name, getattr(self, item.name), minimum=0.0),
+                name,
+                _finite(name, getattr(self, name), minimum=0.0),
             )
+        component_mode = False
+        for name in (
+            "density_penalty_weight",
+            "duplication_component_weight",
+            "duplicate_component_weight",
+            "refutation_component_weight",
+            "staleness_component_weight",
+            "lineage_stagnation_component_weight",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                component_mode = True
+                value = _finite(name, value, minimum=0.0)
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_component_mode", component_mode)
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, float] | None = None) -> TraceScoreWeights:
@@ -922,14 +1027,113 @@ class TraceScoreWeights:
             raise ValueError("trace score weights must be a mapping")
         if any(not isinstance(key, str) for key in values):
             raise ValueError("trace score weight keys must be strings")
-        allowed = {item.name for item in fields(cls)}
+        allowed = {
+            "actionability",
+            "evidence_association",
+            "positive_feedback",
+            "negative_feedback",
+            "drag",
+            "density_penalty_weight",
+            "duplication_component_weight",
+            "duplicate_component_weight",
+            "refutation_component_weight",
+            "staleness_component_weight",
+            "lineage_stagnation_component_weight",
+        }
         unknown = {key for key in values if key not in allowed}
         if unknown:
             raise ValueError("unknown trace score weights: " + ", ".join(sorted(unknown)))
+        if "drag" in values and "density_penalty_weight" in values:
+            try:
+                aliases_agree = float(values["drag"]) == float(
+                    values["density_penalty_weight"]
+                )
+            except (TypeError, ValueError, OverflowError):
+                aliases_agree = False
+            if not aliases_agree:
+                raise ValueError(
+                    "drag and density_penalty_weight contradict each other"
+                )
+        if (
+            "duplication_component_weight" in values
+            and "duplicate_component_weight" in values
+        ):
+            try:
+                aliases_agree = float(values["duplication_component_weight"]) == float(
+                    values["duplicate_component_weight"]
+                )
+            except (TypeError, ValueError, OverflowError):
+                aliases_agree = False
+            if not aliases_agree:
+                raise ValueError(
+                    "duplication_component_weight and duplicate_component_weight "
+                    "contradict each other"
+                )
         return cls(**dict(values))
 
     def public_dict(self) -> dict[str, float]:
-        return _weight_dict(self)
+        density = self.density_penalty_weight
+        if density is None:
+            density = self.drag
+        components = self.component_weights
+        canonical = {
+            "actionability": self.actionability,
+            "evidence_association": self.evidence_association,
+            "positive_feedback": self.positive_feedback,
+            "negative_feedback": self.negative_feedback,
+            "density_penalty_weight": density,
+            "duplicate_component_weight": components[0],
+            "refutation_component_weight": components[1],
+            "staleness_component_weight": components[2],
+            "lineage_stagnation_component_weight": components[3],
+        }
+        if self._component_mode:
+            return canonical
+        # Preserve the exact five-key shape for callers using the historical
+        # aggregate-only weight mapping.
+        return {
+            "actionability": self.actionability,
+            "evidence_association": self.evidence_association,
+            "positive_feedback": self.positive_feedback,
+            "negative_feedback": self.negative_feedback,
+            "drag": self.drag,
+        }
+
+    @property
+    def uses_drag_components(self) -> bool:
+        """Whether the manifest/direct mapping declared explicit D weights."""
+
+        return self._component_mode
+
+    @property
+    def density_weight(self) -> float:
+        """Coefficient multiplying the component density ``D``."""
+
+        return self.density_penalty_weight if self.density_penalty_weight is not None else self.drag
+
+    @property
+    def component_weights(self) -> tuple[float, float, float, float]:
+        """Return ``(dDup, dRef, dStale, dLineage)`` with safe legacy defaults."""
+
+        if not self._component_mode:
+            # An old ``drag`` coefficient represented one aggregate density;
+            # using it for each explicit component is the least surprising
+            # compatibility behavior if an old weight object is paired with a
+            # newly projected trace.
+            return (self.drag, self.drag, self.drag, self.drag)
+        return tuple(
+            0.0 if value is None else value
+            for value in (
+                (
+                    self.duplicate_component_weight
+                    if self.duplicate_component_weight is not None
+                    else self.duplication_component_weight
+                ),
+                self.refutation_component_weight,
+                self.staleness_component_weight,
+                self.lineage_stagnation_component_weight,
+            )
+        )  # type: ignore[return-value]
 
     as_dict = public_dict
 
@@ -976,12 +1180,25 @@ class TraceStateScorer:
     def trace_increment(self, task: TaskState) -> float:
         weights = self.weights
         trace = task.trace
+        if trace.uses_drag_components:
+            d_dup, d_ref, d_stale, d_lineage = weights.component_weights
+            density = (
+                d_dup * trace.duplication
+                + d_ref * trace.refutation
+                + d_stale * trace.staleness
+                + d_lineage * trace.lineage_stagnation
+            )
+            density_penalty = weights.density_weight
+        else:
+            # Legacy aggregate-only callers retain the pre-component formula.
+            density = trace.drag
+            density_penalty = weights.drag
         numerator = (
             weights.actionability * trace.actionability
             + weights.evidence_association * trace.evidence_association
             + weights.positive_feedback * trace.positive_feedback
             - weights.negative_feedback * trace.negative_feedback
-            - weights.drag * trace.drag
+            - density_penalty * density
         )
         return numerator / (1.0 + task.active_allocations)
 
@@ -1214,6 +1431,17 @@ class AllocationDecision:
         horizon = self.agent_run_horizon_reached or self.run_horizon_reached
         object.__setattr__(self, "agent_run_horizon_reached", horizon)
         object.__setattr__(self, "run_horizon_reached", horizon)
+        # A charged scheduler invocation is keyed by the immutable decision
+        # identity. Validate the call ID before it enters any lifecycle
+        # artifact; arbitrary aliases would let one invocation masquerade as
+        # another while still passing cardinality joins.
+        scheduler_call_id = _bounded_text(
+            "scheduler_call_id",
+            self.scheduler_call_id,
+            allow_empty=True,
+            reject_controls=True,
+        )
+        object.__setattr__(self, "scheduler_call_id", scheduler_call_id)
         if self.scheduler_cost is not None and not self.scheduler_call_id:
             object.__setattr__(self, "scheduler_call_id", self.decision_id)
         # Keep the outcome fields as one closed, symmetric state machine.  A
@@ -1228,6 +1456,8 @@ class AllocationDecision:
             # The default above normally supplies the decision ID.  Retain an
             # explicit guard for callers that pass a non-string falsey value.
             raise ValueError("costed scheduler call requires scheduler_call_id")
+        if costed and self.scheduler_call_id != self.decision_id:
+            raise ValueError("scheduler_call_id must equal decision_id")
         if not costed and self.scheduler_call_id:
             raise ValueError("scheduler_call_id requires scheduler cost")
 

@@ -503,6 +503,24 @@ class AllocationTraceBridgeTests(unittest.TestCase):
                 records=(), trace_watermark="W", reference_time=float("nan")
             )
 
+    def test_snapshot_identity_metadata_rejects_lossy_scalar_coercion(self) -> None:
+        for field, value in (
+            ("trace_watermark", 7),
+            ("trace_watermark", True),
+            ("next_cursor", 3),
+            ("snapshot_id", False),
+        ):
+            with self.subTest(field=field, value=value):
+                kwargs = {"records": (), "trace_watermark": "W", field: value}
+                with self.assertRaises(ValueError):
+                    TraceProjectionSnapshotPage(**kwargs)
+
+        malformed = TraceProjectionBridge().read(
+            ["task-a"], ordinary_outcome_ids=("ok", 17)  # type: ignore[arg-type]
+        )
+        self.assertEqual(malformed.source, "zero")
+        self.assertIn("invalid_ordinary_outcome_id", malformed.fallback_reason)
+
     def test_ordinary_outcome_is_excluded_from_projection_and_references(self) -> None:
         source = _SnapshotStore(
             [

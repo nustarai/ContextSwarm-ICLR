@@ -445,6 +445,20 @@ class Figure4RuntimeTests(unittest.TestCase):
         self.assertFalse(decisions[0]["fallback"])
         summary = self.assert_scheduler_summary_is_selectable(run_dir)
         self.assertEqual(summary["scheduler_cost"]["horizon_truncations"], 1)
+        allocation = json.loads(
+            (run_dir / "allocation_summary.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(allocation["horizon_truncations"], 1)
+        self.assertEqual(allocation["scheduler_cost"]["horizon_truncations"], 1)
+        final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            final["health"]["allocation_scheduler_horizon_truncation_count"],
+            1,
+        )
+        self.assertEqual(
+            final["health"]["allocation_scheduler_summary_cost_horizon_truncations"],
+            1,
+        )
 
     def test_llm_global_state_change_is_stale_and_not_admitted(self) -> None:
         original_choose = ReadOnlyLLMSchedulerPolicy.choose

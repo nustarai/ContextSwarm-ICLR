@@ -5,6 +5,7 @@ import math
 import unittest
 
 from contextswarm_mini.allocation_projection import (
+    TraceAllocationProjectionBatch,
     TraceAllocationProjectionAdapter,
     TraceProjectionLimits,
     TraceProjectionRecordBatch,
@@ -53,6 +54,12 @@ class TraceAllocationProjectionTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             batch.for_task("a").drag = 1.0  # type: ignore[misc]
 
+    def test_projection_batch_snapshot_id_does_not_coerce_numbers(self) -> None:
+        with self.assertRaises(ValueError):
+            TraceProjectionRecordBatch((), 0, snapshot_id=17)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            TraceAllocationProjectionBatch((), 0, snapshot_id=False)  # type: ignore[arg-type]
+
     def test_distinct_lineages_associations_and_feedback_are_normalized(self) -> None:
         adapter = TraceAllocationProjectionAdapter(
             TraceProjectionLimits(
@@ -87,6 +94,53 @@ class TraceAllocationProjectionTests(unittest.TestCase):
         self.assertAlmostEqual(projection.positive_feedback, 1 / 3)
         self.assertAlmostEqual(projection.negative_feedback, 1 / 3)
         self.assertEqual(projection.drag, 1.0)
+
+    def test_drag_components_are_individually_projected_and_forwarded(self) -> None:
+        adapter = TraceAllocationProjectionAdapter(
+            TraceProjectionLimits(
+                duplicate_saturation=2,
+                refutation_saturation=4,
+                staleness_saturation=4,
+                lineage_stagnation_saturation=4,
+            )
+        )
+        projection = adapter.project_records(
+            ["a"],
+            [
+                _row(1, "duplicate", lineage_id="dup"),
+                _row(2, "duplicate", lineage_id="dup-2"),
+                _row(3, "refutation", lineage_id="ref"),
+                _row(4, "stale", lineage_id="stale"),
+                _row(5, "lineage_stagnation", lineage_id="stagnant"),
+            ],
+        ).for_task("a")
+        self.assertEqual(projection.duplication, 1.0)
+        self.assertEqual(projection.refutation, 0.25)
+        self.assertEqual(projection.staleness, 0.25)
+        self.assertEqual(projection.lineage_stagnation, 0.25)
+        forwarded = projection.as_core_kwargs()
+        self.assertEqual(
+            set(forwarded),
+            {
+                "actionability",
+                "evidence_association",
+                "positive_feedback",
+                "negative_feedback",
+                "drag",
+                "duplication",
+                "refutation",
+                "staleness",
+                "lineage_stagnation",
+            },
+        )
+
+    def test_synthetic_component_projection_is_explicit_but_zero_is_legacy_compatible(self) -> None:
+        explicit = build_synthetic_trace_projection(
+            {"a": {"duplication": 0.2, "staleness": 0.0}}
+        ).for_task("a")
+        self.assertIn("duplication", explicit.as_core_kwargs())
+        zero = build_synthetic_trace_projection(["a"]).for_task("a")
+        self.assertNotIn("duplication", zero.as_core_kwargs())
 
     def test_replayed_records_and_raw_verifier_receipts_do_not_double_count(self) -> None:
         adapter = TraceAllocationProjectionAdapter()

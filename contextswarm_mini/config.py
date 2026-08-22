@@ -180,13 +180,38 @@ _TRACE_STATE_DEFAULTS: dict[str, float] = {
     "evidence_association": 1.0,
     "positive_feedback": 1.0,
     "negative_feedback": 1.0,
-    "drag": 1.0,
+    # ``density_penalty_weight`` and the four component coefficients are the
+    # registered D formula.  The historical ``drag`` key is accepted below
+    # as a compatibility alias but is canonicalized to density_penalty_weight
+    # before hashing or emitting artifacts.
+    "density_penalty_weight": 1.0,
+    "duplicate_component_weight": 1.0,
+    "refutation_component_weight": 1.0,
+    "staleness_component_weight": 1.0,
+    "lineage_stagnation_component_weight": 1.0,
+}
+
+_TRACE_STATE_LEGACY_ALIASES: dict[str, str] = {
+    "drag": "density_penalty_weight",
+    "duplication_component_weight": "duplicate_component_weight",
 }
 
 _ALLOCATION_NORMALIZATION_DEFAULTS: dict[str, float] = {
     "progress_window_seconds": 600.0,
     "starvation_window_seconds": 600.0,
     "failure_saturation": 3.0,
+    # Trace projection normalizers are part of the same manifest-owned
+    # identity.  They are harmless for task-only arms but must remain fixed
+    # across all Figure 4 policies.
+    "frontier_saturation": 4.0,
+    "association_saturation": 4.0,
+    "feedback_exposure_floor": 1.0,
+    "duplicate_saturation": 4.0,
+    "refutation_saturation": 4.0,
+    "staleness_saturation": 4.0,
+    "lineage_stagnation_saturation": 4.0,
+    "staleness_window_seconds": 600.0,
+    "lineage_stagnation_window_seconds": 600.0,
 }
 
 _FIGURE4_ALLOCATION_POLICIES = frozenset(
@@ -786,9 +811,33 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         key: _number(allocation_formula.get(key), f"allocation.formula.{key}", default)
         for key, default in _FORMULA_DEFAULTS.items()
     }
+    # Normalize the pre-component ``drag`` spelling before validating the
+    # manifest table.  A manifest that supplies both spellings with different
+    # values is contradictory and must fail closed rather than silently choose
+    # one coefficient.
+    trace_state_values = dict(allocation_trace_state)
+    for alias, canonical in _TRACE_STATE_LEGACY_ALIASES.items():
+        if alias not in trace_state_values:
+            continue
+        if canonical in trace_state_values:
+            try:
+                same = float(trace_state_values[alias]) == float(
+                    trace_state_values[canonical]
+                )
+            except (TypeError, ValueError, OverflowError):
+                same = False
+            if not same:
+                raise ConfigError(
+                    f"allocation.trace_state.{alias} contradicts "
+                    f"allocation.trace_state.{canonical}"
+                )
+        else:
+            trace_state_values[canonical] = trace_state_values[alias]
+        del trace_state_values[alias]
+
     parameter_tables = (
         ("allocation.task_state", allocation_task_state, _TASK_STATE_DEFAULTS),
-        ("allocation.trace_state", allocation_trace_state, _TRACE_STATE_DEFAULTS),
+        ("allocation.trace_state", trace_state_values, _TRACE_STATE_DEFAULTS),
         (
             "allocation.normalization",
             allocation_normalization,
@@ -814,6 +863,17 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     )
     if any(value <= 0 for value in normalization_parameters.values()):
         raise ConfigError("allocation.normalization fields must be positive")
+    for key in (
+        "frontier_saturation",
+        "association_saturation",
+        "duplicate_saturation",
+        "refutation_saturation",
+        "staleness_saturation",
+        "lineage_stagnation_saturation",
+    ):
+        value = normalization_parameters[key]
+        if not value.is_integer():
+            raise ConfigError(f"allocation.normalization.{key} must be an integer")
     for key in (
         "failure_penalty",
         "duplication_penalty",
