@@ -198,6 +198,13 @@ class TraceAllocationProjectionTests(unittest.TestCase):
         ).for_task("a")
         self.assertTrue(projection.is_zero)
 
+    def test_legacy_mapping_page_without_sequence_uses_read_order(self) -> None:
+        projection = TraceAllocationProjectionAdapter().project_records(
+            ["a"], [{"task_id": "a", "kind": "frontier", "lineage_id": "l1"}]
+        ).for_task("a")
+        self.assertEqual(projection.frontier_count, 1)
+        self.assertEqual(projection.watermark, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

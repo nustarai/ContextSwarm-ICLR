@@ -12,7 +12,7 @@ to the task-state score and must not be counted again here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any, Iterable, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -389,7 +389,18 @@ class TraceAllocationProjectionAdapter:
         ordered = _bounded_task_ids(task_ids, self.limits.max_tasks)
         allowed = frozenset(ordered)
         ordinary_ids = frozenset(_text(value) for value in ordinary_outcome_ids if _text(value))
-        converted = tuple(_record(item) for item in records)
+        converted_list: list[TraceProjectionRecord] = []
+        for index, item in enumerate(records, start=1):
+            record = _record(item)
+            # CPS progress snapshots predate the allocation watermark field.
+            # Treat such a bounded page as ordered-at-read rather than silently
+            # dropping every row because its implicit sequence is zero.
+            if isinstance(item, Mapping) and not any(
+                key in item for key in ("sequence", "seq", "watermark")
+            ):
+                record = replace(record, sequence=after_watermark + index)
+            converted_list.append(record)
+        converted = tuple(converted_list)
         newer = tuple(item for item in converted if item.sequence > after_watermark)
         # Stable ascending processing prevents a bounded page from skipping old
         # rows when the caller resumes from the returned watermark.
