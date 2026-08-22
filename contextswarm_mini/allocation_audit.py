@@ -21,9 +21,53 @@ AUDIT_SCHEMA = "contextswarm_allocation_audit_v1"
 RUN_SCHEMA = "contextswarm_figure4_run_summary_v1"
 PAIRED_SCHEMA = "contextswarm_figure4_paired_repeat_v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_MAX_AUDIT_IDENTIFIER_CHARS = 512
+_MAX_AUDIT_REASON_CHARS = 1_000
 _FIGURE4_POLICIES = frozenset(
     {"uniform_refill", "task_state", "trace_state", "llm_scheduler"}
 )
+
+
+def _audit_text(
+    value: Any,
+    name: str,
+    *,
+    allow_empty: bool = False,
+    max_chars: int = _MAX_AUDIT_IDENTIFIER_CHARS,
+) -> str:
+    """Validate an artifact identifier/reason without lossy coercion.
+
+    Audit rows are persisted evidence.  Converting ``None``/integers (or a
+    scalar string supplied where a JSON array is expected) to text can make a
+    malformed row look valid and, worse, change which task a counterfactual
+    appears to describe.  Keep this boundary deliberately stricter than the
+    legacy compatibility APIs: callers must provide actual strings.
+    """
+
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if len(value) > max_chars:
+        raise ValueError(f"{name} is too long")
+    if not allow_empty and not value:
+        raise ValueError(f"{name} must be non-empty")
+    if value != value.strip():
+        raise ValueError(f"{name} must not have surrounding whitespace")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError(f"{name} contains control characters")
+    return value
+
+
+def _audit_text_list(value: Any, name: str, *, allow_empty: bool = False) -> tuple[str, ...]:
+    """Return a deterministic tuple from a JSON-array-like ID field."""
+
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{name} must be a list or tuple of strings")
+    result = tuple(_audit_text(item, f"{name} item") for item in value)
+    if not allow_empty and not result:
+        raise ValueError(f"{name} must be non-empty")
+    if len(set(result)) != len(result):
+        raise ValueError(f"{name} must contain unique strings")
+    return result
 
 
 def _frozen_map(value: Mapping[str, Any], *, integer: bool = False) -> Mapping[str, Any]:
@@ -31,13 +75,17 @@ def _frozen_map(value: Mapping[str, Any], *, integer: bool = False) -> Mapping[s
         raise ValueError("expected mapping")
     out: dict[str, Any] = {}
     for key, raw in value.items():
-        if not isinstance(key, str) or not key:
-            raise ValueError("mapping keys must be non-empty strings")
+        _audit_text(key, "mapping key")
         if integer:
             if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
                 raise ValueError(f"allocation for {key!r} must be a non-negative integer")
             out[key] = raw
         else:
+            # JSON numbers decode as int/float.  Do not accept numeric strings
+            # or booleans here: coercion would let a malformed artifact alter
+            # score ordering while still passing validation.
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                raise ValueError(f"score for {key!r} must be a finite number")
             number = float(raw)
             if not math.isfinite(number):
                 raise ValueError(f"score for {key!r} must be finite")
@@ -100,21 +148,36 @@ class AllocationAuditRecord:
 
     @classmethod
     def create(cls, **kwargs: Any) -> "AllocationAuditRecord":
+        # Validate identity fields before any derived vectors are built.  In
+        # particular, never use ``str(value)`` here: ``None`` and integers are
+        # malformed artifact values, not alternate spellings of an ID.
+        state_id = _audit_text(kwargs.pop("state_id"), "state_id")
+        decision_id = _audit_text(kwargs.pop("decision_id"), "decision_id")
+        config_hash = _audit_text(
+            kwargs.pop("allocation_config_sha256"),
+            "allocation_config_sha256",
+        )
+        if _SHA256.fullmatch(state_id) is None or _SHA256.fullmatch(config_hash) is None:
+            raise ValueError("state_id and allocation_config_sha256 must be SHA-256 hex strings")
         before = _frozen_map(kwargs.pop("allocation_before"), integer=True)
         task_scores = _frozen_map(kwargs.pop("task_only_scores"))
         increments = _frozen_map(kwargs.pop("trace_increments"))
         totals = _frozen_map(kwargs.pop("trace_total_scores"))
         _same_keys(task_scores, increments, totals)
-        tasks = tuple(str(x) for x in kwargs.pop("eligible_task_ids"))
-        if not tasks or any(not task for task in tasks) or len(set(tasks)) != len(tasks):
-            raise ValueError("eligible_task_ids must be non-empty, unique task IDs")
+        tasks = _audit_text_list(kwargs.pop("eligible_task_ids"), "eligible_task_ids")
         if not set(tasks).issubset(before):
             raise ValueError("eligible task is absent from allocation vector")
         if set(task_scores) != set(tasks):
             raise ValueError("score maps must contain exactly the eligible task IDs")
-        trace_selected = str(kwargs.pop("trace_state_selected_task_id", "") or "")
-        task_selected = str(kwargs.pop("task_state_selected_task_id", "") or "")
-        admitted = str(kwargs.pop("admitted_task_id", "") or "")
+        trace_selected = _audit_text(
+            kwargs.pop("trace_state_selected_task_id", ""),
+            "trace_state_selected_task_id",
+        )
+        task_selected = _audit_text(
+            kwargs.pop("task_state_selected_task_id", ""),
+            "task_state_selected_task_id",
+        )
+        admitted = _audit_text(kwargs.pop("admitted_task_id", ""), "admitted_task_id")
         if not admitted:
             raise ValueError("audit rows are emitted only for admitted Trace-State decisions")
         if admitted != trace_selected:
@@ -146,15 +209,19 @@ class AllocationAuditRecord:
         delta = sum(trace_after[k] - task_after[k] for k in before)
         if delta != 0:
             raise ValueError("trace/task allocation delta must conserve capacity")
-        if not _SHA256.fullmatch(str(kwargs.get("state_id", ""))) or not _SHA256.fullmatch(str(kwargs.get("allocation_config_sha256", ""))):
-            raise ValueError("state_id and allocation_config_sha256 must be SHA-256 hex strings")
+        fallback_reason = _audit_text(
+            kwargs.pop("fallback_reason", ""),
+            "fallback_reason",
+            allow_empty=True,
+            max_chars=_MAX_AUDIT_REASON_CHARS,
+        )
         record = cls(
-            state_id=str(kwargs.pop("state_id")), decision_id=str(kwargs.pop("decision_id")),
-            eligible_task_ids=tasks, allocation_config_sha256=str(kwargs.pop("allocation_config_sha256")),
+            state_id=state_id, decision_id=decision_id,
+            eligible_task_ids=tasks, allocation_config_sha256=config_hash,
             task_only_scores=task_scores, trace_increments=increments, trace_total_scores=totals,
             allocation_before=before, trace_state_allocation_after=trace_after, task_state_allocation_after=task_after,
             trace_state_selected_task_id=trace_selected, task_state_selected_task_id=task_selected,
-            admitted_task_id=admitted, fallback_reason=str(kwargs.pop("fallback_reason", "") or ""),
+            admitted_task_id=admitted, fallback_reason=fallback_reason,
             active_slots_before=kwargs.pop("active_slots_before"), active_slots_after=kwargs.pop("active_slots_after"),
             free_slots_before=kwargs.pop("free_slots_before"), free_slots_after=kwargs.pop("free_slots_after"),
             scheduler_reserved_slots_before=kwargs.pop("scheduler_reserved_slots_before"), scheduler_reserved_slots_after=kwargs.pop("scheduler_reserved_slots_after"),
@@ -185,7 +252,14 @@ class AllocationAuditRecord:
 
 
 def append_allocation_audit(path: Path, record: AllocationAuditRecord) -> None:
-    append_jsonl(path, record.as_dict())
+    if not isinstance(record, AllocationAuditRecord):
+        raise ValueError("record must be AllocationAuditRecord")
+    # Frozen dataclasses can still be constructed directly (or produced with
+    # ``dataclasses.replace``), bypassing ``create``.  Re-run the complete
+    # schema/capacity validation at the persistence boundary so an invalid
+    # in-memory record can never become authoritative audit evidence.
+    validated = AllocationAuditRecord.from_dict(record.as_dict())
+    append_jsonl(path, validated.as_dict())
 
 
 def read_allocation_audits(path: Path, *, expected_config_sha256: str | None = None, expected_state_ids: Iterable[str] | None = None) -> list[AllocationAuditRecord]:

@@ -50,6 +50,49 @@ class AuditTests(unittest.TestCase):
             path.write_text('{"schema_version":"x","schema_version":"y"}\n')
             with self.assertRaises(ValueError): read_allocation_audits(path)
 
+    def test_audit_identity_and_score_types_are_not_lossily_coerced(self):
+        base = _record().as_dict()
+        base.pop("schema_version")
+        base.pop("capacity_delta_sum")
+        base.pop("capacity_conserved")
+
+        malformed = (
+            ("eligible_task_ids", "abc"),  # scalar strings must not become IDs a/b/c
+            ("eligible_task_ids", ["a", 2, "c"]),
+            ("task_only_scores", {"a": "0.2", "b": 0.5, "c": 0.6}),
+            ("state_id", None),
+            ("decision_id", 17),
+            ("fallback_reason", 3),
+        )
+        for field, value in malformed:
+            with self.subTest(field=field, value=value):
+                row = dict(base)
+                row[field] = value
+                with self.assertRaises(ValueError):
+                    AllocationAuditRecord.create(**row)
+
+    def test_audit_ids_reject_control_or_surrounding_whitespace(self):
+        base = _record().as_dict()
+        base.pop("schema_version")
+        base.pop("capacity_delta_sum")
+        base.pop("capacity_conserved")
+        for field, value in (
+            ("decision_id", " d-1"),
+            ("trace_state_selected_task_id", "a\n"),
+            ("fallback_reason", "bad\x00reason"),
+        ):
+            with self.subTest(field=field):
+                row = dict(base)
+                row[field] = value
+                with self.assertRaises(ValueError):
+                    AllocationAuditRecord.create(**row)
+
+    def test_append_revalidates_directly_constructed_records(self):
+        malformed = replace(_record(), task_only_scores={"a": "0.2", "b": 0.5, "c": 0.6})
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(ValueError):
+                append_allocation_audit(Path(td) / "audit.jsonl", malformed)
+
     def test_vectors_include_ineligible_tasks_but_scores_do_not(self):
         row = _record().as_dict(); row.pop("schema_version"); row.pop("capacity_delta_sum"); row.pop("capacity_conserved")
         for key in ("allocation_before", "trace_state_allocation_after", "task_state_allocation_after"):
