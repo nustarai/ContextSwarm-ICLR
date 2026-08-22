@@ -477,7 +477,24 @@ def _is_bound_terminal_candidate_failure(
     observed_contract = _normalized_sha256(verdict.task_contract_sha256)
     if expected_contract is None or observed_contract != expected_contract:
         return False
-    return bool(str(verdict.judge_job_id or "").strip())
+    if not str(verdict.judge_job_id or "").strip():
+        return False
+    # A retryable hint on a closeout receipt can still denote a provider-side
+    # failure while the independent authority is unavailable.  Treat it as a
+    # candidate attempt only when the terminal reason explicitly binds the
+    # failure to this submitted candidate; a generic/contradictory reason such
+    # as ``verified_without_sorry`` remains closeout infrastructure noise.
+    if _response_value(verdict.response, "retryable") is True:
+        reason = str(_response_value(verdict.response, "terminal_reason") or "").strip().lower()
+        if reason not in {
+            "candidate_attempt_limit",
+            "candidate_failure",
+            "resource_limit",
+            "memory_limit_exceeded",
+            "execution_timeout",
+        }:
+            return False
+    return True
 
 
 def _mark_closeout_infrastructure_incomplete(
@@ -4359,8 +4376,23 @@ def _run_closeout(
             # must remain an ordinary evaluated closeout outcome, regardless
             # of a provider-supplied retryable hint.  Prior solver authority
             # is diagnostic linkage only and is not reused.
+            candidate_failure = Verdict(
+                task_id=observed.task_id,
+                status=observed.status,
+                score=0.0,
+                elapsed_seconds=observed.elapsed_seconds,
+                response={
+                    **dict(observed.response),
+                    "closeout_candidate_attempt": True,
+                },
+                error=observed.error,
+                candidate_sha256=observed.candidate_sha256,
+                task_contract_sha256=observed.task_contract_sha256,
+                judge_job_id=observed.judge_job_id,
+                cache_reused=observed.cache_reused,
+            )
             return _CloseoutDecision(
-                observed,
+                candidate_failure,
                 observed,
                 prior,
                 "evaluated",
@@ -4622,9 +4654,14 @@ def _run_health(
     }
     for verdict in verdicts.values():
         status = normalize_verdict_status(verdict.status)
+        retryable_closeout = _retryable_closeout_infrastructure_failure(verdict)
+        bound_candidate_closeout = (
+            _response_value(verdict.response, "closeout_candidate_attempt") is True
+        )
         if (
             status in incomplete_closeout_statuses
             or status in _NONTERMINAL_VERDICT_STATUSES
+            or (retryable_closeout and not bound_candidate_closeout)
         ):
             issues.add("closeout_incomplete")
         if status == "AUTHORITY_CONFLICT":
@@ -4634,7 +4671,7 @@ def _run_health(
         # A retryable terminal receipt in the independent closeout phase is
         # distinct from the same status during a solver attempt: there is no
         # remaining candidate attempt to refill, so closeout remains degraded.
-        if _retryable_closeout_infrastructure_failure(verdict):
+        if retryable_closeout and not bound_candidate_closeout:
             issues.add("evaluator_infrastructure_error")
         if status == "PROVENANCE_INVALID":
             issues.add("verdict_provenance_invalid")
