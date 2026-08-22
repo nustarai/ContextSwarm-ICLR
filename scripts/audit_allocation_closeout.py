@@ -1703,11 +1703,21 @@ def _check_closeout_lifecycle(
         elif flags == (False, True, False, False, False):
             disposition = "confirmed"
             valid = status == "PROVED" and observed_status == "PROVED"
-        elif flags == (True, False, True, False, False):
-            disposition = "retryable_reused"
+        elif flags in {
+            (False, False, True, False, False),
+            # Older artifacts used this flag to indicate that a solver proof
+            # was reused.  Treat them as the same incomplete disposition, but
+            # require the new zero-score/fresh-closeout contract below.
+            (True, False, True, False, False),
+        }:
+            disposition = "retryable_unconfirmed"
             valid = (
-                status == "PROVED"
+                status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+                and float(row.get("score", 0.0)) == 0.0
                 and observed_status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+                and row.get("reused_authoritative_verdict") is False
+                and row.get("prior_authoritative_proof_available") is True
+                and row.get("fresh_closeout_confirmed") is False
             )
         elif flags == (False, False, False, True, True):
             disposition = "conflict"
@@ -1748,7 +1758,7 @@ def _check_closeout_lifecycle(
             evidence.direct_keys.add(key)
             if _has_positive_score(row):
                 evidence.positive_direct_keys[key] += 1
-        elif disposition in {"confirmed", "retryable_reused"} and key is not None:
+        elif disposition in {"confirmed", "retryable_unconfirmed"} and key is not None:
             evidence.prior_authority_keys.add(key)
         if row.get("cache_reused") is True and key is not None:
             evidence.cache_reused_keys.add(key)
@@ -1778,7 +1788,7 @@ def _check_closeout_lifecycle(
         issues,
         "closeout_authority_chain_mismatch",
     )
-    expected_infra = {task for task, value in dispositions.items() if value == "retryable_reused"}
+    expected_infra = {task for task, value in dispositions.items() if value == "retryable_unconfirmed"}
     expected_confirmed = {task for task, value in dispositions.items() if value == "confirmed"}
     expected_conflict = {task for task, value in dispositions.items() if value == "conflict"}
     if set(infra_rows) != expected_infra or set(confirmed_rows) != expected_confirmed or set(conflict_rows) != expected_conflict:
@@ -1797,12 +1807,15 @@ def _check_closeout_lifecycle(
             or _normalize_status(special.get("final_status"))
             != _normalize_status(row.get("status"))
             or special.get("final_score") != row.get("score")
+            or row.get("score") != 0.0
             or special.get("observed_error_kind") != detail.get("error_kind")
             or special.get("observed_terminal_reason")
             != detail.get("terminal_reason")
             or not _same_optional_hash(special.get("candidate_sha256"), row.get("candidate_sha256"))
             or not _same_optional_hash(special.get("task_contract_sha256"), row.get("task_contract_sha256"))
             or detail.get("retryable") is not True
+            or _response_mapping(row).get("prior_authoritative_proof_available") is not True
+            or _response_mapping(row).get("fresh_closeout_confirmed") is not False
             or _normalize_status(detail.get("observed_status"))
             != _normalize_status(row.get("observed_status"))
         ):
@@ -1882,9 +1895,10 @@ def _check_closeout_lifecycle(
     if len(finished_rows) == 1:
         finished = finished_rows[0]
         expected_counts = {
-            "reused_authoritative_verdicts": sum(value == "retryable_reused" for value in dispositions.values()),
+            "reused_authoritative_verdicts": 0,
             "authoritative_proofs_confirmed": sum(value == "confirmed" for value in dispositions.values()),
-            "closeout_infra_incomplete": sum(value == "retryable_reused" for value in dispositions.values()),
+            "closeout_infra_incomplete": sum(value == "retryable_unconfirmed" for value in dispositions.values()),
+            "closeout_infra_unconfirmed": sum(value == "retryable_unconfirmed" for value in dispositions.values()),
             "authority_conflicts": sum(value == "conflict" for value in dispositions.values()),
             "remote_settlement_unconfirmed": sum(value == "remote" for value in dispositions.values()),
         }
