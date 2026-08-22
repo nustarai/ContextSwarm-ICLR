@@ -4423,11 +4423,17 @@ def _run_health(
         if (
             status in incomplete_closeout_statuses
             or status in _NONTERMINAL_VERDICT_STATUSES
+            or _retryable_closeout_infrastructure_failure(verdict)
         ):
             issues.add("closeout_incomplete")
         if status == "AUTHORITY_CONFLICT":
             issues.add("closeout_authority_conflict")
         if _is_infrastructure_verdict(verdict):
+            issues.add("evaluator_infrastructure_error")
+        # A retryable terminal receipt in the independent closeout phase is
+        # distinct from the same status during a solver attempt: there is no
+        # remaining candidate attempt to refill, so closeout remains degraded.
+        if _retryable_closeout_infrastructure_failure(verdict):
             issues.add("evaluator_infrastructure_error")
         if status == "PROVENANCE_INVALID":
             issues.add("verdict_provenance_invalid")
