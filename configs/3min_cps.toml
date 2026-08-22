@@ -13,6 +13,4 @@ output_root = "runs/3min"
 timeout_seconds = 180
 
 [lean]
-server_url = "http://127.0.0.1:19000"
-agent_local_cutoff_seconds = 30
 max_concurrent_evaluations = 4

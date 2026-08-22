@@ -39,6 +39,8 @@ class AgentResult:
     timed_out: bool = False
     cancelled: bool = False
     mocked: bool = False
+    decision_index: int | None = None
+    run_horizon_reached: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -55,6 +57,8 @@ class AgentResult:
             "timed_out": self.timed_out,
             "cancelled": self.cancelled,
             "mocked": self.mocked,
+            "decision_index": self.decision_index,
+            "run_horizon_reached": self.run_horizon_reached,
         }
 
 
@@ -66,6 +70,10 @@ class Verdict:
     elapsed_seconds: float
     response: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    candidate_sha256: str | None = None
+    task_contract_sha256: str | None = None
+    judge_job_id: str | None = None
+    cache_reused: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +83,10 @@ class Verdict:
             "elapsed_seconds": self.elapsed_seconds,
             "response": self.response,
             "error": self.error,
+            "candidate_sha256": self.candidate_sha256,
+            "task_contract_sha256": self.task_contract_sha256,
+            "judge_job_id": self.judge_job_id,
+            "cache_reused": self.cache_reused,
         }
 
 

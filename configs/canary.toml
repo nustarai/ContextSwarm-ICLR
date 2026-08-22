@@ -1,0 +1,25 @@
+extends = ["base.toml"]
+
+# One-task real transport/security canary. The Judge endpoint is injected only
+# through CONTEXTSWARM_JUDGE_URL by the operator.
+[experiment]
+name = "mobench-controlled-judge-canary"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 1
+initial_agents_per_task = 1
+max_attempts_per_task = 1
+episodes_per_task = 1
+max_tasks = 1
+time_limit_seconds = 180
+output_root = "runs/canary"
+
+[allocation]
+policy = "uniform"
+
+[pi]
+timeout_seconds = 180
+
+[lean]
+max_concurrent_evaluations = 1
+require_result_cache_disabled = true

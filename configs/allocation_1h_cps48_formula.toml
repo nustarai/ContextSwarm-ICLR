@@ -1,0 +1,8 @@
+extends = ["allocation_1h_cps48.toml"]
+
+[experiment]
+name = "mobench-allocation-1h-cps48-formula"
+output_root = "runs/1h_allocation/formula"
+
+[allocation]
+policy = "formula"

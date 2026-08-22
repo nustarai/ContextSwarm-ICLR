@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 import uuid
 
 from .config import ExperimentConfig
@@ -24,6 +25,30 @@ from .models import AgentResult
 
 
 _STDERR_LINE_LIMIT_BYTES = 256 * 1024
+_FILE_TOOLS = ("read", "edit", "write", "grep", "find", "ls")
+_CPS_SHARED_TOOLS = ("cps_search", "cps_publish", "cps_actors")
+_CPS_DIRECT_TOOLS = ("cps_inbox", "cps_send", "cps_ack")
+_SOLVER_EXTENSION_NAME = "pi_solver_tools.mjs"
+_FAST_MODE_EXTENSION_NAME = "pi_fast_mode.mjs"
+_BROKER_ENVIRONMENT_KEYS = frozenset(
+    {
+        "CONTEXTSWARM_JUDGE_URL",
+        "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS",
+    }
+)
+_BROKER_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
+_SOLVER_SYSTEM_PROMPT = """You are a bounded formal-proof construction worker, not a general-purpose coding agent.
+Work only on the assigned result.lean and use only the explicitly provided tools.
+Do not execute shell commands, spawn background or parallel processes, run a local
+Lean/verifier/proof-search service, install or download software, or make raw network
+requests. All dynamic Lean verification must use the runner-provided judge_check tool.
+If that tool is busy or unavailable, continue static proof reasoning or leave the best
+candidate for the runner; never create a local or raw-network fallback. The user prompt
+defines the assigned proof task and, when present, the controlled CPS protocol."""
+_ISOLATED_SYSTEM_PROMPT = """You are a read-only allocation decision component in a bounded experiment.
+Use only the snapshot in the user prompt. You have no tools and must not inspect files,
+execute commands, spawn processes, use the network, or change run state. Return only the
+decision format requested by the user prompt."""
 _CPS_ENVIRONMENT_KEYS = frozenset(
     {
         "CONTEXTSWARM_CPS_DB",
@@ -34,18 +59,34 @@ _CPS_ENVIRONMENT_KEYS = frozenset(
         "CONTEXTSWARM_TASK_ROOT",
     }
 )
-_SAFE_PARENT_ENVIRONMENT_KEYS = frozenset(
+_EVALUATOR_ENVIRONMENT_KEYS = frozenset(
     {
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "PATH",
-        "SSL_CERT_DIR",
-        "SSL_CERT_FILE",
-        "TERM",
-        "TZ",
+        "LEAN_AUTH_TOKEN",
+        "LEAN_SERVER_URL",
+        "LEAN_JUDGE_URL",
+        "JUDGE_URL",
+        "JUDGE_ENDPOINT",
+        "CONTEXTSWARM_JUDGE_URL",
+        "CONTEXTSWARM_JUDGE_ENDPOINT",
+        "CONTEXTSWARM_EVALUATOR_URL",
+        "EVALUATOR_URL",
+        "CONTEXTSWARM_LEAN_SERVER_URL",
+        "CONTEXTSWARM_LEAN_ENV_ID",
+        "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE",
+        "CONTEXTSWARM_LEAN_JUDGE_MODE",
+        "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS",
+        "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS",
     }
 )
+
+
+def _is_evaluator_environment_key(key: str) -> bool:
+    normalized = str(key).strip().upper()
+    return (
+        normalized in _EVALUATOR_ENVIRONMENT_KEYS
+        or normalized.startswith("CONTEXTSWARM_LEAN_")
+        or normalized.startswith("CONTEXTSWARMJUDGE_")
+    )
 
 
 def now_iso() -> str:
@@ -77,6 +118,7 @@ class PiAgent:
         *,
         session_dir: Path | None = None,
         session_id: str | None = None,
+        isolated: bool = False,
     ) -> list[str]:
         command = [
             self.binary(),
@@ -85,26 +127,92 @@ class PiAgent:
             "--approve",
             "--thinking",
             self.config.thinking,
+            "--system-prompt",
+            _ISOLATED_SYSTEM_PROMPT if isolated else _SOLVER_SYSTEM_PROMPT,
         ]
         if session_dir is not None:
             command.extend(["--session-dir", str(session_dir)])
         if session_id:
             command.extend(["--session-id", session_id])
-        if self.config.pi_guard_extension.strip():
-            guard_path = self.config.resolve_runtime_path(self.config.pi_guard_extension)
-            if not guard_path.is_file():
-                raise ValueError(f"worker workspace guard extension is unavailable: {guard_path}")
-            command.extend(["--extension", str(guard_path)])
-        extension = self.config.pi_extension.strip()
-        if self.config.fast_mode and extension:
-            extension_path = self.config.resolve_runtime_path(extension)
-            if extension_path.is_file() and extension_path != self.config.resolve_runtime_path(
-                self.config.pi_guard_extension
-            ):
+        if isolated:
+            command.extend(
+                [
+                    "--no-tools",
+                    "--no-context-files",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "--no-extensions",
+                ]
+            )
+        else:
+            command.extend(
+                [
+                    "--no-context-files",
+                    "--no-skills",
+                    "--no-prompt-templates",
+                    "--no-extensions",
+                    "--tools",
+                    ",".join(self.solver_tools()),
+                ]
+            )
+            for _role, extension_path in self._trusted_extensions():
                 command.extend(["--extension", str(extension_path)])
         if self.config.model:
             command.extend(["--model", self.config.model])
         return command
+
+    def _trusted_extensions(self) -> tuple[tuple[str, Path], ...]:
+        """Resolve the complete explicit extension allowlist or fail closed."""
+
+        solver_extension = Path(__file__).with_name(_SOLVER_EXTENSION_NAME).resolve()
+        if not solver_extension.is_file():
+            raise ValueError(
+                f"controlled Pi solver extension is missing: {solver_extension}"
+            )
+        extensions: list[tuple[str, Path]] = [
+            ("solver_capabilities", solver_extension),
+        ]
+        if self.config.fast_mode:
+            configured = self.config.pi_extension.strip()
+            if not configured:
+                raise ValueError("fast mode requires the bundled trusted Pi extension")
+            expected = Path(__file__).with_name(_FAST_MODE_EXTENSION_NAME).resolve()
+            configured_path = self.config.resolve_runtime_path(configured).resolve()
+            if configured_path != expected:
+                raise ValueError(
+                    "fast mode rejects non-bundled Pi extensions; "
+                    f"expected {_FAST_MODE_EXTENSION_NAME}"
+                )
+            if not expected.is_file():
+                raise ValueError(f"trusted fast-mode Pi extension is missing: {expected}")
+            extensions.append(("fast_mode_provider_policy", expected))
+        return tuple(extensions)
+
+    def trusted_extension_declaration(self) -> dict[str, Any]:
+        """Return a value-free, hash-bound declaration of explicit extensions."""
+
+        rows = []
+        for role, path in self._trusted_extensions():
+            rows.append(
+                {
+                    "role": role,
+                    "name": path.name,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            )
+        return {
+            "schema_version": "contextswarm_pi_extension_policy_v1",
+            "policy": "bundled_explicit_only",
+            "discovery_disabled": True,
+            "extensions": rows,
+        }
+
+    def solver_tools(self) -> tuple[str, ...]:
+        tools = [*_FILE_TOOLS, "judge_check"]
+        if self.config.uses_cps:
+            tools.extend(_CPS_SHARED_TOOLS)
+            tools.extend(_CPS_DIRECT_TOOLS)
+        return tuple(tools)
 
     def environment(
         self,
@@ -114,53 +222,49 @@ class PiAgent:
         workdir: Path,
         extra_env: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
-        # The model-facing Pi process receives an explicit allowlist, not the
-        # operator shell. Judge credentials and raw endpoint variables stay in
-        # the trusted runner/broker process.
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key in _SAFE_PARENT_ENVIRONMENT_KEYS and isinstance(value, str)
-        }
-        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
-        private_home = workdir / ".runtime" / "home"
-        private_tmp = workdir / ".runtime" / "tmp"
-        for directory in (private_home, private_tmp):
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(directory, 0o700)
+        env = dict(os.environ)
+        # The supervisor alone owns raw Judge credentials and endpoints.  A
+        # session-scoped broker capability may be injected below via extra_env.
+        for key in tuple(env):
+            if (
+                _is_evaluator_environment_key(key)
+                or key.startswith("CONTEXTSWARM_JUDGE_")
+                or key.startswith("CONTEXTSWARM_MANIFEST_")
+                or key == "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED"
+                or key == "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"
+            ):
+                env.pop(key, None)
+        # A notebook/operator shell may still carry variables from a previous
+        # CPS run.  Baselines inherit the ordinary process environment, but
+        # never an implicit communication surface; CPS call sites explicitly
+        # add the current run's values through ``extra_env`` below.
+        for key in tuple(env):
+            if key in _CPS_ENVIRONMENT_KEYS or key.startswith("CONTEXTSWARM_CPS_"):
+                env.pop(key, None)
+        private_tmp = workdir / ".tmp"
+        private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(private_tmp, 0o700)
         env.update(
             {
-                "HOME": str(private_home),
-                "TMPDIR": str(private_tmp),
                 "PI_BIN": self.binary(),
                 "EXPERIMENT_PI_BINARY": self.binary(),
                 "CONTEXTSWARM_TASK_ID": task_id,
                 "CONTEXTSWARM_ACTOR_ID": actor_id,
                 "CONTEXTSWARM_WORKDIR": str(workdir),
-                "CONTEXTSWARM_EXPERIMENT_MODE": self.config.mode,
                 "CONTEXTSWARM_EXPERIMENT_SEED": str(self.config.seed),
-                # The guard is a workspace isolation boundary, not a formal-tool
-                # feature toggle. Disabling the shims must not expose sibling or
-                # runner-owned files to the model process.
-                "CONTEXTSWARM_WORKER_GUARD": "1",
-                "CONTEXTSWARM_WORKER_MAX_WRITE_BYTES": str(
-                    self.config.formal_tools_max_candidate_bytes
-                ),
-                "CONTEXTSWARM_EVALUATOR_COMMAND_TIMEOUT_SECONDS": str(
-                    self.config.formal_tools_command_timeout_seconds
-                ),
+                "TMPDIR": str(private_tmp),
                 "AISW_LEASE_WAIT_SECONDS": str(self.config.aisw_lease_wait_seconds),
                 "AISW_LEASE_RETRY_INTERVAL_SECONDS": str(self.config.aisw_lease_retry_interval_seconds),
             }
         )
-        env["PYTHONPATH"] = str(self.config.repo_root)
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        repo_path = str(self.config.repo_root)
+        env["PYTHONPATH"] = repo_path if not existing_pythonpath else f"{repo_path}{os.pathsep}{existing_pythonpath}"
         if self.config.aisw_enabled:
-            env["AISW_HOME"] = os.environ.get("AISW_HOME", "/run/contextswarm-aisw")
+            env["AISW_HOME"] = env.get("AISW_HOME", "/run/contextswarm-aisw")
             env["CONTEXTSWARM_AISW_PRIVATE_HOME_REQUIRED"] = "1"
             env["AISW_DISABLE_LOCAL_FALLBACK"] = "1"
-            env["CONTEXTSWARM_REAL_PI_BINARY"] = os.environ.get(
-                "CONTEXTSWARM_REAL_PI_BINARY", "/usr/local/bin/pi"
-            )
+            env["CONTEXTSWARM_REAL_PI_BINARY"] = env.get("CONTEXTSWARM_REAL_PI_BINARY", "/usr/local/bin/pi")
             node_config = os.environ.get("MINI_SWARM_AISW_NODE_CONFIG", "").strip() or self.config.aisw_node_config.strip()
             if node_config:
                 env["AISW_NODE_CONFIG"] = str(self.config.resolve_runtime_path(node_config))
@@ -176,17 +280,36 @@ class PiAgent:
                 self.trace_path.with_name("pi_fast_mode_provider_requests.jsonl")
             )
         if extra_env:
-            unexpected = {
-                str(key)
-                for key in extra_env
-                if str(key) not in _CPS_ENVIRONMENT_KEYS
-            }
-            if unexpected:
+            controlled = {str(key): str(value) for key, value in extra_env.items()}
+            if set(controlled) != _BROKER_ENVIRONMENT_KEYS:
                 raise ValueError(
-                    "unexpected worker environment capability: "
-                    + ", ".join(sorted(unexpected))
+                    "unsupported solver environment capability; expected only the controlled broker"
                 )
-            env.update({str(key): str(value) for key, value in extra_env.items()})
+            broker_url = controlled["CONTEXTSWARM_JUDGE_URL"].strip()
+            try:
+                parsed_broker = urlsplit(broker_url)
+                broker_port = parsed_broker.port
+            except ValueError as exc:
+                raise ValueError("invalid controlled broker capability") from exc
+            token = parsed_broker.path.removeprefix("/")
+            if (
+                parsed_broker.scheme != "http"
+                or parsed_broker.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or broker_port is None
+                or parsed_broker.username is not None
+                or parsed_broker.password is not None
+                or parsed_broker.query
+                or parsed_broker.fragment
+                or parsed_broker.path != f"/{token}"
+                or _BROKER_TOKEN_PATTERN.fullmatch(token) is None
+            ):
+                raise ValueError("invalid controlled broker capability")
+            raw_deadline = controlled[
+                "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"
+            ].strip()
+            if not raw_deadline.isascii() or not raw_deadline.isdigit() or int(raw_deadline) <= 0:
+                raise ValueError("invalid controlled broker deadline")
+            env.update(controlled)
         return env
 
     def run(
@@ -200,9 +323,10 @@ class PiAgent:
         extra_env: Mapping[str, str] | None = None,
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        isolated: bool = False,
     ) -> AgentResult:
         started = now_iso()
-        command = self.command()
+        command = self.command(isolated=isolated)
         output = _TailBuffer(6_000)
         errors = _TailBuffer(4_000)
         events = 0
@@ -368,7 +492,11 @@ class PiAgent:
             session_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(session_dir, 0o700)
             _prepare_project_settings(workdir, self.config)
-            command = self.command(session_dir=session_dir, session_id=session_id)
+            command = self.command(
+                session_dir=session_dir,
+                session_id=session_id,
+                isolated=isolated,
+            )
             if self.trace_path is not None:
                 self.trace_path.parent.mkdir(parents=True, exist_ok=True)
                 trace_handle = self.trace_path.open("a", encoding="utf-8")
@@ -508,8 +636,10 @@ class PiAgent:
             started_at=started,
             finished_at=now_iso(),
             command=command,
-            output_tail=output.value(),
-            error_tail=errors.value(),
+            # Re-sanitize the assembled tails so a secret split across Pi RPC
+            # text-delta events cannot be reconstructed in final artifacts.
+            output_tail=_redact_sensitive_text(output.value()),
+            error_tail=_redact_sensitive_text(errors.value()),
             events=events,
             timed_out=timed_out,
             cancelled=cancelled,
@@ -773,13 +903,21 @@ _SECRET_PATTERN = re.compile(
     r"credential|client[_-]?secret|secret)[\"']?\s*[:=]\s*)"
     r"(?:[\"'][^\"']*[\"']|[^\s,;}]+)"
 )
+_OPAQUE_SECRET_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"(?:sk|tok|nur|aisw)[_-][A-Za-z0-9_-]{12,}"
+    r"|eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,}){2}"
+    r"|[A-Za-z0-9_-]{48,}"
+    r")(?![A-Za-z0-9])"
+)
 
 
 def _redact_sensitive_text(value: str) -> str:
     text = _AUTHORIZATION_PATTERN.sub(r"\1<redacted>", str(value or ""))
     text = _BEARER_PATTERN.sub("Bearer <redacted>", text)
     text = _SECRET_PATTERN.sub(r"\1<redacted>", text)
-    return _URL_PATTERN.sub("<redacted-url>", text)
+    text = _URL_PATTERN.sub("<redacted-url>", text)
+    return _OPAQUE_SECRET_PATTERN.sub("<redacted-secret>", text)
 
 
 def _close_stdin(process: subprocess.Popen[bytes]) -> None:

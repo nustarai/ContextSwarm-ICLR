@@ -28,18 +28,16 @@ python3 -m contextswarm_mini.cli --config configs/smoke.toml run --mock-agent
 run_meta.json
 transport_preflight.json   # real NuRouter/Lean run
 events.jsonl
-scoreboard_history.jsonl       # 只含 outer-official closeout
-agent_evaluation_history.jsonl # solver 阶段诊断，不是分数
+scoreboard_history.jsonl
 final.json
 cps.sqlite3              # CPS 模式
 communication_trace.jsonl # CPS 事件投影
 elastic_assignments.jsonl  # CPS 动态 agent 分配
 elastic_scheduler_state.json # CPS 调度器收尾状态
+allocation_decisions.jsonl   # 自适应分配决策及当时的因果快照
+allocation_summary.json      # policy 延迟、fallback、token 与 slot 利用率
 closeout_candidates.json   # 三种模式统一的冻结候选索引与 SHA-256
 closeout_candidates/<task>/result.lean # feedback-free 最终评分快照
-telemetry/agent_local_evaluations.jsonl
-telemetry/formal_query_calls.jsonl
-telemetry/official_verdicts.jsonl
 workers/<task>/result.lean # parallel
 workers/<task>/agents/<actor>/result.lean # elastic CPS attempts
 workers/<task>/best/result.lean # elastic CPS best candidate
@@ -58,6 +56,9 @@ CONTEXTSWARM_MINI_PI_VERSION=0.84.2 scripts/build_image.sh
 
 镜像同时固定 Codex compatibility binary（当前默认 `0.148.0`，可用
 `CONTEXTSWARM_MINI_CODEX_VERSION` 覆盖）。
+正式构建只接受 clean worktree，并使用 `git archive HEAD` 作为 Docker context；
+镜像 label 绑定完整 source commit。启动器会校验实际 image ID 与 revision label，
+并把两者写入 run provenance，因此三个 allocation arm 可以做精确版本联结。
 
 默认 manifest 使用标准 provider routing（`fast_mode = false`），这样可以
 兼容没有 runtime-policy endpoint 的 NuRouter release；确认 coordinator 的
@@ -68,8 +69,13 @@ manifest 中打开 fast mode。
 
 1. 可在 Linux 容器执行的 NuRouter/AISW release ELF（优先使用 `nurouter`）；
 2. NuRouter node/coordinator 配置（默认读取 `~/.nurouter/node.toml`）；
-3. 可访问的 MathOlympiadBench Lean router（默认 `http://127.0.0.1:18000`）；
-4. 与该 router Mathlib revision 一致的公开 declaration index（见下文）。
+3. 可访问的 MathOlympiadBench Lean Judge，并在宿主环境中设置
+   `CONTEXTSWARM_JUDGE_URL`。Judge 地址不会写入 tracked manifest。
+
+正式 allocation 和 canary manifest 还要求 supervisor 注入
+`CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL`。它必须指向同一 Judge backend 的
+`/healthz`（也可以给 backend base URL），用于 fail-closed 地确认本次 Lean 环境
+就绪且 result cache 已禁用。
 
 如果使用同机的 `ContextSwarmJudge`，需要启动完整 formal stack（不要只启动
 Lean-Eval slice），例如：
@@ -79,27 +85,43 @@ cd /path/to/ContextSwarmJudge
 ./scripts/start_formal_lean_stack.sh up
 ```
 
-然后确认 `18000/healthz` 的 `accepted_lean_env_ids` 包含
-`formal_matholympiadbench`。
+然后通过 Judge 的 health endpoint 确认 `accepted_lean_env_ids` 包含
+`formal_matholympiadbench`。真实 run 和 preflight 在该变量未设置时会直接拒绝
+启动；离线 `--mock-agent` smoke 不需要它。
 
-默认运行 CPS（index 只读挂载，不进入仓库或镜像）：
+默认运行 CPS：
 
 ```bash
-CONTEXTSWARM_MINI_DECL_INDEX=/path/to/mathlib-decls.sqlite3 \
+# 先在本地 shell 或 secret manager 中设置并 export CONTEXTSWARM_JUDGE_URL。
 scripts/run_docker.sh --config configs/cps.toml
 ```
+
+启动脚本只把环境变量名（`-e CONTEXTSWARM_JUDGE_URL`）交给 Docker，避免私有值
+出现在进程参数、命令日志或 run summary。runner 会把它转换成每个 solver session
+独立的 loopback capability；Solver 看不到 raw Judge endpoint。
+cache-health capability 也只按变量名注入，只供 supervisor preflight 使用；其私有值
+不会交给 Solver，也不会写入 tracked manifest、preflight 证据或运行摘要。
+
+`run_docker.sh` 会从完整解析 `extends` 后的 `[docker]` 读取 `image`、
+`memory_mb` 和 `network`（`host` 或 `bridge`）。`bridge` 会配置
+`host.docker.internal`，用于让 runner 访问显式开放给 Docker bridge 的独立
+Judge，同时隔离容器内硬编码的宿主 `127.0.0.1` 端口。运维侧仍可用 `CONTEXTSWARM_MINI_IMAGE`、
+`CONTEXTSWARM_MINI_MEMORY` 覆盖，两者优先级高于 manifest。
+正式 run/preflight 的启动器拒绝有 tracked 修改的 worktree，并要求整条 manifest
+继承链都来自当前 commit 的 tracked 文件；`runs/` 下的本地 manifest 只允许用于
+mock/plan/validate。完整继承链的 SHA-256 会在容器 entrypoint 再验一次。正式链
+来自只读、commit-bound 镜像，因此校验后也不能被宿主并发修改；开发态的 smoke
+仍可在 dirty worktree 运行。
 
 正式启动前可以只做 transport 检查（不会启动 Pi session）：
 
 ```bash
-CONTEXTSWARM_MINI_DECL_INDEX=/path/to/mathlib-decls.sqlite3 \
 scripts/run_docker.sh --config configs/cps.toml preflight
 ```
 
 运行三种 paper-facing cells：
 
 ```bash
-export CONTEXTSWARM_MINI_DECL_INDEX=/path/to/mathlib-decls.sqlite3
 scripts/run_docker.sh --config configs/mono.toml
 scripts/run_docker.sh --config configs/parallel.toml
 scripts/run_docker.sh --config configs/cps.toml
@@ -114,6 +136,29 @@ max_attempts_per_task = 0   # 0 = 直到 horizon；可设有限重试上限
 cancel_on_proved = true     # 题目证明后取消同题仍运行的 agent
 assignment_policy = "least_active"
 ```
+
+`assignment_policy` 仅保留为底层初始 lease 顺序；初始池之后的新 slot 由
+manifest 的 `[allocation].policy` 选择：
+
+```toml
+[allocation]
+policy = "uniform"          # uniform | formula | agent
+piece_limit_per_task = 3    # 每题最多暴露给 policy 的近期 CPS pieces
+piece_body_chars = 1200
+agent_timeout_seconds = 120 # 只约束中央 Agent scheduler 的单次判断
+```
+
+- `uniform`：不读取 progress，按题目清单做确定性 round-robin；
+- `formula`：读取统一 snapshot，使用 `[allocation.formula]` 中冻结的纯算术权重；
+- `agent`：读取同一 snapshot 与有界 CPS 文本，不接收任何公式或权重，只输出
+  严格的 `task_id/reason/evidence_piece_ids` JSON。它没有 CPS 写接口；非法、超时
+  或在推理期间变为过期的选择会记录并回退 round-robin。
+
+三者都不抢占正在运行的 solver，只有已释放的 slot 才会重新分配。Agent scheduler
+的 wall-clock 和 token 会计入实验成本。`final.json.score_time` 给出固定 horizon 的
+normalized score-time AUC。`solver_slot_utilization` 只统计实际解题时间；
+`compute_slot_utilization` 还会把释放 slot 上的 scheduler 判断时间计入计算占用。
+`scripts/compare_runs.py` 同时报告两者，避免把调度占用误读为解题吞吐。
 
 每次尝试使用独立 workspace，完成后把较强 candidate 合并到
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
@@ -144,13 +189,42 @@ configs/scale_1h_cps96.toml
 其中 Parallel 保持每题一个 baseline agent；CPS24/48/96 分别从每题 2/4/8
 个 agent 起步，总槽位分别为 24/48/96。
 
-用于短 canary 的 180 秒 manifest 已保留在 `configs/3min_*.toml`：
+一小时 CPS48 allocation 对照使用下面三个 manifest；它们都是 12 题、每题初始
+4 个 solver、总 48 slots，除 `allocation.policy` 与输出目录/名称外合同相同：
+
+```text
+configs/allocation_1h_cps48_uniform.toml
+configs/allocation_1h_cps48_formula.toml
+configs/allocation_1h_cps48_agent.toml
+```
+
+完成后可直接比较：
 
 ```bash
-scripts/run_docker.sh --config configs/3min_mono.toml
-scripts/run_docker.sh --config configs/3min_parallel.toml
-scripts/run_docker.sh --config configs/3min_cps.toml
+python3 scripts/compare_runs.py \
+  runs/1h_allocation/uniform/<run-id> \
+  runs/1h_allocation/formula/<run-id> \
+  runs/1h_allocation/agent/<run-id>
 ```
+
+正式实验前先运行单题、单 agent、单次尝试的 180 秒 controlled-Judge canary，
+并让 fail-closed 审计确认至少发生一次真实 `judge_check`：
+
+```bash
+scripts/run_docker.sh --config configs/canary.toml
+python3 scripts/audit_canary_closeout.py runs/canary/<run-id>
+```
+
+审计同时检查真实镜像 provenance、受控 Solver command/tool allowlist、Judge probe
+provenance、broker drain、health、429/OOM/worker error，并报告是否观察到远端 job
+DELETE；自然完成且没有取消 job 的 canary 不强制伪造 DELETE。完整的 3 分钟
+Mono/Parallel/CPS 调试 manifests 仍保留在 `configs/3min_*.toml`。
+
+`judge_broker_closeout.json` 是 solver phase 与 feedback-free closeout 全部结束后的
+最终 lifecycle 证据；只有 `active_handlers = 0`、`fifo_depth = 0` 且
+`remote_unsettled_jobs = 0` 才算 drain 成功。任何无法绑定到 job-id terminal receipt
+的提交、取消或对账结果都会锁存为 `REMOTE_SETTLEMENT_UNCONFIRMED`，永久停止本 arm
+的后续 Judge admission，并让正式 run fail closed。
 
 3 分钟 horizon 只限制 solver 与 CPS 通信：到点后 runner 停止 Pi session、拒绝
 新的 CPS 写入，并按各模式定义冻结每题一个候选。随后 Mono、Parallel、CPS
@@ -175,7 +249,14 @@ CONTEXTSWARM_CODEX_HOME=$HOME/.codex \
 scripts/run_docker.sh --config configs/cps.toml
 ```
 
-脚本通过 `--network host` 让容器访问宿主机上的 AISW coordinator 和 Lean router；AISW binary 与 node config 只读挂载，不会被复制进仓库或镜像。若环境不允许 host network，请把 manifest 中的服务地址改成容器可达地址。
+脚本按 manifest 选择 Docker 网络：默认 `host`；需要隔离宿主回环端口时使用
+`bridge`，并把 runner 的服务地址设为 `host.docker.internal` 上显式开放的独立
+端口。AISW binary、node config 和可选 Codex home 都只读挂载，随后所需私有
+metadata 会复制到容器的临时 `/run`。容器使用宿主 UID/GID、只读根文件系统、
+受限 PID、`no-new-privileges` 和独立 tmpfs，因此新 run artifacts 不再由 root
+创建。实验代码、Prompt、manifest 与 benchmark 均使用构建时写入镜像的冻结
+副本；运行时只挂载宿主 `runs/` 输出目录，避免一小时实验中途受到 worktree
+修改影响。
 
 `run_docker.sh` 会同时发现相邻的 `.nurouter-pi-launcher.json`（或旧
 `.aisw-pi-launcher.json`），并在容器内重写 `real_pi`/`real_codex` 到镜像内
@@ -187,78 +268,12 @@ Fast-mode 使用单独 manifest，并且必须先通过 transport preflight：
 scripts/run_docker.sh --config configs/cps_fast.toml preflight
 ```
 
-## Formal 工具面
-
-Mono、Parallel 和 CPS 由同一个 `[formal_tools]` manifest contract 获得相同的两
-个 task-local 工具；工具不会给 Mono/Parallel 增加通信通道，也不能读取 sibling
-workspace、broker 私有文件、operator 环境变量或原始网络。每个 task 的
-`PUBLIC_FILES.md` 是完整公开文件清单，Pi guard 只允许直接读取这些文件、修改
-`result.lean`/`scratch/`，以及执行下列受限 helper：
-
-```bash
-python3 evaluate.py
-./formal_query search finite sum inequality
-./formal_query decl Finset sum_le_sum
-./formal_query check Finset.sum_le_sum
-./formal_query type 'Nat → Nat'
-./formal_query check --snippet 'example (a b : Nat) : a + b = b + a := by omega'
-./formal_query axioms MyHelperLemma
-./formal_query deps Finset.sum_le_sum
-```
-
-`evaluate.py` 捕获当前 `result.lean` 的 immutable SHA-256 snapshot，再通过 run-owned
-Unix-socket broker 调用真实 Judge。它返回 `VERIFY_FAIL`、
-`COMPILES_WITH_SORRY`、`PROVED` 或明确的 timeout/resource/contract diagnostics；
-这里的 agent-local 结果仅供 agent 改 proof，score 永远为 0，也不会把 CPS task
-标成 solved、取消同题 agent 或写 `scoreboard_history.jsonl`。CPS 原有的 runner-owned
-handoff evaluation 使用独立配额；它拿到严格 canonical `PROVED` 后仍按 manifest 将
-task 标成 solved，并在 `cancel_on_proved=true` 时中止同题在途 agent，但同样不提前
-计分。最终候选仍由 feedback-free outer closeout 重新提交 immutable bytes。
-
-`formal_query` 是 bounded Lean API/LSP scout：`search` 同时搜 task 公开文件和
-revision-matched Mathlib index；`decl` 找声明名；`check`/`type` 用 Judge 的
-`lean_probe_v1` 做 elaboration；`axioms` 在当前 candidate context 中运行
-`#print axioms`；`deps` 只返回 index-related premises，不伪装成 dependency graph。
-声明结果都是 advisory，必须再用 `check` 验证。每 task 的 CLI call、实际 backend
-evaluation job 和 kernel probe 分开计数；cache hit 不消耗 backend budget。
-`telemetry/` 只记录 lane、task、hash、耗时、budget 序号和归类后的 diagnostics；
-`.broker_private/` 中的 capability journal 与 content-addressed snapshots 是本地私有
-运行状态，不属于公开 prompt 或论文摘要。
-
-默认 paper manifest 在 solver 截止前 330 秒停止新的 agent-local Judge admission，
-让已接收的调用有界收口；180 秒 canary 显式使用 30 秒 cutoff。无论诊断调用是否
-来得及执行，CPS 都会先保留 agent 在 horizon 内完成的 regular-file candidate，
-不会因此退回 pristine baseline。
-
-### 构建 declaration index
-
-从与 Judge 完全相同 revision 的公开 Mathlib source tree 构建 SQLite index：
-
-```bash
-python3 scripts/build_decl_index.py \
-  --source-root /path/to/mathlib/Mathlib \
-  --output /path/to/mathlib-decls.sqlite3 \
-  --mathlib-revision <exact-git-revision> \
-  --lean-toolchain leanprover/lean4:v4.9.0
-```
-
-`run_docker.sh` 会计算文件 SHA-256、读取 index 内的 revision，并通过只读 mount
-传给 preflight。也可显式设置 `CONTEXTSWARM_MINI_DECL_INDEX_SHA256` 和
-`CONTEXTSWARM_MINI_MATHLIB_REVISION` 固定 operator contract。paper-facing run 在
-index 缺失、schema/SHA 不符、或 index revision 与 Judge health/probe 不一致时
-fail closed；不会悄悄把不匹配的文本搜索算作 formal tool。
-
 ## CPS 接口
 
-CPS worker 在工作目录中获得 `./context_piece`：
-
-```bash
-./context_piece search --query inequality
-./context_piece create --kind proof_strategy --title 'route' --body '...'
-./context_piece message send --to worker-imo2024_p1-e2 --body '...'
-./context_piece message inbox
-./context_piece actor list
-```
+CPS worker 没有 shell 或本地 `context_piece` CLI。它只能通过 runner 注入的受控
+tools 使用 CPS：`cps_search`、`cps_publish`、`cps_inbox`、`cps_send`、`cps_ack`
+和 `cps_actors`。这些调用都经过 session-bound loopback broker；agent 不能直接读取
+SQLite、跨 workspace 浏览，或自行发起网络请求。
 
 `communication = none` 的 Mono/Parallel workspace 不会创建共享数据库或 helper，避免 baseline 意外获得通信能力。CPS 的实现集中在 `contextswarm_mini/cps.py`，后续可以只替换 policy、ranking 或 digest，而不改 NuRouter/Pi transport。
 
@@ -281,27 +296,15 @@ formal pipeline 上界保守推导。只有整个合法 lifecycle 加 terminal s
 lifecycle receipt 会 fail closed，不会造成无限轮询。客户端主动取消不会被记成普通
 `CANCELLED` 零分，而会标记为 degraded evaluator timeout。`final.json` 不会把
 `queued` / `running` 当作最终 verdict；无法确认终态会明确记录为
-`EVALUATOR_TIMEOUT`。Judge 明确返回的 pre-admission overload 会在 30 秒
+`EVALUATOR_TIMEOUT`；若客户端无法证明远端 job 已终止，则使用更强的
+`REMOTE_SETTLEMENT_UNCONFIRMED` 并停止后续 admission。Judge 明确返回的
+pre-admission overload 会在 30 秒
 admission budget 内有界重试；已经排队后才返回的 terminal、retryable
 `rejected_overloaded` 至多重交一次 whole job。结果不明的 socket/proxy 失败不会
 盲目重交，以免复制仍在运行的 job。Judge 的 `error_kind`、
 `terminal_reason`、queue/execution timing 会保留在安全摘要中，以区分证明错误、
-执行超时、资源限制、过载和基础设施故障。
-
-正分判定是 fail-closed 的：只接受 schema 为
-`contextswarm_formal_verdict_v1` 且同时满足 `status=PROVED`、`correct=true`、
-`cheating=false`、`score=1`、`is_valid_no_sorry=true`、
-`source_contract_status=ok`、`signature_check_status=ok` 的 canonical verdict；Judge
-若返回 `solution_hash`，还必须等于 broker 捕获 bytes 的 SHA-256。旧式 `PASS`、
-`AC`、top-level `success=true` 或单独的 `PROVED` 字样都只能作为诊断，不能得分。
-最终 `scoreboard_history.jsonl` 只由 bounded outer-official closeout 写入；其 deadline
-从候选实际冻结时开始，而不是从预定 solver deadline 倒推。缺少任一 official row 时
-`final.json` 仍保留全部 selected task、固定 `max_score`，并明确标记
-`OFFICIAL_VERDICT_MISSING`/`INCOMPLETE`。
-
-这个实现没有增加跨 experiment cell 的锁、序列化或 evaluator partition。不同 cell
-继续共享 operator 提供的 NuRouter 和 Judge 基础服务；run-local broker 只负责本 cell
-的 capability、预算、snapshot 和 official/diagnostic lane 分离。
+执行超时、资源限制、过载和基础设施故障。只有 canonical `PROVED` / `AC`
+verdict 计入分数。
 
 ## 数据来源
 
