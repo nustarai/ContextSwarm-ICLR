@@ -83,6 +83,10 @@ cd /path/to/ContextSwarmJudge
 scripts/run_docker.sh --config configs/cps.toml
 ```
 
+`run_docker.sh` 会从完整解析 `extends` 后的 `[docker]` 读取 `image` 和
+`memory_mb`。运维侧仍可用 `CONTEXTSWARM_MINI_IMAGE`、
+`CONTEXTSWARM_MINI_MEMORY` 覆盖，两者优先级高于 manifest。
+
 正式启动前可以只做 transport 检查（不会启动 Pi session）：
 
 ```bash
