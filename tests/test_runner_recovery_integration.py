@@ -67,6 +67,59 @@ class _FailTwiceThenSucceedPi(_FailOncePi):
 
 
 class RunnerRecoveryIntegrationTests(unittest.TestCase):
+    def test_mono_does_not_launch_after_horizon_guard(self):
+        base = load_config("configs/mono.toml", ROOT)
+        config = replace(base, max_tasks=1)
+        tasks = load_tasks(config)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            pi = _FailOncePi()
+            broker = _Broker()
+            result, verdicts = _run_mono(
+                config,
+                tasks,
+                run_dir,
+                logger,
+                MockEvaluator(),
+                pi,
+                mock_agent=False,
+                deadline=time.monotonic() - 0.001,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=broker,
+            )
+
+            self.assertEqual(pi.calls, [])
+            self.assertTrue(result.run_horizon_reached)
+            self.assertEqual(next(iter(verdicts.values())).status, "TIME_LIMIT")
+
+    def test_parallel_does_not_launch_after_horizon_guard(self):
+        base = load_config("configs/parallel.toml", ROOT)
+        config = replace(base, max_tasks=1)
+        tasks = load_tasks(config)
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            pi = _FailOncePi()
+            broker = _Broker()
+            results = _run_task_workers(
+                config,
+                tasks,
+                run_dir,
+                logger,
+                MockEvaluator(),
+                pi,
+                make_policy(config.communication, None),
+                mock_agent=False,
+                deadline=time.monotonic() - 0.001,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=broker,
+            )
+
+            self.assertEqual(pi.calls, [])
+            self.assertEqual(broker.calls, 0)
+            self.assertEqual(results[0][1].status, "TIME_LIMIT")
+
     def test_parallel_worker_restarts_same_actor_inside_one_broker_session(self):
         base = load_config("configs/parallel.toml", ROOT)
         config = replace(

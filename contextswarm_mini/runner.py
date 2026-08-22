@@ -2612,21 +2612,37 @@ def _run_elastic_cps(
                 policy_deadline,
             )
             run_horizon_is_limiter = deadline <= policy_deadline
-            result = pi_agent.run(
+            # The allocation policy agent is still an agent process.  Give it
+            # the same bounded outer recovery boundary as solver workers so a
+            # transient coordinator/process exit does not turn one released
+            # slot into an avoidable policy failure.  The local policy timeout
+            # remains fixed; retries consume that same budget and never extend
+            # the experiment horizon.
+            result = _run_solver_with_recovery(
+                config,
+                logger,
+                lambda _recovery_attempt: pi_agent.run(
+                    task_id="__allocation__",
+                    actor_id=actor_id,
+                    episode=index,
+                    prompt=prompt,
+                    workdir=workdir,
+                    deadline_monotonic=scheduler_deadline,
+                    isolated=True,
+                    cancel_event=run_cancel_event,
+                ),
                 task_id="__allocation__",
                 actor_id=actor_id,
                 episode=index,
-                prompt=prompt,
-                workdir=workdir,
-                deadline_monotonic=scheduler_deadline,
-                isolated=True,
+                deadline=scheduler_deadline,
                 cancel_event=run_cancel_event,
             )
-            result.run_horizon_reached = bool(
-                result.timed_out
-                and run_horizon_is_limiter
-                and time.monotonic() >= deadline
-            )
+            # ``scheduler_deadline`` also includes the per-decision policy
+            # timeout.  That timeout is a normal scheduler fallback, not the
+            # experiment horizon; keep the distinction after the generic
+            # recovery boundary has marked a late result as terminal.
+            if not run_horizon_is_limiter and result.run_horizon_reached:
+                result.run_horizon_reached = False
         result.decision_index = index
         with scheduler_results_lock:
             scheduler_result_sink.append(result)
@@ -3267,6 +3283,7 @@ def _run_elastic_cps(
 
         with state.lock:
             early_credit = state.early_proofs.get(actor)
+            already_solved = state.solved
         if early_credit is not None:
             verdict = early_credit.verdict
             logger.event(
@@ -3284,8 +3301,53 @@ def _run_elastic_cps(
                     state.completed_attempts += 1
             return result, verdict, True
 
-        with state.lock:
-            already_solved = state.solved
+        # A non-zero Pi result is a process/session attempt failure, not a
+        # candidate verdict.  In particular, do not send a partially-written
+        # result.lean/result.cpp to the Judge after the bounded recovery layer
+        # has already exhausted its retries.  The worker loop has released
+        # this scheduler lease before resuming the generator, so returning a
+        # terminal failure here lets ``claim_next`` refill the slot while the
+        # fixed horizon remains.
+        if result.returncode != 0:
+            if result.cancelled or already_solved or assignment_cancel_event.is_set():
+                status = "CANCELLED"
+                reason = "solver_cancelled_or_task_solved"
+            elif result.run_horizon_reached or time.monotonic() >= deadline:
+                status = "TIME_LIMIT"
+                reason = "solver_horizon_elapsed"
+            else:
+                status = "AGENT_FAILURE"
+                reason = "solver_process_failed"
+            verdict = Verdict(
+                task.slug,
+                status,
+                0.0,
+                0.0,
+                {"reason": reason},
+            )
+            with allocation_lock:
+                with state.lock:
+                    state.completed_attempts += 1
+                    state.last_verdict_status = status
+                    state.last_feedback = reason
+                    if status == "AGENT_FAILURE":
+                        state.consecutive_failures += 1
+            logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
+            logger.event(
+                "evaluation_finished",
+                **verdict.as_dict(),
+                agent_id=actor,
+                episode=assignment.generation,
+                source="agent_failure",
+                scoreboard_recorded=True,
+                phase="solver",
+                eligible_for_handoff=(
+                    status == "AGENT_FAILURE"
+                    and time.monotonic() < deadline
+                ),
+            )
+            return result, verdict, False
+
         if result.cancelled or already_solved:
             verdict = Verdict(
                 task.slug,
