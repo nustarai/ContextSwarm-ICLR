@@ -424,6 +424,8 @@ class TraceAllocationProjectionAdapter:
             (record.sequence for record in page), default=after_watermark
         )
         if source_watermark is not None:
+            if source_watermark < after_watermark:
+                raise ValueError("source watermark precedes requested watermark")
             if source_watermark < observed_watermark:
                 raise ValueError("source watermark precedes returned records")
             # Do not jump past locally truncated rows.  If the page was fully
