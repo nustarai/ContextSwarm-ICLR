@@ -1,0 +1,53 @@
+# Shared contract for the 6-dataset, 5-minute Mono/Parallel matrix.
+# Operator-private Judge and NuRouter capabilities enter through the launcher
+# environment; do not add endpoints or credentials to this tracked closure.
+extends = ["../base.toml"]
+
+[experiment]
+name = "paper-5min-base"
+mode = "parallel"
+communication = "none"
+max_parallel = 12
+initial_agents_per_task = 1
+# Zero means that a failed candidate attempt does not cap refills before the
+# fixed horizon. The runner still stops an arm when all 12 tasks reach score 1.
+max_attempts_per_task = 0
+cancel_on_proved = true
+episodes_per_task = 1
+max_tasks = 12
+time_limit_seconds = 300
+seed = 0
+
+[pi]
+model = "openai-codex/gpt-5.6-sol"
+thinking = "max"
+fast_mode = false
+timeout_seconds = 300
+http_idle_timeout_ms = 600000
+
+[aisw]
+# CPS admission capacity: one shared twelve-slot ceiling for both arms.  Mono
+# intentionally consumes one solver session; Parallel can consume all twelve.
+max_in_flight = 12
+
+[allocation]
+# Keep the per-agent lifecycle within the fixed five-minute arm horizon.  The
+# inherited baseline is 120 seconds, which would revoke a live Judge session
+# long before the formal 300-second horizon and force avoidable cancellations.
+agent_timeout_seconds = 300
+
+[judge]
+timeout_seconds = 300
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 12
+require_result_cache_disabled = false
+
+[formal_tools]
+# The verified Router currently has no revision-matched declaration index.
+# Keep the diagnostic tool surface available to formal agents without making
+# declaration search an admission requirement. Dataset-specific coding bases
+# disable the formal tool surface entirely.
+require_decl_index = false
+
+[docker]
+network = "host"

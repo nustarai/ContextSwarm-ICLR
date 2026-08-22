@@ -26,8 +26,10 @@ from .models import AgentResult
 
 _STDERR_LINE_LIMIT_BYTES = 256 * 1024
 _FILE_TOOLS = ("read", "edit", "write", "grep", "find", "ls")
-_CPS_SHARED_TOOLS = ("cps_search", "cps_publish", "cps_actors")
+_CPS_SHARED_TOOLS = ("cps_search", "cps_publish")
 _CPS_DIRECT_TOOLS = ("cps_inbox", "cps_send", "cps_ack")
+_CPS_ACTOR_DISCOVERY_TOOL = "cps_actors"
+_CPS_SELECTION_TOOLS = ("cps_feedback",)
 _SOLVER_EXTENSION_NAME = "pi_solver_tools.mjs"
 _FAST_MODE_EXTENSION_NAME = "pi_fast_mode.mjs"
 # Keep the helper interpreter lookup deterministic.  In particular, a worker
@@ -69,6 +71,23 @@ failure, is useful feedback even when it is not a proof.
 If that tool is busy or unavailable, continue static proof reasoning or leave the best
 candidate for the runner; never create a local or raw-network fallback. The user prompt
 defines the assigned proof task and, when present, the controlled CPS protocol."""
+_CODING_SOLVER_SYSTEM_PROMPT = """You are a bounded competitive-programming construction worker, not a general-purpose coding agent.
+Work only on the assigned C++ contest task and use only the explicitly provided tools.
+Read the statement in problem.md and the immutable baseline in baseline/; keep your
+best submission in result.cpp. Do not modify the statement or baseline. Do not
+execute shell commands, spawn background or parallel processes, install software,
+download data, or make raw network requests. The controlled ContextSwarmJudge owns
+compilation, test execution, resource limits, and semantic checking: submit every
+authoritative attempt through the runner-provided judge_check tool. The
+CONTEXTSWARM_JUDGE_URL value is injected only as a session-scoped capability for
+that tool; never read it, construct another client, or contact it directly.
+Complete an early judge_check checkpoint after initial file inspection and before
+extended solution search or CPS communication; do not wait for a polished program.
+Compile errors, wrong answers, runtime errors, time/memory limits, and other
+job-bound terminal candidate results are useful feedback rather than experiment
+infrastructure failures. If judge_check is busy or unavailable, continue static
+reasoning or leave the strongest result.cpp; never create a local compiler/Judge
+fallback. The user prompt defines the assigned task and controlled CPS protocol."""
 _FORMAL_SOLVER_SYSTEM_PROMPT = """You are a bounded formal-proof construction worker, not a general-purpose coding agent.
 Work only on the assigned result.lean and use only the explicitly provided tools.
 Do not execute shell commands except the exact bounded helper commands documented
@@ -165,6 +184,9 @@ class PiAgent:
         session_dir: Path | None = None,
         session_id: str | None = None,
         isolated: bool = False,
+        communication_enabled: bool | None = None,
+        direct_messages: bool = True,
+        selection_enabled: bool = False,
     ) -> list[str]:
         command = [
             self.binary(),
@@ -177,6 +199,8 @@ class PiAgent:
             (
                 _ISOLATED_SYSTEM_PROMPT
                 if isolated
+                else _CODING_SOLVER_SYSTEM_PROMPT
+                if self.config.is_coding
                 else _FORMAL_SOLVER_SYSTEM_PROMPT
                 if self.config.formal_tools_enabled
                 else _SOLVER_SYSTEM_PROMPT
@@ -204,7 +228,13 @@ class PiAgent:
                     "--no-prompt-templates",
                     "--no-extensions",
                     "--tools",
-                    ",".join(self.solver_tools()),
+                    ",".join(
+                        self.solver_tools(
+                            communication_enabled=communication_enabled,
+                            direct_messages=direct_messages,
+                            selection_enabled=selection_enabled,
+                        )
+                    ),
                 ]
             )
             for _role, extension_path in self._trusted_extensions():
@@ -259,13 +289,31 @@ class PiAgent:
             "extensions": rows,
         }
 
-    def solver_tools(self) -> tuple[str, ...]:
+    def solver_tools(
+        self,
+        *,
+        communication_enabled: bool | None = None,
+        direct_messages: bool = True,
+        selection_enabled: bool = False,
+    ) -> tuple[str, ...]:
+        """Return the explicit solver capability allowlist.
+
+        Omitted arguments preserve the historical manifest-derived surface.  The
+        runner may opt into selection feedback independently and suppress direct
+        messaging without changing any non-CPS capability.
+        """
+
         tools = [*_FILE_TOOLS, "judge_check"]
         if self.config.formal_tools_enabled:
             tools.append("bash")
-        if self.config.uses_cps:
+        cps_enabled = self.config.uses_cps if communication_enabled is None else communication_enabled
+        if cps_enabled or selection_enabled:
             tools.extend(_CPS_SHARED_TOOLS)
-            tools.extend(_CPS_DIRECT_TOOLS)
+            if direct_messages:
+                tools.extend(_CPS_DIRECT_TOOLS)
+                tools.append(_CPS_ACTOR_DISCOVERY_TOOL)
+            if selection_enabled:
+                tools.extend(_CPS_SELECTION_TOOLS)
         return tuple(tools)
 
     def environment(
@@ -275,6 +323,9 @@ class PiAgent:
         actor_id: str,
         workdir: Path,
         extra_env: Mapping[str, str] | None = None,
+        communication_enabled: bool | None = None,
+        direct_messages: bool = True,
+        selection_enabled: bool = False,
     ) -> dict[str, str]:
         # Start from a deliberately tiny parent-environment allowlist.  This
         # prevents ambient PATH/PYTHONPATH and operator credentials from
@@ -309,6 +360,13 @@ class PiAgent:
                 "CONTEXTSWARM_WORKDIR": str(workdir),
                 "CONTEXTSWARM_EXPERIMENT_MODE": self.config.mode,
                 "CONTEXTSWARM_EXPERIMENT_SEED": str(self.config.seed),
+                "CONTEXTSWARM_CANDIDATE_FILENAME": (
+                    "result.cpp" if self.config.is_coding else "result.lean"
+                ),
+                "CONTEXTSWARM_LANGUAGE": "cpp" if self.config.is_coding else "lean",
+                "EXPERIMENT_CONFIG_AISW_MAX_IN_FLIGHT": str(
+                    self.config.aisw_max_in_flight
+                ),
                 "CONTEXTSWARM_FORMAL_COMMAND_TIMEOUT_SECONDS": str(
                     self.config.formal_tools_command_timeout_seconds
                 ),
@@ -317,6 +375,11 @@ class PiAgent:
                 "AISW_LEASE_RETRY_INTERVAL_SECONDS": str(self.config.aisw_lease_retry_interval_seconds),
             }
         )
+        # These public capability bits keep the extension's registered surface
+        # aligned with the Pi allowlist.  Defaults preserve the historical
+        # direct-message CPS surface for existing runner call sites.
+        env["CONTEXTSWARM_CPS_DIRECT_MESSAGES"] = "1" if direct_messages else "0"
+        env["CONTEXTSWARM_CPS_SELECTION_ENABLED"] = "1" if selection_enabled else "0"
         # Do not append an operator-supplied PYTHONPATH.  The runner package is
         # the only import root required by the controlled helper/client path.
         env["PYTHONPATH"] = str(self.config.repo_root)
@@ -384,9 +447,17 @@ class PiAgent:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
         isolated: bool = False,
+        communication_enabled: bool | None = None,
+        direct_messages: bool = True,
+        selection_enabled: bool = False,
     ) -> AgentResult:
         started = now_iso()
-        command = self.command(isolated=isolated)
+        command = self.command(
+            isolated=isolated,
+            communication_enabled=communication_enabled,
+            direct_messages=direct_messages,
+            selection_enabled=selection_enabled,
+        )
         output = _TailBuffer(6_000)
         errors = _TailBuffer(4_000)
         events = 0
@@ -556,6 +627,9 @@ class PiAgent:
                 session_dir=session_dir,
                 session_id=session_id,
                 isolated=isolated,
+                communication_enabled=communication_enabled,
+                direct_messages=direct_messages,
+                selection_enabled=selection_enabled,
             )
             if self.trace_path is not None:
                 self.trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -569,6 +643,9 @@ class PiAgent:
                     actor_id=actor_id,
                     workdir=workdir,
                     extra_env=extra_env,
+                    communication_enabled=communication_enabled,
+                    direct_messages=direct_messages,
+                    selection_enabled=selection_enabled,
                 ),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

@@ -16,6 +16,35 @@ class Task:
     metadata: dict[str, Any]
 
     @property
+    def language(self) -> str:
+        """Submission language selected by the benchmark bundle."""
+
+        value = str(self.metadata.get("language") or "lean").strip().lower()
+        return value or "lean"
+
+    @property
+    def candidate_filename(self) -> str:
+        """Mutable candidate filename for this task.
+
+        Formal bundles use ``result.lean`` while coding bundles use
+        ``result.cpp``.  Keeping this on the task lets the runner share one
+        lifecycle without accidentally submitting a C++ file to the Lean
+        broker (or vice versa).
+        """
+
+        configured = str(self.metadata.get("candidate_filename") or "").strip()
+        if configured in {"result.lean", "result.cpp"}:
+            return configured
+        return "result.cpp" if self.language in {"cpp", "c++", "c"} else "result.lean"
+
+    @property
+    def baseline_filename(self) -> str:
+        configured = str(self.metadata.get("baseline_filename") or "").strip()
+        if configured and "/" not in configured and configured not in {".", ".."}:
+            return configured
+        return "baseline.cpp" if self.candidate_filename == "result.cpp" else f"{self.slug}.lean"
+
+    @property
     def problem_id(self) -> str:
         return str(self.metadata.get("problem_id") or self.slug)
 

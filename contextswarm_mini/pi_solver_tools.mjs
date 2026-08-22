@@ -105,6 +105,12 @@ function registerBrokerTool(pi, definition) {
   });
 }
 
+function enabledCapability(name, defaultValue = false) {
+  const raw = String(process.env[name] ?? "").trim().toLowerCase();
+  if (!raw) return defaultValue;
+  return ["1", "true", "yes", "on"].includes(raw);
+}
+
 function normalizeExistingPath(rawPath, cwd) {
   if (typeof rawPath !== "string" || !rawPath.trim()) return null;
   const lexical = isAbsolute(rawPath) ? resolve(rawPath) : resolve(cwd, rawPath);
@@ -124,17 +130,39 @@ function relativeInside(path, cwd) {
   return rel.split(sep).join("/");
 }
 
+// The runner binds the candidate filename per worker session.  Keep the
+// historical formal default and reject every other spelling so task data cannot
+// widen this capability into an arbitrary path.
+function candidateFilename() {
+  const configured = String(process.env.CONTEXTSWARM_CANDIDATE_FILENAME ?? "").trim();
+  return configured === "result.cpp" || configured === "result.lean"
+    ? configured
+    : "result.lean";
+}
+
+function candidateExtension() {
+  return candidateFilename() === "result.cpp" ? "cpp" : "lean";
+}
+
+function escapedCandidateFilename() {
+  return candidateFilename().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function isReadableFile(rel) {
+  const candidate = candidateFilename();
+  const candidatePattern = escapedCandidateFilename();
+  const extension = candidateExtension();
   return (
-    ["problem.md", "result.lean", "metadata.json", "PUBLIC_FILES.md"].includes(rel) ||
-    /^baseline\/[^/]+\.lean$/.test(rel) ||
-    /^tasks\/[^/]+\/(?:problem\.md|result\.lean|metadata\.json|PUBLIC_FILES\.md)$/.test(rel) ||
-    /^tasks\/[^/]+\/baseline\/[^/]+\.lean$/.test(rel)
+    ["problem.md", candidate, "metadata.json", "PUBLIC_FILES.md"].includes(rel) ||
+    new RegExp(`^baseline/[^/]+\\.${extension}$`).test(rel) ||
+    new RegExp(`^tasks/[^/]+/(?:problem\\.md|${candidatePattern}|metadata\\.json|PUBLIC_FILES\\.md)$`).test(rel) ||
+    new RegExp(`^tasks/[^/]+/baseline/[^/]+\\.${extension}$`).test(rel)
   );
 }
 
 function isWritableCandidate(rel) {
-  return rel === "result.lean" || /^tasks\/[^/]+\/result\.lean$/.test(rel);
+  const candidate = candidateFilename();
+  return rel === candidate || new RegExp(`^tasks/[^/]+/${escapedCandidateFilename()}$`).test(rel);
 }
 
 // Unlike read/search paths, the final candidate may not exist yet (the write
@@ -250,6 +278,9 @@ function formalHelperRelative(rawTarget, ctx) {
 }
 
 function isAllowedFormalCommand(command, ctx) {
+  // Coding workers never receive the formal helper capability, and must not
+  // be able to reach it even if a tool-call event is forged locally.
+  if (candidateFilename() !== "result.lean") return false;
   const tokens = boundedShellTokens(command);
   if (!tokens) return false;
   const mode = String(process.env.CONTEXTSWARM_EXPERIMENT_MODE ?? "").trim().toLowerCase();
@@ -289,7 +320,10 @@ function installPathGuard(pi) {
       }
       const rel = writableRelative(input.path, cwd);
       if (!rel) {
-        return { block: true, reason: "write/edit is restricted to assigned result.lean" };
+        return {
+          block: true,
+          reason: `write/edit is restricted to assigned ${candidateFilename()}`,
+        };
       }
       return;
     }
@@ -326,7 +360,7 @@ function installPathGuard(pi) {
       if (!isAllowedFormalCommand(command, ctx)) {
         return {
           block: true,
-          reason: "bash is restricted to the staged evaluate.py and formal_query helpers",
+          reason: "bash is restricted to the staged formal helper commands",
         };
       }
       const configuredTimeout = Number(
@@ -342,14 +376,22 @@ function installPathGuard(pi) {
 export default function registerContextSwarmSolverTools(pi) {
   installPathGuard(pi);
 
+  const candidate = candidateFilename();
+  const language = candidate === "result.cpp" ? "C++" : "Lean";
+  // Direct messaging was part of the original CPS contract, so its default
+  // remains enabled.  The runner sets these explicit, non-secret capability
+  // bits for allocation/selection experiments that must remain message-free.
+  const directMessages = enabledCapability("CONTEXTSWARM_CPS_DIRECT_MESSAGES", true);
+  const selectionEnabled = enabledCapability("CONTEXTSWARM_CPS_SELECTION_ENABLED");
+
   registerBrokerTool(pi, {
     name: "judge_check",
     label: "Controlled Judge Check",
     description:
-      "Submit the runner-bound result.lean to the controlled external Lean Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.",
-    promptSnippet: "Check the current result.lean through the controlled external Judge",
+      `Submit the runner-bound ${candidate} to the controlled external ${language} Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.`,
+    promptSnippet: `Check the current ${candidate} through the controlled external Judge`,
     promptGuidelines: [
-      "Use judge_check one candidate at a time; never attempt local Lean or raw Judge access.",
+      "Use judge_check one candidate at a time; never attempt local compilation or raw Judge access.",
       "A retryable busy result is not permission to use a local fallback.",
     ],
     parameters: objectSchema({
@@ -385,7 +427,7 @@ export default function registerContextSwarmSolverTools(pi) {
     ),
   });
 
-  registerBrokerTool(pi, {
+  if (directMessages) registerBrokerTool(pi, {
     name: "cps_inbox",
     label: "CPS Inbox",
     description: "Read bounded unacknowledged direct messages for this actor.",
@@ -393,7 +435,7 @@ export default function registerContextSwarmSolverTools(pi) {
     parameters: objectSchema({ limit: integerSchema("Maximum returned messages", 8) }),
   });
 
-  registerBrokerTool(pi, {
+  if (directMessages) registerBrokerTool(pi, {
     name: "cps_send",
     label: "Send CPS Message",
     description: "Send a bounded direct message using the runner-bound actor identity.",
@@ -408,7 +450,29 @@ export default function registerContextSwarmSolverTools(pi) {
     ),
   });
 
-  registerBrokerTool(pi, {
+  if (selectionEnabled) registerBrokerTool(pi, {
+    name: "cps_feedback",
+    label: "Record CPS Exposure Feedback",
+    description: "Record attributed feedback for one previously exposed ContextSwarm selection item. Supply the exposure identifiers exactly as returned by the selection surface.",
+    promptSnippet: "Record attributed feedback for an exposed CPS selection item",
+    parameters: objectSchema(
+      {
+        request_key: stringSchema("Idempotency key for this feedback event", 256),
+        exposure_item_id: stringSchema("Identifier of the previously exposed selection item", 256),
+        trace_id: stringSchema("Trace identifier returned with the exposed item", 256),
+        feedback_kind: {
+          type: "string",
+          enum: ["useful", "not_useful", "misleading", "stale", "unsafe", "duplicate", "diagnostic_useful", "needs_refinement", "not_used", "route_attempted", "route_improving"],
+          description: "Canonical attribution feedback kind",
+        },
+        value: { type: "number", description: "Optional numeric feedback value" },
+        note: stringSchema("Optional concise attribution note", 8_000),
+      },
+      ["request_key", "exposure_item_id", "trace_id", "feedback_kind"],
+    ),
+  });
+
+  if (directMessages) registerBrokerTool(pi, {
     name: "cps_ack",
     label: "Acknowledge CPS Message",
     description: "Acknowledge one message that is visible to this runner-bound actor.",
@@ -419,7 +483,7 @@ export default function registerContextSwarmSolverTools(pi) {
     ),
   });
 
-  registerBrokerTool(pi, {
+  if (directMessages) registerBrokerTool(pi, {
     name: "cps_actors",
     label: "List CPS Actors",
     description: "Inspect the bounded public actor roster for recipient discovery.",

@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "validate":
             payload = {
                 "ok": True,
-                "dataset": "matholympiadbench",
+                "dataset": config.dataset_name,
                 "task_count": len(tasks),
                 "tasks": [task.slug for task in tasks],
                 "manifest": str(config.manifest_path),

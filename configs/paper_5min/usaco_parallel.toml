@@ -1,0 +1,9 @@
+extends = ["_usaco.toml"]
+
+[experiment]
+name = "paper-5min-usaco-parallel"
+output_root = "runs/paper_5min/usaco/parallel"
+mode = "parallel"
+communication = "none"
+max_parallel = 12
+episodes_per_task = 1

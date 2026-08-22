@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from typing import Any, Iterable, Mapping
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
@@ -273,7 +274,14 @@ _RAW_FAILURE_STATUSES = {
 
 def normalize_base_url(raw: str) -> str:
     value = str(raw or "").strip().rstrip("/")
-    for suffix in ("/api/lean/jobs", "/api/lean/verify", "/verify", "/healthz"):
+    for suffix in (
+        "/api/lean/jobs",
+        "/api/judge/jobs",
+        "/api/judge/evaluate",
+        "/api/lean/verify",
+        "/verify",
+        "/healthz",
+    ):
         if value.endswith(suffix):
             value = value[: -len(suffix)]
     return value.rstrip("/")
@@ -419,8 +427,9 @@ class LeanEvaluator:
         self._remote_unsettled_lock = threading.Lock()
         self._remote_unsettled_jobs = 0
         self._remote_settlement_event = threading.Event()
-        # A task solved by a peer may cancel a submitted Judge job whose
-        # worker takes longer than the short foreground grace window to reset.
+        # A known cancellation (a peer solved the task or the broker revoked
+        # the claim) may cancel a submitted Judge job whose worker takes
+        # longer than the short foreground grace window to reset.
         # Such a job remains accounted for, but is reconciled asynchronously so
         # it does not poison unrelated CPS admissions while the Judge is doing
         # a known, bounded cancellation.  Unknown identities still use the
@@ -1974,6 +1983,7 @@ class LeanEvaluator:
                 cancel_endpoint=None,
             )
         attempted = False
+        retryable_cancel_observed = _retryable_known_cancellation(current)
         if cancel_path is not None:
             remaining = deadline - time.monotonic()
             attempted = remaining > 0
@@ -1986,6 +1996,10 @@ class LeanEvaluator:
                             _JUDGE_CANCEL_TIMEOUT_SECONDS,
                             remaining,
                         ),
+                    )
+                    retryable_cancel_observed = (
+                        retryable_cancel_observed
+                        or _retryable_known_cancellation(current)
                     )
             except EvaluatorError:
                 # A transport acknowledgement is not settlement.  Continue
@@ -2025,6 +2039,10 @@ class LeanEvaluator:
                     and not _terminal(current)
                 ):
                     last_nonterminal = current
+                    retryable_cancel_observed = (
+                        retryable_cancel_observed
+                        or _retryable_known_cancellation(current)
+                    )
             # Every unsuccessful reconcile attempt yields; malformed terminal
             # receipts and repeated transport failures must not tight-loop.
             time.sleep(
@@ -2033,11 +2051,19 @@ class LeanEvaluator:
                     max(0.0, deadline - time.monotonic()),
                 )
             )
-        if cancellation_reason == "task_solved_by_peer" and attempted:
+        if attempted and (
+            cancellation_reason in {"task_solved_by_peer", "broker_revoked"}
+            or retryable_cancel_observed
+        ):
             # The submission identity is known and a DELETE was attempted, but
-            # the terminal receipt may lag the foreground grace window. Keep
-            # the job's capacity permit retained by the caller and let a
-            # bounded watcher release it only after a job-bound receipt.
+            # the terminal receipt may lag the foreground grace window.  Judge
+            # routers expose this state as retryable/cancel-requested while a
+            # worker is resetting.  Keep the job's capacity permit retained by
+            # the caller and let a bounded watcher release it only after a
+            # job-bound receipt.  This prevents an ordinary, recoverable
+            # cancellation from latching the whole arm as infrastructure
+            # failure.  Unknown identities and non-retryable malformed
+            # receipts still use the fail-closed path below.
             deferred = self._start_settlement_watcher(
                 job_id,
                 last_nonterminal,
@@ -2223,6 +2249,384 @@ class LeanEvaluator:
         return digest.hexdigest()
 
 
+class CodingEvaluator(LeanEvaluator):
+    """Async ContextSwarmJudge adapter for C++ contest bundles.
+
+    The coding Judge deliberately has a separate adapter instead of trying to
+    coerce an OJ receipt into the Lean schema.  It nevertheless exposes the
+    same small runner protocol as :class:`LeanEvaluator`, so Mono, Parallel,
+    broker checkpointing, and feedback-free closeout all remain identical.
+    """
+
+    is_mock_evaluator = False
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout_seconds: int = 300,
+        max_lifecycle_seconds: float = 3_600.0,
+        verification_profile: str = "coding_contest",
+        judge_mode: str = "coding",
+        poll_interval_seconds: float = 0.25,
+        cancel_grace_seconds: float = 5.0,
+    ):
+        super().__init__(
+            normalize_base_url(base_url),
+            lean_env_id="coding",
+            timeout_seconds=timeout_seconds,
+            max_lifecycle_seconds=max_lifecycle_seconds,
+            verification_profile=verification_profile,
+            judge_mode=judge_mode,
+            poll_interval_seconds=poll_interval_seconds,
+            cancel_grace_seconds=cancel_grace_seconds,
+            # Coding admission has no Lean overload replay path.  The runner
+            # handles retry/refill at the candidate-attempt level.
+            admission_retry_seconds=min(30.0, max(0.1, float(cancel_grace_seconds))),
+            terminal_overload_retries=0,
+        )
+
+    def expected_task_contract_sha256(self, task: Task) -> str:
+        digest = hashlib.sha256()
+        for value in (
+            task.slug,
+            task.problem_id,
+            task.language,
+            task.candidate_filename,
+            task.problem_text,
+            task.baseline_code,
+            self.verification_profile,
+            self.judge_mode,
+        ):
+            digest.update(str(value).encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _cancel_request_path(
+        self,
+        job_id: Any,
+        *,
+        cancel_endpoint: Any,
+    ) -> tuple[str | None, str]:
+        """Resolve coding Judge cancellation/status capabilities same-origin."""
+
+        if cancel_endpoint is not None:
+            if not isinstance(cancel_endpoint, str) or not cancel_endpoint.strip():
+                return None, "invalid_cancel_endpoint"
+            raw_endpoint = cancel_endpoint.strip()
+            try:
+                parsed = urlsplit(raw_endpoint)
+                base = urlsplit(self.base_url)
+                if parsed.fragment or not parsed.path.startswith("/"):
+                    return None, "invalid_cancel_endpoint"
+                if parsed.scheme or parsed.netloc:
+                    if (
+                        parsed.scheme.casefold() != base.scheme.casefold()
+                        or parsed.netloc.casefold() != base.netloc.casefold()
+                    ):
+                        return None, "invalid_cancel_endpoint"
+                path = parsed.path
+                if parsed.query:
+                    path += f"?{parsed.query}"
+                return path, "ok"
+            except ValueError:
+                return None, "invalid_cancel_endpoint"
+        normalized = sanitize_worker_identifier(job_id)
+        if normalized is None:
+            return None, "invalid_job_identifier"
+        return f"/api/judge/jobs/{quote(normalized, safe='')}", "ok"
+
+    def health(self) -> dict[str, Any]:
+        return self._request("GET", "/healthz", timeout_seconds=10.0)
+
+    def evaluate(
+        self,
+        task: Task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: Any | None = None,
+        settlement_callback: Any | None = None,
+    ) -> Verdict:
+        return self._evaluate_code(
+            task,
+            _read_candidate(candidate_path),
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
+        )
+
+    def evaluate_fresh(
+        self,
+        task: Task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: Any | None = None,
+        settlement_callback: Any | None = None,
+    ) -> Verdict:
+        return self.evaluate(
+            task,
+            candidate_path,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
+        )
+
+    def probe(
+        self,
+        task: Task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: Any | None = None,
+        settlement_callback: Any | None = None,
+    ) -> Verdict:
+        return self.evaluate(
+            task,
+            candidate_path,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
+        )
+
+    def probe_source(
+        self,
+        task: Task,
+        candidate_code: str,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: Any | None = None,
+        settlement_callback: Any | None = None,
+    ) -> Verdict:
+        if not isinstance(candidate_code, str):
+            raise TypeError("candidate_code must be a string")
+        return self._evaluate_code(
+            task,
+            candidate_code,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+            settlement_callback=settlement_callback,
+        )
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        data = (
+            json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
+            if payload is not None
+            else None
+        )
+        headers = {"Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        try:
+            request = Request(url, data=data, headers=headers, method=method)
+            with urlopen(request, timeout=max(0.1, float(timeout_seconds))) as response:
+                raw = response.read().decode("utf-8")
+            parsed = json.loads(raw) if raw else {}
+        except HTTPError as exc:
+            try:
+                body = exc.read(64 * 1024).decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            raise EvaluatorError(
+                "The coding Judge rejected the request.",
+                category="http_error",
+                http_status=int(exc.code),
+            ) from None
+        except (URLError, TimeoutError, OSError, HTTPException, UnicodeError, json.JSONDecodeError):
+            raise EvaluatorError(
+                "The coding Judge transport failed.",
+                category="network_error",
+            ) from None
+        if not isinstance(parsed, dict):
+            raise EvaluatorError(
+                "The coding Judge returned an invalid response.",
+                category="malformed_response",
+            )
+        return parsed
+
+    @staticmethod
+    def _terminal(payload: Mapping[str, Any]) -> bool:
+        status = str(payload.get("status") or payload.get("job_status") or "").lower()
+        return bool(payload.get("terminal") is True or status in {"succeeded", "failed", "cancelled"})
+
+    @staticmethod
+    def _response_status(payload: Mapping[str, Any]) -> str:
+        response = payload.get("response")
+        if isinstance(response, Mapping):
+            submission = response.get("submission")
+            if isinstance(submission, Mapping) and submission.get("status"):
+                return str(submission["status"]).strip().upper()
+            summary = response.get("summary")
+            if isinstance(summary, Mapping) and summary.get("status"):
+                return str(summary["status"]).strip().upper()
+            for key in ("status", "verdict", "result"):
+                if response.get(key):
+                    return str(response[key]).strip().upper()
+        error = payload.get("error")
+        if isinstance(error, Mapping) and error.get("type"):
+            return str(error["type"]).strip().upper()
+        return str(payload.get("status") or "UNKNOWN").strip().upper()
+
+    def _evaluate_code(
+        self,
+        task: Task,
+        code: str | None,
+        *,
+        deadline_monotonic: float | None,
+        cancel_event: Any | None,
+        settlement_callback: Any | None,
+    ) -> Verdict:
+        started = time.monotonic()
+        source = code or ""
+        provenance = {
+            "candidate_sha256": candidate_sha256(source),
+            "task_contract_sha256": self.expected_task_contract_sha256(task),
+        }
+        if not source.strip():
+            return Verdict(task.slug, "LOCAL_REJECTED", 0.0, 0.0, {"reason": "empty candidate"}, **provenance)
+        if self.remote_unsettled_jobs > 0:
+            return Verdict(task.slug, "REMOTE_SETTLEMENT_UNCONFIRMED", 0.0, 0.0, {"remote_settlement_unconfirmed": True}, **provenance)
+        if cancel_event is not None and cancel_event.is_set():
+            return Verdict(task.slug, "TASK_CANCELLED", 0.0, 0.0, {"reason": "cancel_event_set"}, **provenance)
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "run_horizon_elapsed"}, **provenance)
+        job_id: str | None = None
+        response: dict[str, Any] = {}
+
+        def reconcile_cancel(reason: str) -> tuple[dict[str, Any], str | None, bool]:
+            """Issue DELETE, then account for the job until a bound receipt."""
+
+            current, error, attempted = self._cancel_and_reconcile_details(
+                job_id,
+                response,
+                cancel_endpoint=cancel_endpoint,
+                # The coding runner may cancel a peer or the horizon.  In
+                # either case the identity is known, so retain the permit in
+                # the bounded watcher path rather than latching before the
+                # receipt has had a chance to settle.
+                cancellation_reason="task_solved_by_peer",
+                on_settled=settlement_callback,
+            )
+            return current, error, attempted
+
+        try:
+            submitted = self._request(
+                "POST",
+                "/api/judge/jobs",
+                {
+                    "problem_id": task.problem_id,
+                    "language": task.language,
+                    "code": source,
+                    "submission_id": f"contextswarm-{uuid.uuid4().hex}",
+                },
+                timeout_seconds=min(30.0, max(1.0, (deadline_monotonic - time.monotonic()) if deadline_monotonic else 30.0)),
+            )
+            raw_job_id = submitted.get("job_id") or submitted.get("id")
+            job_id = sanitize_worker_identifier(raw_job_id)
+            if not job_id:
+                self._mark_remote_unsettled()
+                return Verdict(task.slug, "REMOTE_SETTLEMENT_UNCONFIRMED", 0.0, time.monotonic() - started, {"reason": "missing_job_identifier", "remote_settlement_unconfirmed": True}, **provenance)
+            response = submitted
+            cancel_endpoint = submitted.get("cancel_endpoint") or submitted.get(
+                "status_endpoint"
+            )
+            while not self._terminal(response):
+                if cancel_event is not None and cancel_event.is_set():
+                    response, cancel_error, attempted = reconcile_cancel(
+                        _cancel_reason(cancel_event) or "cancelled"
+                    )
+                    if cancel_error == "cancel_settlement_deferred":
+                        return Verdict(
+                            task.slug,
+                            "TASK_CANCELLED",
+                            0.0,
+                            time.monotonic() - started,
+                            {
+                                "reason": "cancel_settlement_deferred",
+                                "judge_cancellation": {
+                                    "attempted": attempted,
+                                    "settled": False,
+                                    "deferred": True,
+                                },
+                            },
+                            judge_job_id=job_id,
+                            **provenance,
+                        )
+                    if cancel_error is not None:
+                        return Verdict(
+                            task.slug,
+                            "REMOTE_SETTLEMENT_UNCONFIRMED",
+                            0.0,
+                            time.monotonic() - started,
+                            {
+                                "reason": "cancel_settlement_unconfirmed",
+                                "remote_settlement_unconfirmed": True,
+                            },
+                            judge_job_id=job_id,
+                            **provenance,
+                        )
+                    break
+                remaining = (deadline_monotonic - time.monotonic()) if deadline_monotonic is not None else self.max_lifecycle_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    response, cancel_error, attempted = reconcile_cancel("horizon_elapsed")
+                    if cancel_error == "cancel_settlement_deferred":
+                        return Verdict(
+                            task.slug,
+                            "OUT_OF_HORIZON",
+                            0.0,
+                            time.monotonic() - started,
+                            {
+                                "reason": "cancel_settlement_deferred",
+                                "judge_cancellation": {
+                                    "attempted": attempted,
+                                    "settled": False,
+                                    "deferred": True,
+                                },
+                            },
+                            judge_job_id=job_id,
+                            **provenance,
+                        )
+                    if cancel_error is not None:
+                        return Verdict(
+                            task.slug,
+                            "REMOTE_SETTLEMENT_UNCONFIRMED",
+                            0.0,
+                            time.monotonic() - started,
+                            {
+                                "reason": "cancel_settlement_unconfirmed",
+                                "remote_settlement_unconfirmed": True,
+                            },
+                            judge_job_id=job_id,
+                            **provenance,
+                        )
+                    break
+                wait_ms = min(1000, max(1, int(min(remaining, 1.0) * 1000)))
+                response = self._request("GET", f"/api/judge/jobs/{quote(job_id, safe='')}?wait_ms={wait_ms}", timeout_seconds=max(1.0, min(30.0, remaining)))
+                if response.get("cancel_endpoint") or response.get("status_endpoint"):
+                    cancel_endpoint = response.get("cancel_endpoint") or response.get("status_endpoint")
+            status = self._response_status(response)
+            nested = response.get("response") if isinstance(response.get("response"), Mapping) else {}
+            safe = safe_worker_response(nested if nested else response)
+            safe["job_status"] = str(response.get("status") or response.get("job_status") or "")[:64]
+            safe["judge_job_id"] = job_id
+            if status == "AC":
+                return Verdict(task.slug, "PROVED", 1.0, time.monotonic() - started, safe, judge_job_id=job_id, **provenance)
+            if status in {"WA", "PE", "CE", "MLE", "TLE", "RE"}:
+                return Verdict(task.slug, status, 0.0, time.monotonic() - started, safe, judge_job_id=job_id, **provenance)
+            return Verdict(task.slug, "EVALUATOR_ERROR", 0.0, time.monotonic() - started, safe, error="coding Judge returned no terminal submission verdict", judge_job_id=job_id, **provenance)
+        except EvaluatorError as exc:
+            return Verdict(task.slug, "EVALUATOR_ERROR", 0.0, time.monotonic() - started, {"evaluator_failure": exc.public_details()}, error="coding Judge transport failed", judge_job_id=job_id, **provenance)
+
+
 class MockEvaluator:
     """Offline smoke evaluator; never represents a paper score."""
 
@@ -2364,6 +2768,35 @@ def _nested_value(payload: Mapping[str, Any], key: str) -> Any:
     if isinstance(canonical, Mapping):
         return canonical.get(key)
     return None
+
+
+def _retryable_known_cancellation(payload: Mapping[str, Any]) -> bool:
+    """Return whether a bound nonterminal cancellation may settle later.
+
+    During DELETE, the ICLR router can return a job-bound ``running`` or
+    ``cancel_requested`` snapshot while the worker REPL is resetting.  Newer
+    receipts mark that state ``retryable``; the router also exposes a
+    cancellation disposition or same-origin status capability.  Requiring an
+    explicit signal (rather than merely seeing a nonterminal status) keeps
+    genuinely unknown/never-settling jobs fail-closed.
+    """
+
+    if not isinstance(payload, Mapping):
+        return False
+    retryable = _nested_value(payload, "retryable")
+    if retryable is True:
+        return True
+    disposition = _nested_value(payload, "router_cancel_disposition")
+    if isinstance(disposition, str) and disposition.strip().lower() in {
+        "cancel_requested",
+        "cancel_unconfirmed",
+    }:
+        return True
+    # ``cancel_requested`` alone is deliberately insufficient: a legacy or
+    # test endpoint may expose that bit while losing the job ledger entirely.
+    # The router's explicit disposition/retryable marker above is the
+    # candidate-independent evidence needed to defer settlement safely.
+    return False
 
 
 def _raw_lifecycle_status(payload: Mapping[str, Any]) -> str:

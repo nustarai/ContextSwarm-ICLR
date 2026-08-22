@@ -31,9 +31,15 @@ from .allocation import (
     UniformAllocationPolicy,
     normalize_verdict_status,
 )
+from .agent_recovery import (
+    is_recoverable_agent_failure,
+    recovery_settings,
+    run_with_recovery,
+)
+from .artifacts import atomic_write_json
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
-from .evaluator import LeanEvaluator, MockEvaluator, sanitize_worker_text
+from .evaluator import CodingEvaluator, LeanEvaluator, MockEvaluator, sanitize_worker_text
 from .elastic_scheduler import AgentAssignment, ElasticScheduler
 from .formal_tools import (
     DeclarationIndex,
@@ -49,6 +55,317 @@ from .models import AgentResult, Task, Verdict
 from .pi_agent import PiAgent
 from .preflight import PreflightError, run_preflight
 from .prompts import build_mono_prompt, build_task_prompt
+from .selection_runtime import SelectionRuntime
+from .selection_store import EXPORT_SCHEMA_VERSION, SelectionStore
+
+
+def _candidate_name(task: Task) -> str:
+    return task.candidate_filename
+
+
+def _baseline_glob(task: Task) -> str:
+    return "*.cpp" if _candidate_name(task) == "result.cpp" else "*.lean"
+
+
+def _candidate_path(root: Path, task: Task) -> Path:
+    """Return the mutable candidate path for either benchmark language."""
+
+    return root / _candidate_name(task)
+
+
+def _selection_capabilities(config: ExperimentConfig) -> tuple[bool, bool, bool]:
+    """Return (enabled, direct-messages, candidate-transfer) capabilities.
+
+    Selection manifests are an isolation boundary: enabled arms explicitly
+    disable direct messages and cross-assignment candidate transfer.  Keep the
+    historical CPS surface unchanged for manifests without a selection table.
+    """
+
+    selection = getattr(config, "selection", None)
+    enabled = bool(getattr(selection, "enabled", False))
+    if not enabled:
+        return False, True, True
+    direct_messages = bool(getattr(selection, "direct_messages", False))
+    candidate_transfer = bool(getattr(selection, "candidate_transfer", False))
+    if direct_messages or candidate_transfer:
+        raise ConfigError(
+            "selection-enabled runs must disable direct messages and "
+            "cross-assignment candidate transfer"
+        )
+    return True, False, False
+
+
+def _selection_comparison_contract_id(config: ExperimentConfig) -> str:
+    """Hash the arm-invariant experiment contract, not only selector limits."""
+
+    contract = config.public_dict()
+    # The human-readable arm label is expected to differ across registered
+    # arms and is not an experimental input.  Selector identity and policy
+    # parameters are the only permitted treatment differences.
+    contract.pop("name", None)
+    # Output locations and operator/runtime discovery booleans do not change
+    # the registered treatment.  Keeping host paths in this identity would
+    # make otherwise matched arms incomparable merely because they write to
+    # different directories.
+    for key in (
+        "dataset_root",
+        "problem_ids_path",
+        "pi_binary_configured",
+        "aisw_binary_configured",
+        "aisw_node_config_configured",
+        "aisw_coordinator_configured",
+        "aisw_account_configured",
+        "aisw_group_configured",
+        "lean_server_configured",
+        "formal_tools_decl_index_configured",
+    ):
+        contract.pop(key, None)
+    contract["selection"] = config.selection.comparison_hash_inputs()
+    return hashlib.sha256(
+        json.dumps(
+            contract,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _require_selection_runtime(
+    config: ExperimentConfig,
+    selection_store: SelectionStore | None,
+    selection_runtime: SelectionRuntime | None,
+    cps_store: CPSStore | None,
+) -> tuple[bool, bool, bool]:
+    """Validate the selection bridge before any solver can be admitted."""
+
+    capabilities = _selection_capabilities(config)
+    if not capabilities[0]:
+        return capabilities
+    if selection_runtime is None or selection_store is None:
+        raise RuntimeError("selection-enabled worker path has no selection runtime")
+    if selection_runtime.selection_store is not selection_store:
+        raise RuntimeError("selection runtime/store binding mismatch")
+    if cps_store is None or selection_runtime.cps_store is not cps_store:
+        raise RuntimeError("selection runtime/shared CPS store binding mismatch")
+    return capabilities
+
+
+def _selection_broker_search(
+    runtime: SelectionRuntime,
+    trace_slot_limit: int,
+    claim: Any,
+    query: str,
+    limit: int,
+) -> Mapping[str, Any]:
+    """Keep interactive search within the same manifest-owned slot limit."""
+
+    bounded_limit = min(max(1, int(limit)), max(1, int(trace_slot_limit)))
+    return runtime.broker_search(claim, query, bounded_limit)
+
+
+def _initialize_selection_runtime(
+    config: ExperimentConfig,
+    run_dir: Path,
+    logger: RunLogger,
+    *,
+    cps_store: CPSStore | None = None,
+    run_id: str = "",
+) -> SelectionRuntime | None:
+    """Initialize the run-local selector bridge and durable registry.
+
+    Legacy (selection-disabled) runs do not create this store or alter their
+    communication surface.  Selection-enabled runs use the runner-owned
+    project-wide snapshot service; no task-local CPS search is promoted into
+    selector state.
+    """
+
+    enabled, _direct_messages, _candidate_transfer = _selection_capabilities(config)
+    if not enabled:
+        return None
+    if not bool(getattr(config, "uses_cps", False)) or cps_store is None:
+        raise ConfigError(
+            "selection-enabled runs require CPS communication; "
+            "the shared selection runtime requires a CPS store"
+        )
+    selection = config.selection
+    store = SelectionStore(run_dir / "selection.sqlite3")
+    runtime = SelectionRuntime(
+        cps_store,
+        store,
+        selection,
+        run_id=run_id or run_dir.name,
+        paired_seed=config.seed,
+        comparison_contract_id=_selection_comparison_contract_id(config),
+    )
+    metadata = {
+        "schema_version": "contextswarm_runner_selection_v1",
+        "enabled": True,
+        "selection_config_id": selection.selection_config_id,
+        "selector_name": selection.selector_name,
+        "selector_version": selection.selector_version,
+        "registered_selector_config_id": runtime.selector_config_id,
+        "comparison_contract_id": runtime.comparison_contract_id,
+        "store": "selection.sqlite3",
+        "visibility": selection.visibility,
+        "direct_messages": selection.direct_messages,
+        "candidate_transfer": selection.candidate_transfer,
+        "trace_search": {
+            "status": "available",
+            "fail_closed": True,
+            "source": "runner_selection_runtime_project_snapshot",
+        },
+    }
+    (run_dir / "selection_runtime.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    logger.event(
+        "selection_runtime_initialized",
+        selection_config_id=selection.selection_config_id,
+        selector_name=selection.selector_name,
+        selector_version=selection.selector_version,
+        registered_selector_config_id=runtime.selector_config_id,
+        trace_search_status="available",
+    )
+    return runtime
+
+
+def _selection_closeout_summary(
+    config: ExperimentConfig,
+    runtime: SelectionRuntime | None,
+    *,
+    broker_drained: bool,
+    run_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Export and summarize durable selection state for run closeout.
+
+    ``SelectionStore.export_jsonl`` takes one SQLite read snapshot and
+    atomically publishes the resulting JSONL file.  Build the closeout
+    summary from the metadata returned by that same call so the artifact's
+    digest/counts and the summary cannot describe different store states.
+    Exporting happens before the caller writes ``selection_summary.json``;
+    consequently an export failure is raised to the existing closeout
+    fail-closed handler and no apparently successful summary is published.
+    """
+
+    enabled, direct_messages, candidate_transfer = _selection_capabilities(config)
+    if not enabled:
+        return {"enabled": False}
+    if runtime is None:
+        raise RuntimeError("selection closeout has no initialized runtime")
+
+    # The selection DB is run-local, so deriving the destination from its
+    # parent avoids accepting an external path (and keeps the artifact field
+    # credential-/host-path-free).  ``export_jsonl`` itself performs the
+    # temporary-file + fsync + atomic-replace publication.
+    export_root = Path(run_dir) if run_dir is not None else runtime.selection_store.path.parent
+    export_path = export_root / "selection_events.jsonl"
+    exported = runtime.selection_store.export_jsonl(export_path)
+    store_summary = exported.get("summary")
+    if not isinstance(store_summary, Mapping):
+        raise RuntimeError("selection store export returned no summary")
+    counts = store_summary.get("counts")
+    if not isinstance(counts, Mapping):
+        raise RuntimeError("selection store export summary has no counts")
+
+    export_schema = exported.get("schema")
+    export_sha256 = exported.get("sha256")
+    export_record_count = exported.get("record_count")
+    export_type_counts = exported.get("record_type_counts")
+    if export_schema != EXPORT_SCHEMA_VERSION:
+        raise RuntimeError("selection store export returned an unsupported schema")
+    if (
+        not isinstance(export_sha256, str)
+        or re.fullmatch(r"[0-9a-fA-F]{64}", export_sha256) is None
+    ):
+        raise RuntimeError("selection store export returned an invalid digest")
+    if (
+        isinstance(export_record_count, bool)
+        or not isinstance(export_record_count, int)
+        or export_record_count < 0
+        or not isinstance(export_type_counts, Mapping)
+    ):
+        raise RuntimeError("selection store export returned invalid record counts")
+    normalized_type_counts: dict[str, int] = {}
+    for key, value in export_type_counts.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+        ):
+            raise RuntimeError("selection store export returned invalid type counts")
+        normalized_type_counts[str(key)] = value
+    if sum(normalized_type_counts.values()) != export_record_count:
+        raise RuntimeError("selection store export record counts do not reconcile")
+
+    # Keep only a relative filename in the run artifact.  The store returns
+    # its concrete destination for API callers, but absolute host paths are
+    # not part of the reproducibility contract.
+    artifact = {
+        "schema": export_schema,
+        "path": export_path.name,
+        "sha256": export_sha256.lower(),
+        "record_count": export_record_count,
+        "record_type_counts": normalized_type_counts,
+    }
+    return {
+        "schema_version": "contextswarm_selection_closeout_v1",
+        "enabled": True,
+        "status": "closed" if broker_drained else "broker_not_drained",
+        "broker_drained": bool(broker_drained),
+        "selection_config_id": config.selection.selection_config_id,
+        "registered_selector_config_id": runtime.selector_config_id,
+        "comparison_contract_id": runtime.comparison_contract_id,
+        "selector_name": config.selection.selector_name,
+        "selector_version": config.selection.selector_version,
+        "visibility": config.selection.visibility,
+        "direct_messages": direct_messages,
+        "candidate_transfer": candidate_transfer,
+        "store": runtime.selection_store.path.name,
+        # ``counts`` is retained at the historical top level for consumers
+        # that already read selection_summary.json.  ``store_summary`` is
+        # the complete identity-bearing SelectionStore summary (IDs and all
+        # feedback counters included), sourced from the export snapshot.
+        "counts": {str(key): int(value) for key, value in dict(counts).items()},
+        "store_summary": dict(store_summary),
+        "artifact": artifact,
+    }
+
+
+def _selection_final_evidence(
+    run_dir: Path,
+    config: ExperimentConfig,
+    *,
+    status: str,
+) -> dict[str, Any]:
+    """Read the closeout summary without hiding a missing enabled artifact."""
+
+    enabled, _direct_messages, _candidate_transfer = _selection_capabilities(config)
+    if not enabled:
+        return {"enabled": False}
+    if status == "DRY_RUN":
+        return {
+            "enabled": True,
+            "status": "dry_run",
+            "selection_config_id": config.selection.selection_config_id,
+        }
+    try:
+        value = json.loads(
+            (run_dir / "selection_summary.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return {
+            "enabled": True,
+            "status": "missing_or_invalid",
+            "selection_config_id": config.selection.selection_config_id,
+        }
+    return dict(value) if isinstance(value, Mapping) else {
+        "enabled": True,
+        "status": "missing_or_invalid",
+        "selection_config_id": config.selection.selection_config_id,
+    }
 
 
 def utc_now() -> str:
@@ -239,6 +556,54 @@ class _AnyCancelEvent:
 
 class RemoteJudgeSettlementError(RuntimeError):
     """The run cannot safely admit work while a remote job is unaccounted for."""
+
+
+def _run_solver_with_recovery(
+    config: ExperimentConfig,
+    logger: RunLogger,
+    invoke: Any,
+    *,
+    task_id: str,
+    actor_id: str,
+    episode: int,
+    deadline: float,
+    cancel_event: Any | None,
+) -> AgentResult:
+    """Apply the common persisted-session recovery contract to a solver."""
+
+    max_restarts, delay_seconds = recovery_settings(config)
+    return run_with_recovery(
+        invoke,
+        task_id=task_id,
+        actor_id=actor_id,
+        episode=episode,
+        deadline_monotonic=deadline,
+        cancel_event=cancel_event,
+        max_restarts=max_restarts,
+        base_delay_seconds=delay_seconds,
+        on_event=lambda event, payload: logger.event(event, **payload),
+    )
+
+
+def _agent_result_can_refill(
+    result: AgentResult,
+    *,
+    deadline: float,
+    cancel_event: Any | None,
+) -> bool:
+    """Whether an exhausted solver attempt may release/refill its slot.
+
+    This deliberately delegates to the same process-level classifier used by
+    ``run_with_recovery``.  In particular, a Judge verdict is never passed
+    here, and cancellation/horizon results are terminal closeout rather than
+    replacement work.
+    """
+
+    return is_recoverable_agent_failure(
+        result,
+        deadline_monotonic=deadline,
+        cancel_event=cancel_event,
+    )
 
 
 def _evaluator_remote_settlement_event(evaluator: Any) -> Any | None:
@@ -1085,25 +1450,127 @@ def load_tasks(config: ExperimentConfig) -> list[Task]:
         raise ConfigError(f"cannot load problem ids: {ids_path}: {exc}") from exc
     if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
         raise ConfigError(f"problem_ids must be a list of strings: {ids_path}")
+
+    manifest_path = dataset_root / "manifest.json"
+    try:
+        bundle_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        bundle_manifest = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot load benchmark manifest: {manifest_path}: {exc}") from exc
+    if not isinstance(bundle_manifest, dict):
+        raise ConfigError(f"benchmark manifest is not an object: {manifest_path}")
+
+    bundle_language = str(bundle_manifest.get("language") or "").strip().lower()
+    coding_bundle = config.is_coding or bundle_language in {"cpp", "c++", "c"}
+    public_metadata: dict[str, Any] = {}
+    public_metadata_name = str(bundle_manifest.get("public_metadata") or "").strip()
+    if public_metadata_name:
+        public_metadata_path = dataset_root / public_metadata_name
+        try:
+            loaded_public_metadata = json.loads(
+                public_metadata_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(
+                f"cannot load benchmark public metadata: {public_metadata_path}: {exc}"
+            ) from exc
+        if not isinstance(loaded_public_metadata, dict):
+            raise ConfigError(
+                f"benchmark public metadata is not an object: {public_metadata_path}"
+            )
+        public_metadata = loaded_public_metadata
+
     tasks: list[Task] = []
     for slug in ids:
         root = dataset_root / slug
-        try:
-            metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
-            problem_text = (root / "problem.md").read_text(encoding="utf-8")
-            baseline_files = sorted((root / "baseline").glob("*.lean"))
-        except OSError as exc:
-            raise ConfigError(f"incomplete task {slug}: {exc}") from exc
-        if not baseline_files:
-            raise ConfigError(f"task {slug} has no baseline/*.lean")
+        metadata_path = root / "metadata.json"
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ConfigError(f"cannot load task metadata {metadata_path}: {exc}") from exc
+        elif coding_bundle:
+            metadata = dict(public_metadata.get(slug) or {})
+        else:
+            raise ConfigError(f"incomplete task {slug}: missing {metadata_path}")
         if not isinstance(metadata, dict):
-            raise ConfigError(f"metadata is not an object: {root / 'metadata.json'}")
+            raise ConfigError(f"metadata is not an object: {metadata_path}")
+        metadata = dict(metadata)
+        for key in (
+            "language",
+            "candidate_filename",
+            "dataset",
+            "benchmark_revision",
+            "verification_profile",
+        ):
+            value = bundle_manifest.get(key)
+            if value is not None:
+                metadata.setdefault(key, value)
+        metadata.setdefault("problem_id", slug)
+
+        problem_path = root / "problem.md"
+        if problem_path.is_file():
+            try:
+                problem_text = problem_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ConfigError(f"cannot load task statement {problem_path}: {exc}") from exc
+        elif coding_bundle and metadata.get("description_no_samples") is not None:
+            title = str(metadata.get("name") or slug)
+            body = str(metadata.get("description_no_samples") or "").rstrip()
+            sample_blocks: list[str] = []
+            samples = metadata.get("samples")
+            if isinstance(samples, list):
+                for index, sample in enumerate(samples, start=1):
+                    if not isinstance(sample, Mapping):
+                        continue
+                    sample_input = str(sample.get("input") or "").rstrip("\n")
+                    sample_output = str(sample.get("output") or "").rstrip("\n")
+                    sample_blocks.append(
+                        f"### Sample {index}\n\nInput:\n```text\n{sample_input}\n```\n\n"
+                        f"Output:\n```text\n{sample_output}\n```"
+                    )
+            sample_text = "\n\n".join(sample_blocks)
+            problem_text = f"# {title}\n\n{body}"
+            if sample_text:
+                problem_text += f"\n\n## Samples\n\n{sample_text}"
+            problem_text += "\n"
+        else:
+            raise ConfigError(f"incomplete task {slug}: missing {problem_path}")
+
+        baseline_files = sorted((root / "baseline").glob("*.lean")) or sorted(
+            (root / "baseline").glob("*.cpp")
+        )
+        if baseline_files:
+            baseline_source = baseline_files[0]
+            try:
+                baseline_code = baseline_source.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ConfigError(f"cannot load task baseline {baseline_source}: {exc}") from exc
+            metadata.setdefault("baseline_filename", baseline_source.name)
+            inferred_coding = baseline_source.suffix.lower() == ".cpp"
+        elif coding_bundle:
+            baseline_code = (
+                "#include <bits/stdc++.h>\n"
+                "using namespace std;\n\n"
+                "int main() {\n"
+                "    ios::sync_with_stdio(false);\n"
+                "    cin.tie(nullptr);\n"
+                "    return 0;\n"
+                "}\n"
+            )
+            metadata.setdefault("baseline_filename", "baseline.cpp")
+            inferred_coding = True
+        else:
+            raise ConfigError(f"task {slug} has no baseline source")
+        metadata.setdefault("candidate_filename", "result.cpp" if inferred_coding else "result.lean")
+        metadata.setdefault("language", "cpp" if inferred_coding else "lean")
         tasks.append(
             Task(
                 slug=slug,
                 root=root,
                 problem_text=problem_text,
-                baseline_code=baseline_files[0].read_text(encoding="utf-8"),
+                baseline_code=baseline_code,
                 metadata=metadata,
             )
         )
@@ -1136,6 +1603,11 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "allocation": config.allocation.public_dict(),
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
+        "judge_kind": config.judge_kind,
+        "aisw_max_in_flight": config.aisw_max_in_flight,
+        "pi_recovery_enabled": config.pi_recovery_enabled,
+        "pi_recovery_max_restarts": config.pi_recovery_max_restarts,
+        "pi_recovery_base_delay_ms": config.pi_recovery_base_delay_ms,
         "model": config.model,
         "thinking": config.thinking,
         "lean_server_configured": bool(config.lean_server_url),
@@ -1169,6 +1641,16 @@ def run_experiment(
     manifest_snapshot["repo_root"] = str(config.repo_root)
     manifest_snapshot["effective_runtime_limits"] = _runtime_limit_snapshot()
     manifest_snapshot["runtime_provenance"] = runtime_provenance
+    if config.selection.enabled:
+        manifest_snapshot["figure3"] = {
+            "schema_version": "contextswarm_figure3_contract_v1",
+            "comparison_contract_id": _selection_comparison_contract_id(config),
+            "task_order": [task.slug for task in tasks],
+            "paired_seed": config.seed,
+            "selector_name": config.selection.selector_name,
+            "selector_version": config.selection.selector_version,
+            "selection_config_id": config.selection.selection_config_id,
+        }
     (run_dir / "run_meta.json").write_text(
         json.dumps(manifest_snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1250,11 +1732,42 @@ def run_experiment(
     run_deadline = horizon_started_monotonic + config.time_limit_seconds
 
     store = CPSStore(run_dir / "cps.sqlite3") if config.uses_cps else None
+    selection_runtime = _initialize_selection_runtime(
+        config,
+        run_dir,
+        logger,
+        cps_store=store,
+        run_id=run_id,
+    )
+    selection_store = (
+        selection_runtime.selection_store if selection_runtime is not None else None
+    )
+    selection_search = (
+        (
+            lambda claim, query, limit: _selection_broker_search(
+                selection_runtime,
+                config.selection.trace_slot_limit,
+                claim,
+                query,
+                limit,
+            )
+        )
+        if selection_runtime is not None
+        else None
+    )
     policy = make_policy(config.communication, store)
-    evaluator = (
-        MockEvaluator(prove_without_sorry=mock_proved)
-        if mock_agent
-        else LeanEvaluator(
+    if mock_agent:
+        evaluator = MockEvaluator(prove_without_sorry=mock_proved)
+    elif config.is_coding:
+        evaluator = CodingEvaluator(
+            config.lean_server_url,
+            timeout_seconds=config.lean_timeout_seconds,
+            max_lifecycle_seconds=config.lean_max_lifecycle_seconds,
+            verification_profile=config.lean_verification_profile,
+            judge_mode=config.lean_judge_mode,
+        )
+    else:
+        evaluator = LeanEvaluator(
             config.lean_server_url,
             lean_env_id=config.lean_env_id,
             timeout_seconds=config.lean_timeout_seconds,
@@ -1262,7 +1775,6 @@ def run_experiment(
             verification_profile=config.lean_verification_profile,
             judge_mode=config.lean_judge_mode,
         )
-    )
     if mock_agent and not callable(
         getattr(evaluator, "expected_task_contract_sha256", None)
     ):
@@ -1291,6 +1803,14 @@ def run_experiment(
         audit_path=run_dir / "judge_checks.jsonl",
         formal_policy=formal_policy,
         formal_audit_path=run_dir / "formal_tool_calls.jsonl",
+        direct_messages_allowed=(
+            _selection_capabilities(config)[1]
+            if _selection_capabilities(config)[0]
+            else None
+        ),
+        selection_store=selection_store,
+        selection_enabled=_selection_capabilities(config)[0],
+        selection_search=selection_search,
     ).start()
     (run_dir / "judge_broker_policy.json").write_text(
         json.dumps(judge_broker.public_policy(), ensure_ascii=False, indent=2, sort_keys=True)
@@ -1354,6 +1874,8 @@ def run_experiment(
                 deadline=run_deadline,
                 evaluator_gate=evaluator_gate,
                 judge_broker=judge_broker,
+                selection_store=selection_store,
+                selection_runtime=selection_runtime,
                 scheduler_result_sink=agent_results,
             )
             for result, verdict in results:
@@ -1372,6 +1894,8 @@ def run_experiment(
                 deadline=run_deadline,
                 evaluator_gate=evaluator_gate,
                 judge_broker=judge_broker,
+                selection_store=selection_store,
+                selection_runtime=selection_runtime,
             )
             for result, verdict in results:
                 agent_results.append(result)
@@ -1512,6 +2036,10 @@ def run_experiment(
             "fifo_depth", -1
         )
     )
+    pending_settlement_watchers = max(
+        int(broker_state.get("pending_settlement_watchers", 0)),
+        int(final_broker_state.get("pending_settlement_watchers", 0)),
+    )
     broker_closeout = {
         "schema_version": "contextswarm_judge_broker_closeout_v1",
         "drained": bool(
@@ -1519,11 +2047,18 @@ def run_experiment(
             and closeout_active_handlers == 0
             and closeout_fifo_depth == 0
             and remote_unsettled_jobs == 0
+            and pending_settlement_watchers == 0
         ),
         "active_handlers": closeout_active_handlers,
         "fifo_depth": closeout_fifo_depth,
         "remote_unsettled_jobs": remote_unsettled_jobs,
     }
+    if pending_settlement_watchers > 0:
+        # Preserve the cause of a bounded drain failure even if the watcher
+        # settles between ``close()`` raising and this final observation.
+        broker_closeout["pending_settlement_watchers"] = (
+            pending_settlement_watchers
+        )
     if remote_unsettled_jobs > 0 and terminal_failure is None:
         terminal_failure = RemoteJudgeSettlementError(
             "remote Judge work did not provide a job-bound terminal receipt during closeout"
@@ -1559,7 +2094,9 @@ def run_experiment(
             **(closeout_artifact_failure_fields or {}),
         )
     elif isinstance(broker_failure, JudgeBrokerDrainError) and (
-        closeout_active_handlers != 0 or closeout_fifo_depth != 0
+        closeout_active_handlers != 0
+        or closeout_fifo_depth != 0
+        or pending_settlement_watchers != 0
     ):
         logger.event("broker_drain_timeout", **broker_closeout)
     elif broker_failure is not None and remote_unsettled_jobs <= 0:
@@ -1568,6 +2105,39 @@ def run_experiment(
         logger.event("remote_settlement_unconfirmed", **broker_closeout)
     else:
         logger.event("judge_broker_closed", **broker_closeout)
+
+    selection_summary_failure: BaseException | None = None
+    selection_summary_failure_fields: dict[str, str] | None = None
+    if selection_runtime is not None:
+        try:
+            selection_summary = _selection_closeout_summary(
+                config,
+                selection_runtime,
+                broker_drained=bool(broker_closeout["drained"]),
+                run_dir=run_dir,
+            )
+            atomic_write_json(run_dir / "selection_summary.json", selection_summary)
+            logger.event(
+                "selection_runtime_closed",
+                status=selection_summary["status"],
+                selection_config_id=selection_summary["selection_config_id"],
+                comparison_contract_id=selection_summary["comparison_contract_id"],
+                counts=selection_summary["counts"],
+            )
+        except BaseException as exc:
+            selection_summary_failure = exc
+            selection_summary_failure_fields = _exception_artifact_fields(
+                exc,
+                config,
+                traceback_bytes=4_000,
+            )
+            logger.event(
+                "selection_closeout_artifact_error",
+                **selection_summary_failure_fields,
+            )
+            if terminal_failure is None:
+                terminal_failure = exc
+                terminal_failure_fields = selection_summary_failure_fields
     if store is not None:
         try:
             store.export_events(run_dir / "communication_trace.jsonl")
@@ -1649,6 +2219,7 @@ def _run_mono(
     )
     early_lock = threading.RLock()
     early_proofs: dict[str, _EarlyProofCredit] = {}
+    full_score_event = threading.Event()
     expected_contracts = {
         task.slug: _expected_task_contract(evaluator, task) for task in tasks
     }
@@ -1657,7 +2228,8 @@ def _run_mono(
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
-        reasons=("runner_failure", "remote_settlement_unconfirmed"),
+        full_score_event,
+        reasons=("runner_failure", "remote_settlement_unconfirmed", "full_score"),
     )
 
     def admit_early_proof(
@@ -1676,7 +2248,7 @@ def _run_mono(
             with early_lock:
                 if task.slug in early_proofs:
                     return
-                verified = worker_dir / "verified" / task.slug / "result.lean"
+                verified = _candidate_path(worker_dir / "verified" / task.slug, task)
                 _atomic_promote_source(snapshot.source, verified, snapshot.sha256)
                 credit = _EarlyProofCredit(
                     verdict=verdict,
@@ -1703,6 +2275,8 @@ def _run_mono(
                     source="judge_check",
                 )
                 early_proofs[task.slug] = credit
+                if config.cancel_on_proved and len(early_proofs) == len(tasks):
+                    full_score_event.set()
         except Exception:
             callback_failure.record()
             raise
@@ -1711,9 +2285,14 @@ def _run_mono(
         result = _mock_result("mono", "bundle", 1)
     else:
         candidates = {
-            task.slug: (task, worker_dir / "tasks" / task.slug / "result.lean")
+            task.slug: (task, _candidate_path(worker_dir / "tasks" / task.slug, task))
             for task in tasks
         }
+        candidate_snapshots: dict[str, Path] = {}
+        for task, candidate in candidates.values():
+            snapshot = candidate.parent / f".best-{task.candidate_filename}"
+            shutil.copy2(candidate, snapshot)
+            candidate_snapshots[task.slug] = snapshot
         with judge_broker.session(
             actor_id="mono",
             workdir=worker_dir,
@@ -1722,16 +2301,74 @@ def _run_mono(
             on_authoritative_verdict=admit_early_proof,
             cancel_event=run_cancel_event,
         ) as broker_env:
-            result = pi_agent.run(
-                task_id="matholympiadbench-latest12",
-                actor_id="mono",
-                episode=1,
-                prompt=prompt,
-                workdir=worker_dir,
-                extra_env=broker_env,
-                deadline_monotonic=deadline,
-                cancel_event=run_cancel_event,
-            )
+            replacement_limit, _recovery_delay = recovery_settings(config)
+            replacement_attempt = 0
+            while True:
+                result = _run_solver_with_recovery(
+                    config,
+                    logger,
+                    lambda _recovery_attempt: pi_agent.run(
+                        task_id=f"{config.name}-bundle",
+                        actor_id="mono",
+                        episode=1,
+                        prompt=prompt,
+                        workdir=worker_dir,
+                        extra_env=broker_env,
+                        deadline_monotonic=deadline,
+                        cancel_event=run_cancel_event,
+                    ),
+                    task_id=f"{config.name}-bundle",
+                    actor_id="mono",
+                    episode=1,
+                    deadline=deadline,
+                    cancel_event=run_cancel_event,
+                )
+                if (
+                    result.returncode == 0
+                    or not _agent_result_can_refill(
+                        result,
+                        deadline=deadline,
+                        cancel_event=run_cancel_event,
+                    )
+                    or replacement_attempt >= replacement_limit
+                ):
+                    break
+                logger.event(
+                    "agent_refill_scheduled",
+                    task_id=f"{config.name}-bundle",
+                    agent_id="mono",
+                    episode=1,
+                    replacement_attempt=replacement_attempt + 1,
+                    max_replacements=replacement_limit,
+                    reason="agent_recovery_exhausted",
+                )
+                logger.event(
+                    "agent_refill_started",
+                    task_id=f"{config.name}-bundle",
+                    agent_id="mono",
+                    episode=1,
+                    replacement_attempt=replacement_attempt + 1,
+                    max_replacements=replacement_limit,
+                    resume_scope="same_session_and_workspace",
+                )
+                for task_id, snapshot in candidate_snapshots.items():
+                    _task, candidate = candidates[task_id]
+                    shutil.copy2(snapshot, candidate)
+                replacement_attempt += 1
+            if (
+                result.returncode == 0
+                and not result.cancelled
+                and not run_cancel_event.is_set()
+                and replacement_attempt
+            ):
+                logger.event(
+                    "agent_refill_succeeded",
+                    task_id=f"{config.name}-bundle",
+                    agent_id="mono",
+                    episode=1,
+                    replacement_attempt=replacement_attempt,
+                    max_replacements=replacement_limit,
+                )
     _raise_if_remote_settlement_unconfirmed(
         evaluator,
         on_failure=callback_failure.record,
@@ -1739,8 +2376,59 @@ def _run_mono(
     callback_failure.raise_if_failed()
     logger.event("agent_finished", **result.as_dict())
     verdicts: dict[str, Verdict] = {}
+    if result.returncode != 0 and not early_proofs:
+        # A failed bundle has no candidate-attempt verdict to retry.  Preserve
+        # the baseline and report a bounded runner failure for every task; the
+        # arm itself remains valid and closes at its fixed horizon.
+        if _agent_result_can_refill(
+            result,
+            deadline=deadline,
+            cancel_event=run_cancel_event,
+        ):
+            logger.event(
+                "agent_refill_exhausted",
+                task_id=f"{config.name}-bundle",
+                agent_id="mono",
+                episode=1,
+                replacement_attempt=replacement_attempt,
+                max_replacements=replacement_limit,
+                reason="replacement_limit",
+            )
+        for task in tasks:
+            status = (
+                "CANCELLED"
+                if result.cancelled or run_cancel_event.is_set()
+                else "TIME_LIMIT"
+                if result.run_horizon_reached or time.monotonic() >= deadline
+                else "AGENT_FAILURE"
+            )
+            verdict = Verdict(
+                task.slug,
+                status,
+                0.0,
+                0.0,
+                {
+                    "reason": (
+                        "solver_cancelled_or_horizon"
+                        if status != "AGENT_FAILURE"
+                        else "solver_process_failed"
+                    )
+                },
+            )
+            verdicts[task.slug] = verdict
+            logger.scoreboard(verdict, episode=1, agent_id="mono")
+            logger.event(
+                "evaluation_finished",
+                **verdict.as_dict(),
+                agent_id="mono",
+                episode=1,
+                source="agent_failure",
+                scoreboard_recorded=True,
+            )
+        _write_mono_bundle(worker_dir, tasks)
+        return result, verdicts
     for task in tasks:
-        candidate = worker_dir / "tasks" / task.slug / "result.lean"
+        candidate = _candidate_path(worker_dir / "tasks" / task.slug, task)
         with early_lock:
             credit = early_proofs.get(task.slug)
         if credit is not None:
@@ -1799,6 +2487,8 @@ def _run_elastic_cps(
     evaluator_gate: threading.BoundedSemaphore,
     judge_broker: JudgeBroker,
     scheduler_result_sink: list[AgentResult],
+    selection_store: SelectionStore | None = None,
+    selection_runtime: SelectionRuntime | None = None,
 ) -> list[tuple[AgentResult, Verdict]]:
     """Run one fixed CPS computation substrate with selectable slot allocation."""
 
@@ -1818,7 +2508,7 @@ def _run_elastic_cps(
         )
         best_dir = task_root / "best"
         best_dir.mkdir(parents=True, exist_ok=True)
-        best_path = best_dir / "result.lean"
+        best_path = _candidate_path(best_dir, task)
         if not best_path.exists():
             best_path.write_text(task.baseline_code, encoding="utf-8")
         state.best_candidate = best_path
@@ -1858,14 +2548,35 @@ def _run_elastic_cps(
     initial_assignment_count = 0
     adaptive_assignments = 0
     callback_failure = _CallbackFailureState()
+    full_score_event = threading.Event()
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
-        reasons=("runner_failure", "remote_settlement_unconfirmed"),
+        full_score_event,
+        reasons=("runner_failure", "remote_settlement_unconfirmed", "full_score"),
     )
 
     assert policy.store is not None
     store = policy.store
+    selection_enabled, direct_messages, candidate_transfer = _require_selection_runtime(
+        config,
+        selection_store,
+        selection_runtime,
+        store,
+    )
+    selection_search = (
+        (
+            lambda claim, query, limit: _selection_broker_search(
+                selection_runtime,
+                config.selection.trace_slot_limit,
+                claim,
+                query,
+                limit,
+            )
+        )
+        if selection_runtime is not None
+        else None
+    )
 
     def record_run_failure() -> None:
         callback_failure.record()
@@ -2012,6 +2723,8 @@ def _run_elastic_cps(
             "allocation_policy": config.allocation.policy,
             "decision_index": decision.decision_index if decision is not None else None,
         }
+        if selection_enabled:
+            row["selection_config_id"] = config.selection.selection_config_id
         with assignments_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         with roster_lock:
@@ -2037,6 +2750,9 @@ def _run_elastic_cps(
             allocation_phase=phase,
             allocation_policy=config.allocation.policy,
             decision_index=decision.decision_index if decision is not None else None,
+            selection_config_id=(
+                config.selection.selection_config_id if selection_enabled else None
+            ),
         )
 
     def record_decision(
@@ -2061,6 +2777,8 @@ def _run_elastic_cps(
             "assigned_generation": assignment.generation if assignment is not None else None,
             "disposition": disposition,
         }
+        if selection_enabled:
+            row["selection_config_id"] = config.selection.selection_config_id
         if execution_snapshot is not None:
             row["execution_snapshot"] = execution_snapshot.as_dict()
         with decisions_path.open("a", encoding="utf-8") as handle:
@@ -2084,6 +2802,9 @@ def _run_elastic_cps(
             agent_run_horizon_reached=decision.agent_run_horizon_reached,
             assigned_agent_id=assignment.agent_id if assignment is not None else None,
             disposition=disposition,
+            selection_config_id=(
+                config.selection.selection_config_id if selection_enabled else None
+            ),
         )
 
     def retire_exhausted_tasks() -> None:
@@ -2289,8 +3010,12 @@ def _run_elastic_cps(
         workdir = state.task_root / "agents" / assignment.agent_id
         _stage_task(state.task, workdir, config=config)
         assert state.best_candidate is not None
-        with state.lock:
-            shutil.copy2(state.best_candidate, workdir / "result.lean")
+        # Selection-enabled arms isolate solver workspaces from candidates
+        # produced by other assignments.  The runner still keeps and promotes
+        # ``best_candidate`` internally for final closeout and bookkeeping.
+        if candidate_transfer:
+            with state.lock:
+                shutil.copy2(state.best_candidate, _candidate_path(workdir, state.task))
         return workdir, state.best_candidate
 
     def execute_assignment(assignment: AgentAssignment) -> Any:
@@ -2300,7 +3025,7 @@ def _run_elastic_cps(
         workdir, best_path = prepare_workspace(state, assignment)
         actor = assignment.agent_id
         task = state.task
-        candidate_path = workdir / "result.lean"
+        candidate_path = _candidate_path(workdir, task)
 
         def admit_task_proof(
             verdict: Verdict,
@@ -2404,7 +3129,13 @@ def _run_elastic_cps(
                         state.completed_attempts += 1
                     if config.cancel_on_proved:
                         state.cancel_event.set()
+                    if config.cancel_on_proved and all(
+                        current_state.solved for current_state in states.values()
+                    ):
+                        full_score_event.set()
                     return True
+
+        candidate_path = _candidate_path(workdir, task)
 
         def admit_early_proof(
             proved_task: Task,
@@ -2448,7 +3179,16 @@ def _run_elastic_cps(
             yield result
             return result, verdict, False
 
-        digest = policy.digest(task.slug, actor, query=task.theorem_name)
+        digest = (
+            selection_runtime.digest(
+                task_id=task.slug,
+                actor_id=actor,
+                query=task.theorem_name,
+                episode=assignment.generation,
+            )
+            if selection_enabled
+            else policy.digest(task.slug, actor, query=task.theorem_name)
+        )
         prompt = build_task_prompt(
             task,
             task_workspace=str(workdir),
@@ -2456,14 +3196,17 @@ def _run_elastic_cps(
             episode=assignment.generation,
             communication_enabled=policy.enabled,
             formal_tools_enabled=config.formal_tools_enabled,
+            direct_messages=direct_messages,
+            selection_enabled=selection_enabled,
             digest=digest,
         )
-        prompt += (
-            "\n\nElastic CPS handoff:\n"
-            "The runner has pre-seeded result.lean with the strongest usable candidate "
-            "from earlier assignments on this task. Keep your candidate in result.lean; "
-            "the runner will merge the strongest verified candidate."
-        )
+        if candidate_transfer:
+            prompt += (
+                "\n\nElastic CPS handoff:\n"
+                f"The runner has pre-seeded {task.candidate_filename} with the strongest usable candidate "
+                f"from earlier assignments on this task. Keep your candidate in {task.candidate_filename}; "
+                "the runner will merge the strongest verified candidate."
+            )
 
         assignment_cancel_event = _AnyCancelEvent(
             run_cancel_event,
@@ -2476,22 +3219,38 @@ def _run_elastic_cps(
             with judge_broker.session(
                 actor_id=actor,
                 workdir=workdir,
-                candidates={task.slug: (task, workdir / "result.lean")},
+                candidates={task.slug: (task, candidate_path)},
                 deadline_monotonic=deadline,
                 cps_store=store,
                 communication=config.communication,
+                direct_messages_allowed=direct_messages,
+                selection_store=selection_store,
+                selection_enabled=selection_enabled,
+                selection_search=selection_search,
                 roster_path=roster_path,
                 on_authoritative_verdict=admit_early_proof,
                 cancel_event=assignment_cancel_event,
             ) as broker_env:
-                result = pi_agent.run(
+                result = _run_solver_with_recovery(
+                    config,
+                    logger,
+                    lambda _recovery_attempt: pi_agent.run(
+                        task_id=task.slug,
+                        actor_id=actor,
+                        episode=assignment.generation,
+                        prompt=prompt,
+                        workdir=workdir,
+                        extra_env=broker_env,
+                        deadline_monotonic=deadline,
+                        cancel_event=assignment_cancel_event,
+                        communication_enabled=policy.enabled,
+                        direct_messages=direct_messages,
+                        selection_enabled=selection_enabled,
+                    ),
                     task_id=task.slug,
                     actor_id=actor,
                     episode=assignment.generation,
-                    prompt=prompt,
-                    workdir=workdir,
-                    extra_env=broker_env,
-                    deadline_monotonic=deadline,
+                    deadline=deadline,
                     cancel_event=assignment_cancel_event,
                 )
         _raise_if_remote_settlement_unconfirmed(
@@ -2539,7 +3298,7 @@ def _run_elastic_cps(
             verdict = _evaluate_candidate(
                 evaluator,
                 task,
-                workdir / "result.lean",
+                candidate_path,
                 deadline,
                 evaluator_gate,
                 cancel_event=assignment_cancel_event,
@@ -2909,12 +3668,37 @@ def _run_task_workers(
     deadline: float,
     evaluator_gate: threading.BoundedSemaphore,
     judge_broker: JudgeBroker,
+    selection_store: SelectionStore | None = None,
+    selection_runtime: SelectionRuntime | None = None,
 ) -> list[tuple[AgentResult, Verdict]]:
     callback_failure = _CallbackFailureState()
+    full_score_event = threading.Event()
+    solved_lock = threading.Lock()
+    solved_tasks: set[str] = set()
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
-        reasons=("runner_failure", "remote_settlement_unconfirmed"),
+        full_score_event,
+        reasons=("runner_failure", "remote_settlement_unconfirmed", "full_score"),
+    )
+    selection_enabled, direct_messages, candidate_transfer = _require_selection_runtime(
+        config,
+        selection_store,
+        selection_runtime,
+        policy.store,
+    )
+    selection_search = (
+        (
+            lambda claim, query, limit: _selection_broker_search(
+                selection_runtime,
+                config.selection.trace_slot_limit,
+                claim,
+                query,
+                limit,
+            )
+        )
+        if selection_runtime is not None
+        else None
     )
 
     def execute(task: Task) -> tuple[AgentResult, Verdict]:
@@ -2927,6 +3711,15 @@ def _run_task_workers(
         early_credit: _EarlyProofCredit | None = None
         expected_contract = _expected_task_contract(evaluator, task)
         allow_mock_provenance = _allows_mock_provenance(evaluator)
+        candidate_path = _candidate_path(workdir, task)
+        # A process/session failure which exhausts its in-session recovery
+        # budget releases this task's slot.  Refill it with a bounded,
+        # communication-free replacement while the fixed arm horizon remains.
+        # The replacement keeps the same actor/episode and workspace so Pi can
+        # resume persisted state; candidate Judge verdicts never enter this
+        # path.  One replacement per configured episode is sufficient to avoid
+        # an unbounded retry loop while still satisfying the refill contract.
+        replacement_limit, _recovery_delay = recovery_settings(config)
 
         def admit_early_proof(
             proved_task: Task,
@@ -2945,7 +3738,7 @@ def _run_task_workers(
                 with early_lock:
                     if early_credit is not None:
                         return
-                    verified = workdir / "verified" / "result.lean"
+                    verified = _candidate_path(workdir / "verified", task)
                     _atomic_promote_source(snapshot.source, verified, snapshot.sha256)
                     credit = _EarlyProofCredit(
                         verdict=verdict,
@@ -2970,6 +3763,11 @@ def _run_task_workers(
                         source="judge_check",
                     )
                     early_credit = credit
+                    if verdict.score >= 1.0 and normalize_verdict_status(verdict.status) in _AUTHORITATIVE_PROVED_STATUSES:
+                        with solved_lock:
+                            solved_tasks.add(task.slug)
+                            if config.cancel_on_proved and len(solved_tasks) == len(tasks):
+                                full_score_event.set()
             except Exception:
                 callback_failure.record()
                 raise
@@ -2978,8 +3776,23 @@ def _run_task_workers(
             callback_failure.raise_if_failed()
             if time.monotonic() >= deadline:
                 break
+            if selection_enabled and not candidate_transfer:
+                # The historical task-worker loop carries one mutable result
+                # across episodes.  Selection arms explicitly forbid that
+                # implicit candidate handoff, even when this helper is invoked
+                # directly by a narrow harness rather than normal CPS dispatch.
+                candidate_path.write_text(task.baseline_code, encoding="utf-8")
             actor = f"worker-{task.slug}-e{episode}"
-            digest = policy.digest(task.slug, actor, query=task.theorem_name)
+            digest = (
+                selection_runtime.digest(
+                    task_id=task.slug,
+                    actor_id=actor,
+                    query=task.theorem_name,
+                    episode=episode,
+                )
+                if selection_enabled
+                else policy.digest(task.slug, actor, query=task.theorem_name)
+            )
             prompt = build_task_prompt(
                 task,
                 task_workspace=str(workdir),
@@ -2987,32 +3800,115 @@ def _run_task_workers(
                 episode=episode,
                 communication_enabled=policy.enabled,
                 formal_tools_enabled=config.formal_tools_enabled,
+                direct_messages=direct_messages,
+                selection_enabled=selection_enabled,
                 digest=digest,
             )
-            if mock_agent:
-                result = _mock_result(actor, task.slug, episode)
-            else:
-                with judge_broker.session(
-                    actor_id=actor,
-                    workdir=workdir,
-                    candidates={task.slug: (task, workdir / "result.lean")},
-                    deadline_monotonic=deadline,
-                    cps_store=policy.store if policy.enabled else None,
-                    communication=config.communication if policy.enabled else "none",
-                    roster_path=(run_dir / "actors.json") if policy.enabled else None,
-                    on_authoritative_verdict=admit_early_proof,
-                    cancel_event=run_cancel_event,
-                ) as broker_env:
-                    result = pi_agent.run(
-                        task_id=task.slug,
+            # Snapshot the candidate entering this logical attempt.  A failed
+            # process may leave a partial file; task-level refill restores the
+            # prior candidate while retaining the persisted Pi session state.
+            candidate_snapshot = workdir / f".best-{task.candidate_filename}"
+            if not candidate_snapshot.exists():
+                shutil.copy2(candidate_path, candidate_snapshot)
+            replacement_attempt = 0
+            while True:
+                if mock_agent:
+                    result = _mock_result(actor, task.slug, episode)
+                else:
+                    with judge_broker.session(
                         actor_id=actor,
-                        episode=episode,
-                        prompt=prompt,
                         workdir=workdir,
-                        extra_env=broker_env,
+                        candidates={task.slug: (task, candidate_path)},
                         deadline_monotonic=deadline,
+                        cps_store=policy.store if policy.enabled else None,
+                        communication=config.communication if policy.enabled else "none",
+                        direct_messages_allowed=direct_messages,
+                        selection_store=selection_store,
+                        selection_enabled=selection_enabled,
+                        selection_search=selection_search,
+                        roster_path=(run_dir / "actors.json") if policy.enabled else None,
+                        on_authoritative_verdict=admit_early_proof,
+                        cancel_event=run_cancel_event,
+                    ) as broker_env:
+                        result = _run_solver_with_recovery(
+                            config,
+                            logger,
+                            lambda _recovery_attempt: pi_agent.run(
+                                task_id=task.slug,
+                                actor_id=actor,
+                                episode=episode,
+                                prompt=prompt,
+                                workdir=workdir,
+                                extra_env=broker_env,
+                                deadline_monotonic=deadline,
+                                cancel_event=run_cancel_event,
+                                communication_enabled=policy.enabled,
+                                direct_messages=direct_messages,
+                                selection_enabled=selection_enabled,
+                            ),
+                            task_id=task.slug,
+                            actor_id=actor,
+                            episode=episode,
+                            deadline=deadline,
+                            cancel_event=run_cancel_event,
+                        )
+
+                # A proof callback may have completed just before a Pi process
+                # exited.  Preserve that authoritative result; otherwise an
+                # abnormal process result is a runner attempt failure and must
+                # be refilled without evaluating its partial candidate.
+                with early_lock:
+                    callback_credit = (
+                        early_credit
+                        if early_credit is not None and early_credit.episode == episode
+                        else None
+                    )
+                if (
+                    result.returncode == 0
+                    or callback_credit is not None
+                    or not _agent_result_can_refill(
+                        result,
+                        deadline=deadline,
                         cancel_event=run_cancel_event,
                     )
+                    or replacement_attempt >= replacement_limit
+                ):
+                    break
+                logger.event(
+                    "agent_refill_scheduled",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=episode,
+                    replacement_attempt=replacement_attempt + 1,
+                    max_replacements=replacement_limit,
+                    reason="agent_recovery_exhausted",
+                )
+                logger.event(
+                    "agent_refill_started",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=episode,
+                    replacement_attempt=replacement_attempt + 1,
+                    max_replacements=replacement_limit,
+                    resume_scope="same_session_and_workspace",
+                )
+                shutil.copy2(candidate_snapshot, candidate_path)
+                replacement_attempt += 1
+
+            if (
+                result.returncode == 0
+                and not result.cancelled
+                and not run_cancel_event.is_set()
+                and replacement_attempt
+            ):
+                logger.event(
+                    "agent_refill_succeeded",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=episode,
+                    replacement_attempt=replacement_attempt,
+                    max_replacements=replacement_limit,
+                )
             _raise_if_remote_settlement_unconfirmed(
                 evaluator,
                 on_failure=callback_failure.record,
@@ -3021,10 +3917,55 @@ def _run_task_workers(
             logger.event("agent_finished", **result.as_dict())
             with early_lock:
                 credit = early_credit if early_credit and early_credit.episode == episode else None
+            if result.returncode != 0 and credit is None:
+                # Keep prior best progress and make the failed attempt visible
+                # without turning it into a candidate Judge retry.  The
+                # horizon/cancellation path is normal closeout, so no refill is
+                # scheduled after it.
+                if _agent_result_can_refill(
+                    result,
+                    deadline=deadline,
+                    cancel_event=run_cancel_event,
+                ):
+                    logger.event(
+                        "agent_refill_exhausted",
+                        task_id=task.slug,
+                        agent_id=actor,
+                        episode=episode,
+                        replacement_attempt=replacement_attempt,
+                        max_replacements=replacement_limit,
+                        reason="replacement_limit",
+                    )
+                if best_result is not None and best_verdict is not None:
+                    return best_result, best_verdict
+                status = (
+                    "CANCELLED"
+                    if result.cancelled or run_cancel_event.is_set()
+                    else "TIME_LIMIT"
+                    if result.run_horizon_reached or time.monotonic() >= deadline
+                    else "AGENT_FAILURE"
+                )
+                failed = Verdict(
+                    task.slug,
+                    status,
+                    0.0,
+                    0.0,
+                    {"reason": "solver_cancelled_or_horizon" if status != "AGENT_FAILURE" else "solver_process_failed"},
+                )
+                logger.scoreboard(failed, episode=episode, agent_id=actor)
+                logger.event(
+                    "evaluation_finished",
+                    **failed.as_dict(),
+                    agent_id=actor,
+                    episode=episode,
+                    source="agent_failure",
+                    scoreboard_recorded=True,
+                )
+                return result, failed
             if credit is not None:
                 _atomic_promote_source(
                     credit.candidate_source,
-                    workdir / "result.lean",
+                    candidate_path,
                     credit.candidate_sha256,
                 )
                 verdict = credit.verdict
@@ -3032,7 +3973,7 @@ def _run_task_workers(
                 verdict = _evaluate_candidate(
                     evaluator,
                     task,
-                    workdir / "result.lean",
+                    candidate_path,
                     deadline,
                     evaluator_gate,
                     cancel_event=run_cancel_event,
@@ -3045,11 +3986,16 @@ def _run_task_workers(
                 verdict = _within_horizon(verdict, deadline)
                 verdict = _enforce_verdict_provenance(
                     verdict,
-                    workdir / "result.lean",
+                    candidate_path,
                     expected_task_contract_sha256=expected_contract,
                     allow_mock_provenance=allow_mock_provenance,
                 )
                 logger.scoreboard(verdict, episode=episode, agent_id=actor)
+            if verdict.score >= 1.0 and normalize_verdict_status(verdict.status) in _AUTHORITATIVE_PROVED_STATUSES:
+                with solved_lock:
+                    solved_tasks.add(task.slug)
+                    if config.cancel_on_proved and len(solved_tasks) == len(tasks):
+                        full_score_event.set()
             logger.event(
                 "evaluation_finished",
                 **verdict.as_dict(),
@@ -3058,6 +4004,7 @@ def _run_task_workers(
                 source="judge_check" if credit is not None else "final_evaluation",
                 scoreboard_recorded=credit is None,
             )
+            shutil.copy2(candidate_path, candidate_snapshot)
             best_result, best_verdict = result, verdict
             if policy.enabled and credit is None:
                 feedback = verdict.error or str(
@@ -3108,16 +4055,16 @@ def _stage_task(
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "problem.md").write_text(task.problem_text, encoding="utf-8")
     baseline_dir = destination / "baseline"
-    baseline_dir.mkdir(exist_ok=True)
-    baseline_source = next(iter(sorted(task.root.glob("baseline/*.lean"))))
-    shutil.copy2(baseline_source, baseline_dir / baseline_source.name)
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    baseline_source = baseline_dir / task.baseline_filename
+    baseline_source.write_text(task.baseline_code, encoding="utf-8")
     (destination / "metadata.json").write_text(
         json.dumps(task.metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    result = destination / "result.lean"
+    result = _candidate_path(destination, task)
     if not result.exists():
-        shutil.copy2(baseline_source, result)
+        result.write_text(task.baseline_code, encoding="utf-8")
     if config.formal_tools_enabled:
         stage_worker_tools(
             destination,
@@ -3321,10 +4268,10 @@ def _remote_settlement_verdict(
 
 def _candidate_source(config: ExperimentConfig, task: Task, run_dir: Path) -> Path:
     if config.mode == "mono":
-        return run_dir / "workers" / "mono" / "tasks" / task.slug / "result.lean"
+        return _candidate_path(run_dir / "workers" / "mono" / "tasks" / task.slug, task)
     if config.uses_cps:
-        return run_dir / "workers" / task.slug / "best" / "result.lean"
-    return run_dir / "workers" / task.slug / "result.lean"
+        return _candidate_path(run_dir / "workers" / task.slug / "best", task)
+    return _candidate_path(run_dir / "workers" / task.slug, task)
 
 
 def _freeze_closeout_candidates(
@@ -3340,7 +4287,7 @@ def _freeze_closeout_candidates(
     rows: list[dict[str, Any]] = []
     for task in tasks:
         source = _candidate_source(config, task, run_dir)
-        destination = root / task.slug / "result.lean"
+        destination = _candidate_path(root / task.slug, task)
         digest: str | None = None
         error: str | None = None
         try:
@@ -3688,16 +4635,24 @@ def _run_closeout(
 
 
 def _write_mono_bundle(worker_dir: Path, tasks: Iterable[Task]) -> None:
+    task_list = list(tasks)
     solutions: dict[str, str] = {}
-    for task in tasks:
-        candidate = worker_dir / "tasks" / task.slug / "result.lean"
+    for task in task_list:
+        candidate = _candidate_path(worker_dir / "tasks" / task.slug, task)
         try:
             solutions[task.slug] = candidate.read_text(encoding="utf-8")
         except OSError:
             solutions[task.slug] = ""
     (worker_dir / "result.json").write_text(
         json.dumps(
-            {"schema_version": "formal_lean_single_run_bundle_v1", "solutions": solutions},
+            {
+                "schema_version": (
+                    "coding_cpp_single_run_bundle_v1"
+                    if any(task.candidate_filename == "result.cpp" for task in task_list)
+                    else "formal_lean_single_run_bundle_v1"
+                ),
+                "solutions": solutions,
+            },
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -3802,10 +4757,22 @@ def _run_health(
     oom_or_137 = 0
     for result in solver_agents:
         tail = f"{result.error_tail}\n{result.output_tail}".lower()
-        if result.returncode == 137 or "out of memory" in tail or "oom-kill" in tail:
+        if (
+            not result.run_horizon_reached
+            and (
+                result.returncode == 137
+                or "out of memory" in tail
+                or "oom-kill" in tail
+            )
+        ):
             oom_or_137 += 1
             issues.add("solver_oom_or_exit_137")
-        if result.returncode != 0 and not result.cancelled and not result.timed_out:
+        if (
+            result.returncode != 0
+            and not result.cancelled
+            and not result.timed_out
+            and not result.run_horizon_reached
+        ):
             unexpected_process_errors += 1
             issues.add("solver_process_error")
 
@@ -4100,7 +5067,7 @@ def _write_final(
         "status": status,
         "mode": config.mode,
         "communication": config.communication,
-        "dataset": "matholympiadbench",
+        "dataset": config.dataset_name,
         "score": sum(item["score"] for item in rows.values()),
         "max_score": len(rows),
         "verdicts": rows,
@@ -4113,6 +5080,11 @@ def _write_final(
             for status in sorted({str(item.get("status")) for item in rows.values()})
         },
         "cps": dict(cps_summary or {"enabled": False}),
+        "selection": _selection_final_evidence(
+            run_dir,
+            config,
+            status=status,
+        ),
         "allocation": allocation_summary,
         "judge_result_cache": _judge_result_cache_evidence(run_dir, config),
         "health": dict(health or {"ok": status in {"COMPLETED", "DRY_RUN"}}),

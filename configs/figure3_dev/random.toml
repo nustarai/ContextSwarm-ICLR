@@ -1,0 +1,13 @@
+extends = ["_base.toml"]
+
+[experiment]
+name = "figure3-dev-matholympiadbench-random"
+output_root = "runs/figure3_dev/matholympiadbench/random"
+
+[selection]
+selector_name = "random"
+
+[selection.policy_params]
+# Uniform sample without replacement is implemented by the paired hash key;
+# no Python/global RNG is used.
+sample_without_replacement = true

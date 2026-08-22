@@ -175,6 +175,13 @@ Pi transport 设置由共享 `[pi]` / `[pi.retry]` manifest 明确控制，三�
 `agent_end` 只代表底层调用结束，runner 会继续等待 Pi 自动 retry/compaction，
 直到收到 `agent_settled` 才结束该 agent。外层 experiment horizon 仍是硬截止。
 
+如果整个 Pi RPC/session 进程在收到 `agent_settled` 前异常退出，`[pi.recovery]`
+提供 runner 级的有界恢复：默认在原 horizon 内重启一次，沿用同一个逻辑
+`actor/task/episode`、workspace、candidate 和确定性的 Pi session，因此已有进度
+可以继续使用。退避时间计入 horizon；正常满分、horizon 到点、runner 主动取消以及
+Judge 返回的候选 verdict 不会触发这层恢复。每次失败、安排重启、恢复成功或耗尽都会
+写入 `events.jsonl`，便于区分 agent 进程故障与候选本身的 PE/WA/超时。
+
 每个 worker 的实际 Pi settings 写入其私有 `.pi/settings.json`；每次调用的原始
 session 进一步隔离在该 worker 的 `.pi/sessions/<session-id>/`，避免 CPS 高并发
 反复扫描其他 session，也不为 Mono/Parallel 增加共享通信面。它们位于 run 目录

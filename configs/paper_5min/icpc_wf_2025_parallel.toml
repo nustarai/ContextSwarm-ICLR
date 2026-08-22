@@ -1,0 +1,9 @@
+extends = ["_icpc_wf_2025.toml"]
+
+[experiment]
+name = "paper-5min-icpc-wf-2025-parallel"
+output_root = "runs/paper_5min/icpc_wf_2025/parallel"
+mode = "parallel"
+communication = "none"
+max_parallel = 12
+episodes_per_task = 1

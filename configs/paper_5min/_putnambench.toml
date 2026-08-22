@@ -1,0 +1,14 @@
+extends = ["_base.toml"]
+
+[experiment]
+dataset_root = "benchmarks/putnambench"
+problem_ids = "benchmarks/putnambench/problem_ids.json"
+
+[judge]
+kind = "formal"
+env_id = "formal_putnambench"
+verification_profile = "formal_proof"
+judge_mode = "fast"
+
+[formal_tools]
+enabled = true

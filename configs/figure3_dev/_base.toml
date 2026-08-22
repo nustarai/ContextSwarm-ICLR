@@ -1,0 +1,81 @@
+# Issue #38 Figure 3 development contract.
+#
+# This is a matched, one-dataset development matrix.  The eight leaf
+# manifests may change only [selection].  Keep the shared runtime, Judge,
+# model, task order, horizon, CPS capacity, and packing limits here.
+#
+# IMPORTANT: allocation.policy = "uniform" is the historical deterministic
+# round-robin allocator.  It is NOT the Uniform Refill policy specified by
+# issue #39.  These manifests are therefore dev/mock fixtures only; a formal
+# Figure 3 run must fail closed until #39 supplies and registers
+# allocation.policy = "uniform_refill".
+extends = ["../base.toml"]
+
+[experiment]
+name = "figure3-dev-base"
+dataset = "matholympiadbench"
+dataset_root = "benchmarks/matholympiadbench"
+problem_ids = "benchmarks/matholympiadbench/problem_ids.json"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 24
+initial_agents_per_task = 2
+max_attempts_per_task = 0
+cancel_on_proved = true
+assignment_policy = "least_active"
+episodes_per_task = 2
+max_tasks = 12
+time_limit_seconds = 300
+seed = 1729
+# Machine-readable readiness marker for launch/audit tooling.  It is
+# intentionally not interpreted by the legacy loader; the docs and tests
+# require operators to reject this matrix for formal runs.
+figure3_readiness = "dev_mock_blocked_on_issue39_uniform_refill"
+
+[allocation]
+# Historical round-robin compatibility policy; see the warning above.
+policy = "uniform"
+piece_limit_per_task = 3
+piece_body_chars = 1200
+agent_timeout_seconds = 300
+
+[pi]
+model = "openai-codex/gpt-5.6-sol"
+thinking = "max"
+fast_mode = false
+timeout_seconds = 300
+http_idle_timeout_ms = 600000
+
+[aisw]
+enabled = false
+max_in_flight = 24
+
+[lean]
+env_id = "formal_matholympiadbench"
+timeout_seconds = 300
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 4
+verification_profile = "formal_proof"
+judge_mode = "fast"
+require_result_cache_disabled = false
+
+[formal_tools]
+enabled = true
+require_decl_index = false
+
+[docker]
+memory_mb = 16384
+internet = "online"
+network = "host"
+
+[selection]
+enabled = true
+selector_version = "figure3_dev_v1"
+visibility = "project_shared"
+trace_slot_limit = 8
+context_token_budget = 4096
+tokenizer = "utf8_bytes_ceil_div4_v1"
+seed = 1729
+tie_break = "trace_id_asc"
+direct_messages = false
+candidate_transfer = false

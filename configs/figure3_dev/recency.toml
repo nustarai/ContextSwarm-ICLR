@@ -1,0 +1,11 @@
+extends = ["_base.toml"]
+
+[experiment]
+name = "figure3-dev-matholympiadbench-recency"
+output_root = "runs/figure3_dev/matholympiadbench/recency"
+
+[selection]
+selector_name = "recency"
+
+[selection.policy_params]
+primary_sort = "commit_seq_desc"

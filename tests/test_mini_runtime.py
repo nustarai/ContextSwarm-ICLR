@@ -554,6 +554,7 @@ class MiniRuntimeTests(unittest.TestCase):
                     "active_handlers": 1,
                     "fifo_depth": 2,
                     "remote_unsettled_jobs": 3,
+                    "pending_settlement_watchers": 4,
                 }
             )
 
@@ -606,6 +607,7 @@ class MiniRuntimeTests(unittest.TestCase):
         self.assertEqual(closeout["active_handlers"], 1)
         self.assertEqual(closeout["fifo_depth"], 2)
         self.assertEqual(closeout["remote_unsettled_jobs"], 3)
+        self.assertEqual(closeout["pending_settlement_watchers"], 4)
         self.assertNotIn("judge_broker_closed", event_names)
         self.assertLess(
             event_names.index("broker_drain_timeout"),

@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from contextswarm_mini.evaluator import (
+    EvaluatorError,
     LeanEvaluator,
     _safe_response,
     _terminal,
@@ -636,6 +637,114 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(evaluator.pending_settlement_watchers, 0)
         self.assertEqual(evaluator.remote_unsettled_jobs, 0)
 
+    def test_retryable_router_cancel_defers_without_peer_reason(self) -> None:
+        """A query/agent timeout must not poison the whole arm while DELETE settles."""
+
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.005,
+            cancel_grace_seconds=0.01,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 1.0
+        calls = 0
+        released = threading.Event()
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            nonlocal calls
+            if method == "DELETE":
+                return {
+                    "job_id": "job-1",
+                    "status": "running",
+                    "cancel_requested": True,
+                    "router_cancel_disposition": "cancel_requested",
+                    "retryable": True,
+                    "status_endpoint": "/api/lean/jobs/job-1",
+                }
+            calls += 1
+            if calls >= 3:
+                return {
+                    "job_id": "job-1",
+                    "status": "cancelled",
+                    "formal_status": "NETWORK_ERROR",
+                    "terminal_reason": "cancelled",
+                    "retryable": True,
+                }
+            return {
+                "job_id": "job-1",
+                "status": "running",
+                "cancel_requested": True,
+                "router_cancel_disposition": "cancel_requested",
+                "retryable": True,
+                "status_endpoint": "/api/lean/jobs/job-1",
+            }
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={
+                    "job_id": "job-1",
+                    "status": "running",
+                    "status_endpoint": "/api/lean/jobs/job-1",
+                },
+                on_settled=released.set,
+            )
+            self.assertTrue(summary.get("deferred"))
+            self.assertFalse(summary["unconfirmed"])
+            self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+            self.assertTrue(released.wait(timeout=1))
+
+        self.assertEqual(evaluator.pending_settlement_watchers, 0)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+
+    def test_terminal_cancelled_network_error_is_bound_and_nonfatal(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.005,
+            cancel_grace_seconds=0.02,
+        )
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            if method == "DELETE":
+                return {
+                    "job_id": "job-1",
+                    "status": "cancelled",
+                    "formal_status": "NETWORK_ERROR",
+                    "error_kind": "cancelled",
+                    "terminal_reason": "cancelled",
+                    "retryable": True,
+                }
+            return {"job_id": "job-1", "status": "cancelled"}
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={"job_id": "job-1", "status": "running"},
+            )
+
+        self.assertEqual(
+            summary,
+            {
+                "attempted": True,
+                "succeeded": True,
+                "settled": True,
+                "unconfirmed": False,
+                "failure_category": None,
+            },
+        )
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+
     def test_peer_cancel_watcher_timeout_latches_and_retains_callback(self) -> None:
         evaluator = LeanEvaluator(
             "https://judge.invalid",
@@ -742,6 +851,51 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertTrue(summary["unconfirmed"])
         self.assertEqual(summary["failure_category"], "cancel_settlement_unconfirmed")
         self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+
+    def test_broker_revocation_defers_delete_timeout_settlement(self) -> None:
+        """A broker revoke is known cancellation, even when DELETE times out."""
+
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        response = {
+            "job_id": "job-1",
+            "status": "running",
+            "status_endpoint": "/settlement/job-1",
+        }
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            if method == "DELETE":
+                raise EvaluatorError("DELETE timed out")
+            return response
+
+        with (
+            patch.object(evaluator, "_request", side_effect=request),
+            patch.object(
+                evaluator,
+                "_start_settlement_watcher",
+                return_value=True,
+            ) as watcher,
+        ):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response=response,
+                cancellation_reason="broker_revoked",
+            )
+
+        watcher.assert_called_once()
+        self.assertTrue(summary["deferred"])
+        self.assertFalse(summary["unconfirmed"])
+        self.assertEqual(summary["failure_category"], "cancel_settlement_deferred")
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
 
     def test_peer_cancel_watcher_callback_failure_latches_remote_work(self) -> None:
         evaluator = LeanEvaluator(
