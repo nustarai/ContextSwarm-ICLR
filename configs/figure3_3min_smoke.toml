@@ -1,0 +1,40 @@
+# Figure 3 origin/main chain smoke.
+#
+# This is an offline/operator smoke preset, not a paper result.  It keeps the
+# same 12-task, 24-slot, 300-second contract as the eight Figure 3 selector
+# leaves and exercises the fixed-horizon closeout path with one selector.
+extends = ["figure3_dev/_base.toml"]
+
+[experiment]
+name = "figure3-smoke-matholympiadbench-random"
+output_root = "runs/figure3_smoke/matholympiadbench/random"
+dataset = "matholympiadbench"
+dataset_root = "benchmarks/matholympiadbench"
+problem_ids = "benchmarks/matholympiadbench/problem_ids.json"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 24
+initial_agents_per_task = 2
+max_tasks = 12
+time_limit_seconds = 300
+cancel_on_proved = true
+
+[aisw]
+# --mock-agent is intentionally offline; keep the provider cap explicit so
+# the preset documents the 24-slot contract used by the real arms.
+enabled = false
+max_in_flight = 24
+
+[lean]
+max_concurrent_evaluations = 4
+
+[formal_tools]
+require_decl_index = false
+
+[selection]
+enabled = true
+selector_version = "figure3_dev_v1"
+selector_name = "random"
+
+[selection.policy_params]
+sample_without_replacement = true
