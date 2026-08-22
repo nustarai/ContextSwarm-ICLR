@@ -427,8 +427,9 @@ class LeanEvaluator:
         self._remote_unsettled_lock = threading.Lock()
         self._remote_unsettled_jobs = 0
         self._remote_settlement_event = threading.Event()
-        # A task solved by a peer may cancel a submitted Judge job whose
-        # worker takes longer than the short foreground grace window to reset.
+        # A known cancellation (a peer solved the task or the broker revoked
+        # the claim) may cancel a submitted Judge job whose worker takes
+        # longer than the short foreground grace window to reset.
         # Such a job remains accounted for, but is reconciled asynchronously so
         # it does not poison unrelated CPS admissions while the Judge is doing
         # a known, bounded cancellation.  Unknown identities still use the
@@ -2051,7 +2052,7 @@ class LeanEvaluator:
                 )
             )
         if attempted and (
-            cancellation_reason == "task_solved_by_peer"
+            cancellation_reason in {"task_solved_by_peer", "broker_revoked"}
             or retryable_cancel_observed
         ):
             # The submission identity is known and a DELETE was attempted, but

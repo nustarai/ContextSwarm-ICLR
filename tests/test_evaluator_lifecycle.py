@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from contextswarm_mini.evaluator import (
+    EvaluatorError,
     LeanEvaluator,
     _safe_response,
     _terminal,
@@ -850,6 +851,51 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertTrue(summary["unconfirmed"])
         self.assertEqual(summary["failure_category"], "cancel_settlement_unconfirmed")
         self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+
+    def test_broker_revocation_defers_delete_timeout_settlement(self) -> None:
+        """A broker revoke is known cancellation, even when DELETE times out."""
+
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        response = {
+            "job_id": "job-1",
+            "status": "running",
+            "status_endpoint": "/settlement/job-1",
+        }
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            if method == "DELETE":
+                raise EvaluatorError("DELETE timed out")
+            return response
+
+        with (
+            patch.object(evaluator, "_request", side_effect=request),
+            patch.object(
+                evaluator,
+                "_start_settlement_watcher",
+                return_value=True,
+            ) as watcher,
+        ):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response=response,
+                cancellation_reason="broker_revoked",
+            )
+
+        watcher.assert_called_once()
+        self.assertTrue(summary["deferred"])
+        self.assertFalse(summary["unconfirmed"])
+        self.assertEqual(summary["failure_category"], "cancel_settlement_deferred")
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
 
     def test_peer_cancel_watcher_callback_failure_latches_remote_work(self) -> None:
         evaluator = LeanEvaluator(
