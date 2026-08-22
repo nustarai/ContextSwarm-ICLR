@@ -212,6 +212,8 @@ def read_allocation_audits(path: Path, *, expected_config_sha256: str | None = N
 
 def validate_capacity_conservation(record: AllocationAuditRecord) -> bool:
     """Revalidate an already-created/decoded record, failing closed."""
+    if record.capacity_delta_sum != 0 or record.capacity_conserved is not True:
+        raise ValueError("invalid emitted capacity-conservation result")
     return AllocationAuditRecord.create(**{k: v for k, v in record.as_dict().items() if k not in {"schema_version", "capacity_delta_sum", "capacity_conserved"}}) is not None
 
 
@@ -614,9 +616,53 @@ def write_figure4_run_summary(path: Path, summary: Mapping[str, Any]) -> None:
     atomic_write_json(path, summary)
 
 
-def build_figure4_paired_repeat(*, paired_repeat_id: str, paired_seed: int | str, arms: Mapping[str, Mapping[str, Any]], comparison_contract: Mapping[str, Any] | None = None, registered_contrasts: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    if not arms: raise ValueError("paired repeat needs at least one arm")
-    return {"schema_version": PAIRED_SCHEMA, "paired_repeat_id": str(paired_repeat_id), "paired_seed": paired_seed, "comparison_contract": dict(comparison_contract or {}), "comparison_contract_sha256": (comparison_contract or {}).get("sha256", ""), "arms": {str(k): dict(v) for k, v in arms.items()}, "registered_contrasts": dict(registered_contrasts or {})}
+def build_figure4_paired_repeat(
+    *,
+    paired_repeat_id: str,
+    paired_seed: int | str,
+    arms: Mapping[str, Mapping[str, Any]],
+    comparison_contract: Mapping[str, Any] | None = None,
+    registered_contrasts: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    required = set(_FIGURE4_POLICIES)
+    if set(arms) != required:
+        raise ValueError(
+            "paired repeat must contain exactly the four Figure 4 arms"
+        )
+    arm_rows = {str(policy): dict(row) for policy, row in arms.items()}
+    for policy, row in arm_rows.items():
+        if row.get("policy", policy) != policy:
+            raise ValueError("paired arm policy does not match its key")
+        if "nauc" not in row or "final_accepted_score" not in row:
+            raise ValueError("paired arm is missing bootstrap metrics")
+        _finite_number(row["nauc"], f"arms.{policy}.nauc")
+        _finite_number(
+            row["final_accepted_score"],
+            f"arms.{policy}.final_accepted_score",
+        )
+    contrasts = dict(registered_contrasts or {})
+    if not contrasts:
+        for name, left, right in (
+            ("trace_state_minus_task_state", "trace_state", "task_state"),
+            ("task_state_minus_uniform_refill", "task_state", "uniform_refill"),
+            ("trace_state_minus_uniform_refill", "trace_state", "uniform_refill"),
+            ("llm_scheduler_minus_trace_state", "llm_scheduler", "trace_state"),
+        ):
+            contrasts[name] = {
+                metric: float(arm_rows[left][metric])
+                - float(arm_rows[right][metric])
+                for metric in ("nauc", "final_accepted_score")
+            }
+    contract = dict(comparison_contract or {})
+    return {
+        "schema_version": PAIRED_SCHEMA,
+        "paired_repeat_id": str(paired_repeat_id),
+        "paired_seed": paired_seed,
+        "comparison_contract": contract,
+        "comparison_contract_sha256": canonical_json_sha256(contract),
+        "arms": arm_rows,
+        "registered_contrasts": contrasts,
+    }
 
 
 def append_figure4_paired_repeat(path: Path, row: Mapping[str, Any]) -> None:
@@ -624,4 +670,14 @@ def append_figure4_paired_repeat(path: Path, row: Mapping[str, Any]) -> None:
     append_jsonl(path, row)
 
 
-__all__ = ["AllocationAuditRecord", "append_allocation_audit", "read_allocation_audits", "validate_capacity_conservation", "build_figure4_run_summary", "write_figure4_run_summary", "build_figure4_paired_repeat", "append_figure4_paired_repeat"]
+__all__ = [
+    "AllocationAuditRecord",
+    "append_allocation_audit",
+    "read_allocation_audits",
+    "validate_capacity_conservation",
+    "canonical_json_sha256",
+    "build_figure4_run_summary",
+    "write_figure4_run_summary",
+    "build_figure4_paired_repeat",
+    "append_figure4_paired_repeat",
+]
