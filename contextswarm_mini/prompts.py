@@ -21,6 +21,20 @@ For direct-message variants you may use `./context_piece message send --to <agen
 Never include credentials, absolute host paths, or full transcripts in a piece."""
 
 
+def _evaluator_routing_instructions() -> str:
+    return """Evaluator route isolation:
+If you choose to run an intermediate external Lean check, read the exact route,
+environment id, verification profile, and judge mode from
+`$CONTEXTSWARM_LEAN_SERVER_URL`, `$CONTEXTSWARM_LEAN_ENV_ID`,
+`$CONTEXTSWARM_LEAN_VERIFICATION_PROFILE`, and
+`$CONTEXTSWARM_LEAN_JUDGE_MODE`. If constructing a client, use
+`$CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS` as the submitted backend execution
+budget and `$CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS` as the whole-job lifecycle
+cap; the execution budget is not an HTTP or whole-job timeout. Do not copy a
+literal endpoint from README or another manifest. Do not probe or call any other
+local Judge port. The runner's final evaluation remains authoritative."""
+
+
 def build_task_prompt(
     task: Task,
     *,
@@ -41,6 +55,8 @@ imports, namespace, and source contract. The external Lean evaluator is the only
 authority for success; do not claim success from intuition or a local text scan.
 
 {_communication_instructions(communication_enabled)}
+
+{_evaluator_routing_instructions()}
 
 Relevant shared context (possibly empty):
 ---
@@ -66,6 +82,8 @@ evaluates every candidate after this session and counts only canonical PROVED ve
 
 {_communication_instructions(communication_enabled)}
 
+{_evaluator_routing_instructions()}
+
 Use the available wall-clock budget on concrete proof construction. Leave every
 task directory with its best candidate, even if some targets remain incomplete.
 """
@@ -75,6 +93,8 @@ def build_finalization_prompt(task: Task, *, digest: str = "") -> str:
     return f"""Re-open {task.slug}/result.lean and leave the strongest checked candidate in place.
 Review the latest evaluator feedback and any relevant shared handoff below. Do not
 change the theorem contract or add proof-bypass declarations.
+
+{_evaluator_routing_instructions()}
 
 {digest or '(no shared handoff)'}
 """
