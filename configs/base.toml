@@ -66,3 +66,4 @@ judge_mode = "fast"
 image = "contextswarm-iclr-mini:latest"
 memory_mb = 16384
 internet = "online"
+network = "host"

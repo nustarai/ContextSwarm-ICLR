@@ -83,8 +83,10 @@ cd /path/to/ContextSwarmJudge
 scripts/run_docker.sh --config configs/cps.toml
 ```
 
-`run_docker.sh` 会从完整解析 `extends` 后的 `[docker]` 读取 `image` 和
-`memory_mb`。运维侧仍可用 `CONTEXTSWARM_MINI_IMAGE`、
+`run_docker.sh` 会从完整解析 `extends` 后的 `[docker]` 读取 `image`、
+`memory_mb` 和 `network`（`host` 或 `bridge`）。`bridge` 会配置
+`host.docker.internal`，用于让 runner 访问显式开放给 Docker bridge 的独立
+Judge，同时隔离容器内硬编码的宿主 `127.0.0.1` 端口。运维侧仍可用 `CONTEXTSWARM_MINI_IMAGE`、
 `CONTEXTSWARM_MINI_MEMORY` 覆盖，两者优先级高于 manifest。
 
 正式启动前可以只做 transport 检查（不会启动 Pi session）：
@@ -171,7 +173,9 @@ CONTEXTSWARM_CODEX_HOME=$HOME/.codex \
 scripts/run_docker.sh --config configs/cps.toml
 ```
 
-脚本通过 `--network host` 让容器访问宿主机上的 AISW coordinator 和 Lean router；AISW binary 与 node config 只读挂载，不会被复制进仓库或镜像。若环境不允许 host network，请把 manifest 中的服务地址改成容器可达地址。
+脚本按 manifest 选择 Docker 网络：默认 `host`；需要隔离宿主回环端口时使用
+`bridge`，并把 runner 的服务地址设为 `host.docker.internal` 上显式开放的独立
+端口。AISW binary 与 node config 只读挂载，不会被复制进仓库或镜像。
 
 `run_docker.sh` 会同时发现相邻的 `.nurouter-pi-launcher.json`（或旧
 `.aisw-pi-launcher.json`），并在容器内重写 `real_pi`/`real_codex` 到镜像内

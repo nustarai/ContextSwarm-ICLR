@@ -174,6 +174,10 @@ class MiniRuntimeTests(unittest.TestCase):
             "CONTEXTSWARM_BEST_CANDIDATE_FILE": "/tmp/stale-result.lean",
             "CONTEXTSWARM_TASK_ROOT": "/tmp/stale-task",
             "CONTEXTSWARM_CPS_FUTURE_CAPABILITY": "stale",
+            "LEAN_AUTH_TOKEN": "ambient-token",
+            "JUDGE_URL": "http://ambient-judge.invalid",
+            "CONTEXTSWARM_JUDGE_URL": "http://ambient-contextswarm-judge.invalid",
+            "CONTEXTSWARMJUDGE_LEAN_ROUTER_URL": "http://ambient-router.invalid",
         }
         with patch.dict(os.environ, stale, clear=False):
             for manifest in ("configs/mono.toml", "configs/parallel.toml"):
@@ -187,13 +191,16 @@ class MiniRuntimeTests(unittest.TestCase):
                     self.assertTrue(stale.keys().isdisjoint(env))
                     self.assertEqual(env["CONTEXTSWARM_TASK_ID"], "fresh-task")
                     self.assertEqual(env["CONTEXTSWARM_ACTOR_ID"], "fresh-actor")
-                    self.assertEqual(
-                        env["CONTEXTSWARM_LEAN_SERVER_URL"],
-                        agent.config.lean_server_url,
+                    self.assertFalse(
+                        any(key.startswith("CONTEXTSWARM_LEAN_") for key in env)
                     )
-                    self.assertEqual(
-                        env["CONTEXTSWARM_LEAN_ENV_ID"],
-                        agent.config.lean_env_id,
+                    self.assertTrue(
+                        {
+                            "LEAN_AUTH_TOKEN",
+                            "JUDGE_URL",
+                            "CONTEXTSWARM_JUDGE_URL",
+                            "CONTEXTSWARMJUDGE_LEAN_ROUTER_URL",
+                        }.isdisjoint(env)
                     )
 
             cps_env = PiAgent(load_config("configs/cps.toml", ROOT)).environment(
@@ -204,7 +211,7 @@ class MiniRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(cps_env["CONTEXTSWARM_CPS_DB"], "/run/current.sqlite3")
 
-    def test_agent_route_is_manifest_bound_without_prompt_endpoint_leak(self) -> None:
+    def test_agent_has_no_evaluator_route_or_prompt_endpoint_leak(self) -> None:
         config = replace(
             load_config("configs/cps.toml", ROOT),
             lean_server_url=(
@@ -220,6 +227,8 @@ class MiniRuntimeTests(unittest.TestCase):
         stale = {
             "CONTEXTSWARM_LEAN_SERVER_URL": "http://127.0.0.1:18000",
             "CONTEXTSWARM_LEAN_ENV_ID": "stale_env",
+            "LEAN_AUTH_TOKEN": "ambient-token",
+            "JUDGE_URL": "http://ambient-judge.invalid",
         }
         with patch.dict(os.environ, stale, clear=False):
             env = PiAgent(config).environment(
@@ -229,17 +238,20 @@ class MiniRuntimeTests(unittest.TestCase):
                 extra_env={
                     "CONTEXTSWARM_LEAN_SERVER_URL": "http://127.0.0.1:18000",
                     "CONTEXTSWARM_LEAN_ENV_ID": "extra_stale_env",
+                    "LEAN_AUTH_TOKEN": "extra-token",
+                    "CONTEXTSWARM_JUDGE_URL": "http://extra-judge.invalid",
+                    "CONTEXTSWARMJUDGE_LEAN_ROUTER_URL": "http://extra-router.invalid",
                 },
             )
-        self.assertEqual(env["CONTEXTSWARM_LEAN_SERVER_URL"], config.lean_server_url)
-        self.assertEqual(env["CONTEXTSWARM_LEAN_ENV_ID"], config.lean_env_id)
-        self.assertEqual(
-            env["CONTEXTSWARM_LEAN_VERIFICATION_PROFILE"],
-            config.lean_verification_profile,
+        self.assertFalse(any(key.startswith("CONTEXTSWARM_LEAN_") for key in env))
+        self.assertTrue(
+            {
+                "LEAN_AUTH_TOKEN",
+                "JUDGE_URL",
+                "CONTEXTSWARM_JUDGE_URL",
+                "CONTEXTSWARMJUDGE_LEAN_ROUTER_URL",
+            }.isdisjoint(env)
         )
-        self.assertEqual(env["CONTEXTSWARM_LEAN_JUDGE_MODE"], config.lean_judge_mode)
-        self.assertEqual(env["CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS"], "321")
-        self.assertEqual(env["CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS"], "6543")
 
         task = load_tasks(config)[0]
         prompts = (
@@ -262,12 +274,9 @@ class MiniRuntimeTests(unittest.TestCase):
         )
         for prompt in prompts:
             with self.subTest(prompt_head=prompt[:40]):
-                self.assertIn("$CONTEXTSWARM_LEAN_SERVER_URL", prompt)
-                self.assertIn("$CONTEXTSWARM_LEAN_ENV_ID", prompt)
-                self.assertIn("$CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS", prompt)
-                self.assertIn("$CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS", prompt)
-                self.assertIn("not an HTTP or whole-job timeout", prompt)
-                self.assertRegex(prompt, r"Do not probe or call any other\s+local Judge port")
+                self.assertNotIn("CONTEXTSWARM_LEAN_", prompt)
+                self.assertRegex(prompt, r"Do not probe, call, or construct a client")
+                self.assertIn("runner evaluates it", prompt)
                 self.assertNotIn(config.lean_server_url, prompt)
                 self.assertNotIn("127.0.0.1:18000", prompt)
                 self.assertNotIn("private-password", prompt)
