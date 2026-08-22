@@ -298,6 +298,13 @@ class AllocationCoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exceeds max bytes"):
             ReadOnlyLLMSchedulerPolicy.prompt(snap, max_bytes=exact - 1)
 
+    def test_prompt_byte_aliases_are_consistent(self) -> None:
+        snap = snapshot(task("a", active=0))
+        with self.assertRaisesRegex(ValueError, "byte limits disagree"):
+            ReadOnlyLLMSchedulerPolicy.prompt(
+                snap, max_bytes=1024, prompt_max_bytes=2048
+            )
+
     def test_llm_can_use_its_owned_scheduler_reservation(self) -> None:
         calls = []
         snap = AllocationStateSnapshot(

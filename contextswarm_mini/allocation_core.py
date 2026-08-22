@@ -422,6 +422,7 @@ def _scheduler_state_dict(snapshot: "AllocationStateSnapshot") -> dict[str, Any]
 
 def _resolve_prompt_bytes(
     *,
+    max_bytes: int | None = None,
     prompt_max_bytes: int | None = None,
     max_prompt_bytes: int | None = None,
     llm_scheduler_prompt_max_bytes: int | None = None,
@@ -431,6 +432,7 @@ def _resolve_prompt_bytes(
     provided = [
         value
         for value in (
+            max_bytes,
             prompt_max_bytes,
             max_prompt_bytes,
             llm_scheduler_prompt_max_bytes,
@@ -1243,22 +1245,10 @@ class ReadOnlyLLMSchedulerPolicy:
         allowing the policy to record a charged deterministic fallback.
         """
 
-        # ``max_bytes`` is the short spelling used by direct callers while
-        # the other names are compatibility aliases.  Resolve all spellings,
-        # including both long byte aliases, before validating agreement.
-        if (
-            prompt_max_bytes is not None
-            and max_prompt_bytes is not None
-            and prompt_max_bytes != max_prompt_bytes
-        ):
-            raise ValueError("LLM scheduler prompt byte limits disagree")
         limit = _resolve_prompt_bytes(
-            prompt_max_bytes=max_bytes,
-            max_prompt_bytes=(
-                prompt_max_bytes
-                if prompt_max_bytes is not None
-                else max_prompt_bytes
-            ),
+            max_bytes=max_bytes,
+            prompt_max_bytes=prompt_max_bytes,
+            max_prompt_bytes=max_prompt_bytes,
             llm_scheduler_prompt_max_bytes=llm_scheduler_prompt_max_bytes,
         )
         token_limit = _resolve_prompt_tokens(
