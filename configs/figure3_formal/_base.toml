@@ -1,0 +1,17 @@
+# Issue #38 formal Figure 3 contract.
+#
+# The development fixtures under ../figure3_dev intentionally retain the
+# legacy `uniform` allocator for offline tests.  This formal base keeps that
+# matrix unchanged while selecting the registered Uniform Refill allocator
+# from the Issue #39 implementation.  The eight leaf manifests may differ
+# only in selector identity/policy parameters and output naming.
+extends = ["../figure3_dev/_base.toml"]
+
+[experiment]
+name = "figure3-formal-matholympiadbench-base"
+output_root = "runs/figure3_formal/matholympiadbench"
+figure3_readiness = "formal_uniform_refill_issue38"
+
+[allocation]
+policy = "uniform_refill"
+
