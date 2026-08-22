@@ -125,6 +125,92 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(decision.selected_task_id, "")
         self.assertIsNone(decision.scheduler_cost)
 
+    def test_llm_can_use_its_owned_scheduler_reservation(self) -> None:
+        calls = []
+        snap = AllocationStateSnapshot(
+            "d",
+            1,
+            0,
+            1,
+            2,
+            1,
+            1,
+            0,
+            (task("a"),),
+            owned_scheduler_reservation_slots=1,
+        )
+
+        def invoke(current, prompt):
+            calls.append((current.state_id, prompt))
+            return LLMSchedulerResponse(
+                json.dumps(
+                    {
+                        "decision_id": "d",
+                        "task_id": "a",
+                        "reason": "admit through owned reservation",
+                        "trace_reference_ids": [],
+                    }
+                )
+            )
+
+        decision = ReadOnlyLLMSchedulerPolicy(invoke).choose(snap)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(decision.selected_task_id, "a")
+        self.assertFalse(decision.fallback)
+
+    def test_owned_scheduler_reservation_is_validated_and_hashed(self) -> None:
+        unowned = AllocationStateSnapshot(
+            "d", 1, 0, 1, 2, 1, 1, 0, (task("a"),)
+        )
+        owned = AllocationStateSnapshot(
+            "d",
+            1,
+            0,
+            1,
+            2,
+            1,
+            1,
+            0,
+            (task("a"),),
+            owned_scheduler_reservation_slots=1,
+        )
+        self.assertEqual(unowned.public_dict()["owned_scheduler_reservation_slots"], 0)
+        self.assertEqual(owned.public_dict()["owned_scheduler_reservation_slots"], 1)
+        self.assertNotEqual(unowned.state_id, owned.state_id)
+        calls = []
+        unowned_decision = ReadOnlyLLMSchedulerPolicy(
+            lambda current, prompt: calls.append(prompt)
+        ).choose(unowned)
+        self.assertEqual(calls, [])
+        self.assertEqual(unowned_decision.selected_task_id, "")
+
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            AllocationStateSnapshot(
+                "d",
+                1,
+                0,
+                1,
+                1,
+                1,
+                0,
+                0,
+                (task("a"),),
+                owned_scheduler_reservation_slots=1,
+            )
+        with self.assertRaisesRegex(ValueError, "at most 1"):
+            AllocationStateSnapshot(
+                "d",
+                1,
+                0,
+                1,
+                3,
+                1,
+                2,
+                0,
+                (task("a"),),
+                owned_scheduler_reservation_slots=2,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

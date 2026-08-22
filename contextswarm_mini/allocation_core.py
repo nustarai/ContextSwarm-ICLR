@@ -203,6 +203,7 @@ class AllocationStateSnapshot:
     scheduler_reserved_slots: int
     free_slots: int
     tasks: tuple[TaskState, ...]
+    owned_scheduler_reservation_slots: int = 0
     trace_watermark: str = ""
     allocation_config_sha256: str = ""
     allocation_parameters: Mapping[str, Any] = field(default_factory=dict)
@@ -244,8 +245,22 @@ class AllocationStateSnapshot:
             "scheduler_reserved_slots",
             _nonnegative_int("scheduler_reserved_slots", self.scheduler_reserved_slots),
         )
+        object.__setattr__(
+            self,
+            "owned_scheduler_reservation_slots",
+            _nonnegative_int(
+                "owned_scheduler_reservation_slots",
+                self.owned_scheduler_reservation_slots,
+            ),
+        )
         object.__setattr__(self, "free_slots", _nonnegative_int("free_slots", self.free_slots))
         object.__setattr__(self, "tasks", tasks)
+        if self.owned_scheduler_reservation_slots > 1:
+            raise ValueError("owned_scheduler_reservation_slots must be at most 1")
+        if self.owned_scheduler_reservation_slots > self.scheduler_reserved_slots:
+            raise ValueError(
+                "owned_scheduler_reservation_slots must not exceed scheduler_reserved_slots"
+            )
         if sum(task.active_allocations for task in tasks) != self.active_solver_slots:
             raise ValueError("active_solver_slots must equal the sum of task active_allocations")
         if (
@@ -275,6 +290,7 @@ class AllocationStateSnapshot:
             "total_capacity": self.total_capacity,
             "active_solver_slots": self.active_solver_slots,
             "scheduler_reserved_slots": self.scheduler_reserved_slots,
+            "owned_scheduler_reservation_slots": self.owned_scheduler_reservation_slots,
             "free_slots": self.free_slots,
             "trace_watermark": self.trace_watermark,
             "allocation_config_sha256": self.allocation_config_sha256,
@@ -325,6 +341,7 @@ class AllocationStateSnapshot:
             "total_capacity": self.total_capacity,
             "active_solver_slots": self.active_solver_slots,
             "scheduler_reserved_slots": self.scheduler_reserved_slots,
+            "owned_scheduler_reservation_slots": self.owned_scheduler_reservation_slots,
             "free_slots": self.free_slots,
             "trace_watermark": self.trace_watermark,
             "allocation_config_sha256": self.allocation_config_sha256,
@@ -743,7 +760,10 @@ class ReadOnlyLLMSchedulerPolicy:
         )
 
     def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
-        if not snapshot.eligible_task_ids or snapshot.free_slots == 0:
+        if not snapshot.eligible_task_ids or (
+            snapshot.free_slots == 0
+            and snapshot.owned_scheduler_reservation_slots == 0
+        ):
             return AllocationDecision(
                 decision_id=snapshot.decision_id,
                 state_id=snapshot.state_id,
