@@ -11,7 +11,12 @@ AISW_BINARY="${CONTEXTSWARM_NUROUTER_BINARY:-${CONTEXTSWARM_AISW_BINARY:-${HOME}
 NODE_CONFIG="${CONTEXTSWARM_NUROUTER_NODE_CONFIG:-${CONTEXTSWARM_AISW_NODE_CONFIG:-}}"
 AISW_METADATA="${CONTEXTSWARM_AISW_LAUNCHER_METADATA:-}"
 CODEX_HOME="${CONTEXTSWARM_CODEX_HOME:-}"
-PIDS_LIMIT="${CONTEXTSWARM_MINI_PIDS_LIMIT:-768}"
+# A CPS48 run contains one NuRouter/Pi pair per in-flight agent.  Each pair
+# uses several runtime threads, so 768 is below the observed steady-state
+# cgroup demand and causes silent ``can't start new thread`` failures.  Keep a
+# bounded container cap, but leave enough headroom for all 48 sessions and
+# broker callbacks; operators may still lower/raise it explicitly.
+PIDS_LIMIT="${CONTEXTSWARM_MINI_PIDS_LIMIT:-2048}"
 RUNTIME_TMPFS_SIZE="${CONTEXTSWARM_MINI_RUNTIME_TMPFS_SIZE:-1g}"
 TMP_TMPFS_SIZE="${CONTEXTSWARM_MINI_TMP_TMPFS_SIZE:-2g}"
 RUN_UID="${CONTEXTSWARM_MINI_RUN_UID:-$(id -u)}"
