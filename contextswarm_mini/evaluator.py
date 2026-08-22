@@ -1982,6 +1982,7 @@ class LeanEvaluator:
                 cancel_endpoint=None,
             )
         attempted = False
+        retryable_cancel_observed = _retryable_known_cancellation(current)
         if cancel_path is not None:
             remaining = deadline - time.monotonic()
             attempted = remaining > 0
@@ -1994,6 +1995,10 @@ class LeanEvaluator:
                             _JUDGE_CANCEL_TIMEOUT_SECONDS,
                             remaining,
                         ),
+                    )
+                    retryable_cancel_observed = (
+                        retryable_cancel_observed
+                        or _retryable_known_cancellation(current)
                     )
             except EvaluatorError:
                 # A transport acknowledgement is not settlement.  Continue
@@ -2033,6 +2038,10 @@ class LeanEvaluator:
                     and not _terminal(current)
                 ):
                     last_nonterminal = current
+                    retryable_cancel_observed = (
+                        retryable_cancel_observed
+                        or _retryable_known_cancellation(current)
+                    )
             # Every unsuccessful reconcile attempt yields; malformed terminal
             # receipts and repeated transport failures must not tight-loop.
             time.sleep(
@@ -2041,11 +2050,19 @@ class LeanEvaluator:
                     max(0.0, deadline - time.monotonic()),
                 )
             )
-        if cancellation_reason == "task_solved_by_peer" and attempted:
+        if attempted and (
+            cancellation_reason == "task_solved_by_peer"
+            or retryable_cancel_observed
+        ):
             # The submission identity is known and a DELETE was attempted, but
-            # the terminal receipt may lag the foreground grace window. Keep
-            # the job's capacity permit retained by the caller and let a
-            # bounded watcher release it only after a job-bound receipt.
+            # the terminal receipt may lag the foreground grace window.  Judge
+            # routers expose this state as retryable/cancel-requested while a
+            # worker is resetting.  Keep the job's capacity permit retained by
+            # the caller and let a bounded watcher release it only after a
+            # job-bound receipt.  This prevents an ordinary, recoverable
+            # cancellation from latching the whole arm as infrastructure
+            # failure.  Unknown identities and non-retryable malformed
+            # receipts still use the fail-closed path below.
             deferred = self._start_settlement_watcher(
                 job_id,
                 last_nonterminal,
@@ -2750,6 +2767,35 @@ def _nested_value(payload: Mapping[str, Any], key: str) -> Any:
     if isinstance(canonical, Mapping):
         return canonical.get(key)
     return None
+
+
+def _retryable_known_cancellation(payload: Mapping[str, Any]) -> bool:
+    """Return whether a bound nonterminal cancellation may settle later.
+
+    During DELETE, the ICLR router can return a job-bound ``running`` or
+    ``cancel_requested`` snapshot while the worker REPL is resetting.  Newer
+    receipts mark that state ``retryable``; the router also exposes a
+    cancellation disposition or same-origin status capability.  Requiring an
+    explicit signal (rather than merely seeing a nonterminal status) keeps
+    genuinely unknown/never-settling jobs fail-closed.
+    """
+
+    if not isinstance(payload, Mapping):
+        return False
+    retryable = _nested_value(payload, "retryable")
+    if retryable is True:
+        return True
+    disposition = _nested_value(payload, "router_cancel_disposition")
+    if isinstance(disposition, str) and disposition.strip().lower() in {
+        "cancel_requested",
+        "cancel_unconfirmed",
+    }:
+        return True
+    # ``cancel_requested`` alone is deliberately insufficient: a legacy or
+    # test endpoint may expose that bit while losing the job ledger entirely.
+    # The router's explicit disposition/retryable marker above is the
+    # candidate-independent evidence needed to defer settlement safely.
+    return False
 
 
 def _raw_lifecycle_status(payload: Mapping[str, Any]) -> str:

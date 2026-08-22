@@ -30,6 +30,12 @@ http_idle_timeout_ms = 600000
 # intentionally consumes one solver session; Parallel can consume all twelve.
 max_in_flight = 12
 
+[allocation]
+# Keep the per-agent lifecycle within the fixed five-minute arm horizon.  The
+# inherited baseline is 120 seconds, which would revoke a live Judge session
+# long before the formal 300-second horizon and force avoidable cancellations.
+agent_timeout_seconds = 300
+
 [judge]
 timeout_seconds = 300
 max_lifecycle_seconds = 3600
