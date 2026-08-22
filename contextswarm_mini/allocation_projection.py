@@ -345,7 +345,7 @@ class TraceProjectionRecord:
             effective_declared=any(key in row for key in ("effective", "is_effective")),
             terminal_declared=any(key in row for key in ("terminal", "is_terminal")),
             trace_id=_text(
-                row.get("trace_id", row.get("piece_id", row.get("context_piece_id", "")))
+                row.get("trace_id", row.get("target_trace_id", ""))
             ),
             lifecycle=_kind(row.get("lifecycle", row.get("status", ""))),
             active=(
@@ -667,6 +667,10 @@ class TraceAllocationProjectionAdapter:
         after_watermark: int = 0,
         ordinary_outcome_ids: Iterable[str] = (),
     ) -> TraceAllocationProjectionBatch:
+        if isinstance(after_watermark, bool) or not isinstance(after_watermark, int):
+            raise ValueError("after_watermark must be a non-negative integer")
+        if after_watermark < 0:
+            raise ValueError("after_watermark must not be negative")
         ordered = _bounded_task_ids(task_ids, self.limits.max_tasks)
         batch = source.read_allocation_projection_records(
             ordered,
@@ -828,15 +832,15 @@ class TraceAllocationProjectionAdapter:
             or record.actionable is not None
             or record.lifecycle
             or record.kind
-            in (
-                _TRACE_KINDS
-                | _FRONTIER_KINDS
-                | _LIFECYCLE_KINDS
-                | _DUPLICATE_KINDS
-                | _REFUTATION_KINDS
-                | _STALE_KINDS
-                | _STAGNATION_KINDS
-            )
+                in (
+                    _TRACE_KINDS
+                    | _FRONTIER_KINDS
+                    | _LIFECYCLE_KINDS
+                    | _DUPLICATE_KINDS
+                    | _REFUTATION_KINDS
+                    | _STALE_KINDS
+                    | _STAGNATION_KINDS
+                )
             or record.relation_kind
             in (_DUPLICATE_KINDS | _REFUTATION_KINDS | _STALE_KINDS)
         )
