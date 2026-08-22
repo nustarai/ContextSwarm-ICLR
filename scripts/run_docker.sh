@@ -7,6 +7,9 @@ AISW_BINARY="${CONTEXTSWARM_NUROUTER_BINARY:-${CONTEXTSWARM_AISW_BINARY:-${HOME}
 NODE_CONFIG="${CONTEXTSWARM_NUROUTER_NODE_CONFIG:-${CONTEXTSWARM_AISW_NODE_CONFIG:-}}"
 AISW_METADATA="${CONTEXTSWARM_AISW_LAUNCHER_METADATA:-}"
 CODEX_HOME="${CONTEXTSWARM_CODEX_HOME:-}"
+DECL_INDEX="${CONTEXTSWARM_MINI_DECL_INDEX:-}"
+DECL_INDEX_SHA256="${CONTEXTSWARM_MINI_DECL_INDEX_SHA256:-}"
+MATHLIB_REVISION="${CONTEXTSWARM_MINI_MATHLIB_REVISION:-}"
 MEMORY="${CONTEXTSWARM_MINI_MEMORY:-16g}"
 CONFIG="configs/cps.toml"
 COMMAND="run"
@@ -124,6 +127,41 @@ if (( MOCK == 0 )); then
       exit 2
     fi
     DOCKER_ARGS+=("-v" "${CODEX_HOME}:/root/.codex:ro")
+  fi
+  if [[ -n "${DECL_INDEX}" ]]; then
+    if [[ ! -f "${DECL_INDEX}" ]]; then
+      echo "Mathlib declaration index not found" >&2
+      exit 2
+    fi
+    if [[ -z "${DECL_INDEX_SHA256}" ]]; then
+      DECL_INDEX_SHA256="$(sha256sum -- "${DECL_INDEX}" | awk '{print $1}')"
+    fi
+    if [[ -z "${MATHLIB_REVISION}" ]]; then
+      MATHLIB_REVISION="$(python3 - "${DECL_INDEX}" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro&immutable=1", uri=True)
+try:
+    row = connection.execute(
+        "SELECT value FROM meta WHERE key = 'mathlib_revision'"
+    ).fetchone()
+finally:
+    connection.close()
+print(str(row[0]).strip() if row else "")
+PY
+)"
+    fi
+    if [[ -z "${MATHLIB_REVISION}" ]]; then
+      echo "Mathlib declaration index has no revision metadata" >&2
+      exit 2
+    fi
+    DOCKER_ARGS+=(
+      "-v" "${DECL_INDEX}:/opt/contextswarm-input/formal/decl-index.sqlite3:ro"
+      "-e" "CONTEXTSWARM_MINI_DECL_INDEX=/opt/contextswarm-input/formal/decl-index.sqlite3"
+      "-e" "CONTEXTSWARM_MINI_DECL_INDEX_SHA256=${DECL_INDEX_SHA256}"
+      "-e" "CONTEXTSWARM_MINI_MATHLIB_REVISION=${MATHLIB_REVISION}"
+    )
   fi
 fi
 

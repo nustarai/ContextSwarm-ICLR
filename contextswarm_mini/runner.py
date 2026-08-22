@@ -16,14 +16,18 @@ import traceback
 import uuid
 from typing import Any, Iterable, Mapping
 
+from .artifacts import append_jsonl, atomic_write_bytes, atomic_write_json, atomic_write_text
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
 from .evaluator import LeanEvaluator, MockEvaluator
+from .evaluator_broker import EvaluatorBroker
 from .elastic_scheduler import AgentAssignment, ElasticScheduler
+from .formal_tools import PUBLIC_FILES_FILENAME, stage_worker_tools
 from .models import AgentResult, Task, Verdict
 from .pi_agent import PiAgent
 from .preflight import PreflightError, run_preflight
 from .prompts import build_mono_prompt, build_task_prompt
+from .secure_io import read_regular_bytes
 
 
 def utc_now() -> str:
@@ -42,9 +46,7 @@ class RunLogger:
 
     def event(self, event_type: str, **payload: Any) -> None:
         row = {"at": utc_now(), "event": event_type, **payload}
-        with self.lock:
-            with (self.output_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        append_jsonl(self.output_dir / "events.jsonl", row, lock=self.lock)
 
     def scoreboard(self, verdict: Verdict, *, episode: int, agent_id: str) -> None:
         row = {
@@ -54,9 +56,20 @@ class RunLogger:
             "agent_id": agent_id,
             **verdict.as_dict(),
         }
-        with self.lock:
-            with (self.output_dir / "scoreboard_history.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        append_jsonl(self.output_dir / "scoreboard_history.jsonl", row, lock=self.lock)
+
+    def agent_evaluation(self, verdict: Verdict, *, episode: int, agent_id: str) -> None:
+        """Diagnostic lane only; this file is never the official scoreboard."""
+
+        row = {
+            "at": utc_now(),
+            "task_id": verdict.task_id,
+            "episode": episode,
+            "agent_id": agent_id,
+            "authority": "agent_local_diagnostic",
+            **verdict.as_dict(),
+        }
+        append_jsonl(self.output_dir / "agent_evaluation_history.jsonl", row, lock=self.lock)
 
 
 @dataclass
@@ -86,11 +99,10 @@ def _verdict_priority(verdict: Verdict | None) -> tuple[int, float]:
         return (-1, -1.0)
     status_rank = {
         "PROVED": 4,
-        "AC": 4,
-        "PASSED": 4,
         "COMPILES_WITH_SORRY": 2,
         "VERIFY_FAIL": 1,
         "CHEATING": 1,
+        "UNEVALUATED_CANDIDATE": 0,
         "LOCAL_REJECTED": 0,
         "MOCK_SKIPPED": 0,
         "RUNNING": -1,
@@ -192,18 +204,20 @@ def run_experiment(
     manifest_snapshot["run_id"] = run_id
     manifest_snapshot["started_at"] = utc_now()
     manifest_snapshot["repo_root"] = str(config.repo_root)
-    (run_dir / "run_meta.json").write_text(
-        json.dumps(manifest_snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(run_dir / "run_meta.json", manifest_snapshot)
     logger.event("run_started", run_id=run_id, **plan(config, tasks))
     if dry_run:
-        (run_dir / "dry_run.json").write_text(
-            json.dumps(plan(config, tasks), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_json(run_dir / "dry_run.json", plan(config, tasks))
         logger.event("dry_run_finished")
-        _write_final(run_dir, config, {}, [], status="DRY_RUN", cps_summary=None)
+        _write_final(
+            run_dir,
+            config,
+            tasks,
+            {},
+            [],
+            status="DRY_RUN",
+            cps_summary=None,
+        )
         return run_dir
 
     if not mock_agent:
@@ -211,7 +225,15 @@ def run_experiment(
             run_preflight(config, run_dir)
         except PreflightError as exc:
             logger.event("preflight_failed", error=str(exc))
-            _write_final(run_dir, config, {}, [], status="PREFLIGHT_FAILED", cps_summary=None)
+            _write_final(
+                run_dir,
+                config,
+                tasks,
+                {},
+                [],
+                status="PREFLIGHT_FAILED",
+                cps_summary=None,
+            )
             raise
 
     store = CPSStore(run_dir / "cps.sqlite3") if config.uses_cps else None
@@ -228,9 +250,16 @@ def run_experiment(
             judge_mode=config.lean_judge_mode,
         )
     )
-    evaluator_gate = threading.BoundedSemaphore(config.lean_max_concurrent_evaluations)
     pi_agent = PiAgent(config, trace_path=run_dir / "pi_events.jsonl")
     run_deadline = time.monotonic() + config.time_limit_seconds
+    broker = EvaluatorBroker(
+        config,
+        tasks,
+        run_dir,
+        evaluator,
+        solver_deadline_monotonic=run_deadline,
+    )
+    broker.start()
     agent_results: list[AgentResult] = []
     verdicts: dict[str, Verdict] = {}
     try:
@@ -241,6 +270,7 @@ def run_experiment(
                 run_dir,
                 logger,
                 pi_agent,
+                broker,
                 mock_agent=mock_agent,
                 deadline=run_deadline,
             )
@@ -251,12 +281,11 @@ def run_experiment(
                 tasks,
                 run_dir,
                 logger,
-                evaluator,
+                broker,
                 pi_agent,
                 policy,
                 mock_agent=mock_agent,
                 deadline=run_deadline,
-                evaluator_gate=evaluator_gate,
             )
             agent_results.extend(results)
         else:
@@ -267,6 +296,7 @@ def run_experiment(
                 logger,
                 pi_agent,
                 policy,
+                broker,
                 mock_agent=mock_agent,
                 deadline=run_deadline,
             )
@@ -276,32 +306,62 @@ def run_experiment(
             "horizon_closed",
             reason="deadline_elapsed" if time.monotonic() >= run_deadline else "solver_completed",
         )
-        frozen = _freeze_closeout_candidates(config, tasks, run_dir, logger)
+        frozen = _freeze_closeout_candidates(config, tasks, run_dir, logger, broker)
+        broker.begin_closeout()
         verdicts = _run_closeout(
             config,
             tasks,
             frozen,
             logger,
-            evaluator,
-            evaluator_gate,
+            broker,
         )
     except Exception as exc:  # preserve closeout artifacts for interrupted cells
         logger.event("run_error", error=str(exc), traceback=traceback.format_exc()[-4_000:])
-        _write_final(run_dir, config, verdicts, agent_results, status="ERROR", cps_summary=store.summary() if store else None)
+        _write_final(
+            run_dir,
+            config,
+            tasks,
+            verdicts,
+            agent_results,
+            status="ERROR",
+            cps_summary=store.summary() if store else None,
+        )
         raise
+    finally:
+        broker.close()
     degraded_statuses = {
+        "BUDGET_EXHAUSTED",
         "CANCELLED",
         "EVALUATOR_ERROR",
         "EVALUATOR_TIMEOUT",
+        "EXECUTION_TIMEOUT",
         "INFRASTRUCTURE_ERROR",
         "MISSING_CANDIDATE",
+        "NETWORK_ERROR",
+        "OFFICIAL_VERDICT_MISSING",
         "OUT_OF_HORIZON",
         "REJECTED_OVERLOADED",
+        "RESOURCE_LIMIT",
     }
-    status = "COMPLETED" if all(verdict.status not in degraded_statuses for verdict in verdicts.values()) else "DEGRADED"
+    if len(verdicts) != len(tasks):
+        status = "INCOMPLETE"
+    else:
+        status = (
+            "COMPLETED"
+            if all(verdict.status not in degraded_statuses for verdict in verdicts.values())
+            else "DEGRADED"
+        )
     if store is not None:
         store.export_events(run_dir / "communication_trace.jsonl")
-    _write_final(run_dir, config, verdicts, agent_results, status=status, cps_summary=store.summary() if store else None)
+    _write_final(
+        run_dir,
+        config,
+        tasks,
+        verdicts,
+        agent_results,
+        status=status,
+        cps_summary=store.summary() if store else None,
+    )
     logger.event("run_finished", status=status, score=sum(v.score for v in verdicts.values()))
     return run_dir
 
@@ -312,6 +372,7 @@ def _run_mono(
     run_dir: Path,
     logger: RunLogger,
     pi_agent: PiAgent,
+    broker: EvaluatorBroker,
     *,
     mock_agent: bool,
     deadline: float,
@@ -319,8 +380,29 @@ def _run_mono(
     worker_dir = run_dir / "workers" / "mono"
     worker_dir.mkdir(parents=True, exist_ok=True)
     for task in tasks:
-        _stage_task(task, worker_dir / "tasks" / task.slug)
-    _write_mono_bundle(worker_dir, tasks)
+        _stage_task(
+            task,
+            worker_dir / "tasks" / task.slug,
+            broker=broker,
+            actor_id="mono",
+            context_piece_enabled=False,
+        )
+    _write_mono_bundle(
+        worker_dir,
+        tasks,
+        max_candidate_bytes=config.formal_tools_max_candidate_bytes,
+    )
+    atomic_write_text(
+        worker_dir / PUBLIC_FILES_FILENAME,
+        (
+            "# Mono public bundle\n\n"
+            "This one baseline session intentionally sees all selected task directories.\n"
+            "The aggregate `result.json` is readable and is regenerated by the runner.\n"
+            "Each `tasks/<slug>/PUBLIC_FILES.md` defines that task's public files and formal tools.\n"
+            "Write only `tasks/<slug>/result.lean`; no CPS surface is present.\n"
+        ),
+        mode=0o444,
+    )
     prompt = build_mono_prompt(tasks, workspace=str(worker_dir), communication_enabled=False)
     if mock_agent:
         result = _mock_result("mono", "bundle", 1)
@@ -334,7 +416,11 @@ def _run_mono(
             deadline_monotonic=deadline,
         )
     logger.event("agent_finished", **result.as_dict())
-    _write_mono_bundle(worker_dir, tasks)
+    _write_mono_bundle(
+        worker_dir,
+        tasks,
+        max_candidate_bytes=config.formal_tools_max_candidate_bytes,
+    )
     return result
 
 
@@ -343,13 +429,12 @@ def _run_elastic_cps(
     tasks: list[Task],
     run_dir: Path,
     logger: RunLogger,
-    evaluator: Any,
+    broker: EvaluatorBroker,
     pi_agent: PiAgent,
     policy: CommunicationPolicy,
     *,
     mock_agent: bool,
     deadline: float,
-    evaluator_gate: threading.BoundedSemaphore,
 ) -> list[AgentResult]:
     """Run CPS with an elastic, task-aware agent pool.
 
@@ -370,7 +455,7 @@ def _run_elastic_cps(
         best_dir.mkdir(parents=True, exist_ok=True)
         best_path = best_dir / "result.lean"
         if not best_path.exists():
-            best_path.write_text(task.baseline_code, encoding="utf-8")
+            atomic_write_text(best_path, task.baseline_code, mode=0o600)
         state.best_candidate = best_path
         states[task.slug] = state
 
@@ -385,7 +470,7 @@ def _run_elastic_cps(
     roster_path = run_dir / "actors.json"
     roster_lock = threading.RLock()
     roster: list[dict[str, Any]] = []
-    roster_path.write_text("[]\n", encoding="utf-8")
+    atomic_write_text(roster_path, "[]\n")
     horizon_epoch_ms = int((time.time() + max(0.0, deadline - time.monotonic())) * 1_000)
     jobs: Queue[AgentAssignment] = Queue()
     results: list[AgentResult] = []
@@ -405,8 +490,7 @@ def _run_elastic_cps(
             "generation": assignment.generation,
             "admitted_at": assignment.admitted_at,
         }
-        with assignments_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        append_jsonl(assignments_path, row, lock=roster_lock)
         with roster_lock:
             roster.append(
                 {
@@ -415,12 +499,10 @@ def _run_elastic_cps(
                     "episode": assignment.generation,
                 }
             )
-            temporary = roster_path.with_suffix(".tmp")
-            temporary.write_text(
+            atomic_write_text(
+                roster_path,
                 json.dumps(roster, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
             )
-            temporary.replace(roster_path)
         logger.event(
             "agent_assigned",
             task_id=assignment.task_id,
@@ -465,10 +547,17 @@ def _run_elastic_cps(
 
     def prepare_workspace(state: _ElasticTaskState, assignment: AgentAssignment) -> tuple[Path, Path]:
         workdir = state.task_root / "agents" / assignment.agent_id
-        _stage_task(state.task, workdir)
+        _stage_task(
+            state.task,
+            workdir,
+            broker=broker,
+            actor_id=assignment.agent_id,
+            context_piece_enabled=policy.enabled,
+        )
         assert state.best_candidate is not None
         with state.lock:
             shutil.copy2(state.best_candidate, workdir / "result.lean")
+            (workdir / "result.lean").chmod(0o600)
         return workdir, state.best_candidate
 
     def execute_assignment(assignment: AgentAssignment) -> tuple[AgentResult, Path | None]:
@@ -524,22 +613,9 @@ def _run_elastic_cps(
         logger.event("agent_finished", **result.as_dict())
         if result.cancelled or state.solved:
             return result, None
-        source = workdir / "result.lean"
-        snapshot = workdir / "evaluation_snapshot.lean"
-        try:
-            shutil.copy2(source, snapshot)
-        except OSError as exc:
-            logger.event(
-                "candidate_snapshot_failed",
-                task_id=task.slug,
-                agent_id=actor,
-                episode=assignment.generation,
-                error=str(exc),
-            )
-            return result, None
-        return result, snapshot
+        return result, workdir / "result.lean"
 
-    def evaluate_snapshot(assignment: AgentAssignment, snapshot: Path) -> None:
+    def evaluate_snapshot(assignment: AgentAssignment, candidate: Path) -> None:
         """Validate an immutable attempt without holding a solver lease."""
 
         state = states[assignment.task_id]
@@ -547,11 +623,12 @@ def _run_elastic_cps(
         actor = assignment.agent_id
         try:
             verdict = _evaluate_candidate(
-                evaluator,
+                broker,
                 task,
-                snapshot,
+                candidate,
                 deadline,
-                evaluator_gate,
+                actor_id=actor,
+                episode=assignment.generation,
             )
         except Exception as exc:
             verdict = Verdict(
@@ -562,7 +639,7 @@ def _run_elastic_cps(
                 error=str(exc),
             )
         eligible = time.monotonic() <= deadline and verdict.status != "OUT_OF_HORIZON"
-        logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
+        logger.agent_evaluation(verdict, episode=assignment.generation, agent_id=actor)
         logger.event(
             "evaluation_finished",
             **verdict.as_dict(),
@@ -574,11 +651,8 @@ def _run_elastic_cps(
         if not eligible:
             return
 
-        solved = verdict.score >= 1.0
         candidate_is_usable = verdict.status in {
             "PROVED",
-            "AC",
-            "PASSED",
             "COMPILES_WITH_SORRY",
             "VERIFY_FAIL",
             "MOCK_SKIPPED",
@@ -588,15 +662,13 @@ def _run_elastic_cps(
                 state.best_verdict = verdict
                 assert state.best_candidate is not None
                 try:
-                    shutil.copy2(snapshot, state.best_candidate)
+                    broker.materialize_snapshot(
+                        task.slug,
+                        str(verdict.response.get("candidate_sha256") or ""),
+                        state.best_candidate,
+                    )
                 except OSError:
                     pass
-            if solved:
-                state.solved = True
-                if config.cancel_on_proved:
-                    state.cancel_event.set()
-        if solved:
-            scheduler.task_solved(task.slug)
 
         # Closeout and late evaluator receipts are deliberately feedback-free.
         if policy.enabled and time.monotonic() < deadline:
@@ -619,6 +691,56 @@ def _run_elastic_cps(
                 deadline_epoch_ms=horizon_epoch_ms,
             )
 
+    def preserve_unevaluated_candidate(
+        assignment: AgentAssignment,
+        candidate: Path,
+    ) -> None:
+        """Keep an agent's completed bytes even when optional feedback closes."""
+
+        state = states[assignment.task_id]
+        try:
+            payload = read_regular_bytes(
+                candidate,
+                trusted_root=candidate.parent,
+                max_bytes=config.formal_tools_max_candidate_bytes,
+            )
+        except OSError as exc:
+            logger.event(
+                "candidate_preservation_failed",
+                task_id=assignment.task_id,
+                agent_id=assignment.agent_id,
+                episode=assignment.generation,
+                error=str(exc),
+            )
+            return
+        digest = hashlib.sha256(payload).hexdigest()
+        fallback = Verdict(
+            assignment.task_id,
+            "UNEVALUATED_CANDIDATE",
+            0.0,
+            0.0,
+            {
+                "candidate_sha256": digest,
+                "selection_authority": "solver_completion_order",
+            },
+        )
+        preserved = False
+        with state.lock:
+            if _verdict_priority(fallback) >= _verdict_priority(state.best_verdict):
+                assert state.best_candidate is not None
+                atomic_write_bytes(state.best_candidate, payload, mode=0o600)
+                state.best_verdict = fallback
+                preserved = True
+        logger.event(
+            "candidate_preserved",
+            task_id=assignment.task_id,
+            agent_id=assignment.agent_id,
+            episode=assignment.generation,
+            candidate_sha256=digest,
+            selected=preserved,
+            evaluator_feedback_required=False,
+        )
+
     # Fill the initial pool.  A queue worker will immediately request a new
     # assignment after each completion, so no task is permanently tied to a
     # Python thread.
@@ -639,10 +761,10 @@ def _run_elastic_cps(
 
     def bounded_evaluate_snapshot(
         assignment: AgentAssignment,
-        snapshot: Path,
+        candidate: Path,
     ) -> None:
         try:
-            evaluate_snapshot(assignment, snapshot)
+            evaluate_snapshot(assignment, candidate)
         except Exception as exc:
             logger.event(
                 "evaluator_worker_error",
@@ -671,6 +793,7 @@ def _run_elastic_cps(
                 # before the independent Judge queue starts or waits.
                 scheduler.finish(assignment, solved=False)
                 if snapshot is not None:
+                    preserve_unevaluated_candidate(assignment, snapshot)
                     remaining = max(0.0, deadline - time.monotonic())
                     admitted = evaluation_backlog_gate.acquire(blocking=False)
                     if not admitted:
@@ -731,10 +854,7 @@ def _run_elastic_cps(
         # retaining every completed Future for the duration of a long run.
         evaluation_executor.shutdown(wait=True, cancel_futures=False)
 
-    (run_dir / "elastic_scheduler_state.json").write_text(
-        json.dumps(scheduler.snapshot(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(run_dir / "elastic_scheduler_state.json", scheduler.snapshot())
     results.sort(key=lambda item: (item.task_id, item.episode, item.agent_id))
     return results
 
@@ -746,13 +866,20 @@ def _run_task_workers(
     logger: RunLogger,
     pi_agent: PiAgent,
     policy: CommunicationPolicy,
+    broker: EvaluatorBroker,
     *,
     mock_agent: bool,
     deadline: float,
 ) -> list[AgentResult]:
     def execute(task: Task) -> AgentResult:
         workdir = run_dir / "workers" / task.slug
-        _stage_task(task, workdir)
+        _stage_task(
+            task,
+            workdir,
+            broker=broker,
+            actor_id=f"worker-{task.slug}",
+            context_piece_enabled=policy.enabled,
+        )
         db_path = str(policy.store.path) if policy.store is not None else ""
         best_result: AgentResult | None = None
         actor = f"worker-{task.slug}-e0"
@@ -799,9 +926,9 @@ def _run_task_workers(
             for task in tasks
             for episode in range(1, config.episodes_per_task + 1)
         ]
-        (run_dir / "actors.json").write_text(
+        atomic_write_text(
+            run_dir / "actors.json",
             json.dumps(actors, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
         )
     with ThreadPoolExecutor(max_workers=config.max_parallel) as executor:
         futures = {executor.submit(execute, task): task.slug for task in tasks}
@@ -811,41 +938,61 @@ def _run_task_workers(
     return results
 
 
-def _stage_task(task: Task, destination: Path) -> None:
+def _stage_task(
+    task: Task,
+    destination: Path,
+    *,
+    broker: EvaluatorBroker,
+    actor_id: str,
+    context_piece_enabled: bool,
+) -> None:
     destination.mkdir(parents=True, exist_ok=True)
-    (destination / "problem.md").write_text(task.problem_text, encoding="utf-8")
+    atomic_write_text(destination / "problem.md", task.problem_text, mode=0o444)
     baseline_dir = destination / "baseline"
     baseline_dir.mkdir(exist_ok=True)
     baseline_source = next(iter(sorted(task.root.glob("baseline/*.lean"))))
     shutil.copy2(baseline_source, baseline_dir / baseline_source.name)
-    (destination / "metadata.json").write_text(
-        json.dumps(task.metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(destination / "metadata.json", task.metadata, mode=0o444)
     result = destination / "result.lean"
     if not result.exists():
         shutil.copy2(baseline_source, result)
+    capability = broker.register_worker(task, destination, actor_id=actor_id)
+    stage_worker_tools(
+        destination,
+        capability=capability,
+        baseline_names=[baseline_source.name],
+        context_piece_enabled=context_piece_enabled,
+    )
+    (destination / "scratch").mkdir(exist_ok=True, mode=0o700)
+    for immutable in (
+        destination / "problem.md",
+        destination / "metadata.json",
+        baseline_dir / baseline_source.name,
+    ):
+        immutable.chmod(0o444)
+    result.chmod(0o600)
 
 
 def _evaluate_candidate(
-    evaluator: Any,
+    broker: EvaluatorBroker,
     task: Task,
     candidate: Path,
     deadline: float,
-    gate: threading.BoundedSemaphore,
+    *,
+    actor_id: str,
+    episode: int,
 ) -> Verdict:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "run_horizon_elapsed"})
-    # Solver-phase evaluator contention may consume the remaining solver
-    # horizon, but it no longer occupies a Pi/scheduler slot: CPS submits this
-    # work to a separate evaluator executor.
-    if not gate.acquire(timeout=remaining):
-        return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "evaluator_admission_horizon_elapsed"})
-    try:
-        return evaluator.evaluate(task, candidate, deadline_monotonic=deadline)
-    finally:
-        gate.release()
+    return broker.evaluate_local(
+        task,
+        candidate,
+        trusted_root=candidate.parent,
+        scope_id=f"runner:{actor_id}",
+        actor_id=actor_id,
+        episode=episode,
+    )
 
 
 def _candidate_source(config: ExperimentConfig, task: Task, run_dir: Path) -> Path:
@@ -861,6 +1008,7 @@ def _freeze_closeout_candidates(
     tasks: list[Task],
     run_dir: Path,
     logger: RunLogger,
+    broker: EvaluatorBroker,
 ) -> dict[str, _FrozenCandidate]:
     """Freeze one mode-defined task candidate before feedback-free scoring."""
 
@@ -873,29 +1021,36 @@ def _freeze_closeout_candidates(
         destination.parent.mkdir(parents=True, exist_ok=True)
         digest: str | None = None
         error: str | None = None
+        selected_source = str(source.relative_to(run_dir))
+        selected_kind = "workspace_at_horizon"
         try:
-            payload = source.read_bytes()
+            locally_proved = broker.best_local_proved(task.slug)
+            if locally_proved is not None:
+                payload = locally_proved.payload
+                selected_source = f"broker_snapshot:{locally_proved.sha256}"
+                selected_kind = "preserved_agent_local_proved_snapshot"
+            else:
+                payload = read_regular_bytes(
+                    source,
+                    trusted_root=run_dir,
+                    max_bytes=config.formal_tools_max_candidate_bytes,
+                )
             digest = hashlib.sha256(payload).hexdigest()
-            temporary = destination.with_suffix(".tmp")
-            temporary.write_bytes(payload)
-            temporary.replace(destination)
-            destination.chmod(0o444)
+            atomic_write_bytes(destination, payload, mode=0o444)
         except OSError as exc:
             error = f"cannot freeze candidate: {exc.strerror or type(exc).__name__}"
         frozen[task.slug] = _FrozenCandidate(task.slug, destination, digest, error)
         row: dict[str, Any] = {
             "task_id": task.slug,
-            "source": str(source.relative_to(run_dir)),
+            "source": selected_source,
+            "selection_kind": selected_kind,
             "snapshot": str(destination.relative_to(run_dir)),
             "candidate_sha256": digest,
         }
         if error:
             row["error"] = error
         rows.append(row)
-    (run_dir / "closeout_candidates.json").write_text(
-        json.dumps({"candidates": rows}, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(run_dir / "closeout_candidates.json", {"candidates": rows})
     logger.event(
         "candidates_frozen",
         candidate_count=len(rows),
@@ -908,10 +1063,9 @@ def _freeze_closeout_candidates(
 
 
 def _evaluate_closeout_candidate(
-    evaluator: Any,
+    broker: EvaluatorBroker,
     task: Task,
     candidate: _FrozenCandidate,
-    gate: threading.BoundedSemaphore,
 ) -> Verdict:
     if candidate.error or not candidate.path.is_file():
         return Verdict(
@@ -922,11 +1076,11 @@ def _evaluate_closeout_candidate(
             {"candidate_sha256": candidate.sha256},
             error=candidate.error or "candidate snapshot is missing",
         )
-    gate.acquire()
-    try:
-        verdict = evaluator.evaluate(task, candidate.path, deadline_monotonic=None)
-    finally:
-        gate.release()
+    verdict = broker.evaluate_official(
+        task,
+        candidate.path,
+        trusted_root=candidate.path.parents[2],
+    )
     verdict.response.setdefault("candidate_sha256", candidate.sha256)
     return verdict
 
@@ -936,8 +1090,7 @@ def _run_closeout(
     tasks: list[Task],
     frozen: Mapping[str, _FrozenCandidate],
     logger: RunLogger,
-    evaluator: Any,
-    gate: threading.BoundedSemaphore,
+    broker: EvaluatorBroker,
 ) -> dict[str, Verdict]:
     """Score frozen candidates under one bounded, feedback-free contract."""
 
@@ -946,12 +1099,13 @@ def _run_closeout(
         candidate_count=len(tasks),
         max_concurrent_evaluations=config.lean_max_concurrent_evaluations,
         execution_timeout_seconds=config.lean_timeout_seconds,
+        closeout_timeout_seconds=config.lean_closeout_timeout_seconds,
     )
     verdicts: dict[str, Verdict] = {}
 
     def evaluate(task: Task) -> Verdict:
         try:
-            return _evaluate_closeout_candidate(evaluator, task, frozen[task.slug], gate)
+            return _evaluate_closeout_candidate(broker, task, frozen[task.slug])
         except Exception as exc:
             return Verdict(task.slug, "EVALUATOR_ERROR", 0.0, 0.0, error=str(exc))
 
@@ -974,15 +1128,25 @@ def _run_closeout(
     return verdicts
 
 
-def _write_mono_bundle(worker_dir: Path, tasks: Iterable[Task]) -> None:
+def _write_mono_bundle(
+    worker_dir: Path,
+    tasks: Iterable[Task],
+    *,
+    max_candidate_bytes: int,
+) -> None:
     solutions: dict[str, str] = {}
     for task in tasks:
         candidate = worker_dir / "tasks" / task.slug / "result.lean"
         try:
-            solutions[task.slug] = candidate.read_text(encoding="utf-8")
-        except OSError:
+            solutions[task.slug] = read_regular_bytes(
+                candidate,
+                trusted_root=worker_dir,
+                max_bytes=max_candidate_bytes,
+            ).decode("utf-8")
+        except (OSError, UnicodeError):
             solutions[task.slug] = ""
-    (worker_dir / "result.json").write_text(
+    atomic_write_text(
+        worker_dir / "result.json",
         json.dumps(
             {"schema_version": "formal_lean_single_run_bundle_v1", "solutions": solutions},
             ensure_ascii=False,
@@ -990,17 +1154,17 @@ def _write_mono_bundle(worker_dir: Path, tasks: Iterable[Task]) -> None:
             sort_keys=True,
         )
         + "\n",
-        encoding="utf-8",
+        mode=0o600,
     )
 
 
 def _write_context_piece_wrapper(workdir: Path) -> None:
     wrapper = workdir / "context_piece"
-    wrapper.write_text(
+    atomic_write_text(
+        wrapper,
         "#!/bin/sh\nexec python3 -m contextswarm_mini.context_piece \"$@\"\n",
-        encoding="utf-8",
+        mode=0o555,
     )
-    wrapper.chmod(0o755)
 
 
 def _mock_result(agent_id: str, task_id: str, episode: int) -> AgentResult:
@@ -1020,14 +1184,36 @@ def _mock_result(agent_id: str, task_id: str, episode: int) -> AgentResult:
 def _write_final(
     run_dir: Path,
     config: ExperimentConfig,
+    tasks: Iterable[Task],
     verdicts: Mapping[str, Verdict],
     agent_results: Iterable[AgentResult],
     *,
     status: str,
     cps_summary: Mapping[str, Any] | None,
 ) -> None:
-    rows = {key: value.as_dict() for key, value in sorted(verdicts.items())}
+    task_list = list(tasks)
+    rows: dict[str, dict[str, Any]] = {}
+    for task in task_list:
+        verdict = verdicts.get(task.slug)
+        if verdict is None:
+            verdict = Verdict(
+                task.slug,
+                "OFFICIAL_VERDICT_MISSING",
+                0.0,
+                0.0,
+                {"reason": "outer official evaluation did not produce a terminal verdict"},
+                error="official verdict missing",
+            )
+        rows[task.slug] = verdict.as_dict()
+    unexpected = sorted(set(verdicts) - {task.slug for task in task_list})
+    if unexpected:
+        status = "INCOMPLETE" if status == "COMPLETED" else status
+    missing_count = sum(1 for item in rows.values() if item["status"] == "OFFICIAL_VERDICT_MISSING")
+    if missing_count and status == "COMPLETED":
+        status = "INCOMPLETE"
     agent_rows = [item.as_dict() for item in agent_results]
+    selected_task_ids = {task.slug for task in task_list}
+    official_verdict_count = sum(1 for task_id in verdicts if task_id in selected_task_ids)
     final = {
         "schema_version": "contextswarm_mini_run_v1",
         "status": status,
@@ -1035,7 +1221,10 @@ def _write_final(
         "communication": config.communication,
         "dataset": "matholympiadbench",
         "score": sum(item["score"] for item in rows.values()),
-        "max_score": len(rows),
+        "max_score": len(task_list),
+        "selected_task_count": len(task_list),
+        "official_verdict_count": official_verdict_count,
+        "missing_official_verdict_count": missing_count,
         "verdicts": rows,
         "agents": agent_rows,
         "horizon_seconds": config.time_limit_seconds,
@@ -1047,7 +1236,4 @@ def _write_final(
         "cps": dict(cps_summary or {"enabled": False}),
         "finished_at": utc_now(),
     }
-    (run_dir / "final.json").write_text(
-        json.dumps(final, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(run_dir / "final.json", final)

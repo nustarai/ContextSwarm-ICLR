@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -9,8 +10,36 @@ import threading
 import time
 import unittest
 
-from contextswarm_mini.evaluator import LeanEvaluator, _safe_response, _terminal
+from contextswarm_mini.evaluator import (
+    FORMAL_VERDICT_SCHEMA_VERSION,
+    LeanEvaluator,
+    _safe_probe_response,
+    _safe_response,
+    _settled_outcome,
+    _terminal,
+)
 from contextswarm_mini.models import Task
+
+
+def _proved_receipt(candidate_sha256: str, *, job_id: str = "job-1", **extra: object) -> dict[str, object]:
+    return {
+        "job_id": job_id,
+        "status": "succeeded",
+        "formal_status": "PROVED",
+        "formal_verdict_schema_version": FORMAL_VERDICT_SCHEMA_VERSION,
+        "is_valid_no_sorry": True,
+        "canonical_verdict": {
+            "schema_version": FORMAL_VERDICT_SCHEMA_VERSION,
+            "status": "PROVED",
+            "score": 1.0,
+            "correct": True,
+            "cheating": False,
+            "source_contract_status": "ok",
+            "signature_check_status": "ok",
+            "solution_hash": candidate_sha256,
+        },
+        **extra,
+    }
 
 
 class _LifecycleServer:
@@ -20,6 +49,7 @@ class _LifecycleServer:
         self.deletes = 0
         self.post_count = 0
         self.post_payloads: list[dict[str, object]] = []
+        self.candidate_sha256 = ""
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -43,6 +73,9 @@ class _LifecycleServer:
                 request_payload = json.loads(self.rfile.read(length) or b"{}")
                 if isinstance(request_payload, dict):
                     owner.post_payloads.append(request_payload)
+                    owner.candidate_sha256 = hashlib.sha256(
+                        str(request_payload.get("code") or "").encode("utf-8")
+                    ).hexdigest()
                 owner.post_count += 1
                 owner.submitted_at = time.monotonic()
                 if owner.mode == "unconfirmed_503":
@@ -91,25 +124,13 @@ class _LifecycleServer:
                     "overloaded_then_proved",
                     "terminal_overloaded_then_proved",
                 }:
-                    self._send(
-                        {
-                            "job_id": "job-1",
-                            "status": "succeeded",
-                            "formal_status": "PROVED",
-                            "correct": True,
-                        }
-                    )
+                    self._send(_proved_receipt(owner.candidate_sha256))
                 elif (
                     owner.mode == "queued_rejected_then_proved"
                     and owner.post_count >= 2
                 ):
                     self._send(
-                        {
-                            "job_id": "job-2",
-                            "status": "succeeded",
-                            "formal_status": "PROVED",
-                            "correct": True,
-                        }
+                        _proved_receipt(owner.candidate_sha256, job_id="job-2")
                     )
                 elif owner.mode in {
                     "queued_rejected_then_proved",
@@ -223,18 +244,15 @@ class _LifecycleServer:
                     )
                 elif owner.mode == "queued_then_proved" and elapsed >= 1.2:
                     self._send(
-                        {
-                            "job_id": "job-1",
-                            "status": "succeeded",
-                            "formal_status": "PROVED",
-                            "correct": True,
-                            "submitted_at_ms": 1_000,
-                            "queue_deadline_ms": 2_000,
-                            "started_at_ms": 1_600,
-                            "finished_at_ms": 2_200,
-                            "queue_wait_ms": 600,
-                            "execution_ms": 600,
-                        }
+                        _proved_receipt(
+                            owner.candidate_sha256,
+                            submitted_at_ms=1_000,
+                            queue_deadline_ms=2_000,
+                            started_at_ms=1_600,
+                            finished_at_ms=2_200,
+                            queue_wait_ms=600,
+                            execution_ms=600,
+                        )
                     )
                 elif owner.mode == "queued_then_proved" and elapsed >= 0.6:
                     self._send(
@@ -396,6 +414,38 @@ class EvaluatorLifecycleTests(unittest.TestCase):
                 self.assertEqual(verdict.status, expected_status)
                 self.assertEqual(verdict.score, 0.0)
 
+    def test_specific_lifecycle_failure_precedes_negative_canonical_verdict(self) -> None:
+        canonical = {
+            "schema_version": FORMAL_VERDICT_SCHEMA_VERSION,
+            "status": "VERIFY_FAIL",
+            "score": 0.0,
+            "correct": False,
+            "cheating": False,
+        }
+        for payload, expected in (
+            (
+                {
+                    "status": "timed_out",
+                    "error_kind": "timeout",
+                    "canonical_verdict": canonical,
+                },
+                "EXECUTION_TIMEOUT",
+            ),
+            (
+                {
+                    "status": "failed",
+                    "error_kind": "memory_limit_exceeded",
+                    "canonical_verdict": canonical,
+                },
+                "RESOURCE_LIMIT",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                status, proved, error = _settled_outcome(payload)
+                self.assertEqual(status, expected)
+                self.assertFalse(proved)
+                self.assertIsNone(error)
+
     def test_succeeded_envelope_without_verdict_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -518,6 +568,20 @@ class EvaluatorLifecycleTests(unittest.TestCase):
                 self.assertEqual(verdict.score, 0.0)
                 self.assertEqual(server.post_count, 1)
 
+    def test_probe_distinguishes_confirmed_admission_overload(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("always_http_429")
+            with server.running() as url:
+                result = LeanEvaluator(url, lean_env_id="test").probe(
+                    _task(root),
+                    "import Mathlib\n#check Nat.succ\n",
+                )
+
+        self.assertEqual(result["status"], "probe_admission_closed")
+        self.assertEqual(result["error_kind"], "judge_admission_overloaded")
+        self.assertEqual(server.post_count, 1)
+
     def test_huge_finite_lifecycle_deadline_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -628,6 +692,110 @@ class EvaluatorLifecycleTests(unittest.TestCase):
                 "execution_ms": 300_001,
             },
         )
+
+    def test_probe_profile_mapping_preserves_only_bounded_diagnostics(self) -> None:
+        result = _safe_probe_response(
+            {
+                "status": "succeeded",
+                "is_valid_with_sorry": False,
+                "probe_diagnostics": {
+                    "items": [
+                        {
+                            "severity": "error",
+                            "data": "unknown identifier",
+                            "line": 3,
+                            "column": 7,
+                            "path": "/private/Main.lean",
+                            "source": "secret source",
+                        }
+                    ],
+                    "truncated": True,
+                },
+            }
+        )
+        self.assertEqual(result["status"], "elab_failed")
+        self.assertTrue(result["diagnostics_truncated"])
+        self.assertEqual(
+            result["diagnostics"],
+            [
+                {
+                    "severity": "error",
+                    "message": "unknown identifier",
+                    "line": 3,
+                    "column": 7,
+                }
+            ],
+        )
+
+    def test_only_exact_canonical_proved_can_score(self) -> None:
+        expected_hash = "a" * 64
+        canonical = {
+            "schema_version": FORMAL_VERDICT_SCHEMA_VERSION,
+            "status": "PROVED",
+            "score": 1.0,
+            "correct": True,
+            "cheating": False,
+            "source_contract_status": "ok",
+            "signature_check_status": "ok",
+            "safeverify_status": "accepted",
+            "solution_hash": expected_hash,
+        }
+        valid = {
+            "status": "succeeded",
+            "formal_verdict_schema_version": FORMAL_VERDICT_SCHEMA_VERSION,
+            "is_valid_no_sorry": True,
+            "canonical_verdict": canonical,
+        }
+        self.assertEqual(
+            _settled_outcome(valid, expected_candidate_sha256=expected_hash),
+            ("PROVED", True, None),
+        )
+
+        mutations = {
+            "wrong_schema": {"schema_version": "legacy"},
+            "partial_score": {"score": 0.999},
+            "incorrect": {"correct": False},
+            "cheating": {"cheating": True},
+            "source_drift": {"source_contract_status": "failed"},
+            "signature_drift": {"signature_check_status": "skipped"},
+            "safeverify_rejected": {"safeverify_status": "rejected"},
+            "candidate_mismatch": {"solution_hash": "b" * 64},
+        }
+        for name, update in mutations.items():
+            with self.subTest(name=name):
+                payload = {
+                    **valid,
+                    "canonical_verdict": {**canonical, **update},
+                }
+                status, proved, error = _settled_outcome(
+                    payload,
+                    expected_candidate_sha256=expected_hash,
+                )
+                self.assertEqual(status, "EVALUATOR_ERROR")
+                self.assertFalse(proved)
+                self.assertTrue(error)
+
+        missing_no_sorry = {**valid, "is_valid_no_sorry": False}
+        self.assertEqual(
+            _settled_outcome(
+                missing_no_sorry,
+                expected_candidate_sha256=expected_hash,
+            )[0],
+            "EVALUATOR_ERROR",
+        )
+
+    def test_legacy_positive_markers_are_diagnostic_only(self) -> None:
+        for payload in (
+            {"status": "PROVED"},
+            {"status": "AC", "score": 1},
+            {"status": "succeeded", "correct": True},
+            {"status": "succeeded", "is_valid_no_sorry": True},
+        ):
+            with self.subTest(payload=payload):
+                status, proved, error = _settled_outcome(payload)
+                self.assertEqual(status, "EVALUATOR_ERROR")
+                self.assertFalse(proved)
+                self.assertTrue(error)
 
 
 if __name__ == "__main__":

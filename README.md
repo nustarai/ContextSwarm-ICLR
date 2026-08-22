@@ -28,7 +28,8 @@ python3 -m contextswarm_mini.cli --config configs/smoke.toml run --mock-agent
 run_meta.json
 transport_preflight.json   # real NuRouter/Lean run
 events.jsonl
-scoreboard_history.jsonl
+scoreboard_history.jsonl       # 只含 outer-official closeout
+agent_evaluation_history.jsonl # solver 阶段诊断，不是分数
 final.json
 cps.sqlite3              # CPS 模式
 communication_trace.jsonl # CPS 事件投影
@@ -36,6 +37,9 @@ elastic_assignments.jsonl  # CPS 动态 agent 分配
 elastic_scheduler_state.json # CPS 调度器收尾状态
 closeout_candidates.json   # 三种模式统一的冻结候选索引与 SHA-256
 closeout_candidates/<task>/result.lean # feedback-free 最终评分快照
+telemetry/agent_local_evaluations.jsonl
+telemetry/formal_query_calls.jsonl
+telemetry/official_verdicts.jsonl
 workers/<task>/result.lean # parallel
 workers/<task>/agents/<actor>/result.lean # elastic CPS attempts
 workers/<task>/best/result.lean # elastic CPS best candidate
@@ -64,7 +68,8 @@ manifest 中打开 fast mode。
 
 1. 可在 Linux 容器执行的 NuRouter/AISW release ELF（优先使用 `nurouter`）；
 2. NuRouter node/coordinator 配置（默认读取 `~/.nurouter/node.toml`）；
-3. 可访问的 MathOlympiadBench Lean router（默认 `http://127.0.0.1:18000`）。
+3. 可访问的 MathOlympiadBench Lean router（默认 `http://127.0.0.1:18000`）；
+4. 与该 router Mathlib revision 一致的公开 declaration index（见下文）。
 
 如果使用同机的 `ContextSwarmJudge`，需要启动完整 formal stack（不要只启动
 Lean-Eval slice），例如：
@@ -77,21 +82,24 @@ cd /path/to/ContextSwarmJudge
 然后确认 `18000/healthz` 的 `accepted_lean_env_ids` 包含
 `formal_matholympiadbench`。
 
-默认运行 CPS：
+默认运行 CPS（index 只读挂载，不进入仓库或镜像）：
 
 ```bash
+CONTEXTSWARM_MINI_DECL_INDEX=/path/to/mathlib-decls.sqlite3 \
 scripts/run_docker.sh --config configs/cps.toml
 ```
 
 正式启动前可以只做 transport 检查（不会启动 Pi session）：
 
 ```bash
+CONTEXTSWARM_MINI_DECL_INDEX=/path/to/mathlib-decls.sqlite3 \
 scripts/run_docker.sh --config configs/cps.toml preflight
 ```
 
 运行三种 paper-facing cells：
 
 ```bash
+export CONTEXTSWARM_MINI_DECL_INDEX=/path/to/mathlib-decls.sqlite3
 scripts/run_docker.sh --config configs/mono.toml
 scripts/run_docker.sh --config configs/parallel.toml
 scripts/run_docker.sh --config configs/cps.toml
@@ -179,6 +187,65 @@ Fast-mode 使用单独 manifest，并且必须先通过 transport preflight：
 scripts/run_docker.sh --config configs/cps_fast.toml preflight
 ```
 
+## Formal 工具面
+
+Mono、Parallel 和 CPS 由同一个 `[formal_tools]` manifest contract 获得相同的两
+个 task-local 工具；工具不会给 Mono/Parallel 增加通信通道，也不能读取 sibling
+workspace、broker 私有文件、operator 环境变量或原始网络。每个 task 的
+`PUBLIC_FILES.md` 是完整公开文件清单，Pi guard 只允许直接读取这些文件、修改
+`result.lean`/`scratch/`，以及执行下列受限 helper：
+
+```bash
+python3 evaluate.py
+./formal_query search finite sum inequality
+./formal_query decl Finset sum_le_sum
+./formal_query check Finset.sum_le_sum
+./formal_query type 'Nat → Nat'
+./formal_query check --snippet 'example (a b : Nat) : a + b = b + a := by omega'
+./formal_query axioms MyHelperLemma
+./formal_query deps Finset.sum_le_sum
+```
+
+`evaluate.py` 捕获当前 `result.lean` 的 immutable SHA-256 snapshot，再通过 run-owned
+Unix-socket broker 调用真实 Judge。它返回 `VERIFY_FAIL`、
+`COMPILES_WITH_SORRY`、`PROVED` 或明确的 timeout/resource/contract diagnostics；
+结果仅供 agent 改 proof，score 永远为 0，也不会把 CPS task 标成 solved、取消同题
+agent 或写 `scoreboard_history.jsonl`。最终候选仍由 feedback-free outer closeout
+重新提交 immutable bytes。
+
+`formal_query` 是 bounded Lean API/LSP scout：`search` 同时搜 task 公开文件和
+revision-matched Mathlib index；`decl` 找声明名；`check`/`type` 用 Judge 的
+`lean_probe_v1` 做 elaboration；`axioms` 在当前 candidate context 中运行
+`#print axioms`；`deps` 只返回 index-related premises，不伪装成 dependency graph。
+声明结果都是 advisory，必须再用 `check` 验证。每 task 的 CLI call、实际 backend
+evaluation job 和 kernel probe 分开计数；cache hit 不消耗 backend budget。
+`telemetry/` 只记录 lane、task、hash、耗时、budget 序号和归类后的 diagnostics；
+`.broker_private/` 中的 capability journal 与 content-addressed snapshots 是本地私有
+运行状态，不属于公开 prompt 或论文摘要。
+
+默认 paper manifest 在 solver 截止前 330 秒停止新的 agent-local Judge admission，
+让已接收的调用有界收口；180 秒 canary 显式使用 30 秒 cutoff。无论诊断调用是否
+来得及执行，CPS 都会先保留 agent 在 horizon 内完成的 regular-file candidate，
+不会因此退回 pristine baseline。
+
+### 构建 declaration index
+
+从与 Judge 完全相同 revision 的公开 Mathlib source tree 构建 SQLite index：
+
+```bash
+python3 scripts/build_decl_index.py \
+  --source-root /path/to/mathlib/Mathlib \
+  --output /path/to/mathlib-decls.sqlite3 \
+  --mathlib-revision <exact-git-revision> \
+  --lean-toolchain leanprover/lean4:v4.9.0
+```
+
+`run_docker.sh` 会计算文件 SHA-256、读取 index 内的 revision，并通过只读 mount
+传给 preflight。也可显式设置 `CONTEXTSWARM_MINI_DECL_INDEX_SHA256` 和
+`CONTEXTSWARM_MINI_MATHLIB_REVISION` 固定 operator contract。paper-facing run 在
+index 缺失、schema/SHA 不符、或 index revision 与 Judge health/probe 不一致时
+fail closed；不会悄悄把不匹配的文本搜索算作 formal tool。
+
 ## CPS 接口
 
 CPS worker 在工作目录中获得 `./context_piece`：
@@ -217,8 +284,22 @@ admission budget 内有界重试；已经排队后才返回的 terminal、retrya
 `rejected_overloaded` 至多重交一次 whole job。结果不明的 socket/proxy 失败不会
 盲目重交，以免复制仍在运行的 job。Judge 的 `error_kind`、
 `terminal_reason`、queue/execution timing 会保留在安全摘要中，以区分证明错误、
-执行超时、资源限制、过载和基础设施故障。只有 canonical `PROVED` / `AC`
-verdict 计入分数。
+执行超时、资源限制、过载和基础设施故障。
+
+正分判定是 fail-closed 的：只接受 schema 为
+`contextswarm_formal_verdict_v1` 且同时满足 `status=PROVED`、`correct=true`、
+`cheating=false`、`score=1`、`is_valid_no_sorry=true`、
+`source_contract_status=ok`、`signature_check_status=ok` 的 canonical verdict；Judge
+若返回 `solution_hash`，还必须等于 broker 捕获 bytes 的 SHA-256。旧式 `PASS`、
+`AC`、top-level `success=true` 或单独的 `PROVED` 字样都只能作为诊断，不能得分。
+最终 `scoreboard_history.jsonl` 只由 bounded outer-official closeout 写入；其 deadline
+从候选实际冻结时开始，而不是从预定 solver deadline 倒推。缺少任一 official row 时
+`final.json` 仍保留全部 selected task、固定 `max_score`，并明确标记
+`OFFICIAL_VERDICT_MISSING`/`INCOMPLETE`。
+
+这个实现没有增加跨 experiment cell 的锁、序列化或 evaluator partition。不同 cell
+继续共享 operator 提供的 NuRouter 和 Judge 基础服务；run-local broker 只负责本 cell
+的 capability、预算、snapshot 和 official/diagnostic lane 分离。
 
 ## 数据来源
 

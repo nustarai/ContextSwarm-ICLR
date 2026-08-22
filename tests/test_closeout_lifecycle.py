@@ -15,11 +15,13 @@ from unittest.mock import patch
 from contextswarm_mini.config import load_config
 from contextswarm_mini.context_piece import main as context_piece_main
 from contextswarm_mini.cps import CPSStore
+from contextswarm_mini.evaluator_broker import EvaluatorBroker
 from contextswarm_mini.models import Task, Verdict
 from contextswarm_mini.runner import (
     RunLogger,
     _freeze_closeout_candidates,
     _mock_result,
+    _write_final,
     load_tasks,
     run_experiment,
 )
@@ -34,14 +36,15 @@ class _SlowEvaluator:
     def __init__(self, *, prove_without_sorry: bool = False):
         del prove_without_sorry
 
-    def evaluate(
+    def evaluate_bytes(
         self,
         task: Task,
-        _candidate: Path,
+        _candidate: bytes,
         *,
         deadline_monotonic: float | None = None,
+        started: float | None = None,
     ) -> Verdict:
-        del deadline_monotonic
+        del deadline_monotonic, started
         time.sleep(self.delay_seconds)
         return Verdict(task.slug, "VERIFY_FAIL", 0.0, self.delay_seconds)
 
@@ -49,33 +52,39 @@ class _SlowEvaluator:
 class _ProvingEvaluator(_SlowEvaluator):
     delay_seconds = 0.0
 
-    def evaluate(
+    def evaluate_bytes(
         self,
         task: Task,
-        _candidate: Path,
+        _candidate: bytes,
         *,
         deadline_monotonic: float | None = None,
+        started: float | None = None,
     ) -> Verdict:
-        del deadline_monotonic
+        del deadline_monotonic, started
         return Verdict(task.slug, "PROVED", 1.0, 0.0)
 
 
 class _RecordingEvaluator(_SlowEvaluator):
-    calls: list[tuple[str, Path, float | None, str]] = []
+    calls: list[tuple[str, str, str]] = []
     lock = threading.Lock()
 
-    def evaluate(
+    def evaluate_bytes(
         self,
         task: Task,
-        candidate: Path,
+        candidate: bytes,
         *,
         deadline_monotonic: float | None = None,
+        started: float | None = None,
     ) -> Verdict:
-        payload = candidate.read_bytes()
-        digest = hashlib.sha256(payload).hexdigest()
+        del started
+        digest = hashlib.sha256(candidate).hexdigest()
+        phase = (
+            "closeout"
+            if deadline_monotonic is not None and deadline_monotonic - time.monotonic() > 60
+            else "solver"
+        )
         with self.lock:
-            self.calls.append((task.slug, candidate.resolve(), deadline_monotonic, digest))
-        phase = "closeout" if deadline_monotonic is None else "solver"
+            self.calls.append((task.slug, phase, digest))
         return Verdict(
             task.slug,
             "PROVED" if phase == "closeout" else "VERIFY_FAIL",
@@ -88,18 +97,44 @@ class _RecordingEvaluator(_SlowEvaluator):
 class _CancelledEvaluator(_SlowEvaluator):
     delay_seconds = 0.0
 
-    def evaluate(
+    def evaluate_bytes(
         self,
         task: Task,
-        _candidate: Path,
+        _candidate: bytes,
         *,
         deadline_monotonic: float | None = None,
+        started: float | None = None,
     ) -> Verdict:
-        del deadline_monotonic
+        del deadline_monotonic, started
         return Verdict(task.slug, "CANCELLED", 0.0, 0.0)
 
 
 class CloseoutLifecycleTests(unittest.TestCase):
+    def test_final_fills_missing_official_rows_without_shrinking_max_score(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = replace(load_config("configs/parallel.toml", ROOT), max_tasks=2)
+            tasks = load_tasks(config)
+            _write_final(
+                root,
+                config,
+                tasks,
+                {tasks[0].slug: Verdict(tasks[0].slug, "PROVED", 1.0, 0.0)},
+                [],
+                status="COMPLETED",
+                cps_summary=None,
+            )
+            final = json.loads((root / "final.json").read_text(encoding="utf-8"))
+            self.assertEqual(final["status"], "INCOMPLETE")
+            self.assertEqual(final["max_score"], 2)
+            self.assertEqual(final["selected_task_count"], 2)
+            self.assertEqual(final["official_verdict_count"], 1)
+            self.assertEqual(final["missing_official_verdict_count"], 1)
+            self.assertEqual(
+                final["verdicts"][tasks[1].slug]["status"],
+                "OFFICIAL_VERDICT_MISSING",
+            )
+
     def test_all_modes_use_the_same_frozen_closeout_phase(self) -> None:
         for manifest in ("configs/mono.toml", "configs/parallel.toml", "configs/cps.toml"):
             with self.subTest(manifest=manifest), tempfile.TemporaryDirectory() as temporary:
@@ -110,6 +145,8 @@ class CloseoutLifecycleTests(unittest.TestCase):
                     max_attempts_per_task=1,
                     time_limit_seconds=2,
                     lean_max_concurrent_evaluations=1,
+                    lean_official_reserved_evaluations=0,
+                    lean_agent_local_cutoff_seconds=0,
                 )
                 _RecordingEvaluator.calls = []
                 with patch("contextswarm_mini.runner.MockEvaluator", _RecordingEvaluator):
@@ -125,14 +162,13 @@ class CloseoutLifecycleTests(unittest.TestCase):
                 )["candidates"]
                 self.assertEqual(len(frozen), 2)
                 self.assertTrue(all(row["candidate_sha256"] for row in frozen))
-                closeout_calls = [call for call in _RecordingEvaluator.calls if call[2] is None]
+                closeout_calls = [call for call in _RecordingEvaluator.calls if call[1] == "closeout"]
                 self.assertEqual(len(closeout_calls), 2)
                 frozen_hashes = {
                     row["task_id"]: row["candidate_sha256"] for row in frozen
                 }
-                for task_id, candidate, deadline, digest in closeout_calls:
-                    self.assertIsNone(deadline)
-                    self.assertTrue(candidate.is_relative_to(run_dir / "closeout_candidates"))
+                for task_id, phase, digest in closeout_calls:
+                    self.assertEqual(phase, "closeout")
                     self.assertEqual(digest, frozen_hashes[task_id])
                 self.assertEqual(
                     {
@@ -172,6 +208,8 @@ class CloseoutLifecycleTests(unittest.TestCase):
                     max_parallel=2,
                     time_limit_seconds=1,
                     lean_max_concurrent_evaluations=1,
+                    lean_official_reserved_evaluations=0,
+                    lean_agent_local_cutoff_seconds=0,
                 )
                 run_dir = run_experiment(
                     config,
@@ -209,12 +247,23 @@ class CloseoutLifecycleTests(unittest.TestCase):
             source.parent.mkdir(parents=True)
             original = task.baseline_code
             source.write_text(original, encoding="utf-8")
-            frozen = _freeze_closeout_candidates(
+            broker = EvaluatorBroker(
                 config,
                 [task],
                 root,
-                RunLogger(root),
-            )[task.slug]
+                _SlowEvaluator(),
+                solver_deadline_monotonic=time.monotonic() + 1,
+            )
+            try:
+                frozen = _freeze_closeout_candidates(
+                    config,
+                    [task],
+                    root,
+                    RunLogger(root),
+                    broker,
+                )[task.slug]
+            finally:
+                broker.close()
             source.write_text("changed after freeze\n", encoding="utf-8")
 
             self.assertEqual(frozen.path.read_text(encoding="utf-8"), original)
@@ -234,6 +283,7 @@ class CloseoutLifecycleTests(unittest.TestCase):
                     max_attempts_per_task=2,
                     time_limit_seconds=2,
                     lean_max_concurrent_evaluations=1,
+                    lean_official_reserved_evaluations=0,
                 )
                 run_dir = run_experiment(
                     config,
@@ -318,6 +368,7 @@ class CloseoutLifecycleTests(unittest.TestCase):
                 max_attempts_per_task=0,
                 time_limit_seconds=0.05,
                 lean_max_concurrent_evaluations=1,
+                lean_official_reserved_evaluations=0,
             )
             with patch("contextswarm_mini.runner.MockEvaluator", _SlowEvaluator):
                 run_dir = run_experiment(
@@ -347,6 +398,7 @@ class CloseoutLifecycleTests(unittest.TestCase):
                     max_attempts_per_task=1,
                     time_limit_seconds=0.2,
                     lean_max_concurrent_evaluations=1,
+                    lean_official_reserved_evaluations=0,
                 )
                 run_dir = run_experiment(
                     config,
@@ -448,6 +500,10 @@ class CloseoutLifecycleTests(unittest.TestCase):
         )
         expected_task_contract: tuple[tuple[str, str, str, str], ...] | None = None
         semantic_evaluator_contracts: set[tuple[object, ...]] = set()
+        formal_tool_contracts: set[tuple[object, ...]] = set()
+        cutoff_contracts: dict[tuple[int, str], set[int]] = {
+            group: set() for group in groups
+        }
         transport_contracts: set[tuple[object, ...]] = set()
 
         for (duration, endpoint), manifests in groups.items():
@@ -478,10 +534,30 @@ class CloseoutLifecycleTests(unittest.TestCase):
                         (
                             config.lean_env_id,
                             config.lean_timeout_seconds,
+                            config.lean_max_lifecycle_seconds,
                             config.lean_max_concurrent_evaluations,
+                            config.lean_official_reserved_evaluations,
+                            config.lean_closeout_timeout_seconds,
                             config.lean_verification_profile,
                             config.lean_judge_mode,
                         )
+                    )
+                    formal_tool_contracts.add(
+                        (
+                            config.formal_tools_enabled,
+                            config.formal_tools_version,
+                            config.formal_tools_evaluate_calls_per_task,
+                            config.formal_tools_evaluate_backend_jobs_per_task,
+                            config.formal_tools_query_calls_per_task,
+                            config.formal_tools_query_backend_probes_per_task,
+                            config.formal_tools_max_candidate_bytes,
+                            config.formal_tools_command_timeout_seconds,
+                            config.formal_tools_require_decl_index,
+                            config.pi_guard_extension,
+                        )
+                    )
+                    cutoff_contracts[(duration, endpoint)].add(
+                        config.lean_agent_local_cutoff_seconds
                     )
                     transport_contracts.add(
                         (
@@ -495,7 +571,17 @@ class CloseoutLifecycleTests(unittest.TestCase):
                     )
 
         self.assertEqual(len(semantic_evaluator_contracts), 1)
-        self.assertEqual(semantic_evaluator_contracts.pop()[2], 4)
+        self.assertEqual(semantic_evaluator_contracts.pop()[3], 4)
+        self.assertEqual(len(formal_tool_contracts), 1)
+        self.assertTrue(formal_tool_contracts.pop()[0])
+        self.assertEqual(
+            cutoff_contracts,
+            {
+                (3600, "http://127.0.0.1:18000"): {330},
+                (3600, "http://127.0.0.1:19000"): {330},
+                (180, "http://127.0.0.1:19000"): {30},
+            },
+        )
         self.assertEqual(len(transport_contracts), 1)
 
 

@@ -1,62 +1,52 @@
 from __future__ import annotations
 
-from pathlib import Path
+import threading
+import time
 import unittest
-from unittest.mock import patch
 
-from contextswarm_mini.models import Task, Verdict
-from contextswarm_mini.runner import _evaluate_candidate
-
-
-class _DelayedAvailabilityGate:
-    """Act like a busy evaluator gate that becomes available after 30s."""
-
-    def __init__(self) -> None:
-        self.timeouts: list[float] = []
-        self.releases = 0
-
-    def acquire(self, *, timeout: float) -> bool:
-        self.timeouts.append(timeout)
-        return timeout > 30.0
-
-    def release(self) -> None:
-        self.releases += 1
-
-
-class _RecordingEvaluator:
-    def __init__(self) -> None:
-        self.deadlines: list[float] = []
-
-    def evaluate(self, task: Task, _candidate: Path, *, deadline_monotonic: float) -> Verdict:
-        self.deadlines.append(deadline_monotonic)
-        return Verdict(task.slug, "PROVED", 1.0, 0.0)
+from contextswarm_mini.evaluator_broker import BrokerError, _PriorityAdmission
 
 
 class EvaluatorAdmissionTests(unittest.TestCase):
-    def test_gate_wait_uses_full_remaining_horizon(self) -> None:
-        task = Task(
-            slug="task",
-            root=Path("."),
-            problem_text="",
-            baseline_code="",
-            metadata={},
-        )
-        gate = _DelayedAvailabilityGate()
-        evaluator = _RecordingEvaluator()
+    def test_waiter_uses_the_remaining_deadline(self) -> None:
+        admission = _PriorityAdmission(1, 0)
+        outcome: list[str] = []
 
-        with patch("contextswarm_mini.runner.time.monotonic", return_value=100.0):
-            verdict = _evaluate_candidate(
-                evaluator,
-                task,
-                Path("result.lean"),
-                deadline=145.0,
-                gate=gate,  # type: ignore[arg-type]
-            )
+        def wait_for_slot() -> None:
+            try:
+                with admission.acquire("agent_local", deadline=time.monotonic() + 0.5):
+                    outcome.append("admitted")
+            except BrokerError:
+                outcome.append("timed_out")
 
-        self.assertEqual(verdict.status, "PROVED")
-        self.assertEqual(gate.timeouts, [45.0])
-        self.assertEqual(gate.releases, 1)
-        self.assertEqual(evaluator.deadlines, [145.0])
+        with admission.acquire("agent_local", deadline=time.monotonic() + 1):
+            thread = threading.Thread(target=wait_for_slot)
+            thread.start()
+            time.sleep(0.05)
+            self.assertEqual(outcome, [])
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome, ["admitted"])
+
+    def test_reserved_capacity_remains_available_to_official_closeout(self) -> None:
+        admission = _PriorityAdmission(2, 1)
+        local_outcome: list[str] = []
+
+        def second_local() -> None:
+            try:
+                with admission.acquire("formal_query", deadline=time.monotonic() + 0.08):
+                    local_outcome.append("admitted")
+            except BrokerError:
+                local_outcome.append("timed_out")
+
+        with admission.acquire("agent_local", deadline=time.monotonic() + 1):
+            thread = threading.Thread(target=second_local)
+            thread.start()
+            with admission.acquire("official", deadline=time.monotonic() + 0.5):
+                thread.join(timeout=0.5)
+
+        self.assertEqual(local_outcome, ["timed_out"])
 
 
 if __name__ == "__main__":

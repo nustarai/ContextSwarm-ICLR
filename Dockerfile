@@ -7,7 +7,9 @@ ARG CODEX_VERSION=0.148.0
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/opt/contextswarm \
-    CONTEXTSWARM_REPO_ROOT=/opt/contextswarm
+    CONTEXTSWARM_REPO_ROOT=/opt/contextswarm \
+    CONTEXTSWARM_MINI_PI_VERSION=${PI_VERSION} \
+    CONTEXTSWARM_MINI_CODEX_VERSION=${CODEX_VERSION}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 ca-certificates git bash procps \

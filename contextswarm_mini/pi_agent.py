@@ -34,6 +34,18 @@ _CPS_ENVIRONMENT_KEYS = frozenset(
         "CONTEXTSWARM_TASK_ROOT",
     }
 )
+_SAFE_PARENT_ENVIRONMENT_KEYS = frozenset(
+    {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TERM",
+        "TZ",
+    }
+)
 
 
 def now_iso() -> str:
@@ -78,10 +90,17 @@ class PiAgent:
             command.extend(["--session-dir", str(session_dir)])
         if session_id:
             command.extend(["--session-id", session_id])
+        if self.config.formal_tools_enabled and self.config.pi_guard_extension.strip():
+            guard_path = self.config.resolve_runtime_path(self.config.pi_guard_extension)
+            if not guard_path.is_file():
+                raise ValueError(f"formal worker guard extension is unavailable: {guard_path}")
+            command.extend(["--extension", str(guard_path)])
         extension = self.config.pi_extension.strip()
         if self.config.fast_mode and extension:
             extension_path = self.config.resolve_runtime_path(extension)
-            if extension_path.is_file():
+            if extension_path.is_file() and extension_path != self.config.resolve_runtime_path(
+                self.config.pi_guard_extension
+            ):
                 command.extend(["--extension", str(extension_path)])
         if self.config.model:
             command.extend(["--model", self.config.model])
@@ -95,34 +114,50 @@ class PiAgent:
         workdir: Path,
         extra_env: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
-        env = dict(os.environ)
-        # A notebook/operator shell may still carry variables from a previous
-        # CPS run.  Baselines inherit the ordinary process environment, but
-        # never an implicit communication surface; CPS call sites explicitly
-        # add the current run's values through ``extra_env`` below.
-        for key in tuple(env):
-            if key in _CPS_ENVIRONMENT_KEYS or key.startswith("CONTEXTSWARM_CPS_"):
-                env.pop(key, None)
+        # The model-facing Pi process receives an explicit allowlist, not the
+        # operator shell. Judge credentials and raw endpoint variables stay in
+        # the trusted runner/broker process.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in _SAFE_PARENT_ENVIRONMENT_KEYS and isinstance(value, str)
+        }
+        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+        private_home = workdir / ".runtime" / "home"
+        private_tmp = workdir / ".runtime" / "tmp"
+        for directory in (private_home, private_tmp):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(directory, 0o700)
         env.update(
             {
+                "HOME": str(private_home),
+                "TMPDIR": str(private_tmp),
                 "PI_BIN": self.binary(),
                 "EXPERIMENT_PI_BINARY": self.binary(),
                 "CONTEXTSWARM_TASK_ID": task_id,
                 "CONTEXTSWARM_ACTOR_ID": actor_id,
                 "CONTEXTSWARM_WORKDIR": str(workdir),
+                "CONTEXTSWARM_EXPERIMENT_MODE": self.config.mode,
                 "CONTEXTSWARM_EXPERIMENT_SEED": str(self.config.seed),
+                "CONTEXTSWARM_WORKER_GUARD": "1" if self.config.formal_tools_enabled else "0",
+                "CONTEXTSWARM_WORKER_MAX_WRITE_BYTES": str(
+                    self.config.formal_tools_max_candidate_bytes
+                ),
+                "CONTEXTSWARM_EVALUATOR_COMMAND_TIMEOUT_SECONDS": str(
+                    self.config.formal_tools_command_timeout_seconds
+                ),
                 "AISW_LEASE_WAIT_SECONDS": str(self.config.aisw_lease_wait_seconds),
                 "AISW_LEASE_RETRY_INTERVAL_SECONDS": str(self.config.aisw_lease_retry_interval_seconds),
             }
         )
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        repo_path = str(self.config.repo_root)
-        env["PYTHONPATH"] = repo_path if not existing_pythonpath else f"{repo_path}{os.pathsep}{existing_pythonpath}"
+        env["PYTHONPATH"] = str(self.config.repo_root)
         if self.config.aisw_enabled:
-            env["AISW_HOME"] = env.get("AISW_HOME", "/run/contextswarm-aisw")
+            env["AISW_HOME"] = os.environ.get("AISW_HOME", "/run/contextswarm-aisw")
             env["CONTEXTSWARM_AISW_PRIVATE_HOME_REQUIRED"] = "1"
             env["AISW_DISABLE_LOCAL_FALLBACK"] = "1"
-            env["CONTEXTSWARM_REAL_PI_BINARY"] = env.get("CONTEXTSWARM_REAL_PI_BINARY", "/usr/local/bin/pi")
+            env["CONTEXTSWARM_REAL_PI_BINARY"] = os.environ.get(
+                "CONTEXTSWARM_REAL_PI_BINARY", "/usr/local/bin/pi"
+            )
             node_config = os.environ.get("MINI_SWARM_AISW_NODE_CONFIG", "").strip() or self.config.aisw_node_config.strip()
             if node_config:
                 env["AISW_NODE_CONFIG"] = str(self.config.resolve_runtime_path(node_config))
@@ -138,6 +173,16 @@ class PiAgent:
                 self.trace_path.with_name("pi_fast_mode_provider_requests.jsonl")
             )
         if extra_env:
+            unexpected = {
+                str(key)
+                for key in extra_env
+                if str(key) not in _CPS_ENVIRONMENT_KEYS
+            }
+            if unexpected:
+                raise ValueError(
+                    "unexpected worker environment capability: "
+                    + ", ".join(sorted(unexpected))
+                )
             env.update({str(key): str(value) for key, value in extra_env.items()})
         return env
 

@@ -37,8 +37,8 @@ Task: {task.slug}
 Workspace: {task_workspace}
 The public statement is in problem.md. The immutable starting skeleton is in baseline/.
 Write your candidate proof only to result.lean and preserve the theorem statement,
-imports, namespace, and source contract. The external Lean evaluator is the only
-authority for success; do not claim success from intuition or a local text scan.
+imports, namespace, and source contract. PUBLIC_FILES.md lists the complete public
+file and capability surface for this task.
 
 {_communication_instructions(communication_enabled)}
 
@@ -63,6 +63,7 @@ For each task, read its problem.md and baseline/*.lean, then write the candidate
 tasks/<slug>/result.lean (the runner also maintains the aggregate result.json bundle).
 Do not modify the source statement or baseline. The runner
 evaluates every candidate after this session and counts only canonical PROVED verdicts.
+Each task directory has a PUBLIC_FILES.md capability manifest.
 
 {_communication_instructions(communication_enabled)}
 

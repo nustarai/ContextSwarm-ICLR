@@ -59,8 +59,37 @@ env_id = "formal_matholympiadbench"
 timeout_seconds = 300
 max_lifecycle_seconds = 3600
 max_concurrent_evaluations = 4
+# One slot remains available to feedback-free outer closeout whenever total
+# capacity is greater than one. This reservation is run-local; experiment
+# cells still share the same external Judge service as before.
+official_reserved_evaluations = 1
+# Stop admitting optional solver feedback near the one-hour boundary so
+# already-running probes can settle and the candidate set can freeze cleanly.
+agent_local_cutoff_seconds = 330
+# Solving still stops at experiment.time_limit_seconds. This separate bound is
+# only for evaluating the already-frozen candidates.
+closeout_timeout_seconds = 14400
 verification_profile = "formal_proof"
 judge_mode = "fast"
+
+[formal_tools]
+enabled = true
+surface_version = "contextswarm_mini_formal_tools_v1"
+evaluate_calls_per_task = 120
+evaluate_backend_jobs_per_task = 120
+query_calls_per_task = 60
+query_backend_probes_per_task = 120
+max_candidate_bytes = 2097152
+# Pi's Bash tool must not terminate a legal 300-second Judge call first.
+command_timeout_seconds = 420
+# Supply a revision-matched index through an operator-local manifest or
+# CONTEXTSWARM_MINI_DECL_INDEX. Formal preflight fails closed while this is
+# required but missing; no paper run silently claims declaration search.
+decl_index = ""
+decl_index_sha256 = ""
+mathlib_revision = ""
+require_decl_index = true
+pi_guard_extension = "contextswarm_mini/pi_worker_guard.mjs"
 
 [docker]
 image = "contextswarm-iclr-mini:latest"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import copy
+import ipaddress
 from pathlib import Path
 import tomllib
 from typing import Any, Mapping
@@ -125,8 +126,24 @@ class ExperimentConfig:
     lean_timeout_seconds: int
     lean_max_lifecycle_seconds: int
     lean_max_concurrent_evaluations: int
+    lean_official_reserved_evaluations: int
+    lean_agent_local_cutoff_seconds: int
+    lean_closeout_timeout_seconds: int
     lean_verification_profile: str
     lean_judge_mode: str
+    formal_tools_enabled: bool
+    formal_tools_version: str
+    formal_tools_evaluate_calls_per_task: int
+    formal_tools_evaluate_backend_jobs_per_task: int
+    formal_tools_query_calls_per_task: int
+    formal_tools_query_backend_probes_per_task: int
+    formal_tools_max_candidate_bytes: int
+    formal_tools_command_timeout_seconds: int
+    formal_tools_decl_index: str
+    formal_tools_decl_index_sha256: str
+    formal_tools_mathlib_revision: str
+    formal_tools_require_decl_index: bool
+    pi_guard_extension: str
     docker_image: str
     docker_memory_mb: int
     docker_internet: str
@@ -191,8 +208,24 @@ class ExperimentConfig:
             "lean_timeout_seconds": self.lean_timeout_seconds,
             "lean_max_lifecycle_seconds": self.lean_max_lifecycle_seconds,
             "lean_max_concurrent_evaluations": self.lean_max_concurrent_evaluations,
+            "lean_official_reserved_evaluations": self.lean_official_reserved_evaluations,
+            "lean_agent_local_cutoff_seconds": self.lean_agent_local_cutoff_seconds,
+            "lean_closeout_timeout_seconds": self.lean_closeout_timeout_seconds,
             "lean_verification_profile": self.lean_verification_profile,
             "lean_judge_mode": self.lean_judge_mode,
+            "formal_tools_enabled": self.formal_tools_enabled,
+            "formal_tools_version": self.formal_tools_version,
+            "formal_tools_evaluate_calls_per_task": self.formal_tools_evaluate_calls_per_task,
+            "formal_tools_evaluate_backend_jobs_per_task": self.formal_tools_evaluate_backend_jobs_per_task,
+            "formal_tools_query_calls_per_task": self.formal_tools_query_calls_per_task,
+            "formal_tools_query_backend_probes_per_task": self.formal_tools_query_backend_probes_per_task,
+            "formal_tools_max_candidate_bytes": self.formal_tools_max_candidate_bytes,
+            "formal_tools_command_timeout_seconds": self.formal_tools_command_timeout_seconds,
+            "formal_tools_decl_index_configured": bool(self.formal_tools_decl_index),
+            "formal_tools_decl_index_sha256": self.formal_tools_decl_index_sha256,
+            "formal_tools_mathlib_revision": self.formal_tools_mathlib_revision,
+            "formal_tools_require_decl_index": self.formal_tools_require_decl_index,
+            "pi_guard_extension_configured": bool(self.pi_guard_extension),
             "docker_image": self.docker_image,
             "docker_memory_mb": self.docker_memory_mb,
             "docker_internet": self.docker_internet,
@@ -224,6 +257,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         aisw_payload = payload.get("nurouter")
     aisw = _as_dict(aisw_payload, "aisw")
     lean = _as_dict(payload.get("lean"), "lean")
+    formal_tools = _as_dict(payload.get("formal_tools"), "formal_tools")
     docker = _as_dict(payload.get("docker"), "docker")
 
     mode = _text(experiment.get("mode"), "cps").lower()
@@ -329,8 +363,89 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         "lean.max_concurrent_evaluations",
         1,
     )
+    official_reserved_default = 1 if lean_max_evaluations > 1 else 0
+    lean_official_reserved = _nonnegative_int(
+        lean.get("official_reserved_evaluations"),
+        "lean.official_reserved_evaluations",
+        official_reserved_default,
+    )
+    if lean_official_reserved >= lean_max_evaluations:
+        raise ConfigError(
+            "lean.official_reserved_evaluations must be smaller than "
+            "lean.max_concurrent_evaluations"
+        )
+    lean_agent_local_cutoff = _nonnegative_int(
+        lean.get("agent_local_cutoff_seconds"),
+        "lean.agent_local_cutoff_seconds",
+        min(horizon, lean_timeout + 30),
+    )
+    lean_closeout_timeout = _positive_int(
+        lean.get("closeout_timeout_seconds"),
+        "lean.closeout_timeout_seconds",
+        max(3_600, lean_max_lifecycle * 4),
+    )
     profile = _text(lean.get("verification_profile"), "formal_proof")
     judge_mode = _text(lean.get("judge_mode"), "fast")
+
+    formal_tools_enabled = bool(formal_tools.get("enabled", True))
+    formal_tools_version = _text(
+        formal_tools.get("surface_version"),
+        "contextswarm_mini_formal_tools_v1",
+    )
+    evaluate_calls = _positive_int(
+        formal_tools.get("evaluate_calls_per_task"),
+        "formal_tools.evaluate_calls_per_task",
+        120,
+    )
+    evaluate_backend_jobs = _positive_int(
+        formal_tools.get("evaluate_backend_jobs_per_task"),
+        "formal_tools.evaluate_backend_jobs_per_task",
+        evaluate_calls,
+    )
+    query_calls = _positive_int(
+        formal_tools.get("query_calls_per_task"),
+        "formal_tools.query_calls_per_task",
+        60,
+    )
+    query_backend_probes = _positive_int(
+        formal_tools.get("query_backend_probes_per_task"),
+        "formal_tools.query_backend_probes_per_task",
+        120,
+    )
+    max_candidate_bytes = _positive_int(
+        formal_tools.get("max_candidate_bytes"),
+        "formal_tools.max_candidate_bytes",
+        2 * 1024 * 1024,
+    )
+    command_timeout = _positive_int(
+        formal_tools.get("command_timeout_seconds"),
+        "formal_tools.command_timeout_seconds",
+        lean_timeout + 120,
+    )
+    if command_timeout < lean_timeout:
+        raise ConfigError(
+            "formal_tools.command_timeout_seconds must be at least lean.timeout_seconds"
+        )
+    decl_index = _text(formal_tools.get("decl_index"))
+    decl_index_sha256 = _text(formal_tools.get("decl_index_sha256")).lower()
+    if decl_index_sha256 and (
+        len(decl_index_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in decl_index_sha256)
+    ):
+        raise ConfigError("formal_tools.decl_index_sha256 must be a lowercase SHA-256")
+    mathlib_revision = _text(formal_tools.get("mathlib_revision"))
+    require_decl_index = bool(formal_tools.get("require_decl_index", True))
+    pi_guard_extension = _text(
+        formal_tools.get("pi_guard_extension"),
+        "contextswarm_mini/pi_worker_guard.mjs",
+    )
+    if formal_tools_enabled and lean_agent_local_cutoff >= horizon:
+        raise ConfigError(
+            "lean.agent_local_cutoff_seconds must be smaller than "
+            "experiment.time_limit_seconds while formal tools are enabled"
+        )
+    if formal_tools_enabled and not pi_guard_extension:
+        raise ConfigError("formal_tools.pi_guard_extension is required when tools are enabled")
 
     cfg = ExperimentConfig(
         manifest_path=manifest_path,
@@ -375,8 +490,24 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         lean_timeout_seconds=lean_timeout,
         lean_max_lifecycle_seconds=lean_max_lifecycle,
         lean_max_concurrent_evaluations=lean_max_evaluations,
+        lean_official_reserved_evaluations=lean_official_reserved,
+        lean_agent_local_cutoff_seconds=lean_agent_local_cutoff,
+        lean_closeout_timeout_seconds=lean_closeout_timeout,
         lean_verification_profile=profile,
         lean_judge_mode=judge_mode,
+        formal_tools_enabled=formal_tools_enabled,
+        formal_tools_version=formal_tools_version,
+        formal_tools_evaluate_calls_per_task=evaluate_calls,
+        formal_tools_evaluate_backend_jobs_per_task=evaluate_backend_jobs,
+        formal_tools_query_calls_per_task=query_calls,
+        formal_tools_query_backend_probes_per_task=query_backend_probes,
+        formal_tools_max_candidate_bytes=max_candidate_bytes,
+        formal_tools_command_timeout_seconds=command_timeout,
+        formal_tools_decl_index=decl_index,
+        formal_tools_decl_index_sha256=decl_index_sha256,
+        formal_tools_mathlib_revision=mathlib_revision,
+        formal_tools_require_decl_index=require_decl_index,
+        pi_guard_extension=pi_guard_extension,
         docker_image=_text(docker.get("image"), "contextswarm-iclr-mini:latest"),
         docker_memory_mb=_positive_int(docker.get("memory_mb"), "docker.memory_mb", 16384),
         docker_internet=_text(docker.get("internet"), "online"),
@@ -395,6 +526,14 @@ def _redact_endpoint(raw: str) -> str:
         return "<configured>" if value else ""
     if parsed.scheme and parsed.hostname:
         host = parsed.hostname
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host.lower() == "localhost"
+        if not loopback:
+            return "<configured>"
+        if ":" in host:
+            host = f"[{host}]"
         if parsed.port:
             host = f"{host}:{parsed.port}"
         return f"{parsed.scheme}://{host}"
