@@ -429,6 +429,72 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(server.deletes, 1)
         self.assertTrue(verdict.response["cancel_requested"])
 
+    def test_horizon_cancel_defers_known_job_until_router_receipt(self) -> None:
+        """A deadline-driven DELETE must not latch the whole evaluator."""
+
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.005,
+            settlement_grace_seconds=0.02,
+            cancel_grace_seconds=0.01,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 1.0
+        foreground_polls = 0
+        delete_seen = False
+        watcher_polls = 0
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            nonlocal delete_seen, foreground_polls, watcher_polls
+            if method == "POST":
+                return {"job_id": "horizon-job", "status": "queued"}
+            if method == "DELETE":
+                delete_seen = True
+                return {
+                    "job_id": "horizon-job",
+                    "status": "cancel_requested",
+                    "cancel_requested": True,
+                    "retryable": True,
+                }
+            # The short foreground reconciliation window sees only a
+            # nonterminal receipt.  The background watcher then observes the
+            # terminal receipt a few polls later.
+            if delete_seen and threading.current_thread().name.startswith(
+                "judge-settlement-"
+            ):
+                watcher_polls += 1
+                if watcher_polls >= 3:
+                    return {"job_id": "horizon-job", "status": "cancelled"}
+            if not evaluator.pending_settlement_watchers:
+                foreground_polls += 1
+            return {"job_id": "horizon-job", "status": "running"}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(evaluator, "_request", side_effect=request):
+                verdict = evaluator.evaluate(
+                    _task(root),
+                    self._candidate(root),
+                    deadline_monotonic=time.monotonic() + 1.05,
+                )
+                self.assertEqual(verdict.status, "TASK_CANCELLED")
+                self.assertTrue(verdict.response["judge_cancellation"]["deferred"])
+                self.assertGreaterEqual(foreground_polls, 1)
+                deadline = time.monotonic() + 1.0
+                while (
+                    evaluator.pending_settlement_watchers
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+
+        self.assertEqual(evaluator.pending_settlement_watchers, 0)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+
     def test_cancel_reconciles_returned_status_capability_before_success(self) -> None:
         evaluator = LeanEvaluator(
             "https://judge.invalid",

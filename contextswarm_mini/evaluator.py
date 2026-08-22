@@ -362,6 +362,33 @@ def _cancel_reason(cancel_event: Any | None) -> str | None:
     return None
 
 
+def _evaluation_cancel_reason(
+    cancel_event: Any | None,
+    *,
+    deadline_monotonic: float | None,
+) -> str | None:
+    """Preserve cancellation provenance when the evaluation horizon wins.
+
+    A formal evaluation can leave its polling loop because the fixed run
+    horizon elapsed without a task-local Event being set.  In that case the
+    submitted Judge job is still a known, runner-owned cancellation: DELETE
+    was intentional and the router may need a little time to publish its
+    terminal receipt.  Treat the elapsed deadline as provenance rather than
+    allowing the short foreground cancel grace to turn it into an unknown
+    remote settlement failure.
+    """
+
+    reason = _cancel_reason(cancel_event)
+    if reason:
+        return reason
+    if (
+        deadline_monotonic is not None
+        and time.monotonic() >= deadline_monotonic
+    ):
+        return "horizon_elapsed"
+    return None
+
+
 def _settlement_callback(cancel_event: Any | None) -> Any | None:
     callback = getattr(cancel_event, "settlement_callback", None)
     if callable(callback):
@@ -1485,7 +1512,10 @@ class LeanEvaluator:
                             job_id,
                             response=response,
                             cancel_endpoint=cancel_endpoint,
-                            cancellation_reason=_cancel_reason(cancel_event),
+                            cancellation_reason=_evaluation_cancel_reason(
+                                cancel_event,
+                                deadline_monotonic=deadline_monotonic,
+                            ),
                             on_settled=settlement_callback,
                         )
                         return self._cancelled_verdict(
@@ -1522,7 +1552,10 @@ class LeanEvaluator:
                                 job_id,
                                 response=response,
                                 cancel_endpoint=cancel_endpoint,
-                                cancellation_reason=_cancel_reason(cancel_event),
+                                cancellation_reason=_evaluation_cancel_reason(
+                                    cancel_event,
+                                    deadline_monotonic=deadline_monotonic,
+                                ),
                                 on_settled=settlement_callback,
                             )
                             return self._cancelled_verdict(
@@ -1596,7 +1629,10 @@ class LeanEvaluator:
                             job_id,
                             response=response,
                             cancel_endpoint=cancel_endpoint,
-                            cancellation_reason=_cancel_reason(cancel_event),
+                            cancellation_reason=_evaluation_cancel_reason(
+                                cancel_event,
+                                deadline_monotonic=deadline_monotonic,
+                            ),
                             on_settled=settlement_callback,
                         )
                         return self._cancelled_verdict(
@@ -1613,7 +1649,10 @@ class LeanEvaluator:
                         job_id,
                         response,
                         cancel_endpoint=cancel_endpoint,
-                        cancellation_reason=_cancel_reason(cancel_event),
+                        cancellation_reason=_evaluation_cancel_reason(
+                            cancel_event,
+                            deadline_monotonic=deadline_monotonic,
+                        ),
                         on_settled=settlement_callback,
                     )
                 )
@@ -1775,7 +1814,10 @@ class LeanEvaluator:
                         job_id,
                         response=response,
                         cancel_endpoint=cancel_endpoint,
-                        cancellation_reason=_cancel_reason(cancel_event),
+                        cancellation_reason=_evaluation_cancel_reason(
+                            cancel_event,
+                            deadline_monotonic=deadline_monotonic,
+                        ),
                         on_settled=settlement_callback,
                     )
                 return self._cancelled_verdict(
@@ -1791,7 +1833,10 @@ class LeanEvaluator:
                         str(job_id),
                         response,
                         cancel_endpoint=cancel_endpoint,
-                        cancellation_reason=_cancel_reason(cancel_event),
+                        cancellation_reason=_evaluation_cancel_reason(
+                            cancel_event,
+                            deadline_monotonic=deadline_monotonic,
+                        ),
                         on_settled=settlement_callback,
                     )
                 )
@@ -2052,18 +2097,23 @@ class LeanEvaluator:
                 )
             )
         if attempted and (
-            cancellation_reason in {"task_solved_by_peer", "broker_revoked"}
+            cancellation_reason
+            in {"task_solved_by_peer", "broker_revoked", "horizon_elapsed"}
             or retryable_cancel_observed
         ):
             # The submission identity is known and a DELETE was attempted, but
             # the terminal receipt may lag the foreground grace window.  Judge
             # routers expose this state as retryable/cancel-requested while a
-            # worker is resetting.  Keep the job's capacity permit retained by
-            # the caller and let a bounded watcher release it only after a
-            # job-bound receipt.  This prevents an ordinary, recoverable
-            # cancellation from latching the whole arm as infrastructure
-            # failure.  Unknown identities and non-retryable malformed
-            # receipts still use the fail-closed path below.
+            # worker is resetting.  A fixed experiment horizon is another
+            # candidate-independent cancellation source: the runner issued
+            # DELETE deliberately and the Judge may publish its receipt just
+            # after the short foreground grace window.  Keep the job's
+            # capacity permit retained by the caller and let a bounded watcher
+            # release it only after a job-bound receipt.  This prevents an
+            # ordinary, recoverable cancellation from latching the whole arm
+            # as infrastructure failure.  Unknown identities and
+            # non-retryable malformed receipts still use the fail-closed path
+            # below.
             deferred = self._start_settlement_watcher(
                 job_id,
                 last_nonterminal,
