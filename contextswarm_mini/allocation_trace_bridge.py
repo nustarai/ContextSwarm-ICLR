@@ -640,6 +640,27 @@ def _record_evidence_id(record: Any) -> str:
     return str(getattr(record, "evidence_id", "") or "").strip()
 
 
+def _record_id(record: Any) -> str:
+    if isinstance(record, Mapping):
+        return str(
+            record.get("record_id")
+            or record.get("event_id")
+            or record.get("id")
+            or ""
+        ).strip()
+    return str(getattr(record, "record_id", "") or "").strip()
+
+
+def _record_source_outcome_id(record: Any) -> str:
+    if isinstance(record, Mapping):
+        return str(
+            record.get("source_outcome_id")
+            or record.get("outcome_id")
+            or ""
+        ).strip()
+    return str(getattr(record, "source_outcome_id", "") or "").strip()
+
+
 def _record_trace_id(record: Any) -> str:
     if isinstance(record, Mapping):
         return str(
@@ -741,7 +762,17 @@ def _trace_references(
         task_id = _record_task_id(record)
         trace_id = _record_trace_id(record)
         evidence_id = _record_evidence_id(record)
-        if task_id in by_task and trace_id and trace_id not in ordinary and evidence_id not in ordinary:
+        ordinary_aliases = (
+            _record_id(record),
+            _record_source_outcome_id(record),
+            evidence_id,
+            trace_id,
+        )
+        if (
+            task_id in by_task
+            and trace_id
+            and ordinary.isdisjoint(value for value in ordinary_aliases if value)
+        ):
             by_task[task_id].add(trace_id[:512])
     return tuple(
         (task_id, tuple(sorted(by_task[task_id])[:100]))

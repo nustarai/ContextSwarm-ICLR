@@ -540,6 +540,41 @@ class AllocationTraceBridgeTests(unittest.TestCase):
         self.assertEqual(projection.source_outcome_ids, ())
         self.assertEqual(view.references_for_task("task-a"), ("trace-a",))
 
+    def test_ordinary_record_and_source_outcome_aliases_do_not_become_references(self) -> None:
+        source = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(
+                        {
+                            "sequence": 1,
+                            "record_id": "ordinary-record",
+                            "task_id": "task-a",
+                            "kind": "piece_snapshot",
+                            "trace_id": "trace-from-record",
+                            "active": True,
+                        },
+                        {
+                            "sequence": 2,
+                            "record_id": "row-2",
+                            "source_outcome_id": "ordinary-source",
+                            "task_id": "task-a",
+                            "kind": "piece_snapshot",
+                            "trace_id": "trace-from-source-outcome",
+                            "active": True,
+                        },
+                    ),
+                    trace_watermark="W",
+                )
+            ]
+        )
+        view = TraceProjectionBridge().read(
+            ["task-a"],
+            store=source,
+            ordinary_outcome_ids=("ordinary-record", "ordinary-source"),
+        )
+        self.assertEqual(view.source, "selection_store_snapshot")
+        self.assertEqual(view.references_for_task("task-a"), ())
+
     def test_snapshot_watermark_drift_cursor_replay_and_source_head_fail_closed(self) -> None:
         drift = _SnapshotStore(
             [
