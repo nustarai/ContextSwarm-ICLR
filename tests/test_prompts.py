@@ -18,8 +18,7 @@ from contextswarm_mini.prompts import (
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_ROOT = ROOT / "benchmarks" / "matholympiadbench"
-WORK_MODE_MARKER = "        ## Work Mode\n\n"
-NEXT_SECTION = "\n        ## "
+WORK_MODE_HEADING = re.compile(r"(?m)^(?P<indent>[ ]*)## Work Mode[ ]*\n\n")
 CPS_TOOLS = (
     "cps_search",
     "cps_publish",
@@ -98,12 +97,22 @@ class PromptContractTests(unittest.TestCase):
         self.assertEqual(len(paths), 12)
         for path in paths:
             source = path.read_text(encoding="utf-8")
-            _, marker, after = source.partition(WORK_MODE_MARKER)
+            marker = WORK_MODE_HEADING.search(source)
             with self.subTest(problem=path.parent.name):
-                self.assertEqual(marker, WORK_MODE_MARKER)
-                next_section = after.find(NEXT_SECTION)
-                actual = after[:next_section] if next_section >= 0 else after.rstrip("\n")
-                self.assertEqual(actual, render_problem_work_mode())
+                self.assertIsNotNone(marker)
+                assert marker is not None
+                indent = marker.group("indent")
+                after = source[marker.end() :]
+                next_heading = re.search(
+                    rf"(?m)^{re.escape(indent)}## [^#]",
+                    after,
+                )
+                actual = (
+                    after[: next_heading.start()].rstrip("\n")
+                    if next_heading
+                    else after.rstrip("\n")
+                )
+                self.assertEqual(actual, render_problem_work_mode(indent=indent))
 
     def test_problem_work_mode_sync_check_passes(self) -> None:
         result = subprocess.run(

@@ -23,6 +23,18 @@
   ],
   "split": "test",
   "solved": true,
+  "benchmark_revision": "matholympiadbench-latest12-integrity-v2",
+  "semantics_revision": 2,
+  "upstream_dataset_repository": "https://huggingface.co/datasets/Goedel-LM/MathOlympiadBench",
+  "upstream_dataset_revision": "390cec5f70461573a41f9be1576777264e2fc3d1",
+  "upstream_dataset_artifact": "MOBench.jsonl",
+  "upstream_repository": "https://github.com/dwrensha/compfiles",
+  "upstream_problem_path": "Compfiles/UK2024R1P1.lean",
+  "upstream_statement_commit": "8cc036358767cc9d2c3d2c285b267a26efebb02f",
+  "contextswarm_fix_commit": "5ce40d200affbb9e9d432da1a49d565a1c5ab7b0",
+  "derivation_status": "semantics_preserving_representation_normalization",
+  "contract_scope": "Fintype.card of the good-permutation subtype, equivalent to Set.ncard of the finite predicate set",
+  "result_compatibility": "same_mathematics_but_proof_artifacts_require_the_revised_header",
   "curated_corrections": [
     "uk2024_r1_p1_count_good_permutations_as_subtype"
   ]

@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "suite_revision": "clever-hard12-integrity-v2",
+  "audit_date": "2026-08-22",
+  "identity_policy": "Every changed Lean contract or corrected public contract scope receives a new problem slug; scores from superseded ids must not be merged.",
+  "source_chain": {
+    "official_repository": "https://github.com/trishullab/clever",
+    "official_reference_commit": "830a9a9f3fcd6afa68379fb9d9b58d5083754147",
+    "intermediate_repository": "https://github.com/goedelcodeprover/Goedel-Code-Prover",
+    "intermediate_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+    "intermediate_file": "benchmark/clever_bench.json",
+    "intermediate_sha256": "f9c40ba9c1cff83452f0abdd9a23b023b808b7a74f5fe8f0df414e4cf972eb42",
+    "contextswarm_import_commit": "e945f595ad37c1c8f67b9c1d9dbaadd64070c98b",
+    "contextswarm_initial_selection_commit": "2c22948a6ff432a0961cb95a52856f944cf3c241",
+    "contextswarm_final_selection_commit": "5ac54311f9ada9c1ae803975a88638cb9ae9c0c7"
+  },
+  "entries": {
+    "cleverbench_48": {
+      "source_index": 48,
+      "upstream_problem": "src/lean4/human_eval/problem_49.lean",
+      "classification": "preexisting_repaired_fork",
+      "evidence_commit": "4ff9e8949314ec31be4a88caed01c4d1eabd9da9",
+      "change": "Treat p=0 as out of domain instead of requiring the impossible 0<p for every quantified p.",
+      "baseline_sha256": "f4279152c1520b4632b75653fd474df91e31df80b1801b8ecd38238309131609"
+    },
+    "cleverbench_22": {
+      "source_index": 22,
+      "upstream_problem": "src/lean4/human_eval/problem_23.lean",
+      "classification": "preexisting_repaired_fork",
+      "evidence_commit": "dd5df4840d1818e3323c1915b98b944a3a25e66e",
+      "change": "Keep the recursive length condition outside the zero-result biconditional.",
+      "baseline_sha256": "17e1491bfa2ae99631235362242d149d8bbe8110bc7e65a43b869bb576737da6"
+    },
+    "cleverbench_18_v2": {
+      "source_index": 18,
+      "supersedes": "cleverbench_18",
+      "upstream_problem": "src/lean4/human_eval/problem_18.lean",
+      "classification": "official_fix_synced",
+      "evidence_commit": "c462ac1e1840f04fa48cca4f4dfbaf527d1df362",
+      "change": "Specify empty-substring count as string.length and make the checked implementation agree.",
+      "baseline_sha256": "5d70f72979786169aa517cb5c2d30ed9deb6ac43b8238e82c1b888403f280b3b"
+    },
+    "cleverbench_54_v2": {
+      "source_index": 54,
+      "supersedes": "cleverbench_54",
+      "upstream_problem": "src/lean4/human_eval/problem_55.lean",
+      "classification": "intermediate_conversion_repaired",
+      "evidence_commit": "f24360d35c2c73043b7446c7e9fbbfcdc5220955",
+      "change": "Restore the upstream inductive Fibonacci relation and correct the executable recurrence.",
+      "baseline_sha256": "795de8870472f02ef4d1068933cf6296f1d1b715c56b895d97c9de4060c2bec3"
+    },
+    "cleverbench_102_v2": {
+      "source_index": 102,
+      "supersedes": "cleverbench_102",
+      "upstream_problem": "src/lean4/human_eval/problem_103.lean",
+      "classification": "contract_scope_clarified",
+      "evidence_commit": "019a99821b0b1287f265287fb5e5f855dcf627e0",
+      "change": "Version and label the checked Nat.div behavior as floor average; nearest rounding is not claimed.",
+      "baseline_sha256": "c33ddc01357a00f9c9cb03c3cce9e507597f2dc1f40d1b60d3d3b61c8fe4900f"
+    },
+    "cleverbench_82": {
+      "source_index": 82,
+      "upstream_problem": "src/lean4/human_eval/problem_83.lean",
+      "classification": "intermediate_snapshot_no_identified_semantic_drift",
+      "change": "No semantic defect was identified in the audited checked Lean contract.",
+      "baseline_sha256": "9994d428d18ce003eee7ef6ff060b25c558c4eddd322111979e21686b9bc2964"
+    },
+    "cleverbench_3": {
+      "source_index": 3,
+      "upstream_problem": "src/lean4/human_eval/problem_3.lean",
+      "classification": "intermediate_snapshot_no_identified_semantic_drift",
+      "change": "No semantic defect was identified in the audited checked Lean contract.",
+      "baseline_sha256": "5c63604723f09f67b2e7de2f62e6ec6c734baaa06732dfc2ac9255fcee47eb93"
+    },
+    "cleverbench_89_v2": {
+      "source_index": 89,
+      "supersedes": "cleverbench_89",
+      "upstream_problem": "src/lean4/human_eval/problem_90.lean",
+      "classification": "under_specification_repaired",
+      "evidence_commit": "c79cfb45a744ae43d4488e3bd1418bc683108967",
+      "change": "Require a returned second-smallest value to be a member of the input list.",
+      "baseline_sha256": "4c9a837d5f8e1734d90bc879d8e85d38f4ab9850022a8eb4e96844714155fa23"
+    },
+    "cleverbench_127": {
+      "source_index": 127,
+      "upstream_problem": "src/lean4/human_eval/problem_128.lean",
+      "classification": "intermediate_snapshot_no_identified_semantic_drift",
+      "change": "No semantic defect was identified in the audited checked Lean contract.",
+      "baseline_sha256": "b40e27fd7593da43634e38fc512a7b69ed1e79cdf362282d8eeb2790d0186867"
+    },
+    "cleverbench_135": {
+      "source_index": 135,
+      "upstream_problem": "src/lean4/human_eval/problem_136.lean",
+      "classification": "intermediate_snapshot_no_identified_semantic_drift",
+      "change": "No semantic defect was identified in the audited checked Lean contract.",
+      "baseline_sha256": "c7f2ef44c38b829e57f2a402d930a3f30476369d6d16c93b0449620eb82d3fa1"
+    },
+    "cleverbench_144": {
+      "source_index": 144,
+      "upstream_problem": "src/lean4/human_eval/problem_146.lean",
+      "classification": "intermediate_snapshot_no_identified_semantic_drift",
+      "change": "No semantic defect was identified in the audited checked Lean contract.",
+      "baseline_sha256": "39c798a9a0c94505ee0d1351046742866233ca230dce0a1ae7a3fa4a736a521c"
+    },
+    "cleverbench_150": {
+      "source_index": 150,
+      "upstream_problem": "src/lean4/human_eval/problem_152.lean",
+      "classification": "preexisting_repaired_fork",
+      "evidence_commit": "e6a7310e0437062ef0a23d691e8953e8de4e4f57",
+      "change": "Make equal-length valid rational encodings the checked input domain.",
+      "baseline_sha256": "72e1dc93b9fb84fe149383aefa46b97f6843da638f2153bbf8c2608cedae5530"
+    }
+  }
+}

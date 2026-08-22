@@ -1,0 +1,43 @@
+{
+  "dataset": "matholympiadbench",
+  "problem_id": "Imo2023P2V2",
+  "slug": "imo2023_p2_v2",
+  "subset": "test",
+  "namespace": null,
+  "theorem_name": "imo2023_p1",
+  "theorem_names": [
+    "imo2023_p1"
+  ],
+  "imports": [
+    "Mathlib",
+    "Aesop"
+  ],
+  "lean_env_id": "formal_matholympiadbench",
+  "source_kind": "matholympiadbench_project_multi_assignment",
+  "source_index": 164,
+  "source_name": "Imo2023P2",
+  "source_sha256": "f286b8942a7b9517be103139d2240adaeabbc1e5f195eb2817aacf9109b1bb95",
+  "category": "geometry",
+  "tags": [
+    "geometry"
+  ],
+  "split": "test",
+  "solved": false,
+  "benchmark_revision": "matholympiadbench-latest12-integrity-v2",
+  "semantics_revision": 2,
+  "supersedes_problem_id": "imo2023_p2",
+  "upstream_dataset_repository": "https://huggingface.co/datasets/Goedel-LM/MathOlympiadBench",
+  "upstream_dataset_revision": "390cec5f70461573a41f9be1576777264e2fc3d1",
+  "upstream_dataset_artifact": "MOBench.jsonl",
+  "upstream_repository": "https://github.com/dwrensha/compfiles",
+  "upstream_problem_path": "Compfiles/Imo2023P2.lean",
+  "upstream_fix_commit": "9eb1eefae03f7da96911ae1551e588a5f8f63ced",
+  "derivation_status": "upstream_fix_semantics_backported_to_v49",
+  "contract_scope": "affine-independent triangle with all three angles acute and a one-dimensional tangent at P, using the Lean 4.9 logical backport of Sphere.IsTangentAt",
+  "result_compatibility": "incompatible_with_imo2023_p2_results",
+  "curated_corrections": [
+    "imo2023_p2_affine_independent_triangle",
+    "imo2023_p2_one_dimensional_tangent",
+    "imo2023_p2_sphere_is_tangent_at_v49_backport"
+  ]
+}

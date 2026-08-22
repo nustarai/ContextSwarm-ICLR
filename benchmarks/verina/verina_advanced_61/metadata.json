@@ -1,0 +1,24 @@
+{
+  "problem_id": "verina/verina_advanced_61.lean",
+  "slug": "verina_advanced_61",
+  "subset": "advanced",
+  "namespace": null,
+  "theorem_name": "productExceptSelf_spec_satisfied",
+  "source_benchmark": "Goedel-Code-Prover/benchmark/verina_bench.json",
+  "source_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+  "source_json_sha256": "2db247946216c8f1cd3421136686273511f59e2284876712743d41ba82df19b0",
+  "baseline_sha256": "ec6606700222699ed135f6e4dbd4f013a9f57fa895a19db2eed25a55ae79197e",
+  "benchmark_revision": "verina-functional-hard12-integrity-v2",
+  "semantics_revision": 1,
+  "upstream_repository": "https://github.com/sunblaze-ucb/verina",
+  "upstream_problem_path": "datasets/verina/verina_advanced_61/task.lean",
+  "upstream_description_path": "datasets/verina/verina_advanced_61/description.txt",
+  "upstream_introduction_commit": "6866f2980402566dcd8c51266c53d629bfae35c0",
+  "upstream_reference_commit": "66b3ce5014edafb20cb26b87c681e7f31847249f",
+  "derivation_status": "functional_projection_with_excluded_complexity_claim",
+  "contract_scope": "product-except-self functional postcondition for the checked implementation",
+  "excluded_claims": [
+    "O(n) running time",
+    "asymptotic complexity certification"
+  ]
+}

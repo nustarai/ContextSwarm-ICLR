@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "suite_revision": "verina-functional-hard12-integrity-v2",
+  "audit_date": "2026-08-22",
+  "claim": "A score certifies only the checked Lean functional precondition/postcondition for each included implementation.",
+  "source_chain": {
+    "official_repository": "https://github.com/sunblaze-ucb/verina",
+    "official_introduction_commit": "6866f2980402566dcd8c51266c53d629bfae35c0",
+    "official_reference_commit": "66b3ce5014edafb20cb26b87c681e7f31847249f",
+    "intermediate_repository": "https://github.com/goedelcodeprover/Goedel-Code-Prover",
+    "intermediate_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+    "intermediate_file": "benchmark/verina_bench.json",
+    "intermediate_sha256": "2db247946216c8f1cd3421136686273511f59e2284876712743d41ba82df19b0",
+    "contextswarm_import_commit": "fde8490050a6ad71fa9c4383b61601d8d18d9bcc",
+    "contextswarm_selection_commit": "643887e20a8f302c5c8fdbb53bbd8f0ae2e3273f"
+  },
+  "entries": {
+    "verina_advanced_67": {
+      "upstream_task": "datasets/verina/verina_advanced_67/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "cea6fdb6ea430a8b8cffdb6bee3a616d07654dddbdab376667f94cac8e43c4f1"
+    },
+    "verina_advanced_81": {
+      "upstream_task": "datasets/verina/verina_advanced_81/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "775ded56ce1ae6f54a13da92a0c33992e3c838afae7ff9b1f6eaee6fa30ba46c"
+    },
+    "verina_advanced_61": {
+      "upstream_task": "datasets/verina/verina_advanced_61/task.lean",
+      "upstream_description": "datasets/verina/verina_advanced_61/description.txt",
+      "classification": "functional_projection_with_excluded_complexity_claim",
+      "checked_contract": "product-except-self functional postcondition for the included implementation",
+      "excluded_claims": ["O(n) running time", "asymptotic complexity certification"],
+      "baseline_sha256": "ec6606700222699ed135f6e4dbd4f013a9f57fa895a19db2eed25a55ae79197e"
+    },
+    "verina_advanced_48": {
+      "upstream_task": "datasets/verina/verina_advanced_48/task.lean",
+      "upstream_description": "datasets/verina/verina_advanced_48/description.txt",
+      "classification": "functional_projection_with_excluded_algorithm_claim",
+      "checked_contract": "sorted permutation produced by the included insertion-sort implementation",
+      "excluded_claims": ["merge-sort algorithm identity", "divide-and-conquer implementation"],
+      "baseline_sha256": "860cc359f67ba4c6afff057d7e4caa7c903acba33c1b686431bddb1869f49742"
+    },
+    "verina_advanced_45": {
+      "upstream_task": "datasets/verina/verina_advanced_45/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "05e2462d3d1a04c4dd854cd57a0ebb2f4f0b9c7e6acee346acaf091a4d8784ad"
+    },
+    "verina_advanced_63": {
+      "upstream_task": "datasets/verina/verina_advanced_63/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "01354806fb62a653262de0590429b9dcab9823a07b2403a8c2e207e595ceac0a"
+    },
+    "verina_advanced_73": {
+      "upstream_task": "datasets/verina/verina_advanced_73/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "67cc0f968e5872c99b17c27e79054b460464264e284336ad1d0830770f01540c"
+    },
+    "verina_advanced_7": {
+      "upstream_task": "datasets/verina/verina_advanced_7/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "1b91d793556cd06925ca76684e289512588841959d076f5c251c1141b404e323"
+    },
+    "verina_advanced_69": {
+      "upstream_task": "datasets/verina/verina_advanced_69/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "1a5b67e773bae8a409535aeaf080aedd84fb4e0e7f70d6175249c4ce97bac932"
+    },
+    "verina_advanced_40": {
+      "upstream_task": "datasets/verina/verina_advanced_40/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "0fe24d3f0b65122ae155891e0e9c8193f042f26e2825c9abd61a3551abbcc3b6"
+    },
+    "verina_advanced_53": {
+      "upstream_task": "datasets/verina/verina_advanced_53/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "9cab79f6ce7a128d0de4df67c8b95d0846fff520cc42ed209dcd2a302db0ba40"
+    },
+    "verina_advanced_59": {
+      "upstream_task": "datasets/verina/verina_advanced_59/task.lean",
+      "classification": "upstream_functional_projection",
+      "checked_contract": "checked Lean functional precondition/postcondition for the included implementation",
+      "baseline_sha256": "c1e713b7b34ffb6d34eaf84122d0d005dcdc19b1d3054222039eab15b35dc0d3"
+    }
+  }
+}

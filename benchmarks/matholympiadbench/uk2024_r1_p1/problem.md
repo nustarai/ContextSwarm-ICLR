@@ -17,6 +17,14 @@ typist may type MATHS, MTAHS or TMASH, but not ATMSH.
 Determine, with proof, the number of possible spellings of OLYMPIADS
 that might be typed.
 
+## Formalization Revision
+
+ContextSwarm commit `5ce40d200affbb9e9d432da1a49d565a1c5ab7b0` replaced the
+finite set's `Set.ncard` presentation by `Fintype.card` of the corresponding
+subtype. This is a semantics-preserving Lean representation normalization, not a
+change to the olympiad question. Mathematical scores remain comparable, although
+proof artifacts tied to the old theorem header are not mechanically reusable.
+
         ## Task Surface
 
         - Baseline file: `baseline/uk2024_r1_p1.lean`.

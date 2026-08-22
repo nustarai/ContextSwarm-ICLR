@@ -1,0 +1,31 @@
+{
+  "dataset": "clever",
+  "problem_id": "cleverbench_48",
+  "slug": "cleverbench_48",
+  "subset": "clever",
+  "namespace": "cleverbench_48",
+  "theorem_name": "implementation_postcond_satisfied",
+  "theorem_names": [
+    "implementation_postcond_satisfied"
+  ],
+  "imports": [
+    "Mathlib",
+    "Std",
+    "Tacs"
+  ],
+  "source_kind": "clever_project_multi_assignment",
+  "source_benchmark": "Goedel-Code-Prover/benchmark/clever_bench.json",
+  "source_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+  "source_json_sha256": "f9c40ba9c1cff83452f0abdd9a23b023b808b7a74f5fe8f0df414e4cf972eb42",
+  "source_index": 48,
+  "baseline_sha256": "f4279152c1520b4632b75653fd474df91e31df80b1801b8ecd38238309131609",
+  "benchmark_revision": "clever-hard12-integrity-v2",
+  "semantics_revision": 1,
+  "upstream_repository": "https://github.com/trishullab/clever",
+  "upstream_problem_path": "src/lean4/human_eval/problem_49.lean",
+  "upstream_reference_commit": "830a9a9f3fcd6afa68379fb9d9b58d5083754147",
+  "upstream_introduction_commit": "ce2f589d49824acb2136d84f7da40b4bb2b23007",
+  "derivation_status": "preexisting_repaired_fork",
+  "contract_scope": "2^n modulo p; p=0 is an explicitly accepted out-of-domain case",
+  "upstream_comparable": false
+}

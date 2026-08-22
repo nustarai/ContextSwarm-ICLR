@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "benchmark_revision": "matholympiadbench-latest12-integrity-v2",
+  "upstream_repository": "https://github.com/Goedel-LM/MathOlympiadBench",
+  "upstream_source_revision": "390cec5f70461573a41f9be1576777264e2fc3d1",
+  "upstream_artifact": "MOBench.jsonl",
+  "upstream_artifact_sha256": "f286b8942a7b9517be103139d2240adaeabbc1e5f195eb2817aacf9109b1bb95",
+  "contextswarm_import_commit": "129edc7877d500fbc488ad6e544759bf29dd450f",
+  "contextswarm_curated_fix_commit": "5ce40d200affbb9e9d432da1a49d565a1c5ab7b0",
+  "result_identity_policy": "A semantic statement repair uses a new task id; historical results from a superseded or pre-correction contract are not combined with this revision.",
+  "entries": {
+    "imo2024_p1": {
+      "source_problem_id": "Imo2024P1",
+      "source_index": 151,
+      "classification": "dataset_semantics_unchanged",
+      "baseline_sha256": "cb34b023e37f808e1fa9cb9b2f2f47541e1e63122457a37f2b4bc8836cb0955f"
+    },
+    "imo2024_p2": {
+      "source_problem_id": "Imo2024P2",
+      "source_index": 105,
+      "classification": "dataset_semantics_unchanged",
+      "baseline_sha256": "392f9aa35a9058f7c9a3fdefc0aeba08379f47acf2b139e63c47a81a3ff29349"
+    },
+    "imo2024_p3": {
+      "source_problem_id": "Imo2024P3",
+      "source_index": 70,
+      "classification": "dataset_semantics_unchanged",
+      "baseline_sha256": "db1e4f496b68c335a9452ac412344a0bac35d004695429923720f51b2f847a49"
+    },
+    "imo2024_p5": {
+      "source_problem_id": "Imo2024P5",
+      "source_index": 5,
+      "classification": "dataset_semantics_unchanged",
+      "baseline_sha256": "1e1123fbfe581c999035396bc44d2582ed9ae17ed055d99fbdfd4db8f23dfd30"
+    },
+    "imo2024_p6": {
+      "source_problem_id": "Imo2024P6",
+      "source_index": 215,
+      "classification": "dataset_semantics_unchanged",
+      "baseline_sha256": "c4d09afa0e603a8437192c8e9f1f0ea4905007df4b4c42a282738351e4e410be"
+    },
+    "uk2024_r1_p1": {
+      "source_problem_id": "UK2024R1P1",
+      "source_index": 94,
+      "classification": "semantics_preserving_representation_normalization",
+      "baseline_sha256": "fb1b46ffc688bc444f198f91d06a3a183360b77001a2daf676dc251c4b66176f"
+    },
+    "uk2024_r1_p2": {
+      "source_problem_id": "UK2024R1P2",
+      "source_index": 142,
+      "classification": "dataset_semantics_unchanged",
+      "baseline_sha256": "e9c49a08d0b2615bd04b20091e5eb22f655c17e7a8895a9067471120a3fe97d0"
+    },
+    "usa2024_p2": {
+      "source_problem_id": "Usa2024P2",
+      "source_index": 224,
+      "classification": "contextswarm_repair_later_upstream_aligned",
+      "baseline_sha256": "56cde130a6936b0b085ab933b44d081a9261f467af6ba863b836159c44307421"
+    },
+    "imo2023_p2_v2": {
+      "source_problem_id": "Imo2023P2",
+      "source_index": 164,
+      "classification": "upstream_fix_semantics_backported_to_v49",
+      "supersedes": "imo2023_p2",
+      "baseline_sha256": "c1912757c517f0e3a176b5fbf690f02ad4b0c7c3d776c1205845ce1ec9a1bad0"
+    },
+    "imo2023_p3": {
+      "source_problem_id": "Imo2023P3",
+      "source_index": 134,
+      "classification": "dataset_semantics_unchanged",
+      "baseline_sha256": "729da649683dfaed49174f359439f965063e18b1c56b35752099db0c17590d5b"
+    },
+    "imo2023_p4": {
+      "source_problem_id": "Imo2023P4",
+      "source_index": 222,
+      "classification": "dataset_semantics_unchanged",
+      "baseline_sha256": "4c517908aeb0849df93e025ead2d150a8d738adf49edeff4ee1e2e0829025897"
+    },
+    "imo2023_p5": {
+      "source_problem_id": "Imo2023P5",
+      "source_index": 183,
+      "classification": "contextswarm_repaired_fork",
+      "baseline_sha256": "8bb753673100fd5239262b0a2434d9065d414b44c821d817eb350a6cfc49ab4e"
+    }
+  }
+}

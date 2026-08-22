@@ -1,0 +1,31 @@
+{
+  "dataset": "clever",
+  "problem_id": "cleverbench_150",
+  "slug": "cleverbench_150",
+  "subset": "clever",
+  "namespace": "cleverbench_150",
+  "theorem_name": "implementation_postcond_satisfied",
+  "theorem_names": [
+    "implementation_postcond_satisfied"
+  ],
+  "imports": [
+    "Mathlib",
+    "Std",
+    "Tacs"
+  ],
+  "source_kind": "clever_project_multi_assignment",
+  "source_benchmark": "Goedel-Code-Prover/benchmark/clever_bench.json",
+  "source_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+  "source_json_sha256": "f9c40ba9c1cff83452f0abdd9a23b023b808b7a74f5fe8f0df414e4cf972eb42",
+  "source_index": 150,
+  "baseline_sha256": "72e1dc93b9fb84fe149383aefa46b97f6843da638f2153bbf8c2608cedae5530",
+  "benchmark_revision": "clever-hard12-integrity-v2",
+  "semantics_revision": 1,
+  "upstream_repository": "https://github.com/trishullab/clever",
+  "upstream_problem_path": "src/lean4/human_eval/problem_152.lean",
+  "upstream_reference_commit": "830a9a9f3fcd6afa68379fb9d9b58d5083754147",
+  "upstream_introduction_commit": "e6a7310e0437062ef0a23d691e8953e8de4e4f57",
+  "derivation_status": "preexisting_repaired_fork",
+  "contract_scope": "pointwise absolute differences when inputs are equal-length valid rational encodings; other inputs are out of domain",
+  "upstream_comparable": false
+}

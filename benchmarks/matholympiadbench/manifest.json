@@ -1,10 +1,25 @@
 {
-  "schema_version": "contextswarm_mini_matholympiadbench_v1",
+  "aliases": [
+    "imobench",
+    "om_bench"
+  ],
+  "benchmark_revision": "matholympiadbench-latest12-integrity-v2",
+  "candidate_filename": "result.lean",
+  "contextswarm_source": {
+    "path": "definitions/formal/matholympiadbench/latest12",
+    "repository": "https://github.com/shiyegao/ContextSwarm",
+    "revision": "cfed6e508193a0eeebdc56e1e8846f70a0ecc635"
+  },
   "dataset": "matholympiadbench",
-  "subset": "latest12",
-  "problem_ids": "problem_ids.json",
+  "integrity_manifest": "benchmark_integrity.json",
+  "language": "lean",
   "lean_env_id": "formal_matholympiadbench",
-  "verification_profile": "formal_proof",
+  "problem_ids": "problem_ids.json",
+  "provenance": "PROVENANCE.md",
+  "runnable_with_contextswarm_mini": true,
+  "schema_version": "contextswarm_mini_matholympiadbench_v1",
   "source_revision": "f286b8942a7b9517be103139d2240adaeabbc1e5f195eb2817aacf9109b1bb95",
-  "candidate_filename": "result.lean"
+  "subset": "latest12",
+  "task_count": 12,
+  "verification_profile": "formal_proof"
 }
