@@ -69,6 +69,7 @@ _FORMAL_NONCACHEABLE_STATUSES = frozenset(
         "REJECTED_OVERLOADED",
         "TASK_CANCELLED",
     }
+)
 # CPS workers must first receive a real terminal Judge/local-contract result.
 # Admission, transport, provenance, and other control failures do not satisfy
 # this ordering contract.
