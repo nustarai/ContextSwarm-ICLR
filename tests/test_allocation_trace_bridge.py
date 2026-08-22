@@ -575,6 +575,40 @@ class AllocationTraceBridgeTests(unittest.TestCase):
         self.assertEqual(view.source, "selection_store_snapshot")
         self.assertEqual(view.references_for_task("task-a"), ())
 
+    def test_opaque_source_watermark_changes_snapshot_identity(self) -> None:
+        base = {
+            "sequence": 1,
+            "record_id": "trace-row",
+            "task_id": "task-a",
+            "kind": "piece_snapshot",
+            "trace_id": "trace-a",
+            "lineage_id": "lineage-a",
+            "active": True,
+        }
+        first = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(base,),
+                    trace_watermark="trace-cut",
+                    source_watermark="source-cut-1",
+                    snapshot_id="snapshot-a",
+                )
+            ]
+        )
+        second = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(base,),
+                    trace_watermark="trace-cut",
+                    source_watermark="source-cut-2",
+                    snapshot_id="snapshot-a",
+                )
+            ]
+        )
+        first_view = TraceProjectionBridge().read(["task-a"], store=first)
+        second_view = TraceProjectionBridge().read(["task-a"], store=second)
+        self.assertNotEqual(first_view.watermark, second_view.watermark)
+
     def test_snapshot_watermark_drift_cursor_replay_and_source_head_fail_closed(self) -> None:
         drift = _SnapshotStore(
             [

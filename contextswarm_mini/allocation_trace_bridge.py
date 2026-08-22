@@ -164,12 +164,13 @@ class TraceProjectionSnapshotSource(Protocol):
 
 def _snapshot_identity(
     task_ids: Sequence[str],
-    source_watermark: str,
+    source_watermark: int | str | None,
     records: Sequence[Any],
     ordinary_outcome_ids: Iterable[str],
     *,
     snapshot_id: str = "",
     reference_time: float | None = None,
+    trace_watermark: str | None = None,
 ) -> str:
     """Hash only the bounded projection contract, never raw source metadata."""
 
@@ -185,9 +186,18 @@ def _snapshot_identity(
     )
     return _canonical_sha(
         {
-            "schema": "contextswarm_trace_projection_snapshot_v2",
+            "schema": "contextswarm_trace_projection_snapshot_v3",
             "task_ids": list(task_ids),
-            "source_watermark": str(source_watermark),
+            # Keep the causal trace watermark and the source-owned opaque
+            # watermark separate.  A source watermark may change while the
+            # normalized records happen to remain equal; that still denotes a
+            # different pinned materialization and must invalidate stale state.
+            "trace_watermark": str(
+                trace_watermark if trace_watermark is not None else source_watermark
+            ),
+            "source_watermark": (
+                None if source_watermark is None else str(source_watermark)
+            ),
             "snapshot_id": str(snapshot_id or "")[:512],
             "reference_time": reference_time,
             "ordinary_outcome_ids": sorted(
@@ -1055,11 +1065,16 @@ class TraceProjectionBridge:
                             batch=batch,
                             watermark="snapshot:" + _snapshot_identity(
                                 ordered,
-                                as_of,
+                                (
+                                    source_watermark
+                                    if source_watermark is not None
+                                    else (snapshot_id or as_of)
+                                ),
                                 records,
                                 ordinary_ids,
                                 snapshot_id=snapshot_id,
                                 reference_time=page_reference_time,
+                                trace_watermark=as_of,
                             ),
                             source="selection_store_snapshot",
                             complete=True,
@@ -1101,11 +1116,12 @@ class TraceProjectionBridge:
                     batch=batch,
                     watermark="legacy:" + _snapshot_identity(
                         ordered,
-                        str(raw_batch.watermark),
+                        raw_batch.watermark,
                         raw_batch.records,
                         ordinary_ids,
                         snapshot_id=str(getattr(raw_batch, "snapshot_id", "") or ""),
                         reference_time=reference_time,
+                        trace_watermark=str(raw_batch.watermark),
                     ),
                     source="selection_store_protocol",
                     complete=True,
