@@ -253,8 +253,10 @@ AISW binary、node config 和可选 Codex home 都只读挂载，随后所需私
 `no-new-privileges` 和独立 tmpfs，因此新 run artifacts 不再由 root 创建。若服务不在
 宿主网络上，应把 `CONTEXTSWARM_JUDGE_URL` 设置为容器实际可达的地址，而不是修改
 tracked manifest。实验代码、Prompt、manifest 与 benchmark 均使用构建时写入镜像的
-冻结副本；运行时只挂载宿主 `runs/` 输出目录，避免一小时实验中途受到 worktree
-修改影响。
+冻结副本；运行时 PID 上限默认为 2048（可用 `CONTEXTSWARM_MINI_PIDS_LIMIT` 覆盖），
+这是为 CPS48 每个 Pi/NuRouter session 的线程余量设置的有界上限，不改变 48 个
+in-flight agent 合同。运行时只挂载宿主 `runs/` 输出目录，避免一小时实验中途受到
+worktree 修改影响。
 
 `run_docker.sh` 会同时发现相邻的 `.nurouter-pi-launcher.json`（或旧
 `.aisw-pi-launcher.json`），并在容器内重写 `real_pi`/`real_codex` 到镜像内
