@@ -15,6 +15,7 @@ from contextswarm_mini.allocation_core import (
     TaskState,
     TaskStateAllocationPolicy,
     TaskStateScorer,
+    TaskScoreWeights,
     TraceFeatures,
     TraceScoreWeights,
     TraceStateAllocationPolicy,
@@ -254,6 +255,30 @@ class AllocationCoreTests(unittest.TestCase):
             task("a", checker_quality=math.nan)
         with self.assertRaises(ValueError):
             TraceFeatures(drag=math.inf)
+
+    def test_numeric_boundaries_reject_lossy_coercion_and_huge_integers(self) -> None:
+        with self.assertRaises(ValueError):
+            TraceFeatures(actionability="0.5")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            TaskState("a", True, 0, checker_quality="0.5")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            AllocationStateSnapshot(
+                "d", 0, "0", 1.0, 1, 0, 0, 1, (task("a", active=0),)
+            )  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            AllocationDecision(
+                "d", "s", 0, "task_state", "a", "ok", scores={"a": "1"}
+            )  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            TaskScoreWeights.from_mapping(False)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            TraceScoreWeights.from_mapping(False)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            TaskScoreWeights.from_mapping({1: 1})  # type: ignore[dict-item]
+        with self.assertRaises(ValueError):
+            TaskScoreWeights.from_mapping({"checker_quality": True})  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            TaskState("a", True, 0, checker_quality=10**400)
 
     def test_core_records_reject_type_coercion_and_malformed_fields(self) -> None:
         # IDs and declared ID collections are part of the causal identity.  Do

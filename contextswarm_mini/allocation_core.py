@@ -72,9 +72,19 @@ class _SchedulerPromptError(ValueError):
 
 
 def _finite(name: str, value: float, *, minimum: float | None = None) -> float:
-    if isinstance(value, bool):
+    # JSON-facing numeric fields are deliberately restricted to the two
+    # scalar types JSON can represent losslessly here. ``float(value)`` alone
+    # accepts numeric strings, Decimal-like objects, and arbitrary user-defined
+    # coercions, making malformed artifacts indistinguishable from values that
+    # came from the registered manifest.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite number")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        # Very large integers can raise OverflowError during conversion; keep
+        # all malformed numeric inputs on the stable ValueError path.
+        raise ValueError(f"{name} must be a finite number") from exc
     if not math.isfinite(result):
         raise ValueError(f"{name} must be finite")
     if minimum is not None and result < minimum:
@@ -866,12 +876,19 @@ class TaskScoreWeights:
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, float] | None = None) -> TaskScoreWeights:
-        values = values or {}
+        if values is None:
+            values = {}
+        if not isinstance(values, Mapping):
+            raise ValueError("task score weights must be a mapping")
+        if any(not isinstance(key, str) for key in values):
+            raise ValueError("task score weight keys must be strings")
         allowed = {item.name for item in fields(cls)}
-        unknown = set(values) - allowed
+        unknown = {key for key in values if key not in allowed}
         if unknown:
             raise ValueError("unknown task score weights: " + ", ".join(sorted(unknown)))
-        return cls(**{key: float(value) for key, value in values.items()})
+        # Let __post_init__ enforce the exact numeric contract; never coerce
+        # strings or booleans through float(...).
+        return cls(**dict(values))
 
     def public_dict(self) -> dict[str, float]:
         return _weight_dict(self)
@@ -899,12 +916,17 @@ class TraceScoreWeights:
 
     @classmethod
     def from_mapping(cls, values: Mapping[str, float] | None = None) -> TraceScoreWeights:
-        values = values or {}
+        if values is None:
+            values = {}
+        if not isinstance(values, Mapping):
+            raise ValueError("trace score weights must be a mapping")
+        if any(not isinstance(key, str) for key in values):
+            raise ValueError("trace score weight keys must be strings")
         allowed = {item.name for item in fields(cls)}
-        unknown = set(values) - allowed
+        unknown = {key for key in values if key not in allowed}
         if unknown:
             raise ValueError("unknown trace score weights: " + ", ".join(sorted(unknown)))
-        return cls(**{key: float(value) for key, value in values.items()})
+        return cls(**dict(values))
 
     def public_dict(self) -> dict[str, float]:
         return _weight_dict(self)
