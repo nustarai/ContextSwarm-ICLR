@@ -9,6 +9,7 @@ name = "mobench-figure4-dev-cps48"
 output_root = "runs/figure4_dev"
 time_limit_seconds = 180
 seed = 39
+figure4_phase = "development"
 
 [selection]
 enabled = false
@@ -16,7 +17,10 @@ visibility = "project_shared"
 seed = 39
 tie_break = "trace_id_asc"
 direct_messages = false
-candidate_transfer = false
+# Legacy allocation development still carries the strongest per-task candidate
+# into each refill.  Formal Figure 4 replaces this sentinel with the selected
+# enabled selector identity while retaining the same task-local transfer rule.
+candidate_transfer = true
 
 [allocation.task_state]
 checker_quality = 1.0

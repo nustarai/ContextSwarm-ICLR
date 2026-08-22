@@ -43,11 +43,17 @@ ORDERED_TASK_IDS = [
 # arm-specific default.  Replacing it later must update all four arms together.
 DEVELOPMENT_SELECTOR_IDENTITY = {
     "enabled": False,
+    "selector_name": "",
+    "selector_version": "",
     "visibility": "project_shared",
+    "trace_slot_limit": 0,
+    "context_token_budget": 0,
+    "tokenizer": "",
     "seed": 39,
     "tie_break": "trace_id_asc",
+    "policy_params": {},
     "direct_messages": False,
-    "candidate_transfer": False,
+    "candidate_transfer": True,
 }
 
 
@@ -151,7 +157,22 @@ class Figure4DevelopmentManifestTests(unittest.TestCase):
             selection = _raw_manifest(config).get("selection")
 
             with self.subTest(policy=policy):
-                self.assertEqual(selection, DEVELOPMENT_SELECTOR_IDENTITY)
+                self.assertIsInstance(selection, dict)
+                assert isinstance(selection, dict)
+                self.assertFalse(selection["enabled"])
+                self.assertTrue(selection["candidate_transfer"])
+                self.assertEqual(
+                    config.selection.hash_inputs(), DEVELOPMENT_SELECTOR_IDENTITY
+                )
+                self.assertEqual(
+                    config.public_dict()["selection"],
+                    config.selection.public_dict(),
+                )
+                self.assertEqual(
+                    session_plan["selection"], config.selection.public_dict()
+                )
+                self.assertEqual(config.figure4_phase, "development")
+                self.assertEqual(session_plan["figure4_phase"], "development")
                 self.assertEqual(config.mode, "cps")
                 self.assertEqual(config.communication, "blackboard")
                 self.assertEqual(config.dataset_name, "matholympiadbench")

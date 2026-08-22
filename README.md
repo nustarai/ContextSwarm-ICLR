@@ -179,8 +179,12 @@ Issue #39 的 Figure 4 路径使用四个独立的新 policy 名，旧三臂及�
 
 开发用的 `configs/figure4_dev_cps48_*.toml` 四臂固定 MathOlympiadBench、12×4
 初始池、180 秒 horizon 和同一参数合同，仅 policy、运行名称和输出目录不同。
-其中 selector 明确保持 disabled；这批运行只用于实现验证，不能当作正式 Figure 4
-结果。正式 repeats 必须在 Figure 3 selector 冻结后使用其相同 identity/config。
+其中 selector 明确保持 disabled，且 `experiment.figure4_phase = "development"`；
+该哨兵身份如实记录 legacy refill 会继承题内 best candidate，因此
+`candidate_transfer = true`。这批运行只用于实现验证，不能当作正式 Figure 4
+结果。正式 repeats 必须标记 `figure4_phase = "formal"`；配置加载器会拒绝未启用、
+身份不完整、允许 direct messages 或禁用 task-local candidate transfer 的 selector，
+确保只能使用 Figure 3 冻结的同一 identity/config，同时固定 RQ3 的题内解答传递。
 Trace-State 额外产生 `allocation_audit.jsonl`，从每个实际 dispatch 的同一个
 immutable snapshot 计算不 dispatch 的 Task-State counterfactual。
 

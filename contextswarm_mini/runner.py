@@ -1392,6 +1392,8 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "max_attempts_per_task": config.max_attempts_per_task,
         "assignment_policy": config.assignment_policy,
         "allocation": config.allocation.public_dict(),
+        "selection": config.selection.public_dict(),
+        "figure4_phase": config.figure4_phase,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
         "judge_kind": config.judge_kind,

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import copy
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -93,6 +95,60 @@ def _number(value: Any, name: str, default: float) -> float:
     return result
 
 
+def _strict_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{name} must be a boolean")
+    return value
+
+
+def _required_nonnegative_int(
+    table: Mapping[str, Any], key: str, table_name: str
+) -> int:
+    if key not in table:
+        raise ConfigError(f"{table_name}.{key} is required when selection is enabled")
+    value = table[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{table_name}.{key} must be an integer")
+    if value < 0:
+        raise ConfigError(f"{table_name}.{key} must not be negative")
+    return value
+
+
+def _required_positive_int(
+    table: Mapping[str, Any], key: str, table_name: str
+) -> int:
+    value = _required_nonnegative_int(table, key, table_name)
+    if value == 0:
+        raise ConfigError(f"{table_name}.{key} must be positive")
+    return value
+
+
+def _canonical_json_value(value: Any, name: str) -> Any:
+    """Validate and normalize a TOML value for stable public hashing."""
+
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or not key:
+                raise ConfigError(f"{name} keys must be non-empty strings")
+            normalized[key] = _canonical_json_value(item, f"{name}.{key}")
+        return {key: normalized[key] for key in sorted(normalized)}
+    if isinstance(value, list):
+        return [
+            _canonical_json_value(item, f"{name}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, (str, bool, int)) or value is None:
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ConfigError(f"{name} numbers must be finite")
+        return value
+    raise ConfigError(
+        f"{name} must contain only strings, booleans, numbers, arrays, and tables"
+    )
+
+
 _FORMULA_DEFAULTS: dict[str, float] = {
     "active_balance_weight": 2.0,
     "candidate_quality_weight": 1.5,
@@ -131,6 +187,231 @@ _ALLOCATION_NORMALIZATION_DEFAULTS: dict[str, float] = {
     "starvation_window_seconds": 600.0,
     "failure_saturation": 3.0,
 }
+
+_FIGURE4_ALLOCATION_POLICIES = frozenset(
+    {"uniform_refill", "task_state", "trace_state", "llm_scheduler"}
+)
+
+
+_SELECTOR_NAMES = frozenset(
+    {
+        "random",
+        "recency",
+        "bm25_mmr",
+        "smoothed_popularity",
+        "feedback_diversity",
+        "no_interaction_feedback",
+        "unnormalized_feedback",
+        "nustigmergy",
+    }
+)
+_SELECTION_FIELDS = frozenset(
+    {
+        "enabled",
+        "selector_name",
+        "selector_version",
+        "visibility",
+        "trace_slot_limit",
+        "context_token_budget",
+        "tokenizer",
+        "seed",
+        "tie_break",
+        "policy_params",
+        "direct_messages",
+        "candidate_transfer",
+    }
+)
+
+
+@dataclass(frozen=True)
+class SelectionConfig:
+    """Manifest-owned trace-selection policy and comparison boundary.
+
+    ``policy_params`` is deliberately opaque to the manifest loader: selector
+    implementations own its schema.  Keeping it fully explicit and in the
+    canonical identity prevents policy-specific numerical defaults from being
+    hidden in this common configuration layer.
+    """
+
+    enabled: bool
+    selector_name: str
+    selector_version: str
+    visibility: str
+    trace_slot_limit: int
+    context_token_budget: int
+    tokenizer: str
+    seed: int
+    tie_break: str
+    policy_params: dict[str, Any]
+    direct_messages: bool
+    candidate_transfer: bool
+
+    def hash_inputs(self) -> dict[str, Any]:
+        """Return the complete canonical selector-configuration identity."""
+
+        return {
+            "enabled": self.enabled,
+            "selector_name": self.selector_name,
+            "selector_version": self.selector_version,
+            "visibility": self.visibility,
+            "trace_slot_limit": self.trace_slot_limit,
+            "context_token_budget": self.context_token_budget,
+            "tokenizer": self.tokenizer,
+            "seed": self.seed,
+            "tie_break": self.tie_break,
+            "policy_params": _canonical_json_value(
+                self.policy_params, "selection.policy_params"
+            ),
+            "direct_messages": self.direct_messages,
+            "candidate_transfer": self.candidate_transfer,
+        }
+
+    def comparison_hash_inputs(self) -> dict[str, Any]:
+        """Return arm-invariant selection inputs for a comparison hash.
+
+        The runner combines these inputs with the rest of the experiment
+        contract.  Selector identity and policy parameters are intentionally
+        absent because those are the sole registered differences among arms.
+        """
+
+        inputs = self.hash_inputs()
+        for key in ("selector_name", "selector_version", "policy_params"):
+            inputs.pop(key)
+        return inputs
+
+    @property
+    def selection_config_id(self) -> str:
+        canonical = json.dumps(
+            self.hash_inputs(),
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    @property
+    def identity_frozen(self) -> bool:
+        """Whether this config carries a complete immutable selector identity."""
+
+        return bool(
+            self.enabled
+            and self.selector_name
+            and self.selector_version
+            and self.visibility == "project_shared"
+            and self.trace_slot_limit > 0
+            and self.context_token_budget > 0
+            and self.tokenizer
+            and self.tie_break == "trace_id_asc"
+            and not self.direct_messages
+        )
+
+    def public_dict(self) -> dict[str, Any]:
+        result = self.hash_inputs()
+        result["selection_config_id"] = self.selection_config_id
+        return result
+
+
+def _parse_selection(value: Any) -> SelectionConfig:
+    selection = _as_dict(value, "selection")
+    unknown = set(selection) - _SELECTION_FIELDS
+    if unknown:
+        raise ConfigError("unknown selection fields: " + ", ".join(sorted(unknown)))
+
+    enabled = (
+        _strict_bool(selection["enabled"], "selection.enabled")
+        if "enabled" in selection
+        else False
+    )
+    required = (
+        "selector_name",
+        "selector_version",
+        "visibility",
+        "trace_slot_limit",
+        "context_token_budget",
+        "tokenizer",
+        "seed",
+        "tie_break",
+        "policy_params",
+        "direct_messages",
+        "candidate_transfer",
+    )
+    if enabled:
+        missing = [key for key in required if key not in selection]
+        if missing:
+            raise ConfigError(
+                "selection fields required when enabled: " + ", ".join(missing)
+            )
+
+    def optional_text(key: str, default: str = "") -> str:
+        if key not in selection:
+            return default
+        raw = selection[key]
+        if not isinstance(raw, str) or not raw.strip():
+            raise ConfigError(f"selection.{key} must be a non-empty string")
+        return raw.strip()
+
+    selector_name = optional_text("selector_name")
+    if selector_name and selector_name not in _SELECTOR_NAMES:
+        raise ConfigError(
+            "selection.selector_name must be one of " + ", ".join(sorted(_SELECTOR_NAMES))
+        )
+    selector_version = optional_text("selector_version")
+    if selector_version and not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", selector_version):
+        raise ConfigError("selection.selector_version has an invalid format")
+    visibility = optional_text("visibility", "project_shared")
+    if visibility != "project_shared":
+        raise ConfigError("selection.visibility must be project_shared")
+    tokenizer = optional_text("tokenizer")
+    if tokenizer and not re.fullmatch(r"[A-Za-z0-9_.:/+-]{1,200}", tokenizer):
+        raise ConfigError("selection.tokenizer has an invalid format")
+    tie_break = optional_text("tie_break", "trace_id_asc")
+    if tie_break != "trace_id_asc":
+        raise ConfigError("selection.tie_break must be trace_id_asc")
+
+    trace_slot_limit = (
+        _required_positive_int(selection, "trace_slot_limit", "selection")
+        if "trace_slot_limit" in selection
+        else 0
+    )
+    context_token_budget = (
+        _required_positive_int(selection, "context_token_budget", "selection")
+        if "context_token_budget" in selection
+        else 0
+    )
+    seed = (
+        _required_nonnegative_int(selection, "seed", "selection")
+        if "seed" in selection
+        else 0
+    )
+    policy_params = _canonical_json_value(
+        _as_dict(selection.get("policy_params"), "selection.policy_params"),
+        "selection.policy_params",
+    )
+    direct_messages = (
+        _strict_bool(selection["direct_messages"], "selection.direct_messages")
+        if "direct_messages" in selection
+        else False
+    )
+    candidate_transfer = (
+        _strict_bool(selection["candidate_transfer"], "selection.candidate_transfer")
+        if "candidate_transfer" in selection
+        else False
+    )
+    return SelectionConfig(
+        enabled=enabled,
+        selector_name=selector_name,
+        selector_version=selector_version,
+        visibility=visibility,
+        trace_slot_limit=trace_slot_limit,
+        context_token_budget=context_token_budget,
+        tokenizer=tokenizer,
+        seed=seed,
+        tie_break=tie_break,
+        policy_params=policy_params,
+        direct_messages=direct_messages,
+        candidate_transfer=candidate_transfer,
+    )
 
 
 @dataclass(frozen=True)
@@ -175,6 +456,8 @@ class ExperimentConfig:
     cancel_on_proved: bool
     assignment_policy: str
     allocation: AllocationConfig
+    selection: SelectionConfig
+    figure4_phase: str
     episodes_per_task: int
     max_tasks: int
     time_limit_seconds: int
@@ -286,6 +569,8 @@ class ExperimentConfig:
             "cancel_on_proved": self.cancel_on_proved,
             "assignment_policy": self.assignment_policy,
             "allocation": self.allocation.public_dict(),
+            "selection": self.selection.public_dict(),
+            "figure4_phase": self.figure4_phase,
             "episodes_per_task": self.episodes_per_task,
             "max_tasks": self.max_tasks,
             "time_limit_seconds": self.time_limit_seconds,
@@ -375,6 +660,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     allocation_normalization = _as_dict(
         allocation.get("normalization"), "allocation.normalization"
     )
+    selection_config = _parse_selection(payload.get("selection"))
 
     mode = _text(experiment.get("mode"), "cps").lower()
     if mode not in {"mono", "parallel", "cps"}:
@@ -385,7 +671,31 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         raise ConfigError(f"experiment.communication must be one of {sorted(allowed_communication)}")
     if mode in {"mono", "parallel"} and communication != "none":
         raise ConfigError("mono and parallel baselines must run with communication = none")
+    if selection_config.enabled:
+        if mode != "cps":
+            raise ConfigError("enabled selection requires experiment.mode = cps")
+        # Figure 3 isolates trace ranking.  ``direct`` would restore the
+        # worker-to-worker surface and ``hybrid`` would additionally expose
+        # the legacy global-scope channel; even with tool registration gates,
+        # accepting either here would make the treatment boundary depend on a
+        # second communication policy.  Require the one shared-trace surface
+        # explicitly rather than treating every non-``none`` value as CPS.
+        if communication != "blackboard":
+            raise ConfigError(
+                "enabled selection requires experiment.communication = blackboard"
+            )
 
+    figure4_phase = _text(experiment.get("figure4_phase")).lower()
+    if figure4_phase not in {"", "development", "formal"}:
+        raise ConfigError(
+            "experiment.figure4_phase must be development or formal when set"
+        )
+    if figure4_phase and mode != "cps":
+        raise ConfigError("Figure 4 phase requires experiment.mode = cps")
+    if figure4_phase and communication != "blackboard":
+        raise ConfigError(
+            "Figure 4 phase requires experiment.communication = blackboard"
+        )
     dataset_raw = _text(experiment.get("dataset_root"), "benchmarks/matholympiadbench")
     problem_raw = _text(experiment.get("problem_ids"), "benchmarks/matholympiadbench/problem_ids.json")
     dataset_root = Path(dataset_raw).expanduser()
@@ -425,6 +735,36 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
             "allocation.policy must be one of "
             + ", ".join(sorted(allowed_allocation_policies))
         )
+    if figure4_phase and allocation_policy not in _FIGURE4_ALLOCATION_POLICIES:
+        raise ConfigError(
+            "Figure 4 phase requires one of the four registered allocation policies: "
+            + ", ".join(sorted(_FIGURE4_ALLOCATION_POLICIES))
+        )
+    if figure4_phase == "development" and selection_config.enabled:
+        raise ConfigError(
+            "Figure 4 development manifests require selection.enabled = false"
+        )
+    if selection_config.enabled and not figure4_phase:
+        if selection_config.direct_messages or selection_config.candidate_transfer:
+            raise ConfigError(
+                "enabled selection requires direct_messages = false and "
+                "candidate_transfer = false"
+            )
+    if figure4_phase == "development":
+        if selection_config.direct_messages or not selection_config.candidate_transfer:
+            raise ConfigError(
+                "Figure 4 development sentinel requires direct_messages = false and "
+                "candidate_transfer = true"
+            )
+    if figure4_phase == "formal":
+        if not selection_config.identity_frozen:
+            raise ConfigError(
+                "formal Figure 4 requires a complete frozen enabled selector identity"
+            )
+        if not selection_config.candidate_transfer:
+            raise ConfigError(
+                "formal Figure 4 requires candidate_transfer = true"
+            )
     unknown_formula = set(allocation_formula) - set(_FORMULA_DEFAULTS)
     if unknown_formula:
         raise ConfigError(
@@ -646,6 +986,8 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         cancel_on_proved=cancel_on_proved,
         assignment_policy=assignment_policy,
         allocation=allocation_config,
+        selection=selection_config,
+        figure4_phase=figure4_phase,
         episodes_per_task=episodes,
         max_tasks=max_tasks,
         time_limit_seconds=horizon,
