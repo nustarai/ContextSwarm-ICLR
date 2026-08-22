@@ -57,6 +57,9 @@ FORBIDDEN_EVENTS = {
     "elastic_worker_error",
     "preflight_failed",
     "broker_drain_timeout",
+    "broker_close_error",
+    "broker_closeout_artifact_error",
+    "remote_settlement_unconfirmed",
 }
 VOLATILE_META_FIELDS = {
     "horizon_started_at",
@@ -80,6 +83,7 @@ BAD_JUDGE_STATUSES = {
     "NETWORK_ERROR",
     "PROVENANCE_INVALID",
     "REJECTED_OVERLOADED",
+    "REMOTE_SETTLEMENT_UNCONFIRMED",
 }
 BROKER_CONTROL_STATUSES = {
     "ADMISSION_ERROR",
@@ -91,6 +95,7 @@ BROKER_CONTROL_STATUSES = {
     "JUDGE_ADMISSION_TIMEOUT",
     "SESSION_PROBE_BUDGET_EXHAUSTED",
     "SNAPSHOT_ERROR",
+    "REMOTE_SETTLEMENT_UNCONFIRMED",
 }
 BROKER_SOFT_CONTROL_STATUSES = {
     "SESSION_PROBE_COOLDOWN",
@@ -583,6 +588,7 @@ def _check_broker_closeout(
         _add_issue(issues, "judge_broker_closeout_invalid")
     active_handlers = closeout.get("active_handlers")
     fifo_depth = closeout.get("fifo_depth")
+    remote_unsettled_jobs = closeout.get("remote_unsettled_jobs")
     counts_valid = (
         isinstance(active_handlers, int)
         and not isinstance(active_handlers, bool)
@@ -590,6 +596,9 @@ def _check_broker_closeout(
         and isinstance(fifo_depth, int)
         and not isinstance(fifo_depth, bool)
         and fifo_depth >= 0
+        and isinstance(remote_unsettled_jobs, int)
+        and not isinstance(remote_unsettled_jobs, bool)
+        and remote_unsettled_jobs >= 0
     )
     if not counts_valid:
         _add_issue(issues, "judge_broker_closeout_invalid")
@@ -598,6 +607,7 @@ def _check_broker_closeout(
         or not counts_valid
         or active_handlers != 0
         or fifo_depth != 0
+        or remote_unsettled_jobs != 0
     ):
         _add_issue(issues, "judge_broker_not_drained")
 

@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 import uuid
 
 from .config import ExperimentConfig
@@ -29,6 +30,13 @@ _CPS_SHARED_TOOLS = ("cps_search", "cps_publish", "cps_actors")
 _CPS_DIRECT_TOOLS = ("cps_inbox", "cps_send", "cps_ack")
 _SOLVER_EXTENSION_NAME = "pi_solver_tools.mjs"
 _FAST_MODE_EXTENSION_NAME = "pi_fast_mode.mjs"
+_BROKER_ENVIRONMENT_KEYS = frozenset(
+    {
+        "CONTEXTSWARM_JUDGE_URL",
+        "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS",
+    }
+)
+_BROKER_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
 _SOLVER_SYSTEM_PROMPT = """You are a bounded formal-proof construction worker, not a general-purpose coding agent.
 Work only on the assigned result.lean and use only the explicitly provided tools.
 Do not execute shell commands, spawn background or parallel processes, run a local
@@ -41,6 +49,16 @@ _ISOLATED_SYSTEM_PROMPT = """You are a read-only allocation decision component i
 Use only the snapshot in the user prompt. You have no tools and must not inspect files,
 execute commands, spawn processes, use the network, or change run state. Return only the
 decision format requested by the user prompt."""
+_CPS_ENVIRONMENT_KEYS = frozenset(
+    {
+        "CONTEXTSWARM_CPS_DB",
+        "CONTEXTSWARM_ACTORS_FILE",
+        "CONTEXTSWARM_HORIZON_EPOCH_MS",
+        "CONTEXTSWARM_ASSIGNMENT_FILE",
+        "CONTEXTSWARM_BEST_CANDIDATE_FILE",
+        "CONTEXTSWARM_TASK_ROOT",
+    }
+)
 
 
 def now_iso() -> str:
@@ -183,6 +201,13 @@ class PiAgent:
         env.pop("CONTEXTSWARM_JUDGE_URL", None)
         env.pop("CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", None)
         env.pop("CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS", None)
+        # A notebook/operator shell may still carry variables from a previous
+        # CPS run.  Baselines inherit the ordinary process environment, but
+        # never an implicit communication surface; CPS call sites explicitly
+        # add the current run's values through ``extra_env`` below.
+        for key in tuple(env):
+            if key in _CPS_ENVIRONMENT_KEYS or key.startswith("CONTEXTSWARM_CPS_"):
+                env.pop(key, None)
         private_tmp = workdir / ".tmp"
         private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(private_tmp, 0o700)
@@ -222,7 +247,36 @@ class PiAgent:
                 self.trace_path.with_name("pi_fast_mode_provider_requests.jsonl")
             )
         if extra_env:
-            env.update({str(key): str(value) for key, value in extra_env.items()})
+            controlled = {str(key): str(value) for key, value in extra_env.items()}
+            if set(controlled) != _BROKER_ENVIRONMENT_KEYS:
+                raise ValueError(
+                    "unsupported solver environment capability; expected only the controlled broker"
+                )
+            broker_url = controlled["CONTEXTSWARM_JUDGE_URL"].strip()
+            try:
+                parsed_broker = urlsplit(broker_url)
+                broker_port = parsed_broker.port
+            except ValueError as exc:
+                raise ValueError("invalid controlled broker capability") from exc
+            token = parsed_broker.path.removeprefix("/")
+            if (
+                parsed_broker.scheme != "http"
+                or parsed_broker.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or broker_port is None
+                or parsed_broker.username is not None
+                or parsed_broker.password is not None
+                or parsed_broker.query
+                or parsed_broker.fragment
+                or parsed_broker.path != f"/{token}"
+                or _BROKER_TOKEN_PATTERN.fullmatch(token) is None
+            ):
+                raise ValueError("invalid controlled broker capability")
+            raw_deadline = controlled[
+                "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"
+            ].strip()
+            if not raw_deadline.isascii() or not raw_deadline.isdigit() or int(raw_deadline) <= 0:
+                raise ValueError("invalid controlled broker deadline")
+            env.update(controlled)
         return env
 
     def run(

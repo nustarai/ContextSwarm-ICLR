@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_\u4e00-\u9fff]+")
@@ -104,6 +104,82 @@ class CPSStore:
                 """
             )
 
+    @classmethod
+    def _begin_write(
+        cls,
+        db: sqlite3.Connection,
+        *,
+        deadline_epoch_ms: int | None = None,
+        cancel_guard: Callable[[], bool] | None = None,
+    ) -> None:
+        """Acquire the write lock, then revalidate the write capability."""
+
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            cls._validate_write_capability(
+                db,
+                deadline_epoch_ms=deadline_epoch_ms,
+                cancel_guard=cancel_guard,
+            )
+        except Exception:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _validate_write_capability(
+        db: sqlite3.Connection,
+        *,
+        deadline_epoch_ms: int | None = None,
+        cancel_guard: Callable[[], bool] | None = None,
+    ) -> None:
+        """Validate cancellation and horizon inside the active write txn."""
+
+        if cancel_guard is not None and cancel_guard():
+            raise RuntimeError("CPS communication capability has been revoked")
+        if deadline_epoch_ms is None:
+            return
+        now_epoch_ms = int(
+            db.execute(
+                "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
+            ).fetchone()[0]
+        )
+        if now_epoch_ms >= int(deadline_epoch_ms):
+            raise RuntimeError("CPS communication horizon has elapsed")
+
+    @classmethod
+    def _commit_write(
+        cls,
+        db: sqlite3.Connection,
+        *,
+        deadline_epoch_ms: int | None = None,
+        cancel_guard: Callable[[], bool] | None = None,
+    ) -> None:
+        """Revalidate immediately before making a write transaction durable."""
+
+        cls._validate_write_capability(
+            db,
+            deadline_epoch_ms=deadline_epoch_ms,
+            cancel_guard=cancel_guard,
+        )
+        db.execute("COMMIT")
+
+    @staticmethod
+    def _insert_event(
+        db: sqlite3.Connection,
+        event_type: str,
+        *,
+        task_id: str | None,
+        actor_id: str | None,
+        payload: Mapping[str, Any] | None,
+    ) -> str:
+        event_id = uuid.uuid4().hex
+        db.execute(
+            "INSERT INTO events(event_id,event_type,task_id,actor_id,payload,created_at) VALUES(?,?,?,?,?,?)",
+            (event_id, event_type, task_id, actor_id, _json(dict(payload or {})), utc_now()),
+        )
+        return event_id
+
     def record_event(
         self,
         event_type: str,
@@ -111,13 +187,32 @@ class CPSStore:
         task_id: str | None = None,
         actor_id: str | None = None,
         payload: Mapping[str, Any] | None = None,
+        deadline_epoch_ms: int | None = None,
+        cancel_guard: Callable[[], bool] | None = None,
     ) -> str:
-        event_id = uuid.uuid4().hex
         with self._db() as db:
-            db.execute(
-                "INSERT INTO events(event_id,event_type,task_id,actor_id,payload,created_at) VALUES(?,?,?,?,?,?)",
-                (event_id, event_type, task_id, actor_id, _json(dict(payload or {})), utc_now()),
+            self._begin_write(
+                db,
+                deadline_epoch_ms=deadline_epoch_ms,
+                cancel_guard=cancel_guard,
             )
+            try:
+                event_id = self._insert_event(
+                    db,
+                    event_type,
+                    task_id=task_id,
+                    actor_id=actor_id,
+                    payload=payload,
+                )
+                self._commit_write(
+                    db,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    cancel_guard=cancel_guard,
+                )
+            except Exception:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
         return event_id
 
     def create_piece(
@@ -129,6 +224,8 @@ class CPSStore:
         title: str,
         body: str,
         tags: Iterable[str] = (),
+        deadline_epoch_ms: int | None = None,
+        cancel_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         piece_id = uuid.uuid4().hex
         row = {
@@ -142,20 +239,41 @@ class CPSStore:
             "created_at": utc_now(),
         }
         with self._db() as db:
-            db.execute(
-                "INSERT INTO pieces(id,task_id,author,kind,title,body,tags,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                (
-                    row["id"],
-                    row["task_id"],
-                    row["author"],
-                    row["kind"],
-                    row["title"],
-                    row["body"],
-                    _json(row["tags"]),
-                    row["created_at"],
-                ),
+            self._begin_write(
+                db,
+                deadline_epoch_ms=deadline_epoch_ms,
+                cancel_guard=cancel_guard,
             )
-        self.record_event("piece_created", task_id=task_id, actor_id=author, payload=row)
+            try:
+                db.execute(
+                    "INSERT INTO pieces(id,task_id,author,kind,title,body,tags,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        row["id"],
+                        row["task_id"],
+                        row["author"],
+                        row["kind"],
+                        row["title"],
+                        row["body"],
+                        _json(row["tags"]),
+                        row["created_at"],
+                    ),
+                )
+                self._insert_event(
+                    db,
+                    "piece_created",
+                    task_id=task_id,
+                    actor_id=author,
+                    payload=row,
+                )
+                self._commit_write(
+                    db,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    cancel_guard=cancel_guard,
+                )
+            except Exception:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
         return row
 
     def search(
@@ -209,6 +327,8 @@ class CPSStore:
         sender: str,
         recipient: str | None,
         body: str,
+        deadline_epoch_ms: int | None = None,
+        cancel_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         message = {
             "id": uuid.uuid4().hex,
@@ -220,18 +340,39 @@ class CPSStore:
             "acked_at": None,
         }
         with self._db() as db:
-            db.execute(
-                "INSERT INTO messages(id,task_id,sender,recipient,body,created_at) VALUES(?,?,?,?,?,?)",
-                (
-                    message["id"],
-                    message["task_id"],
-                    message["sender"],
-                    message["recipient"],
-                    message["body"],
-                    message["created_at"],
-                ),
+            self._begin_write(
+                db,
+                deadline_epoch_ms=deadline_epoch_ms,
+                cancel_guard=cancel_guard,
             )
-        self.record_event("message_sent", task_id=task_id, actor_id=sender, payload=message)
+            try:
+                db.execute(
+                    "INSERT INTO messages(id,task_id,sender,recipient,body,created_at) VALUES(?,?,?,?,?,?)",
+                    (
+                        message["id"],
+                        message["task_id"],
+                        message["sender"],
+                        message["recipient"],
+                        message["body"],
+                        message["created_at"],
+                    ),
+                )
+                self._insert_event(
+                    db,
+                    "message_sent",
+                    task_id=task_id,
+                    actor_id=sender,
+                    payload=message,
+                )
+                self._commit_write(
+                    db,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    cancel_guard=cancel_guard,
+                )
+            except Exception:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
         return message
 
     def inbox(self, *, task_id: str, recipient: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -246,17 +387,44 @@ class CPSStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def ack_message(self, message_id: str, actor_id: str) -> bool:
+    def ack_message(
+        self,
+        message_id: str,
+        actor_id: str,
+        *,
+        deadline_epoch_ms: int | None = None,
+        cancel_guard: Callable[[], bool] | None = None,
+    ) -> bool:
         now = utc_now()
         with self._db() as db:
-            cursor = db.execute(
-                "UPDATE messages SET acked_at=? WHERE id=? AND acked_at IS NULL",
-                (now, message_id),
+            self._begin_write(
+                db,
+                deadline_epoch_ms=deadline_epoch_ms,
+                cancel_guard=cancel_guard,
             )
-        if cursor.rowcount:
-            self.record_event("message_acked", actor_id=actor_id, payload={"id": message_id})
-            return True
-        return False
+            try:
+                cursor = db.execute(
+                    "UPDATE messages SET acked_at=? WHERE id=? AND acked_at IS NULL",
+                    (now, message_id),
+                )
+                if cursor.rowcount:
+                    self._insert_event(
+                        db,
+                        "message_acked",
+                        task_id=None,
+                        actor_id=actor_id,
+                        payload={"id": message_id},
+                    )
+                self._commit_write(
+                    db,
+                    deadline_epoch_ms=deadline_epoch_ms,
+                    cancel_guard=cancel_guard,
+                )
+            except Exception:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        return bool(cursor.rowcount)
 
     def digest(
         self,
@@ -428,6 +596,7 @@ class CommunicationPolicy:
         body: str,
         kind: str = "handoff",
         tags: Iterable[str] = (),
+        deadline_epoch_ms: int | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -439,13 +608,28 @@ class CommunicationPolicy:
             title=title,
             body=body,
             tags=tags,
+            deadline_epoch_ms=deadline_epoch_ms,
         )
 
-    def send(self, task_id: str, actor_id: str, body: str, recipient: str | None = None) -> None:
+    def send(
+        self,
+        task_id: str,
+        actor_id: str,
+        body: str,
+        recipient: str | None = None,
+        *,
+        deadline_epoch_ms: int | None = None,
+    ) -> None:
         if not self.enabled or self.name == "blackboard":
             return
         assert self.store is not None
-        self.store.send_message(task_id=task_id, sender=actor_id, recipient=recipient, body=body)
+        self.store.send_message(
+            task_id=task_id,
+            sender=actor_id,
+            recipient=recipient,
+            body=body,
+            deadline_epoch_ms=deadline_epoch_ms,
+        )
 
 
 def make_policy(name: str, store: CPSStore | None) -> CommunicationPolicy:

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 import datetime as dt
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -174,6 +175,58 @@ class _CallbackFailureState:
             raise RuntimeError("runner worker/admission failure")
 
 
+class _AnyCancelEvent:
+    """Small Event-compatible OR view used across runner-owned lifecycles."""
+
+    def __init__(self, *events: Any):
+        self._events = tuple(event for event in events if event is not None)
+
+    def is_set(self) -> bool:
+        return any(bool(event.is_set()) for event in self._events)
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while not self.is_set():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                delay = min(remaining, 0.02)
+            else:
+                delay = 0.02
+            threading.Event().wait(delay)
+        return True
+
+
+class RemoteJudgeSettlementError(RuntimeError):
+    """The run cannot safely admit work while a remote job is unaccounted for."""
+
+
+def _evaluator_remote_settlement_event(evaluator: Any) -> Any | None:
+    event = getattr(evaluator, "remote_settlement_event", None)
+    if event is None or not callable(getattr(event, "is_set", None)):
+        return None
+    return event
+
+
+def _raise_if_remote_settlement_unconfirmed(
+    evaluator: Any,
+    verdict: Verdict | None = None,
+    *,
+    on_failure: Any | None = None,
+) -> None:
+    if (
+        _evaluator_remote_unsettled_jobs(evaluator) <= 0
+        and (verdict is None or not _verdict_has_unsettled_remote_work(verdict))
+    ):
+        return
+    if callable(on_failure):
+        on_failure()
+    raise RemoteJudgeSettlementError(
+        "remote Judge work did not provide a job-bound terminal receipt"
+    )
+
+
 @dataclass
 class _ElasticTaskState:
     """Run-local state for multiple agents collaborating on one task."""
@@ -196,6 +249,16 @@ class _ElasticTaskState:
     early_proofs: dict[str, _EarlyProofCredit] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _FrozenCandidate:
+    """Immutable per-task input to the feedback-free closeout phase."""
+
+    task_id: str
+    path: Path
+    sha256: str | None
+    error: str | None = None
+
+
 def _verdict_priority(verdict: Verdict | None) -> tuple[int, float]:
     if verdict is None:
         return (-1, -1.0)
@@ -204,8 +267,15 @@ def _verdict_priority(verdict: Verdict | None) -> tuple[int, float]:
         "COMPILES_WITH_SORRY": 2,
         "VERIFY_FAIL": 1,
         "LOCAL_REJECTED": 0,
-        "RUNNING": 0,
-        "OUT_OF_HORIZON": 0,
+        "MOCK_SKIPPED": 0,
+        "RUNNING": -1,
+        "OUT_OF_HORIZON": -1,
+        "EVALUATOR_TIMEOUT": -1,
+        "EVALUATOR_ERROR": -1,
+        "INFRASTRUCTURE_ERROR": -1,
+        "EXECUTION_TIMEOUT": -1,
+        "RESOURCE_LIMIT": -1,
+        "CANCELLED": -1,
     }
     return (status_rank.get(normalize_verdict_status(verdict.status), 0), float(verdict.score))
 
@@ -227,6 +297,7 @@ _INFRASTRUCTURE_VERDICT_STATUSES = frozenset(
         "INVALID_REQUEST",
         "INVALID_TASK_SELECTION",
         "PROVENANCE_INVALID",
+        "REMOTE_SETTLEMENT_UNCONFIRMED",
     }
 )
 _NONTERMINAL_VERDICT_STATUSES = frozenset(
@@ -275,6 +346,23 @@ def _file_sha256(path: Path) -> str | None:
 
 def _expected_task_contract(evaluator: Any, task: Task) -> str:
     method = getattr(evaluator, "expected_task_contract_sha256", None)
+    if not callable(method) and getattr(
+        evaluator, "_contextswarm_legacy_test_mock", False
+    ):
+        # A few lifecycle tests replace MockEvaluator with a deliberately tiny
+        # recording double.  Give only that explicitly marked, test-only
+        # object a deterministic contract; real evaluators still fail closed.
+        digest = hashlib.sha256()
+        for value in (
+            task.slug,
+            task.problem_id,
+            task.theorem_name,
+            task.baseline_code,
+            "legacy-test-mock",
+        ):
+            digest.update(value.encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
     if not callable(method):
         raise ValueError("evaluator does not expose its expected task contract")
     value = str(method(task) or "").strip().lower()
@@ -284,7 +372,36 @@ def _expected_task_contract(evaluator: Any, task: Task) -> str:
 
 
 def _allows_mock_provenance(evaluator: Any) -> bool:
-    return getattr(evaluator, "is_mock_evaluator", False) is True
+    return bool(
+        getattr(evaluator, "is_mock_evaluator", False) is True
+        or getattr(evaluator, "_contextswarm_legacy_test_mock", False)
+    )
+
+
+def _bind_legacy_test_mock_verdict(
+    evaluator: Any,
+    task: Task,
+    candidate: Path,
+    verdict: Verdict,
+) -> Verdict:
+    """Add candidate binding only for an explicitly marked mock test double."""
+
+    if not getattr(evaluator, "_contextswarm_legacy_test_mock", False):
+        return verdict
+    response = dict(verdict.response)
+    response["mock"] = True
+    return Verdict(
+        task_id=verdict.task_id,
+        status=verdict.status,
+        score=verdict.score,
+        elapsed_seconds=verdict.elapsed_seconds,
+        response=response,
+        error=verdict.error,
+        candidate_sha256=_file_sha256(candidate),
+        task_contract_sha256=_expected_task_contract(evaluator, task),
+        judge_job_id=verdict.judge_job_id,
+        cache_reused=verdict.cache_reused,
+    )
 
 
 def _has_authoritative_provenance(
@@ -415,6 +532,7 @@ def _publish_authoritative_validation(
     label: str,
     verdict: Verdict,
     feedback: str,
+    deadline_epoch_ms: int | None = None,
 ) -> None:
     candidate_hash = str(verdict.candidate_sha256 or "").lower()
     contract_hash = str(verdict.task_contract_sha256 or "").lower()
@@ -447,6 +565,7 @@ def _publish_authoritative_validation(
         title=f"{label}: {verdict.status}",
         body=body,
         tags=("runner_authoritative", "judge_verified"),
+        deadline_epoch_ms=deadline_epoch_ms,
     )
 
 
@@ -592,6 +711,11 @@ def _score_time_metrics(run_dir: Path, *, horizon_seconds: float, max_score: int
     for line in lines:
         try:
             row = json.loads(line)
+            # Frozen closeout is the fair terminal score, not an in-horizon
+            # discovery.  Only realtime Judge/solver evidence contributes to
+            # the score-time objective.
+            if str(row.get("source") or "") == "closeout":
+                continue
             if float(row.get("score") or 0.0) < 1.0:
                 continue
             task_id = str(row.get("task_id") or "")
@@ -780,10 +904,17 @@ def run_experiment(
             config.lean_server_url,
             lean_env_id=config.lean_env_id,
             timeout_seconds=config.lean_timeout_seconds,
+            max_lifecycle_seconds=config.lean_max_lifecycle_seconds,
             verification_profile=config.lean_verification_profile,
             judge_mode=config.lean_judge_mode,
         )
     )
+    if mock_agent and not callable(
+        getattr(evaluator, "expected_task_contract_sha256", None)
+    ):
+        # Test suites may replace MockEvaluator with a minimal recording
+        # double.  This marker is never set for a real experiment evaluator.
+        setattr(evaluator, "_contextswarm_legacy_test_mock", True)
     evaluator_gate = threading.BoundedSemaphore(config.lean_max_concurrent_evaluations)
     judge_broker = JudgeBroker(
         evaluator,
@@ -799,6 +930,7 @@ def run_experiment(
     agent_results: list[AgentResult] = []
     attempt_verdicts: list[Verdict] = []
     verdicts: dict[str, Verdict] = {}
+    frozen: dict[str, _FrozenCandidate] = {}
     run_failure: BaseException | None = None
     run_failure_fields: dict[str, str] | None = None
     try:
@@ -816,7 +948,6 @@ def run_experiment(
                 judge_broker=judge_broker,
             )
             agent_results.append(mono_result)
-            verdicts.update(mono_verdicts)
             attempt_verdicts.extend(mono_verdicts.values())
         elif config.uses_cps:
             results = _run_elastic_cps(
@@ -836,9 +967,6 @@ def run_experiment(
             for result, verdict in results:
                 agent_results.append(result)
                 attempt_verdicts.append(verdict)
-                current = verdicts.get(verdict.task_id)
-                if _verdict_priority(verdict) >= _verdict_priority(current):
-                    verdicts[verdict.task_id] = verdict
         else:
             results = _run_task_workers(
                 config,
@@ -856,7 +984,15 @@ def run_experiment(
             for result, verdict in results:
                 agent_results.append(result)
                 attempt_verdicts.append(verdict)
-                verdicts[verdict.task_id] = verdict
+        logger.event(
+            "horizon_closed",
+            reason=(
+                "deadline_elapsed"
+                if time.monotonic() >= run_deadline
+                else "solver_completed"
+            ),
+        )
+        frozen = _freeze_closeout_candidates(config, tasks, run_dir, logger)
     except BaseException as exc:  # delay artifacts until broker capabilities are silent
         run_failure = exc
         run_failure_fields = _exception_artifact_fields(
@@ -887,15 +1023,103 @@ def run_experiment(
         try:
             observed = judge_broker.drain_state()
         except Exception:
-            observed = {"active_handlers": -1, "fifo_depth": -1}
+            observed = {
+                "active_handlers": -1,
+                "fifo_depth": -1,
+                "remote_unsettled_jobs": -1,
+            }
         broker_state = {"drained": False, **observed}
 
+    terminal_failure = run_failure or broker_failure
+    terminal_failure_fields = (
+        run_failure_fields
+        or broker_failure_fields
+    )
+    if terminal_failure is None:
+        try:
+            # The broker is already silent here: closeout cannot write CPS
+            # feedback or influence any solver/allocation decision.
+            verdicts = _run_closeout(
+                config,
+                tasks,
+                frozen,
+                logger,
+                evaluator,
+                evaluator_gate,
+                reusable_verdicts=attempt_verdicts,
+            )
+        except BaseException as exc:
+            terminal_failure = exc
+            terminal_failure_fields = _exception_artifact_fields(
+                exc,
+                config,
+                traceback_bytes=4_000,
+            )
+
+    # Closeout itself submits feedback-free Judge work after the capability
+    # server is silent.  Re-observe the evaluator latch only after that phase;
+    # otherwise an unknown closeout job would be hidden by a stale zero written
+    # immediately after broker shutdown.
+    try:
+        final_broker_state = judge_broker.drain_state()
+    except BaseException as exc:
+        final_broker_state = {
+            "active_handlers": -1,
+            "fifo_depth": -1,
+            "remote_unsettled_jobs": -1,
+        }
+        if terminal_failure is None:
+            terminal_failure = exc
+            terminal_failure_fields = _exception_artifact_fields(
+                exc,
+                config,
+                traceback_bytes=4_000,
+            )
+    closeout_reported_remote = any(
+        normalize_verdict_status(verdict.status)
+        == "REMOTE_SETTLEMENT_UNCONFIRMED"
+        for verdict in verdicts.values()
+    )
+    remote_unsettled_jobs = max(
+        int(broker_state.get("remote_unsettled_jobs", -1)),
+        int(final_broker_state.get("remote_unsettled_jobs", -1)),
+    )
+    if closeout_reported_remote and remote_unsettled_jobs == 0:
+        # Compatibility fallback for narrow evaluator adapters.  Production
+        # LeanEvaluator owns the exact count and always sets it before return.
+        remote_unsettled_jobs = 1
+    closeout_active_handlers = int(
+        (broker_state if broker_failure is not None else final_broker_state).get(
+            "active_handlers", -1
+        )
+    )
+    closeout_fifo_depth = int(
+        (broker_state if broker_failure is not None else final_broker_state).get(
+            "fifo_depth", -1
+        )
+    )
     broker_closeout = {
         "schema_version": "contextswarm_judge_broker_closeout_v1",
-        "drained": broker_state.get("drained") is True,
-        "active_handlers": int(broker_state.get("active_handlers", -1)),
-        "fifo_depth": int(broker_state.get("fifo_depth", -1)),
+        "drained": bool(
+            broker_state.get("drained") is True
+            and closeout_active_handlers == 0
+            and closeout_fifo_depth == 0
+            and remote_unsettled_jobs == 0
+        ),
+        "active_handlers": closeout_active_handlers,
+        "fifo_depth": closeout_fifo_depth,
+        "remote_unsettled_jobs": remote_unsettled_jobs,
     }
+    if remote_unsettled_jobs > 0 and terminal_failure is None:
+        terminal_failure = RemoteJudgeSettlementError(
+            "remote Judge work did not provide a job-bound terminal receipt during closeout"
+        )
+        terminal_failure_fields = _exception_artifact_fields(
+            terminal_failure,
+            config,
+            traceback_bytes=4_000,
+        )
+
     closeout_artifact_failure: BaseException | None = None
     closeout_artifact_failure_fields: dict[str, str] | None = None
     try:
@@ -911,25 +1135,25 @@ def run_experiment(
             config,
             traceback_bytes=4_000,
         )
+        if terminal_failure is None:
+            terminal_failure = exc
+            terminal_failure_fields = closeout_artifact_failure_fields
 
-    if broker_failure is None and closeout_artifact_failure is None:
-        logger.event("judge_broker_closed", **broker_closeout)
-    elif isinstance(broker_failure, JudgeBrokerDrainError):
-        logger.event("broker_drain_timeout", **broker_closeout)
-    elif broker_failure is not None:
-        logger.event("broker_close_error", **broker_closeout)
-    else:
+    if closeout_artifact_failure is not None:
         logger.event(
             "broker_closeout_artifact_error",
             **(closeout_artifact_failure_fields or {}),
         )
-
-    terminal_failure = run_failure or broker_failure or closeout_artifact_failure
-    terminal_failure_fields = (
-        run_failure_fields
-        or broker_failure_fields
-        or closeout_artifact_failure_fields
-    )
+    elif isinstance(broker_failure, JudgeBrokerDrainError) and (
+        closeout_active_handlers != 0 or closeout_fifo_depth != 0
+    ):
+        logger.event("broker_drain_timeout", **broker_closeout)
+    elif broker_failure is not None and remote_unsettled_jobs <= 0:
+        logger.event("broker_close_error", **broker_closeout)
+    elif remote_unsettled_jobs > 0:
+        logger.event("remote_settlement_unconfirmed", **broker_closeout)
+    else:
+        logger.event("judge_broker_closed", **broker_closeout)
     if store is not None:
         try:
             store.export_events(run_dir / "communication_trace.jsonl")
@@ -1011,6 +1235,10 @@ def _run_mono(
     }
     allow_mock_provenance = _allows_mock_provenance(evaluator)
     callback_failure = _CallbackFailureState()
+    run_cancel_event = _AnyCancelEvent(
+        callback_failure,
+        _evaluator_remote_settlement_event(evaluator),
+    )
 
     def admit_early_proof(
         task: Task,
@@ -1072,7 +1300,7 @@ def _run_mono(
             candidates=candidates,
             deadline_monotonic=deadline,
             on_authoritative_verdict=admit_early_proof,
-            cancel_event=callback_failure,
+            cancel_event=run_cancel_event,
         ) as broker_env:
             result = pi_agent.run(
                 task_id="matholympiadbench-latest12",
@@ -1082,8 +1310,12 @@ def _run_mono(
                 workdir=worker_dir,
                 extra_env=broker_env,
                 deadline_monotonic=deadline,
-                cancel_event=callback_failure,
+                cancel_event=run_cancel_event,
             )
+    _raise_if_remote_settlement_unconfirmed(
+        evaluator,
+        on_failure=callback_failure.record,
+    )
     callback_failure.raise_if_failed()
     logger.event("agent_finished", **result.as_dict())
     verdicts: dict[str, Verdict] = {}
@@ -1099,7 +1331,19 @@ def _run_mono(
             )
             verdict = credit.verdict
         else:
-            verdict = _evaluate_candidate(evaluator, task, candidate, deadline, evaluator_gate)
+            verdict = _evaluate_candidate(
+                evaluator,
+                task,
+                candidate,
+                deadline,
+                evaluator_gate,
+                cancel_event=run_cancel_event,
+            )
+            _raise_if_remote_settlement_unconfirmed(
+                evaluator,
+                verdict,
+                on_failure=callback_failure.record,
+            )
             verdict = _within_horizon(verdict, deadline)
             verdict = _enforce_verdict_provenance(
                 verdict,
@@ -1176,14 +1420,28 @@ def _run_elastic_cps(
     allocation_lock = threading.RLock()
     roster: list[dict[str, Any]] = []
     roster_path.write_text("[]\n", encoding="utf-8")
+    horizon_epoch_ms = int(
+        (time.time() + max(0.0, deadline - time.monotonic())) * 1_000
+    )
     jobs: Queue[AgentAssignment] = Queue()
     results: list[tuple[AgentResult, Verdict]] = []
     results_lock = threading.RLock()
     scheduler_results_lock = threading.RLock()
+    evaluation_backlog_limit = max(
+        2,
+        config.max_parallel + config.lean_max_concurrent_evaluations,
+    )
+    evaluation_backlog_gate = threading.BoundedSemaphore(
+        evaluation_backlog_limit
+    )
     decision_index = 0
     initial_assignment_count = 0
     adaptive_assignments = 0
     callback_failure = _CallbackFailureState()
+    run_cancel_event = _AnyCancelEvent(
+        callback_failure,
+        _evaluator_remote_settlement_event(evaluator),
+    )
 
     assert policy.store is not None
     store = policy.store
@@ -1230,6 +1488,7 @@ def _run_elastic_cps(
                 workdir=workdir,
                 deadline_monotonic=scheduler_deadline,
                 isolated=True,
+                cancel_event=run_cancel_event,
             )
             result.run_horizon_reached = bool(
                 result.timed_out
@@ -1419,7 +1678,10 @@ def _run_elastic_cps(
                 if exhausted:
                     state.retired = True
             if exhausted:
-                scheduler.task_solved(task_id)
+                scheduler.retire_task(
+                    task_id,
+                    reason="attempt_budget_exhausted",
+                )
                 logger.event(
                     "task_attempt_budget_exhausted",
                     task_id=task_id,
@@ -1449,6 +1711,9 @@ def _run_elastic_cps(
         allocation_lock.acquire()
         try:
             while time.monotonic() < deadline:
+                if _evaluator_remote_unsettled_jobs(evaluator) > 0:
+                    record_run_failure()
+                    return None
                 if callback_failure.failed:
                     return None
                 retire_exhausted_tasks()
@@ -1459,8 +1724,9 @@ def _run_elastic_cps(
                     state = states[assignment.task_id]
                     with state.lock:
                         unavailable = state.solved or state.retired
+                        solved = state.solved
                     if unavailable:
-                        scheduler.finish(assignment, solved=True)
+                        scheduler.finish(assignment, solved=solved)
                         continue
                     return accept_assignment(assignment, phase="initial")
 
@@ -1606,7 +1872,8 @@ def _run_elastic_cps(
             shutil.copy2(state.best_candidate, workdir / "result.lean")
         return workdir, state.best_candidate
 
-    def execute_assignment(assignment: AgentAssignment) -> tuple[AgentResult, Verdict, bool]:
+    def execute_assignment(assignment: AgentAssignment) -> Any:
+        """Yield once when solver capacity is releasable, then settle Judge work."""
         callback_failure.raise_if_failed()
         state = states[assignment.task_id]
         workdir, best_path = prepare_workspace(state, assignment)
@@ -1667,6 +1934,7 @@ def _run_elastic_cps(
                         label=f"attempt {assignment.generation}",
                         verdict=verdict,
                         feedback=feedback,
+                        deadline_epoch_ms=horizon_epoch_ms,
                     )
                     logger.event(
                         "best_candidate_promoted",
@@ -1753,7 +2021,10 @@ def _run_elastic_cps(
                 **verdict.as_dict(),
                 agent_id=actor,
                 episode=assignment.generation,
+                phase="solver",
+                eligible_for_handoff=False,
             )
+            yield result
             return result, verdict, False
 
         digest = policy.digest(task.slug, actor, query=task.theorem_name)
@@ -1772,6 +2043,10 @@ def _run_elastic_cps(
             "the runner will merge the strongest verified candidate."
         )
 
+        assignment_cancel_event = _AnyCancelEvent(
+            run_cancel_event,
+            state.cancel_event,
+        )
         if mock_agent:
             result = _mock_result(actor, task.slug, assignment.generation)
         else:
@@ -1784,7 +2059,7 @@ def _run_elastic_cps(
                 communication=config.communication,
                 roster_path=roster_path,
                 on_authoritative_verdict=admit_early_proof,
-                cancel_event=state.cancel_event,
+                cancel_event=assignment_cancel_event,
             ) as broker_env:
                 result = pi_agent.run(
                     task_id=task.slug,
@@ -1794,10 +2069,19 @@ def _run_elastic_cps(
                     workdir=workdir,
                     extra_env=broker_env,
                     deadline_monotonic=deadline,
-                    cancel_event=state.cancel_event,
+                    cancel_event=assignment_cancel_event,
                 )
+        _raise_if_remote_settlement_unconfirmed(
+            evaluator,
+            on_failure=record_run_failure,
+        )
         callback_failure.raise_if_failed()
         logger.event("agent_finished", **result.as_dict())
+
+        # Everything below this point is evaluator/commit work.  The queue
+        # worker advances the generator only on the bounded evaluator pool, so
+        # a slow Judge never occupies the released Pi solver slot.
+        yield result
 
         with state.lock:
             early_credit = state.early_proofs.get(actor)
@@ -1810,6 +2094,8 @@ def _run_elastic_cps(
                 episode=assignment.generation,
                 source="judge_check",
                 scoreboard_recorded=False,
+                phase="solver",
+                eligible_for_handoff=True,
             )
             with allocation_lock:
                 with state.lock:
@@ -1833,6 +2119,12 @@ def _run_elastic_cps(
                 workdir / "result.lean",
                 deadline,
                 evaluator_gate,
+                cancel_event=assignment_cancel_event,
+            )
+            _raise_if_remote_settlement_unconfirmed(
+                evaluator,
+                verdict,
+                on_failure=record_run_failure,
             )
             verdict = _within_horizon(verdict, deadline)
             verdict = _enforce_verdict_provenance(
@@ -1865,6 +2157,8 @@ def _run_elastic_cps(
                     episode=assignment.generation,
                     source="final_evaluation",
                     scoreboard_recorded=True,
+                    phase="solver",
+                    eligible_for_handoff=True,
                 )
                 return result, verdict, True
 
@@ -1895,6 +2189,8 @@ def _run_elastic_cps(
                 episode=assignment.generation,
                 source="final_evaluation",
                 scoreboard_recorded=True,
+                phase="solver",
+                eligible_for_handoff=False,
             )
             return result, verdict, False
 
@@ -1961,6 +2257,7 @@ def _run_elastic_cps(
                 label=f"attempt {assignment.generation}",
                 verdict=verdict,
                 feedback=feedback,
+                deadline_epoch_ms=horizon_epoch_ms,
             )
         logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
         logger.event(
@@ -1970,6 +2267,12 @@ def _run_elastic_cps(
             episode=assignment.generation,
             source="final_evaluation",
             scoreboard_recorded=True,
+            phase="solver",
+            eligible_for_handoff=(
+                not superseded
+                and time.monotonic() <= deadline
+                and normalize_verdict_status(verdict.status) != "OUT_OF_HORIZON"
+            ),
         )
         return result, verdict, False
 
@@ -1986,6 +2289,51 @@ def _run_elastic_cps(
 
     worker_count = max(1, min(config.max_parallel, len(initial_assignments)))
 
+    evaluation_executor = ThreadPoolExecutor(
+        max_workers=config.lean_max_concurrent_evaluations,
+        thread_name_prefix="cps-evaluator",
+    )
+
+    def settle_execution(
+        assignment: AgentAssignment,
+        execution: Any,
+        *,
+        release_backlog: bool,
+    ) -> None:
+        try:
+            try:
+                next(execution)
+            except StopIteration as stopped:
+                settled = stopped.value
+            else:
+                raise RuntimeError("assignment yielded more than once")
+            if not (
+                isinstance(settled, tuple)
+                and len(settled) == 3
+                and isinstance(settled[0], AgentResult)
+                and isinstance(settled[1], Verdict)
+            ):
+                raise RuntimeError("assignment did not produce a complete settlement")
+            result, verdict, _solved = settled
+            with results_lock:
+                results.append((result, verdict))
+        except Exception as exc:
+            record_run_failure()
+            logger.event(
+                "evaluator_worker_error",
+                task_id=assignment.task_id,
+                agent_id=assignment.agent_id,
+                episode=assignment.generation,
+                **_exception_artifact_fields(
+                    exc,
+                    config,
+                    traceback_bytes=2_000,
+                ),
+            )
+        finally:
+            if release_backlog:
+                evaluation_backlog_gate.release()
+
     def worker_loop() -> None:
         while True:
             try:
@@ -1994,12 +2342,64 @@ def _run_elastic_cps(
                 if callback_failure.failed or time.monotonic() >= deadline or scheduler.done:
                     return
                 continue
+            lease_released = False
+            execution: Any | None = None
             try:
-                result, verdict, solved = execute_assignment(assignment)
-                with results_lock:
-                    results.append((result, verdict))
+                execution = execute_assignment(assignment)
+                next(execution)
                 with allocation_lock:
-                    scheduler.finish(assignment, solved=solved)
+                    scheduler.finish(assignment, solved=False)
+                lease_released = True
+
+                remaining = max(0.0, deadline - time.monotonic())
+                admitted = evaluation_backlog_gate.acquire(blocking=False)
+                if not admitted:
+                    logger.event(
+                        "evaluation_backpressure_wait",
+                        task_id=assignment.task_id,
+                        agent_id=assignment.agent_id,
+                        episode=assignment.generation,
+                        backlog_limit=evaluation_backlog_limit,
+                    )
+                    wait_deadline = time.monotonic() + remaining
+                    while not admitted and time.monotonic() < wait_deadline:
+                        callback_failure.raise_if_failed()
+                        admitted = evaluation_backlog_gate.acquire(
+                            timeout=min(
+                                0.2,
+                                max(0.0, wait_deadline - time.monotonic()),
+                            )
+                        )
+                if admitted:
+                    try:
+                        evaluation_executor.submit(
+                            settle_execution,
+                            assignment,
+                            execution,
+                            release_backlog=True,
+                        )
+                        execution = None
+                    except Exception:
+                        evaluation_backlog_gate.release()
+                        execution.close()
+                        raise
+                else:
+                    logger.event(
+                        "evaluation_backpressure_expired",
+                        task_id=assignment.task_id,
+                        agent_id=assignment.agent_id,
+                        episode=assignment.generation,
+                        backlog_limit=evaluation_backlog_limit,
+                    )
+                    # At the horizon the generator's evaluator path resolves
+                    # immediately to OUT_OF_HORIZON, preserving exact attempt
+                    # closeout even when the bounded queue cannot admit it.
+                    settle_execution(
+                        assignment,
+                        execution,
+                        release_backlog=False,
+                    )
+                    execution = None
                 replacement = claim_next()
                 if replacement is not None:
                     jobs.put(replacement)
@@ -2015,17 +2415,25 @@ def _run_elastic_cps(
                         traceback_bytes=2_000,
                     ),
                 )
-                with allocation_lock:
-                    scheduler.finish(assignment, solved=False)
+                if not lease_released:
+                    with allocation_lock:
+                        scheduler.finish(assignment, solved=False)
+                if execution is not None:
+                    execution.close()
                 return
             finally:
                 jobs.task_done()
 
-    if initial_assignments:
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(worker_loop) for _ in range(worker_count)]
-            for future in futures:
-                future.result()
+    try:
+        if initial_assignments:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = [executor.submit(worker_loop) for _ in range(worker_count)]
+                for future in futures:
+                    future.result()
+    finally:
+        # Every admitted evaluator settles before candidate freezing.  This is
+        # a bounded queue join, not a solver-slot join.
+        evaluation_executor.shutdown(wait=True, cancel_futures=False)
 
     callback_failure.raise_if_failed()
 
@@ -2061,6 +2469,7 @@ def _run_elastic_cps(
         json.dumps(allocation_summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    results.sort(key=lambda pair: (pair[1].task_id, pair[0].episode, pair[0].agent_id))
     return results
 
 
@@ -2079,6 +2488,10 @@ def _run_task_workers(
     judge_broker: JudgeBroker,
 ) -> list[tuple[AgentResult, Verdict]]:
     callback_failure = _CallbackFailureState()
+    run_cancel_event = _AnyCancelEvent(
+        callback_failure,
+        _evaluator_remote_settlement_event(evaluator),
+    )
 
     def execute(task: Task) -> tuple[AgentResult, Verdict]:
         workdir = run_dir / "workers" / task.slug
@@ -2163,7 +2576,7 @@ def _run_task_workers(
                     communication=config.communication if policy.enabled else "none",
                     roster_path=(run_dir / "actors.json") if policy.enabled else None,
                     on_authoritative_verdict=admit_early_proof,
-                    cancel_event=callback_failure,
+                    cancel_event=run_cancel_event,
                 ) as broker_env:
                     result = pi_agent.run(
                         task_id=task.slug,
@@ -2173,8 +2586,12 @@ def _run_task_workers(
                         workdir=workdir,
                         extra_env=broker_env,
                         deadline_monotonic=deadline,
-                        cancel_event=callback_failure,
+                        cancel_event=run_cancel_event,
                     )
+            _raise_if_remote_settlement_unconfirmed(
+                evaluator,
+                on_failure=callback_failure.record,
+            )
             callback_failure.raise_if_failed()
             logger.event("agent_finished", **result.as_dict())
             with early_lock:
@@ -2193,6 +2610,12 @@ def _run_task_workers(
                     workdir / "result.lean",
                     deadline,
                     evaluator_gate,
+                    cancel_event=run_cancel_event,
+                )
+                _raise_if_remote_settlement_unconfirmed(
+                    evaluator,
+                    verdict,
+                    on_failure=callback_failure.record,
                 )
                 verdict = _within_horizon(verdict, deadline)
                 verdict = _enforce_verdict_provenance(
@@ -2268,7 +2691,11 @@ def _stage_task(task: Task, destination: Path) -> None:
 
 
 def _within_horizon(verdict: Verdict, deadline: float) -> Verdict:
-    if time.monotonic() <= deadline:
+    if (
+        normalize_verdict_status(verdict.status)
+        == "REMOTE_SETTLEMENT_UNCONFIRMED"
+        or time.monotonic() <= deadline
+    ):
         return verdict
     return Verdict(
         task_id=verdict.task_id,
@@ -2290,20 +2717,360 @@ def _evaluate_candidate(
     candidate: Path,
     deadline: float,
     gate: threading.BoundedSemaphore,
+    *,
+    cancel_event: Any | None = None,
 ) -> Verdict:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
+    acquired, remote_unsettled = _acquire_evaluator_gate(
+        evaluator,
+        gate,
+        deadline_monotonic=deadline,
+    )
+    if remote_unsettled:
+        return _remote_settlement_verdict(task)
+    if not acquired:
         return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "run_horizon_elapsed"})
-    # Evaluator contention is part of the shared experiment horizon.  A fixed
-    # admission timeout can reject a candidate while substantial run time is
-    # still available, especially in high-concurrency cells.  Wait for the
-    # gate for exactly the remaining horizon instead.
-    if not gate.acquire(timeout=remaining):
-        return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "evaluator_admission_horizon_elapsed"})
+    evaluator_unsettled_before = _evaluator_remote_unsettled_jobs(evaluator)
+    release_gate = True
     try:
-        return evaluator.evaluate(task, candidate, deadline_monotonic=deadline)
+        evaluate_kwargs: dict[str, Any] = {"deadline_monotonic": deadline}
+        if cancel_event is not None and _call_accepts_cancel_event(evaluator.evaluate):
+            evaluate_kwargs["cancel_event"] = cancel_event
+        verdict = evaluator.evaluate(task, candidate, **evaluate_kwargs)
+        verdict = _bind_legacy_test_mock_verdict(evaluator, task, candidate, verdict)
+        evaluator_unsettled_after = _evaluator_remote_unsettled_jobs(evaluator)
+        call_unsettled = (
+            evaluator_unsettled_after > 0
+            or _verdict_has_unsettled_remote_work(verdict)
+        )
+        if call_unsettled:
+            release_gate = False
+            return _remote_settlement_verdict(task, verdict)
+        return verdict
+    except BaseException:
+        if _evaluator_remote_unsettled_jobs(evaluator) > evaluator_unsettled_before:
+            release_gate = False
+        raise
     finally:
-        gate.release()
+        if release_gate:
+            gate.release()
+
+
+def _evaluator_remote_unsettled_jobs(evaluator: Any) -> int:
+    try:
+        value = getattr(evaluator, "remote_unsettled_jobs", 0)
+    except Exception:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
+
+
+def _call_accepts_cancel_event(function: Any) -> bool:
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "cancel_event"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _acquire_evaluator_gate(
+    evaluator: Any,
+    gate: threading.BoundedSemaphore,
+    *,
+    deadline_monotonic: float | None,
+) -> tuple[bool, bool]:
+    """Wait in short intervals so the global remote latch aborts admission."""
+
+    while True:
+        if _evaluator_remote_unsettled_jobs(evaluator) > 0:
+            return False, True
+        if deadline_monotonic is None:
+            wait_seconds = 0.1
+        else:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                return False, False
+            wait_seconds = min(remaining, 0.1)
+        if not gate.acquire(timeout=wait_seconds):
+            continue
+        if _evaluator_remote_unsettled_jobs(evaluator) > 0:
+            gate.release()
+            return False, True
+        return True, False
+
+
+def _verdict_has_unsettled_remote_work(verdict: Verdict) -> bool:
+    response = verdict.response if isinstance(verdict.response, Mapping) else {}
+    cancellation = response.get("judge_cancellation")
+    return (
+        normalize_verdict_status(verdict.status)
+        == "REMOTE_SETTLEMENT_UNCONFIRMED"
+        or response.get("remote_settlement_unconfirmed") is True
+        or response.get("settlement_error") == "cancel_settlement_unconfirmed"
+        or (
+            isinstance(cancellation, Mapping)
+            and cancellation.get("attempted") is True
+            and cancellation.get("settled") is not True
+        )
+    )
+
+
+def _remote_settlement_verdict(
+    task: Task,
+    original: Verdict | None = None,
+) -> Verdict:
+    response = dict(original.response) if original is not None else {}
+    response["remote_settlement_unconfirmed"] = True
+    response.setdefault("reason", "remote_judge_terminal_receipt_unconfirmed")
+    return Verdict(
+        task_id=task.slug,
+        status="REMOTE_SETTLEMENT_UNCONFIRMED",
+        score=0.0,
+        elapsed_seconds=(original.elapsed_seconds if original is not None else 0.0),
+        response=response,
+        error=(original.error if original is not None else None),
+        candidate_sha256=(original.candidate_sha256 if original is not None else None),
+        task_contract_sha256=(
+            original.task_contract_sha256 if original is not None else None
+        ),
+        judge_job_id=(original.judge_job_id if original is not None else None),
+        cache_reused=(original.cache_reused if original is not None else False),
+    )
+
+
+def _candidate_source(config: ExperimentConfig, task: Task, run_dir: Path) -> Path:
+    if config.mode == "mono":
+        return run_dir / "workers" / "mono" / "tasks" / task.slug / "result.lean"
+    if config.uses_cps:
+        return run_dir / "workers" / task.slug / "best" / "result.lean"
+    return run_dir / "workers" / task.slug / "result.lean"
+
+
+def _freeze_closeout_candidates(
+    config: ExperimentConfig,
+    tasks: list[Task],
+    run_dir: Path,
+    logger: RunLogger,
+) -> dict[str, _FrozenCandidate]:
+    """Freeze one mode-defined candidate per task before final evaluation."""
+
+    root = run_dir / "closeout_candidates"
+    frozen: dict[str, _FrozenCandidate] = {}
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        source = _candidate_source(config, task, run_dir)
+        destination = root / task.slug / "result.lean"
+        digest: str | None = None
+        error: str | None = None
+        try:
+            payload = source.read_bytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            _atomic_write_candidate(payload, destination, digest)
+            destination.chmod(0o444)
+        except OSError as exc:
+            error = f"cannot freeze candidate: {exc.strerror or type(exc).__name__}"
+        frozen[task.slug] = _FrozenCandidate(task.slug, destination, digest, error)
+        row: dict[str, Any] = {
+            "task_id": task.slug,
+            "source": str(source.relative_to(run_dir)),
+            "snapshot": str(destination.relative_to(run_dir)),
+            "candidate_sha256": digest,
+        }
+        if error is not None:
+            row["error"] = error
+        rows.append(row)
+    index = {"candidates": rows}
+    (run_dir / "closeout_candidates.json").write_text(
+        json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    # Keep an index beside the immutable files as well as at the run root so
+    # a copied closeout bundle remains self-describing.
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "index.json").write_text(
+        json.dumps(index, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    logger.event(
+        "candidates_frozen",
+        candidate_count=len(rows),
+        candidates=[
+            {"task_id": row["task_id"], "candidate_sha256": row["candidate_sha256"]}
+            for row in rows
+        ],
+    )
+    return frozen
+
+
+def _reusable_closeout_verdict(
+    evaluator: Any,
+    task: Task,
+    candidate: _FrozenCandidate,
+    verdicts: Iterable[Verdict],
+) -> Verdict | None:
+    """Reuse an exact authoritative proof without creating a duplicate score."""
+
+    if candidate.sha256 is None:
+        return None
+    expected_contract = _expected_task_contract(evaluator, task)
+    allow_mock = _allows_mock_provenance(evaluator)
+    best: Verdict | None = None
+    for verdict in verdicts:
+        if verdict.task_id != task.slug:
+            continue
+        if (
+            normalize_verdict_status(verdict.status) != "PROVED"
+            or float(verdict.score) < 1.0
+            or str(verdict.candidate_sha256 or "").lower() != candidate.sha256
+            or str(verdict.task_contract_sha256 or "").lower() != expected_contract
+            or not (
+                verdict.judge_job_id
+                or (allow_mock and verdict.response.get("mock") is True)
+            )
+        ):
+            continue
+        if _verdict_priority(verdict) > _verdict_priority(best):
+            best = verdict
+    return best
+
+
+def _evaluate_closeout_candidate(
+    evaluator: Any,
+    task: Task,
+    candidate: _FrozenCandidate,
+    gate: threading.BoundedSemaphore,
+) -> Verdict:
+    if candidate.error or not candidate.path.is_file():
+        return Verdict(
+            task.slug,
+            "MISSING_CANDIDATE",
+            0.0,
+            0.0,
+            {"candidate_sha256": candidate.sha256},
+            error=candidate.error or "candidate snapshot is missing",
+        )
+    acquired, remote_unsettled = _acquire_evaluator_gate(
+        evaluator,
+        gate,
+        deadline_monotonic=None,
+    )
+    if remote_unsettled:
+        return _remote_settlement_verdict(task)
+    if not acquired:  # pragma: no cover - an unbounded wait has no third state
+        return _remote_settlement_verdict(task)
+    evaluator_unsettled_before = _evaluator_remote_unsettled_jobs(evaluator)
+    release_gate = True
+    try:
+        verdict = evaluator.evaluate(task, candidate.path, deadline_monotonic=None)
+        verdict = _bind_legacy_test_mock_verdict(
+            evaluator,
+            task,
+            candidate.path,
+            verdict,
+        )
+        evaluator_unsettled_after = _evaluator_remote_unsettled_jobs(evaluator)
+        call_unsettled = (
+            evaluator_unsettled_after > 0
+            or _verdict_has_unsettled_remote_work(verdict)
+        )
+        if call_unsettled:
+            release_gate = False
+            verdict = _remote_settlement_verdict(task, verdict)
+    except BaseException:
+        if _evaluator_remote_unsettled_jobs(evaluator) > evaluator_unsettled_before:
+            release_gate = False
+        raise
+    finally:
+        if release_gate:
+            gate.release()
+    return _enforce_verdict_provenance(
+        verdict,
+        candidate.path,
+        expected_task_contract_sha256=_expected_task_contract(evaluator, task),
+        allow_mock_provenance=_allows_mock_provenance(evaluator),
+    )
+
+
+def _run_closeout(
+    config: ExperimentConfig,
+    tasks: list[Task],
+    frozen: Mapping[str, _FrozenCandidate],
+    logger: RunLogger,
+    evaluator: Any,
+    gate: threading.BoundedSemaphore,
+    *,
+    reusable_verdicts: Iterable[Verdict] = (),
+) -> dict[str, Verdict]:
+    """Score frozen candidates under one bounded, feedback-free contract."""
+
+    prior = tuple(reusable_verdicts)
+    logger.event(
+        "closeout_started",
+        candidate_count=len(tasks),
+        max_concurrent_evaluations=config.lean_max_concurrent_evaluations,
+        execution_timeout_seconds=config.lean_timeout_seconds,
+    )
+    verdicts: dict[str, Verdict] = {}
+    reused: dict[str, bool] = {}
+
+    def evaluate(task: Task) -> tuple[Verdict, bool]:
+        try:
+            candidate = frozen[task.slug]
+            reusable = _reusable_closeout_verdict(
+                evaluator,
+                task,
+                candidate,
+                prior,
+            )
+            if reusable is not None:
+                return reusable, True
+            return _evaluate_closeout_candidate(evaluator, task, candidate, gate), False
+        except Exception as exc:
+            return (
+                Verdict(
+                    task.slug,
+                    "EVALUATOR_ERROR",
+                    0.0,
+                    0.0,
+                    error=sanitize_worker_text(exc),
+                ),
+                False,
+            )
+
+    worker_count = max(1, min(config.lean_max_concurrent_evaluations, len(tasks)))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="closeout") as executor:
+        futures = {executor.submit(evaluate, task): task for task in tasks}
+        for future in as_completed(futures):
+            task = futures[future]
+            verdict, was_reused = future.result()
+            verdicts[task.slug] = verdict
+            reused[task.slug] = was_reused
+            if not was_reused:
+                logger.scoreboard(
+                    verdict,
+                    episode=0,
+                    agent_id="closeout",
+                    source="closeout",
+                )
+            logger.event(
+                "closeout_evaluation_finished",
+                **verdict.as_dict(),
+                agent_id="closeout",
+                episode=0,
+                reused_authoritative_verdict=was_reused,
+                scoreboard_recorded=not was_reused,
+            )
+    ordered = {task.slug: verdicts[task.slug] for task in tasks}
+    logger.event(
+        "closeout_finished",
+        score=sum(verdict.score for verdict in ordered.values()),
+        reused_authoritative_verdicts=sum(reused.values()),
+    )
+    return ordered
 
 
 def _write_mono_bundle(worker_dir: Path, tasks: Iterable[Task]) -> None:
@@ -2387,6 +3154,24 @@ def _run_health(
             issues.add("verdict_provenance_invalid")
     if len(verdicts) != expected_task_count:
         issues.add("final_task_bundle_incomplete")
+    incomplete_closeout_statuses = {
+        "CANCELLED",
+        "EVALUATOR_ERROR",
+        "EVALUATOR_TIMEOUT",
+        "INFRASTRUCTURE_ERROR",
+        "MISSING_CANDIDATE",
+        "OUT_OF_HORIZON",
+        "REJECTED_OVERLOADED",
+        "REMOTE_SETTLEMENT_UNCONFIRMED",
+    }
+    for verdict in verdicts.values():
+        status = normalize_verdict_status(verdict.status)
+        if status in incomplete_closeout_statuses or status in _NONTERMINAL_VERDICT_STATUSES:
+            issues.add("closeout_incomplete")
+        if status in _INFRASTRUCTURE_VERDICT_STATUSES:
+            issues.add("evaluator_infrastructure_error")
+        if status == "PROVENANCE_INVALID":
+            issues.add("verdict_provenance_invalid")
 
     unexpected_process_errors = 0
     oom_or_137 = 0
@@ -2435,11 +3220,61 @@ def _run_health(
     if not events_valid:
         issues.add("events_invalid_or_missing")
     worker_errors = sum(
-        str(row.get("event") or "") in {"run_error", "elastic_worker_error", "preflight_failed"}
+        str(row.get("event") or "")
+        in {
+            "run_error",
+            "elastic_worker_error",
+            "evaluator_worker_error",
+            "preflight_failed",
+        }
         for row in events
     )
     if worker_errors:
         issues.add("runner_or_worker_error")
+
+    lifecycle_events = (
+        "horizon_closed",
+        "candidates_frozen",
+        "closeout_started",
+        "closeout_finished",
+    )
+    lifecycle_observed = any(
+        row.get("event") in lifecycle_events for row in events
+    ) or (run_dir / "closeout_candidates.json").exists()
+    if lifecycle_observed:
+        lifecycle_positions: list[int] = []
+        for event_name in lifecycle_events:
+            positions = [
+                index
+                for index, row in enumerate(events)
+                if row.get("event") == event_name
+            ]
+            if len(positions) != 1:
+                issues.add("closeout_lifecycle_incomplete")
+            else:
+                lifecycle_positions.append(positions[0])
+        if (
+            len(lifecycle_positions) == len(lifecycle_events)
+            and lifecycle_positions != sorted(lifecycle_positions)
+        ):
+            issues.add("closeout_lifecycle_incomplete")
+        closeout_rows = [
+            row for row in events if row.get("event") == "closeout_evaluation_finished"
+        ]
+        if verdicts and len(closeout_rows) != expected_task_count:
+            issues.add("closeout_lifecycle_incomplete")
+        try:
+            closeout_index = json.loads(
+                (run_dir / "closeout_candidates.json").read_text(encoding="utf-8")
+            )
+            indexed_candidates = closeout_index["candidates"]
+            if (
+                not isinstance(indexed_candidates, list)
+                or len(indexed_candidates) != expected_task_count
+            ):
+                issues.add("closeout_candidate_index_invalid")
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            issues.add("closeout_candidate_index_invalid")
 
     scheduler_event_rows = [
         row for row in events if row.get("event") == "allocation_scheduler_finished"

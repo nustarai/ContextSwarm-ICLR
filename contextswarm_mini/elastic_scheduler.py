@@ -41,6 +41,7 @@ class _TaskState:
     task_id: str
     initial_agents: int
     solved: bool = False
+    retired_reason: str | None = None
     next_generation: int = 1
     initial_admitted: int = 0
 
@@ -195,7 +196,10 @@ class ElasticScheduler:
         with self._lock:
             return not self._active and (
                 not self._tasks
-                or all(state.solved for state in self._tasks.values())
+                or all(
+                    state.solved or state.retired_reason is not None
+                    for state in self._tasks.values()
+                )
                 or self._horizon_reached(float(self._clock()))
             )
 
@@ -227,15 +231,27 @@ class ElasticScheduler:
         # admitted task recover its initial workers before spare retries.
         for offset in range(len(states)):
             state = states[(self._initial_cursor + offset) % len(states)]
-            if not state.solved and state.initial_admitted < state.initial_agents:
+            if (
+                not state.solved
+                and state.retired_reason is None
+                and state.initial_admitted < state.initial_agents
+            ):
                 self._initial_cursor = (self._initial_cursor + offset + 1) % len(states)
                 return state
         for offset in range(len(states)):
             state = states[(self._cursor + offset) % len(states)]
-            if not state.solved and len(self._active_by_task[state.task_id]) < state.initial_agents:
+            if (
+                not state.solved
+                and state.retired_reason is None
+                and len(self._active_by_task[state.task_id]) < state.initial_agents
+            ):
                 self._cursor = (self._cursor + offset + 1) % len(states)
                 return state
-        unsolved = [state for state in states if not state.solved]
+        unsolved = [
+            state
+            for state in states
+            if not state.solved and state.retired_reason is None
+        ]
         if not unsolved:
             return None
         if self.assignment_policy == "least_active":
@@ -324,14 +340,24 @@ class ElasticScheduler:
         agent: str | AgentAssignment,
         *,
         solved: bool = False,
+        retire_reason: str | None = None,
         now: float | None = None,
     ) -> AgentAssignment | None:
-        """Release a worker; ``solved=True`` also solves its task.
+        """Release a worker and optionally solve or retire its task.
 
         Unknown or already released workers are ignored and return ``None``.
+        ``retire_reason`` stops new leases without claiming that the task was
+        solved and without cancelling any other active lease.
         A finish after the horizon is still accepted so callers can close
         their bookkeeping cleanly.
         """
+        if solved and retire_reason is not None:
+            raise ValueError("finish cannot solve and retire a task simultaneously")
+        normalized_retire_reason = (
+            str(retire_reason).strip() if retire_reason is not None else None
+        )
+        if retire_reason is not None and not normalized_retire_reason:
+            raise ValueError("retire_reason must be non-empty")
         agent_id = agent.agent_id if isinstance(agent, AgentAssignment) else str(agent)
         with self._lock:
             assignment = self._active.pop(agent_id, None)
@@ -345,11 +371,17 @@ class ElasticScheduler:
                     "agent_id": assignment.agent_id,
                     "generation": assignment.generation,
                     "solved": bool(solved),
+                    "retire_reason": normalized_retire_reason,
                     "finished_at": float(self._clock() if now is None else now),
                 }
             )
             if solved:
                 self._solve_locked(assignment.task_id)
+            elif normalized_retire_reason is not None:
+                self._retire_locked(
+                    assignment.task_id,
+                    normalized_retire_reason,
+                )
             return assignment
 
     release = finish
@@ -371,7 +403,30 @@ class ElasticScheduler:
         # workers that are still running.  Their slots must remain accounted
         # for until ``finish`` or an explicit ``cancel_task`` call.
         state.solved = True
+        state.retired_reason = None
         self._history.append({"event": "task_solved", "task_id": task_id})
+        return True
+
+    def retire_task(self, task_id: object, *, reason: str) -> bool:
+        """Stop new leases for an unsolved task without cancelling active ones."""
+
+        normalized = self._task_id(task_id)
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("reason must be non-empty")
+        with self._lock:
+            return self._retire_locked(normalized, normalized_reason)
+
+    def _retire_locked(self, task_id: str, reason: str) -> bool:
+        state = self._tasks.get(task_id)
+        if state is None:
+            raise KeyError(f"unknown task id: {task_id}")
+        if state.solved or state.retired_reason is not None:
+            return False
+        state.retired_reason = reason
+        self._history.append(
+            {"event": "task_retired", "task_id": task_id, "reason": reason}
+        )
         return True
 
     def cancel_task(self, task_id: object) -> tuple[AgentAssignment, ...]:
@@ -417,6 +472,8 @@ class ElasticScheduler:
             by_task = {
                 task_id: {
                     "solved": state.solved,
+                    "retired": state.retired_reason is not None,
+                    "retired_reason": state.retired_reason,
                     "initial_agents": state.initial_agents,
                     "initial_admitted": state.initial_admitted,
                     "active_agents": len(self._active_by_task[task_id]),

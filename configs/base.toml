@@ -82,7 +82,8 @@ lease_retry_interval_seconds = 2
 [lean]
 env_id = "formal_matholympiadbench"
 timeout_seconds = 300
-max_concurrent_evaluations = 1
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 4
 verification_profile = "formal_proof"
 judge_mode = "fast"
 require_result_cache_disabled = false

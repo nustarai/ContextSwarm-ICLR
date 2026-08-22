@@ -51,6 +51,9 @@ class JudgeBrokerDrainError(RuntimeError):
             "drained": False,
             "active_handlers": max(0, int(state.get("active_handlers", 0))),
             "fifo_depth": max(0, int(state.get("fifo_depth", 0))),
+            "remote_unsettled_jobs": max(
+                0, int(state.get("remote_unsettled_jobs", 0))
+            ),
         }
 
 
@@ -75,6 +78,7 @@ class _SessionClaim:
     workdir: Path
     candidates: dict[str, _CandidateBinding]
     deadline_monotonic: float
+    deadline_epoch_ms: int
     cps_store: CPSStore | None = None
     communication: str = "none"
     roster_path: Path | None = None
@@ -87,6 +91,7 @@ class _SessionClaim:
     last_probe_started: float = 0.0
     probe_active: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    cps_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 class _ClaimCancelEvent:
@@ -172,6 +177,7 @@ class JudgeBroker:
         self._admission_queue: deque[object] = deque()
         self._handler_condition = threading.Condition()
         self._active_handlers = 0
+        self._remote_unsettled_jobs = 0
         self._server: _BrokerHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -245,20 +251,27 @@ class JudgeBroker:
         # serve_forever is stopped, claims are revoked, and no handler or FIFO
         # waiter remains that could re-populate either count.
         final_state = self.drain_state()
-        if final_state["active_handlers"] or final_state["fifo_depth"]:
+        if any(final_state.values()):
             raise JudgeBrokerDrainError(final_state)
         return {"drained": True, **final_state}
 
     def drain_state(self) -> dict[str, int]:
-        """Return the two closeout counters consumed by runner health checks."""
+        """Return the closeout counters consumed by runner health checks."""
 
         with self._handler_condition:
             active_handlers = self._active_handlers
+            broker_unsettled_jobs = self._remote_unsettled_jobs
+        evaluator_unsettled_jobs = _nonnegative_count(
+            getattr(self.evaluator, "remote_unsettled_jobs", 0)
+        )
         with self._admission_condition:
             fifo_depth = len(self._admission_queue)
         return {
             "active_handlers": max(0, int(active_handlers)),
             "fifo_depth": max(0, int(fifo_depth)),
+            "remote_unsettled_jobs": (
+                max(0, int(broker_unsettled_jobs)) + evaluator_unsettled_jobs
+            ),
         }
 
     @property
@@ -269,6 +282,10 @@ class JudgeBroker:
     def fifo_depth(self) -> int:
         return self.drain_state()["fifo_depth"]
 
+    @property
+    def remote_unsettled_jobs(self) -> int:
+        return self.drain_state()["remote_unsettled_jobs"]
+
     def _handler_started(self) -> None:
         with self._handler_condition:
             self._active_handlers += 1
@@ -278,11 +295,38 @@ class JudgeBroker:
             self._active_handlers -= 1
             self._handler_condition.notify_all()
 
+    def _mark_remote_unsettled(self) -> None:
+        """Latch one unconfirmed remote job without retaining its identity."""
+
+        # LeanEvaluator latches every unconfirmed cancellation, including
+        # direct runner evaluations outside a broker handler.  Narrow test or
+        # alternate evaluator adapters may expose only the safe response; use
+        # the broker-local counter as their fail-closed fallback.
+        if _nonnegative_count(
+            getattr(self.evaluator, "remote_unsettled_jobs", 0)
+        ) > 0:
+            return
+        with self._handler_condition:
+            self._remote_unsettled_jobs += 1
+            self._handler_condition.notify_all()
+
+    def _remote_settlement_unconfirmed(self) -> bool:
+        """Return whether any run-local Judge work lacks terminal proof."""
+
+        with self._handler_condition:
+            broker_unsettled_jobs = self._remote_unsettled_jobs
+        return broker_unsettled_jobs > 0 or _nonnegative_count(
+            getattr(self.evaluator, "remote_unsettled_jobs", 0)
+        ) > 0
+
     def _wait_for_drain(self, deadline_monotonic: float) -> dict[str, Any]:
         while True:
             state = self.drain_state()
             if state["active_handlers"] == 0 and state["fifo_depth"] == 0:
-                return {"drained": True, **state}
+                return {
+                    "drained": state["remote_unsettled_jobs"] == 0,
+                    **state,
+                }
             remaining = deadline_monotonic - time.monotonic()
             if remaining <= 0:
                 return {"drained": False, **state}
@@ -303,6 +347,7 @@ class JudgeBroker:
             "submitted_job_cancellation": "delete_on_probe_cancel_or_deadline",
             "closeout_requires_active_handlers": 0,
             "closeout_requires_fifo_depth": 0,
+            "closeout_requires_remote_unsettled_jobs": 0,
             "drain_timeout_seconds": self.drain_timeout_seconds,
         }
 
@@ -367,12 +412,15 @@ class JudgeBroker:
         normalized_deadline = float(deadline_monotonic)
         if not math.isfinite(normalized_deadline):
             raise ValueError("broker session deadline must be finite")
+        remaining_seconds = max(0.0, normalized_deadline - time.monotonic())
+        deadline_epoch_ms = int((time.time() + remaining_seconds) * 1_000)
         token = secrets.token_urlsafe(32)
         claim = _SessionClaim(
             actor_id=str(actor_id),
             workdir=resolved_workdir,
             candidates=bindings,
             deadline_monotonic=normalized_deadline,
+            deadline_epoch_ms=deadline_epoch_ms,
             cps_store=cps_store,
             communication=normalized_communication,
             roster_path=Path(roster_path).resolve() if roster_path is not None else None,
@@ -382,8 +430,6 @@ class JudgeBroker:
         with self._claims_lock:
             self._claims[token] = claim
         host, port = self._server.server_address[:2]
-        remaining_seconds = max(0.0, claim.deadline_monotonic - time.monotonic())
-        deadline_epoch_ms = int((time.time() + remaining_seconds) * 1_000)
         try:
             yield {
                 "CONTEXTSWARM_JUDGE_URL": f"http://{host}:{port}/{token}",
@@ -395,6 +441,12 @@ class JudgeBroker:
                 self._claims.pop(token, None)
             with self._admission_condition:
                 self._admission_condition.notify_all()
+            # A handler may already have resolved the claim before it was
+            # removed from the token map.  Drain its serialized CPS operation
+            # so this context cannot return while a stale capability can still
+            # commit runner-owned communication state.
+            with claim.cps_lock:
+                pass
 
     def _handle_http(self, handler: BaseHTTPRequestHandler) -> None:
         parts = [part for part in handler.path.split("?")[0].split("/") if part]
@@ -520,17 +572,24 @@ class JudgeBroker:
                 )
                 self._audit(claim, task_id, result, accepted=False)
                 return result
+            if self._remote_settlement_unconfirmed():
+                result = _remote_settlement_control_result()
+                self._audit(claim, task_id, result, accepted=False)
+                return result
             claim.probe_active = True
 
         started = time.monotonic()
         gate_wait_started = started
         acquired = False
+        retain_evaluator_gate = False
         accepted = False
         call_index: int | None = None
         result: dict[str, Any]
         binding = claim.candidates[task_id]
         snapshot: CandidateSnapshot | None = None
         authoritative_verdict: Verdict | None = None
+        evaluator_unsettled_before = 0
+        evaluator_call_started = False
         try:
             # Freeze exactly what this capability call submits before waiting
             # for the shared Judge gate.  The worker may continue editing its
@@ -583,7 +642,9 @@ class JudgeBroker:
                 )
             gate_wait = time.monotonic() - gate_wait_started
             if not acquired:
-                if _claim_cancelled(claim):
+                if self._remote_settlement_unconfirmed():
+                    result = _remote_settlement_control_result()
+                elif _claim_cancelled(claim):
                     result = _control_result(
                         "TASK_CANCELLED",
                         "This solver task was cancelled before Judge admission.",
@@ -604,6 +665,8 @@ class JudgeBroker:
                         "The experiment horizon elapsed while waiting for Judge admission.",
                         retryable=False,
                     )
+            elif self._remote_settlement_unconfirmed():
+                result = _remote_settlement_control_result()
             elif _claim_cancelled(claim):
                 result = _control_result(
                     "TASK_CANCELLED",
@@ -655,11 +718,15 @@ class JudgeBroker:
                 else:
                     evaluator_call = self.evaluator.evaluate
                     candidate_argument = binding.path
+                evaluator_unsettled_before = _nonnegative_count(
+                    getattr(self.evaluator, "remote_unsettled_jobs", 0)
+                )
                 evaluator_kwargs: dict[str, Any] = {
                     "deadline_monotonic": claim.deadline_monotonic,
                 }
                 if _accepts_cancel_event(evaluator_call):
                     evaluator_kwargs["cancel_event"] = _ClaimCancelEvent(claim)
+                evaluator_call_started = True
                 verdict: Verdict = evaluator_call(
                     binding.task,
                     candidate_argument,
@@ -667,6 +734,25 @@ class JudgeBroker:
                 )
                 verdict_status = _safe_verdict_status(verdict.status)
                 safe_job_id = sanitize_worker_identifier(verdict.judge_job_id)
+                safe_response = safe_worker_response(verdict.response)
+                evaluator_unsettled_after = _nonnegative_count(
+                    getattr(self.evaluator, "remote_unsettled_jobs", 0)
+                )
+                call_unsettled = (
+                    evaluator_unsettled_after > 0
+                    or _has_unsettled_remote_work(
+                        verdict_status,
+                        safe_response,
+                    )
+                )
+                if call_unsettled:
+                    # The evaluator has attempted cancellation but cannot
+                    # prove the remote job terminal.  Permanently consume this
+                    # process-local permit and latch a non-sensitive count;
+                    # releasing it could exceed the experiment's Judge
+                    # concurrency contract while the remote job still runs.
+                    retain_evaluator_gate = True
+                    self._mark_remote_unsettled()
                 result = {
                     "ok": verdict_status
                     not in {
@@ -686,7 +772,7 @@ class JudgeBroker:
                     "elapsed_seconds": round(
                         max(0.0, _safe_finite_float(verdict.elapsed_seconds)), 6
                     ),
-                    "response": safe_worker_response(verdict.response),
+                    "response": safe_response,
                     "error": (
                         sanitize_worker_text(verdict.error) if verdict.error else None
                     ),
@@ -704,8 +790,21 @@ class JudgeBroker:
                         "NETWORK_ERROR",
                     },
                 }
+                if call_unsettled:
+                    result.update(
+                        {
+                            "ok": False,
+                            "status": "REMOTE_SETTLEMENT_UNCONFIRMED",
+                            "proved": False,
+                            "score": 0.0,
+                            "retryable": False,
+                        }
+                    )
+                    safe_response["remote_settlement_unconfirmed"] = True
                 proof_claimed = verdict_status == "PROVED" or _safe_score(verdict.score) >= 1.0
-                if proof_claimed and time.monotonic() >= claim.deadline_monotonic:
+                if call_unsettled:
+                    authoritative_verdict = None
+                elif proof_claimed and time.monotonic() >= claim.deadline_monotonic:
                     result.update(
                         {
                             "ok": False,
@@ -734,7 +833,7 @@ class JudgeBroker:
                         elapsed_seconds=max(
                             0.0, _safe_finite_float(verdict.elapsed_seconds)
                         ),
-                        response=safe_worker_response(verdict.response),
+                        response=safe_response,
                         error=(
                             sanitize_worker_text(verdict.error)
                             if verdict.error
@@ -760,20 +859,38 @@ class JudgeBroker:
                         }
                     )
         except Exception as exc:  # keep one failed probe from killing the broker thread
-            result = {
-                "ok": False,
-                "accepted": accepted,
-                "call_index": call_index,
-                "task_id": task_id,
-                "status": "EVALUATOR_ERROR",
-                "proved": False,
-                "score": 0.0,
-                "response": {},
-                "error": sanitize_worker_text(exc),
-                "retryable": True,
-            }
+            evaluator_unsettled_after = _nonnegative_count(
+                getattr(self.evaluator, "remote_unsettled_jobs", 0)
+            )
+            if (
+                evaluator_call_started
+                and evaluator_unsettled_after > evaluator_unsettled_before
+            ):
+                retain_evaluator_gate = True
+                self._mark_remote_unsettled()
+                result = _remote_settlement_control_result()
+                result.update(
+                    {
+                        "accepted": accepted,
+                        "call_index": call_index,
+                        "task_id": task_id,
+                    }
+                )
+            else:
+                result = {
+                    "ok": False,
+                    "accepted": accepted,
+                    "call_index": call_index,
+                    "task_id": task_id,
+                    "status": "EVALUATOR_ERROR",
+                    "proved": False,
+                    "score": 0.0,
+                    "response": {},
+                    "error": sanitize_worker_text(exc),
+                    "retryable": True,
+                }
         finally:
-            if acquired:
+            if acquired and not retain_evaluator_gate:
                 self._release_evaluator_gate()
             with claim.lock:
                 claim.probe_active = False
@@ -834,6 +951,8 @@ class JudgeBroker:
             self._admission_queue.append(waiter)
         try:
             while True:
+                if self._remote_settlement_unconfirmed():
+                    return False
                 if _claim_cancelled(claim):
                     return False
                 with self._admission_condition:
@@ -852,6 +971,10 @@ class JudgeBroker:
                     return False
                 acquired = self.evaluator_gate.acquire(timeout=min(remaining, 0.1))
                 if acquired:
+                    if self._remote_settlement_unconfirmed():
+                        self._release_evaluator_gate()
+                        acquired = False
+                        return False
                     return True
         finally:
             with self._admission_condition:
@@ -900,6 +1023,31 @@ class JudgeBroker:
         return normalized
 
     def _cps_operation(
+        self,
+        claim: _SessionClaim,
+        operation: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        # Serialize each session's CPS calls with capability revocation.  The
+        # store rechecks the same cancellation signal after acquiring its
+        # SQLite write lock, closing the cancellation-during-lock-wait race.
+        with claim.cps_lock:
+            failure = _cps_capability_failure(claim)
+            if failure is not None:
+                return failure
+            try:
+                return self._cps_operation_locked(claim, operation, payload)
+            except RuntimeError:
+                # CPSStore intentionally raises a plain RuntimeError when the
+                # horizon or cancellation guard closes after a lock wait.  Map
+                # only a now-observable capability closure to a stable worker
+                # response; unrelated store failures remain BROKER_ERROR.
+                failure = _cps_capability_failure(claim)
+                if failure is not None:
+                    return failure
+                raise
+
+    def _cps_operation_locked(
         self,
         claim: _SessionClaim,
         operation: str,
@@ -968,6 +1116,8 @@ class JudgeBroker:
                 title=title,
                 body=body,
                 tags=[tag for tag in tags if tag],
+                deadline_epoch_ms=claim.deadline_epoch_ms,
+                cancel_guard=lambda: _claim_cancelled(claim),
             )
             return {"ok": True, "piece": _safe_piece(item)}
         if operation == "cps_actors":
@@ -989,6 +1139,8 @@ class JudgeBroker:
                 sender=claim.actor_id,
                 recipient=recipient,
                 body=body,
+                deadline_epoch_ms=claim.deadline_epoch_ms,
+                cancel_guard=lambda: _claim_cancelled(claim),
             )
             return {"ok": True, "message": _safe_message(item)}
         if operation == "cps_inbox":
@@ -1009,7 +1161,15 @@ class JudgeBroker:
             visible = store.inbox(task_id=task_id, recipient=claim.actor_id, limit=50)
             if not any(str(item.get("id")) == message_id for item in visible):
                 return {"ok": False, "status": "MESSAGE_NOT_VISIBLE", "acked": False}
-            return {"ok": True, "acked": store.ack_message(message_id, claim.actor_id)}
+            return {
+                "ok": True,
+                "acked": store.ack_message(
+                    message_id,
+                    claim.actor_id,
+                    deadline_epoch_ms=claim.deadline_epoch_ms,
+                    cancel_guard=lambda: _claim_cancelled(claim),
+                ),
+            }
         return _control_result("UNKNOWN_CPS_OPERATION", "Unknown CPS operation.", retryable=False)
 
     def _audit(
@@ -1079,6 +1239,62 @@ def _claim_cancelled(claim: _SessionClaim) -> bool:
     return claim.revoked_event.is_set() or (
         claim.cancel_event is not None and claim.cancel_event.is_set()
     )
+
+
+def _cps_capability_failure(claim: _SessionClaim) -> dict[str, Any] | None:
+    """Return a stable fail-closed result for an expired CPS capability."""
+
+    if (
+        time.monotonic() >= claim.deadline_monotonic
+        or int(time.time() * 1_000) >= claim.deadline_epoch_ms
+    ):
+        return _control_result(
+            "OUT_OF_HORIZON",
+            "The CPS communication horizon has elapsed.",
+            retryable=False,
+        )
+    if _claim_cancelled(claim):
+        return _control_result(
+            "TASK_CANCELLED",
+            "This solver task no longer accepts CPS work.",
+            retryable=False,
+        )
+    return None
+
+
+def _has_unsettled_remote_cancellation(response: Mapping[str, Any]) -> bool:
+    cancellation = response.get("judge_cancellation")
+    return (
+        isinstance(cancellation, Mapping)
+        and cancellation.get("attempted") is True
+        and cancellation.get("settled") is not True
+    )
+
+
+def _has_unsettled_remote_work(
+    verdict_status: str,
+    response: Mapping[str, Any],
+) -> bool:
+    return (
+        verdict_status == "REMOTE_SETTLEMENT_UNCONFIRMED"
+        or response.get("remote_settlement_unconfirmed") is True
+        or response.get("settlement_error") == "cancel_settlement_unconfirmed"
+        or _has_unsettled_remote_cancellation(response)
+    )
+
+
+def _remote_settlement_control_result() -> dict[str, Any]:
+    return _control_result(
+        "REMOTE_SETTLEMENT_UNCONFIRMED",
+        "Remote Judge work did not provide a job-bound terminal receipt; further admission is disabled.",
+        retryable=False,
+    )
+
+
+def _nonnegative_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
 
 
 def _accepts_cancel_event(function: Callable[..., Any]) -> bool:

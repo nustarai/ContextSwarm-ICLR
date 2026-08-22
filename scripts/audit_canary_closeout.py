@@ -46,6 +46,7 @@ BAD_EVENTS = {
     "broker_drain_timeout",
     "broker_close_error",
     "broker_closeout_artifact_error",
+    "remote_settlement_unconfirmed",
 }
 BAD_STATUSES = {
     "EVALUATOR_ERROR",
@@ -58,6 +59,7 @@ BAD_STATUSES = {
     "JUDGE_ADMISSION_TIMEOUT",
     "CANDIDATE_SNAPSHOT_ERROR",
     "SESSION_PROBE_BUDGET_EXHAUSTED",
+    "REMOTE_SETTLEMENT_UNCONFIRMED",
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -297,6 +299,7 @@ def audit_canary(run_dir: Path) -> dict[str, Any]:
             or closeout.get("drained") is not True
             or closeout.get("active_handlers") != 0
             or closeout.get("fifo_depth") != 0
+            or closeout.get("remote_unsettled_jobs") != 0
         ):
             audit.add("judge_broker_not_drained")
 

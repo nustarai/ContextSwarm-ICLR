@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from email.message import Message
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import threading
@@ -12,7 +12,11 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from contextswarm_mini.evaluator import EvaluatorError, LeanEvaluator
+from contextswarm_mini.evaluator import (
+    EvaluatorError,
+    LeanEvaluator,
+    safe_worker_response,
+)
 from contextswarm_mini.models import Task
 
 
@@ -31,9 +35,13 @@ class _CountingEvaluator(LeanEvaluator):
         super().__init__("http://unused", lean_env_id="fixed-env")
         self.payloads: list[dict[str, object]] = []
 
-    def _request(self, method: str, path: str, payload=None, *, timeout_seconds=None):  # type: ignore[no-untyped-def]
+    def _request(  # type: ignore[no-untyped-def]
+        self, method, path, payload=None, *, timeout_seconds=None, cancel_event=None
+    ):
+        del method, path, timeout_seconds, cancel_event
         self.payloads.append(dict(payload or {}))
         result: dict[str, object] = {
+            "job_id": "counting-job",
             "status": "failed",
             "formal_status": "VERIFY_FAIL",
         }
@@ -54,11 +62,18 @@ class _CountingEvaluator(LeanEvaluator):
 
 
 class _OneFailureEvaluator(_CountingEvaluator):
-    def _request(self, method: str, path: str, payload=None, *, timeout_seconds=None):  # type: ignore[no-untyped-def]
+    def _request(  # type: ignore[no-untyped-def]
+        self, method, path, payload=None, *, timeout_seconds=None, cancel_event=None
+    ):
+        del method, path, timeout_seconds, cancel_event
         self.payloads.append(dict(payload or {}))
         if len(self.payloads) == 1:
             raise EvaluatorError("temporary")
-        return {"status": "failed", "formal_status": "VERIFY_FAIL"}
+        return {
+            "job_id": "one-failure-job",
+            "status": "failed",
+            "formal_status": "VERIFY_FAIL",
+        }
 
 
 class _DeadlineRecordingEvaluator(_CountingEvaluator):
@@ -66,7 +81,10 @@ class _DeadlineRecordingEvaluator(_CountingEvaluator):
         super().__init__()
         self.timeouts: list[float | None] = []
 
-    def _request(self, method: str, path: str, payload=None, *, timeout_seconds=None):  # type: ignore[no-untyped-def]
+    def _request(  # type: ignore[no-untyped-def]
+        self, method, path, payload=None, *, timeout_seconds=None, cancel_event=None
+    ):
+        del cancel_event
         self.timeouts.append(timeout_seconds)
         return super()._request(
             method, path, payload, timeout_seconds=timeout_seconds
@@ -74,8 +92,10 @@ class _DeadlineRecordingEvaluator(_CountingEvaluator):
 
 
 class _OverloadedEvaluator(_CountingEvaluator):
-    def _request(self, method: str, path: str, payload=None, *, timeout_seconds=None):  # type: ignore[no-untyped-def]
-        del method, path, payload, timeout_seconds
+    def _request(  # type: ignore[no-untyped-def]
+        self, method, path, payload=None, *, timeout_seconds=None, cancel_event=None
+    ):
+        del method, path, payload, timeout_seconds, cancel_event
         raise EvaluatorError(
             "https://judge.invalid/private token=test-secret /home/test/source.lean",
             category="judge_overloaded_deadline",
@@ -86,8 +106,10 @@ class _OverloadedEvaluator(_CountingEvaluator):
 
 
 class _UnsafeResponseEvaluator(_CountingEvaluator):
-    def _request(self, method: str, path: str, payload=None, *, timeout_seconds=None):  # type: ignore[no-untyped-def]
-        del method, path, payload, timeout_seconds
+    def _request(  # type: ignore[no-untyped-def]
+        self, method, path, payload=None, *, timeout_seconds=None, cancel_event=None
+    ):
+        del method, path, payload, timeout_seconds, cancel_event
         return {
             "status": "failed",
             "formal_status": "VERIFY_FAIL",
@@ -115,8 +137,10 @@ class _RunHorizonExpiredEvaluator(_CountingEvaluator):
         super().__init__()
         self.clock = clock
 
-    def _request(self, method: str, path: str, payload=None, *, timeout_seconds=None):  # type: ignore[no-untyped-def]
-        del method, path, payload, timeout_seconds
+    def _request(  # type: ignore[no-untyped-def]
+        self, method, path, payload=None, *, timeout_seconds=None, cancel_event=None
+    ):
+        del method, path, payload, timeout_seconds, cancel_event
         self.clock[0] = 2.0
         raise EvaluatorError(
             "The Judge request deadline elapsed.",
@@ -126,6 +150,24 @@ class _RunHorizonExpiredEvaluator(_CountingEvaluator):
 
 
 class EvaluatorProbeTests(unittest.TestCase):
+    def test_public_evaluate_accepts_cancel_event_without_submitting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "result.lean"
+            candidate.write_text(
+                "import Mathlib\ntheorem task : True := by trivial\n",
+                encoding="utf-8",
+            )
+            cancelled = threading.Event()
+            cancelled.set()
+            evaluator = _CountingEvaluator()
+            verdict = evaluator.evaluate(
+                _task(root), candidate, cancel_event=cancelled
+            )
+
+        self.assertEqual(verdict.status, "TASK_CANCELLED")
+        self.assertEqual(evaluator.payloads, [])
+
     def test_exact_probe_verdict_is_reused_by_final_evaluation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -299,53 +341,289 @@ class EvaluatorProbeTests(unittest.TestCase):
         self.assertNotIn(private_marker, rendered)
         self.assertIn("configuration is invalid", str(raised.exception))
 
-    def test_http_429_and_503_retry_past_three_attempts_within_horizon(self) -> None:
-        requests = 0
+    def test_empty_or_malformed_post_503_fails_closed_without_replay(self) -> None:
+        headers = Message()
+        headers["Retry-After"] = "0"
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *_args: object) -> None:
-                return
+        for body in (b"", b"{not-json"):
+            with self.subTest(body=body):
+                attempts = 0
 
-            def do_POST(self) -> None:  # noqa: N802
-                nonlocal requests
-                requests += 1
-                self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                if requests < 5:
-                    self.send_response(429 if requests == 1 else 503)
-                    self.send_header("Retry-After", "0")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                raw = b'{"status":"failed","formal_status":"VERIFY_FAIL"}'
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+                def unavailable(_request, *, timeout):  # type: ignore[no-untyped-def]
+                    nonlocal attempts
+                    self.assertGreater(timeout, 0)
+                    attempts += 1
+                    raise HTTPError(
+                        "https://judge.invalid/private",
+                        503,
+                        "unavailable",
+                        headers,
+                        BytesIO(body),
+                    )
 
-        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
+                evaluator = LeanEvaluator(
+                    "http://unused", lean_env_id="fixed-env", timeout_seconds=5
+                )
+                with patch(
+                    "contextswarm_mini.evaluator.urlopen",
+                    side_effect=unavailable,
+                ), patch("contextswarm_mini.evaluator.time.sleep") as sleep:
+                    with self.assertRaises(EvaluatorError) as raised:
+                        evaluator._request(
+                            "POST", "/api/lean/jobs", {"code": "proof"}
+                        )
+
+                self.assertEqual(raised.exception.category, "http_error")
+                self.assertEqual(raised.exception.http_status, 503)
+                self.assertEqual(raised.exception.attempts, 1)
+                self.assertEqual(attempts, 1)
+                sleep.assert_not_called()
+
+    def test_ambiguous_submission_latches_and_gates_later_entries(self) -> None:
+        cases = (
+            ("transport_timeout", None, "network_error"),
+            ("empty_2xx", b"", "malformed_response"),
+            ("malformed_2xx", b"{not-json", "malformed_response"),
+            (
+                "nonterminal_missing_id",
+                b'{"status":"queued"}',
+                "missing_job_identifier",
+            ),
+            (
+                "terminal_missing_id",
+                b'{"status":"failed","formal_status":"VERIFY_FAIL"}',
+                "missing_job_identifier",
+            ),
+            ("generic_503", None, "http_error"),
+        )
+
+        for mode, body, failure_category in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                attempts = 0
+                root = Path(temporary)
+                candidate = root / "result.lean"
+                candidate.write_text(
+                    "import Mathlib\ntheorem task : True := by trivial\n",
+                    encoding="utf-8",
+                )
+
+                class Response:
+                    def __enter__(self):  # type: ignore[no-untyped-def]
+                        return self
+
+                    def __exit__(self, *_args: object) -> None:
+                        return None
+
+                    def read(self) -> bytes:
+                        return body or b""
+
+                def fake_urlopen(_request, *, timeout):  # type: ignore[no-untyped-def]
+                    nonlocal attempts
+                    self.assertGreater(timeout, 0)
+                    attempts += 1
+                    if mode == "transport_timeout":
+                        raise TimeoutError("private transport detail")
+                    if mode == "generic_503":
+                        raise HTTPError(
+                            "https://judge.invalid/private",
+                            503,
+                            "unavailable",
+                            Message(),
+                            BytesIO(b""),
+                        )
+                    return Response()
+
+                evaluator = LeanEvaluator(
+                    "http://unused", lean_env_id="fixed-env", timeout_seconds=5
+                )
+                with patch(
+                    "contextswarm_mini.evaluator.urlopen",
+                    side_effect=fake_urlopen,
+                ):
+                    causal = evaluator.evaluate(_task(root), candidate)
+                    gated = evaluator.probe(_task(root), candidate)
+
+                self.assertEqual(causal.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
+                self.assertIs(
+                    causal.response["remote_settlement_unconfirmed"], True
+                )
+                self.assertEqual(
+                    causal.response["evaluator_failure"]["category"],
+                    failure_category,
+                )
+                self.assertIs(
+                    safe_worker_response(causal.response)[
+                        "remote_settlement_unconfirmed"
+                    ],
+                    True,
+                )
+                self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+                self.assertTrue(evaluator.remote_settlement_event.is_set())
+                self.assertEqual(gated.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
+                self.assertEqual(
+                    gated.response["reason"], "remote_settlement_gate_latched"
+                )
+                self.assertNotIn(
+                    "remote_settlement_unconfirmed", gated.response
+                )
+                self.assertEqual(attempts, 1)
+
+    def test_explicit_pre_admission_overload_receipt_is_retried(self) -> None:
+        attempts = 0
+        headers = Message()
+        headers["Retry-After"] = "0"
+
+        class Response:
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return (
+                    b'{"job_id":"job-1","status":"succeeded",'
+                    b'"formal_status":"PROVED","correct":true}'
+                )
+
+        def fake_urlopen(_request, *, timeout):  # type: ignore[no-untyped-def]
+            nonlocal attempts
+            self.assertGreater(timeout, 0)
+            attempts += 1
+            if attempts < 3:
+                receipt = json.dumps(
+                    {
+                        "job_id": f"rejected-{attempts}",
+                        "status": "rejected_overloaded",
+                        "terminal_reason": "router_capacity",
+                        "error_kind": "lean_router_overloaded",
+                        "retryable": True,
+                    }
+                ).encode("utf-8")
+                raise HTTPError(
+                    "https://judge.invalid/private",
+                    503,
+                    "overloaded",
+                    headers,
+                    BytesIO(receipt),
+                )
+            return Response()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "result.lean"
+            candidate.write_text(
+                "import Mathlib\ntheorem task : True := by trivial\n",
+                encoding="utf-8",
+            )
             evaluator = LeanEvaluator(
-                f"http://127.0.0.1:{server.server_port}",
+                "http://unused",
                 lean_env_id="fixed-env",
                 timeout_seconds=5,
+                poll_interval_seconds=0.05,
+                admission_retry_seconds=1.0,
             )
             with patch(
-                "contextswarm_mini.evaluator._MIN_HTTP_BACKOFF_SECONDS", 0.001
-            ), patch(
-                "contextswarm_mini.evaluator._MAX_HTTP_BACKOFF_SECONDS", 0.002
+                "contextswarm_mini.evaluator.urlopen",
+                side_effect=fake_urlopen,
+            ), patch("contextswarm_mini.evaluator.time.sleep"):
+                verdict = evaluator.evaluate(_task(root), candidate)
+
+        self.assertEqual(verdict.status, "PROVED")
+        self.assertEqual(verdict.score, 1.0)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+        self.assertFalse(evaluator.remote_settlement_event.is_set())
+
+    def test_global_latch_blocks_an_overload_admission_retry(self) -> None:
+        attempts = 0
+        evaluator = LeanEvaluator(
+            "http://unused",
+            lean_env_id="fixed-env",
+            poll_interval_seconds=0.05,
+            admission_retry_seconds=1.0,
+        )
+
+        def fake_urlopen(_request, *, timeout):  # type: ignore[no-untyped-def]
+            nonlocal attempts
+            self.assertGreater(timeout, 0)
+            attempts += 1
+            # Simulate a different concurrent submission latching unknown
+            # remote work while this call receives a safe overload rejection.
+            evaluator._mark_remote_unsettled()  # noqa: SLF001
+            receipt = json.dumps(
+                {
+                    "status": "rejected_overloaded",
+                    "terminal_reason": "router_capacity",
+                    "retryable": True,
+                }
+            ).encode("utf-8")
+            raise HTTPError(
+                "https://judge.invalid/private",
+                503,
+                "overloaded",
+                Message(),
+                BytesIO(receipt),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "result.lean"
+            candidate.write_text(
+                "import Mathlib\ntheorem task : True := by trivial\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "contextswarm_mini.evaluator.urlopen",
+                side_effect=fake_urlopen,
             ):
-                payload = evaluator._request(
-                    "POST", "/api/lean/jobs", {"code": "proof"}
+                verdict = evaluator.evaluate(_task(root), candidate)
+
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
+        self.assertEqual(verdict.response["reason"], "remote_settlement_gate_latched")
+        self.assertNotIn("remote_settlement_unconfirmed", verdict.response)
+        self.assertEqual(attempts, 1)
+
+    def test_unstructured_get_503_remains_capacity_retriable(self) -> None:
+        attempts = 0
+        headers = Message()
+        headers["Retry-After"] = "0"
+
+        class Response:
+            def __enter__(self):  # type: ignore[no-untyped-def]
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"status":"running"}'
+
+        def fake_urlopen(_request, *, timeout):  # type: ignore[no-untyped-def]
+            nonlocal attempts
+            self.assertGreater(timeout, 0)
+            attempts += 1
+            if attempts < 3:
+                raise HTTPError(
+                    "https://judge.invalid/private",
+                    503,
+                    "unavailable",
+                    headers,
+                    BytesIO(b"{not-json"),
                 )
-        finally:
-            server.shutdown()
-            thread.join(timeout=2)
-            server.server_close()
-        self.assertEqual(payload["formal_status"], "VERIFY_FAIL")
-        self.assertEqual(requests, 5)
+            return Response()
+
+        evaluator = LeanEvaluator(
+            "http://unused", lean_env_id="fixed-env", timeout_seconds=5
+        )
+        with patch(
+            "contextswarm_mini.evaluator.urlopen", side_effect=fake_urlopen
+        ), patch("contextswarm_mini.evaluator.time.sleep") as sleep:
+            response = evaluator._request("GET", "/api/lean/jobs/job-1")
+
+        self.assertEqual(response["status"], "running")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_retry_after_above_five_seconds_is_honored_when_horizon_allows(self) -> None:
         attempts = 0
@@ -360,7 +638,10 @@ class EvaluatorProbeTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return b'{"status":"failed","formal_status":"VERIFY_FAIL"}'
+                return (
+                    b'{"job_id":"job-1","status":"failed",'
+                    b'"formal_status":"VERIFY_FAIL"}'
+                )
 
         def fake_urlopen(_request, *, timeout):  # type: ignore[no-untyped-def]
             nonlocal attempts
@@ -389,7 +670,7 @@ class EvaluatorProbeTests(unittest.TestCase):
         self.assertEqual(attempts, 2)
         sleep.assert_called_once_with(7.25)
 
-    def test_retry_after_beyond_remaining_horizon_fails_without_sleeping(self) -> None:
+    def test_get_retry_after_beyond_remaining_horizon_fails_without_sleeping(self) -> None:
         headers = Message()
         headers["Retry-After"] = "20"
 
@@ -411,7 +692,7 @@ class EvaluatorProbeTests(unittest.TestCase):
         ), patch("contextswarm_mini.evaluator.time.sleep") as sleep:
             with self.assertRaises(EvaluatorError) as raised:
                 evaluator._request(
-                    "POST", "/api/lean/jobs", {"code": "proof"}, timeout_seconds=0.1
+                    "GET", "/api/lean/jobs/job-1", timeout_seconds=0.1
                 )
         self.assertEqual(raised.exception.category, "judge_overloaded_deadline")
         self.assertEqual(raised.exception.http_status, 503)
@@ -432,7 +713,10 @@ class EvaluatorProbeTests(unittest.TestCase):
                 return None
 
             def read(self) -> bytes:
-                return b'{"status":"failed","formal_status":"VERIFY_FAIL"}'
+                return (
+                    b'{"job_id":"job-1","status":"failed",'
+                    b'"formal_status":"VERIFY_FAIL"}'
+                )
 
         def fake_urlopen(request, *, timeout):  # type: ignore[no-untyped-def]
             del timeout

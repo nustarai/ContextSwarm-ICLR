@@ -47,6 +47,23 @@ class ElasticSchedulerTests(unittest.TestCase):
         self.assertEqual(scheduler.remaining_slots, 2)
         self.assertTrue(all(lease.task_id == "b" for lease in scheduler.active()))
 
+    def test_retired_task_stops_admission_without_becoming_solved(self) -> None:
+        scheduler = ElasticScheduler(
+            ["a"], max_parallel=2, initial_agents=2, horizon=20
+        )
+        first = scheduler.next_assignment()
+        second = scheduler.next_assignment()
+        assert first is not None and second is not None
+
+        scheduler.finish(first, retire_reason="attempt_budget_exhausted")
+
+        self.assertIsNone(scheduler.next_assignment())
+        self.assertEqual(scheduler.active(), (second,))
+        snapshot = scheduler.snapshot()["tasks"]["a"]
+        self.assertFalse(snapshot["solved"])
+        self.assertTrue(snapshot["retired"])
+        self.assertEqual(snapshot["retired_reason"], "attempt_budget_exhausted")
+
     def test_horizon_blocks_new_leases_but_allows_closeout(self) -> None:
         current = [10.0]
         scheduler = ElasticScheduler(["a"], max_parallel=1, initial_agents=1, horizon=5, clock=lambda: current[0])

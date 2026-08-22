@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from http.client import HTTPException
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -63,12 +64,7 @@ def run_preflight(config: ExperimentConfig, output_dir: Path) -> dict[str, Any]:
     try:
         health = LeanEvaluator(config.lean_server_url, lean_env_id=config.lean_env_id).health()
         report["lean"] = _safe_health(health, config.lean_env_id)
-        if report["lean"].get("requested_env_accepted") is False:
-            raise PreflightError(
-                f"Lean router does not advertise the requested environment: {config.lean_env_id}"
-            )
-        if report["lean"].get("workspace_ready") is False:
-            raise PreflightError("Lean router workspace is not ready")
+        _validate_lean_health(report["lean"])
         if config.lean_require_result_cache_disabled:
             cache_health_url = os.environ.get(
                 "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", ""
@@ -260,8 +256,41 @@ def _safe_health(payload: dict[str, Any], requested_env: str) -> dict[str, Any]:
         "canonical_supported_lean_env_ids",
     }
     result = {key: payload[key] for key in allowed if key in payload}
-    accepted = payload.get("accepted_lean_env_ids") or payload.get("supported_lean_env_ids")
+    accepted = payload.get("accepted_lean_env_ids")
     if isinstance(accepted, list):
-        result["accepted_lean_env_ids"] = accepted
-        result["requested_env_accepted"] = requested_env in accepted
+        safe_accepted = [value for value in accepted if isinstance(value, str)]
+        result["accepted_lean_env_ids"] = safe_accepted
+        result["requested_env_accepted"] = requested_env in safe_accepted
     return result
+
+
+def _validate_lean_health(health: dict[str, Any]) -> None:
+    """Require an explicitly usable Judge without rejecting legacy mocks.
+
+    Core readiness fields are mandatory. Capacity fields were added later, so
+    their absence remains compatible; once advertised, however, they must
+    prove that a real submission can be admitted now.
+    """
+
+    if health.get("ok") is not True:
+        raise PreflightError("Lean router health is not ready")
+    if health.get("workspace_ready") is not True:
+        raise PreflightError("Lean router workspace is not ready")
+    if health.get("requested_env_accepted") is not True:
+        raise PreflightError(
+            "Lean router does not explicitly accept the requested environment"
+        )
+    if "available_service_units" in health:
+        available = health.get("available_service_units")
+        if (
+            isinstance(available, bool)
+            or not isinstance(available, (int, float))
+            or not math.isfinite(float(available))
+            or available <= 0
+        ):
+            raise PreflightError("Lean router has no available service units")
+    if (
+        "capacity_state" in health
+        and health.get("capacity_state") != "AVAILABLE"
+    ):
+        raise PreflightError("Lean router capacity is not available")

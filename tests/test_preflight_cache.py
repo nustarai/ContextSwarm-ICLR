@@ -82,6 +82,125 @@ class PreflightResultCacheTests(unittest.TestCase):
                 self.assertTrue(config.lean_require_result_cache_disabled)
                 self.assertTrue(config.public_dict()["lean_require_result_cache_disabled"])
 
+    def test_lean_health_requires_explicit_core_readiness(self) -> None:
+        config = replace(
+            load_config("configs/smoke.toml", ROOT),
+            aisw_enabled=False,
+            lean_server_url="http://judge.invalid",
+            lean_require_result_cache_disabled=False,
+        )
+        healthy = {
+            "ok": True,
+            "workspace_ready": True,
+            "accepted_lean_env_ids": [config.lean_env_id],
+        }
+
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw)
+            with (
+                patch(
+                    "contextswarm_mini.preflight.PiAgent.binary",
+                    return_value="/bin/true",
+                ),
+                patch(
+                    "contextswarm_mini.preflight.LeanEvaluator.health",
+                    return_value=healthy,
+                ),
+            ):
+                report = run_preflight(config, output)
+        self.assertEqual(report["status"], "ok")
+        self.assertTrue(report["lean"]["requested_env_accepted"])
+        self.assertNotIn("available_service_units", report["lean"])
+        self.assertNotIn("capacity_state", report["lean"])
+
+        failures = (
+            ("missing_ok", {key: value for key, value in healthy.items() if key != "ok"}),
+            ("false_ok", {**healthy, "ok": False}),
+            (
+                "missing_workspace",
+                {key: value for key, value in healthy.items() if key != "workspace_ready"},
+            ),
+            ("unready_workspace", {**healthy, "workspace_ready": False}),
+            (
+                "missing_accepted_envs",
+                {
+                    "ok": True,
+                    "workspace_ready": True,
+                    "supported_lean_env_ids": [config.lean_env_id],
+                },
+            ),
+            (
+                "wrong_environment",
+                {**healthy, "accepted_lean_env_ids": ["different-env"]},
+            ),
+        )
+        for label, health in failures:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                with (
+                    patch(
+                        "contextswarm_mini.preflight.PiAgent.binary",
+                        return_value="/bin/true",
+                    ),
+                    patch(
+                        "contextswarm_mini.preflight.LeanEvaluator.health",
+                        return_value=health,
+                    ),
+                ):
+                    with self.assertRaises(PreflightError):
+                        run_preflight(config, Path(raw))
+
+    def test_lean_health_rejects_advertised_unavailable_capacity(self) -> None:
+        config = replace(
+            load_config("configs/smoke.toml", ROOT),
+            aisw_enabled=False,
+            lean_server_url="http://judge.invalid",
+            lean_require_result_cache_disabled=False,
+        )
+        healthy = {
+            "ok": True,
+            "workspace_ready": True,
+            "accepted_lean_env_ids": [config.lean_env_id],
+            "available_service_units": 1,
+            "capacity_state": "AVAILABLE",
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                patch(
+                    "contextswarm_mini.preflight.PiAgent.binary",
+                    return_value="/bin/true",
+                ),
+                patch(
+                    "contextswarm_mini.preflight.LeanEvaluator.health",
+                    return_value=healthy,
+                ),
+            ):
+                report = run_preflight(config, Path(raw))
+        self.assertEqual(report["lean"]["available_service_units"], 1)
+        self.assertEqual(report["lean"]["capacity_state"], "AVAILABLE")
+
+        failures = (
+            ("zero_units", {**healthy, "available_service_units": 0}),
+            ("negative_units", {**healthy, "available_service_units": -1}),
+            ("invalid_units", {**healthy, "available_service_units": True}),
+            ("degraded", {**healthy, "capacity_state": "DEGRADED"}),
+            ("saturated", {**healthy, "capacity_state": "SATURATED"}),
+            ("unknown", {**healthy, "capacity_state": "UNKNOWN"}),
+        )
+        for label, health in failures:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                with (
+                    patch(
+                        "contextswarm_mini.preflight.PiAgent.binary",
+                        return_value="/bin/true",
+                    ),
+                    patch(
+                        "contextswarm_mini.preflight.LeanEvaluator.health",
+                        return_value=health,
+                    ),
+                ):
+                    with self.assertRaises(PreflightError):
+                        run_preflight(config, Path(raw))
+
     def test_cache_health_accepts_base_or_healthz_and_keeps_only_safe_evidence(self) -> None:
         _HealthHandler.enabled = False
         _HealthHandler.ok = True

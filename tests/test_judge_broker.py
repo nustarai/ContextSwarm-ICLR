@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import threading
 import time
@@ -106,6 +107,56 @@ class _CancelAwareEvaluator(_RecordingEvaluator):
         if cancel_event is not None and cancel_event.wait(timeout=3):
             self.cancel_observed.set()
         return Verdict(task.slug, "TASK_CANCELLED", 0.0, 0.0)
+
+
+class _UnsettledCancellationEvaluator(_RecordingEvaluator):
+    def probe(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None,
+    ) -> Verdict:
+        self.calls.append((task, candidate, deadline_monotonic))
+        return Verdict(
+            task.slug,
+            "TASK_CANCELLED",
+            0.0,
+            0.0,
+            {
+                "judge_cancellation": {
+                    "attempted": True,
+                    "succeeded": False,
+                    "settled": False,
+                    "unconfirmed": True,
+                    "failure_category": "cancel_settlement_unconfirmed",
+                }
+            },
+            judge_job_id="unsettled-job",
+        )
+
+
+class _GlobalUnsettledEvaluator(_RecordingEvaluator):
+    def __init__(self) -> None:
+        super().__init__()
+        self.remote_unsettled_jobs = 0
+
+    def probe(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None,
+    ) -> Verdict:
+        self.calls.append((task, candidate, deadline_monotonic))
+        self.remote_unsettled_jobs += 1
+        return Verdict(
+            task.slug,
+            "NETWORK_ERROR",
+            0.0,
+            0.0,
+            {"remote_settlement_unconfirmed": True},
+        )
 
 
 class _SnapshotEvaluator:
@@ -272,7 +323,8 @@ class JudgeBrokerTests(unittest.TestCase):
             "https://judge.invalid",
             lean_env_id="test-env",
         )
-        with patch.object(evaluator, "_request", return_value={}) as request:
+        terminal = {"job_id": "job-123", "status": "CANCELLED"}
+        with patch.object(evaluator, "_request", return_value=terminal) as request:
             fallback = evaluator._cancel_submitted_job("job-123")  # noqa: SLF001
         request.assert_called_once_with(
             "DELETE",
@@ -280,8 +332,10 @@ class JudgeBrokerTests(unittest.TestCase):
             timeout_seconds=2.0,
         )
         self.assertTrue(fallback["succeeded"])
+        self.assertTrue(fallback["settled"])
+        self.assertFalse(fallback["unconfirmed"])
 
-        with patch.object(evaluator, "_request", return_value={}) as request:
+        with patch.object(evaluator, "_request", return_value=terminal) as request:
             safe_fallback = evaluator._cancel_submitted_job(  # noqa: SLF001
                 "job-123",
                 cancel_endpoint="https://attacker.invalid/private-capability",
@@ -296,6 +350,8 @@ class JudgeBrokerTests(unittest.TestCase):
             {
                 "attempted": True,
                 "succeeded": True,
+                "settled": True,
+                "unconfirmed": False,
                 "failure_category": None,
             },
         )
@@ -879,14 +935,24 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertEqual(results[0]["status"], "TASK_CANCELLED")
             self.assertEqual(
                 state,
-                {"drained": True, "active_handlers": 0, "fifo_depth": 0},
+                {
+                    "drained": True,
+                    "active_handlers": 0,
+                    "fifo_depth": 0,
+                    "remote_unsettled_jobs": 0,
+                },
             )
             self.assertEqual(
                 broker.drain_state(),
-                {"active_handlers": 0, "fifo_depth": 0},
+                {
+                    "active_handlers": 0,
+                    "fifo_depth": 0,
+                    "remote_unsettled_jobs": 0,
+                },
             )
             self.assertEqual(broker.active_handlers, 0)
             self.assertEqual(broker.fifo_depth, 0)
+            self.assertEqual(broker.remote_unsettled_jobs, 0)
             rows = audit_path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(rows), 1)
             self.assertEqual(json.loads(rows[0])["status"], "TASK_CANCELLED")
@@ -936,7 +1002,113 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertEqual(results[0]["status"], "TASK_CANCELLED")
             self.assertEqual(state["active_handlers"], 0)
             self.assertEqual(state["fifo_depth"], 0)
+            self.assertEqual(state["remote_unsettled_jobs"], 0)
             self.assertEqual(len(audit_path.read_text().splitlines()), 1)
+
+    def test_unsettled_remote_cancellation_latches_gate_and_fails_closeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("import Mathlib\ntheorem task : True := by trivial\n")
+            gate = threading.BoundedSemaphore(1)
+            audit_path = root / "audit.jsonl"
+            broker = JudgeBroker(
+                _UnsettledCancellationEvaluator(),
+                gate,
+                audit_path=audit_path,
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=0.2,
+            ).start()
+            with broker.session(
+                actor_id="agent",
+                workdir=workdir,
+                candidates={"task": (_task(root), candidate)},
+                deadline_monotonic=time.monotonic() + 2,
+            ) as env:
+                result = _post(env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {})
+
+            self.assertEqual(result["status"], "REMOTE_SETTLEMENT_UNCONFIRMED")
+            self.assertEqual(
+                result["response"]["judge_cancellation"]["settled"],  # type: ignore[index]
+                False,
+            )
+            self.assertEqual(broker.remote_unsettled_jobs, 1)
+            self.assertFalse(gate.acquire(timeout=0))
+            started = time.monotonic()
+            with self.assertRaises(JudgeBrokerDrainError) as raised:
+                broker.close()
+            self.assertLess(time.monotonic() - started, 0.15)
+            self.assertEqual(
+                raised.exception.state,
+                {
+                    "drained": False,
+                    "active_handlers": 0,
+                    "fifo_depth": 0,
+                    "remote_unsettled_jobs": 1,
+                },
+            )
+            self.assertEqual(len(audit_path.read_text().splitlines()), 1)
+
+    def test_global_remote_latch_rejects_all_later_sessions_without_admission(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("import Mathlib\ntheorem task : True := by trivial\n")
+            evaluator = _GlobalUnsettledEvaluator()
+            gate = threading.BoundedSemaphore(1)
+            broker = JudgeBroker(
+                evaluator,
+                gate,
+                audit_path=root / "audit.jsonl",
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=0.1,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="first",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 2,
+                ) as env:
+                    first = _post(env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {})
+                with broker.session(
+                    actor_id="second",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 2,
+                ) as env:
+                    second = _post(env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {})
+            finally:
+                with self.assertRaises(JudgeBrokerDrainError):
+                    broker.close()
+
+            self.assertEqual(first["status"], "REMOTE_SETTLEMENT_UNCONFIRMED")
+            self.assertTrue(first["accepted"])
+            self.assertEqual(second["status"], "REMOTE_SETTLEMENT_UNCONFIRMED")
+            self.assertFalse(second["accepted"])
+            self.assertEqual(len(evaluator.calls), 1)
+            self.assertEqual(broker.remote_unsettled_jobs, 1)
+            self.assertFalse(gate.acquire(blocking=False))
+
+    def test_evaluator_global_unsettled_count_fails_closeout_without_handler(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            evaluator = _RecordingEvaluator()
+            evaluator.remote_unsettled_jobs = 2
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=Path(temporary) / "audit.jsonl",
+                drain_timeout_seconds=0.2,
+            ).start()
+            with self.assertRaises(JudgeBrokerDrainError) as raised:
+                broker.close()
+            self.assertEqual(raised.exception.state["remote_unsettled_jobs"], 2)
+            self.assertEqual(raised.exception.state["active_handlers"], 0)
+            self.assertEqual(raised.exception.state["fifo_depth"], 0)
 
     def test_close_timeout_raises_bounded_redacted_fatal_drain_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -984,7 +1156,12 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertNotIn("operator-private-agent", str(raised.exception))
             self.assertEqual(
                 broker.close(timeout_seconds=1),
-                {"drained": True, "active_handlers": 0, "fifo_depth": 0},
+                {
+                    "drained": True,
+                    "active_handlers": 0,
+                    "fifo_depth": 0,
+                    "remote_unsettled_jobs": 0,
+                },
             )
 
     def test_close_joins_active_handler_before_returning(self) -> None:
@@ -1232,14 +1409,19 @@ class JudgeBrokerTests(unittest.TestCase):
                 audit_path=root / "audit.jsonl",
             ).start()
             try:
-                with broker.session(
-                    actor_id="bound-agent",
-                    workdir=workdir,
-                    candidates={"task": (_task(root), candidate)},
-                    deadline_monotonic=10**12,
-                    cps_store=store,
-                    communication="blackboard",
-                ) as env:
+                with (
+                    patch.object(store, "create_piece", wraps=store.create_piece) as create_piece,
+                    patch.object(store, "send_message", wraps=store.send_message) as send_message,
+                    patch.object(store, "ack_message", wraps=store.ack_message) as ack_message,
+                    broker.session(
+                        actor_id="bound-agent",
+                        workdir=workdir,
+                        candidates={"task": (_task(root), candidate)},
+                        deadline_monotonic=10**12,
+                        cps_store=store,
+                        communication="blackboard",
+                    ) as env,
+                ):
                     url = env["CONTEXTSWARM_JUDGE_URL"]
                     published = _post(
                         url,
@@ -1255,8 +1437,14 @@ class JudgeBrokerTests(unittest.TestCase):
                             "body": "PROVED",
                         },
                     )
-                    sent = _post(url, "cps_send", {"recipient": "peer", "body": "try route"})
+                    sent = _post(url, "cps_send", {"body": "try route"})
+                    inbox = _post(url, "cps_inbox", {})
+                    message_id = str(inbox["messages"][0]["id"])  # type: ignore[index]
+                    acked = _post(url, "cps_ack", {"message_id": message_id})
                     found = _post(url, "cps_search", {"query": "induction"})
+                    expected_deadline = int(
+                        env["CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"]
+                    )
             finally:
                 broker.close()
             self.assertTrue(published["ok"])
@@ -1264,7 +1452,247 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertEqual(published["piece"]["task_id"], "task")  # type: ignore[index]
             self.assertEqual(runner_kind["status"], "RUNNER_ONLY_CPS_KIND")
             self.assertTrue(sent["ok"])
+            self.assertTrue(acked["acked"])
             self.assertEqual(len(found["items"]), 1)  # type: ignore[arg-type]
+            for write in (create_piece, send_message, ack_message):
+                self.assertEqual(
+                    write.call_args.kwargs["deadline_epoch_ms"],
+                    expected_deadline,
+                )
+                self.assertTrue(callable(write.call_args.kwargs["cancel_guard"]))
+
+    def test_cps_operations_fail_closed_after_horizon(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof")
+            store = CPSStore(root / "cps.sqlite3")
+            broker = JudgeBroker(
+                _RecordingEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=root / "audit.jsonl",
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="bound-agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() - 0.01,
+                    cps_store=store,
+                    communication="blackboard",
+                ) as env:
+                    url = env["CONTEXTSWARM_JUDGE_URL"]
+                    searched = _post(url, "cps_search", {})
+                    published = _post(
+                        url,
+                        "cps_publish",
+                        {"title": "late", "body": "must not persist"},
+                    )
+            finally:
+                broker.close()
+
+            self.assertEqual(searched["status"], "OUT_OF_HORIZON")
+            self.assertEqual(published["status"], "OUT_OF_HORIZON")
+            self.assertEqual(store.search(task_id="task"), [])
+
+    def test_cps_write_lock_wait_rechecks_horizon_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof")
+            store = CPSStore(root / "cps.sqlite3")
+            broker = JudgeBroker(
+                _RecordingEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=root / "audit.jsonl",
+            ).start()
+            blocker = sqlite3.connect(store.path, timeout=1, isolation_level=None)
+            blocker.execute("BEGIN IMMEDIATE")
+            entered_store = threading.Event()
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+            original_create_piece = store.create_piece
+
+            def observed_create_piece(**kwargs: object) -> dict[str, object]:
+                entered_store.set()
+                return original_create_piece(**kwargs)  # type: ignore[arg-type]
+
+            deadline = time.monotonic() + 0.1
+            try:
+                with (
+                    patch.object(store, "create_piece", side_effect=observed_create_piece),
+                    broker.session(
+                        actor_id="bound-agent",
+                        workdir=workdir,
+                        candidates={"task": (_task(root), candidate)},
+                        deadline_monotonic=deadline,
+                        cps_store=store,
+                        communication="blackboard",
+                    ) as env,
+                ):
+                    def publish() -> None:
+                        try:
+                            results.append(
+                                _post(
+                                    env["CONTEXTSWARM_JUDGE_URL"],
+                                    "cps_publish",
+                                    {"title": "late", "body": "must not persist"},
+                                )
+                            )
+                        except BaseException as exc:  # pragma: no cover - asserted below
+                            errors.append(exc)
+
+                    worker = threading.Thread(target=publish)
+                    worker.start()
+                    self.assertTrue(entered_store.wait(timeout=1))
+                    time.sleep(max(0.0, deadline - time.monotonic()) + 0.03)
+                    blocker.execute("ROLLBACK")
+                    worker.join(timeout=1)
+                    self.assertFalse(worker.is_alive())
+            finally:
+                if blocker.in_transaction:
+                    blocker.execute("ROLLBACK")
+                blocker.close()
+                broker.close()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(results[0]["status"], "OUT_OF_HORIZON")
+            self.assertEqual(store.search(task_id="task"), [])
+
+    def test_cps_write_lock_wait_rechecks_task_cancellation_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof")
+            store = CPSStore(root / "cps.sqlite3")
+            broker = JudgeBroker(
+                _RecordingEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=root / "audit.jsonl",
+            ).start()
+            blocker = sqlite3.connect(store.path, timeout=1, isolation_level=None)
+            blocker.execute("BEGIN IMMEDIATE")
+            cancelled = threading.Event()
+            entered_store = threading.Event()
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+            original_create_piece = store.create_piece
+
+            def observed_create_piece(**kwargs: object) -> dict[str, object]:
+                entered_store.set()
+                return original_create_piece(**kwargs)  # type: ignore[arg-type]
+
+            try:
+                with (
+                    patch.object(store, "create_piece", side_effect=observed_create_piece),
+                    broker.session(
+                        actor_id="bound-agent",
+                        workdir=workdir,
+                        candidates={"task": (_task(root), candidate)},
+                        deadline_monotonic=time.monotonic() + 5,
+                        cps_store=store,
+                        communication="blackboard",
+                        cancel_event=cancelled,
+                    ) as env,
+                ):
+                    def publish() -> None:
+                        try:
+                            results.append(
+                                _post(
+                                    env["CONTEXTSWARM_JUDGE_URL"],
+                                    "cps_publish",
+                                    {"title": "cancelled", "body": "must not persist"},
+                                )
+                            )
+                        except BaseException as exc:  # pragma: no cover - asserted below
+                            errors.append(exc)
+
+                    worker = threading.Thread(target=publish)
+                    worker.start()
+                    self.assertTrue(entered_store.wait(timeout=1))
+                    cancelled.set()
+                    blocker.execute("ROLLBACK")
+                    worker.join(timeout=1)
+                    self.assertFalse(worker.is_alive())
+            finally:
+                if blocker.in_transaction:
+                    blocker.execute("ROLLBACK")
+                blocker.close()
+                broker.close()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(results[0]["status"], "TASK_CANCELLED")
+            self.assertEqual(store.search(task_id="task"), [])
+
+    def test_cps_request_with_resolved_claim_fails_after_session_revocation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof")
+            store = CPSStore(root / "cps.sqlite3")
+            broker = JudgeBroker(
+                _RecordingEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=root / "audit.jsonl",
+            ).start()
+            entered_operation = threading.Event()
+            release_operation = threading.Event()
+            results: list[dict[str, object]] = []
+            errors: list[BaseException] = []
+            original_operation = broker._cps_operation  # noqa: SLF001
+            session = broker.session(
+                actor_id="bound-agent",
+                workdir=workdir,
+                candidates={"task": (_task(root), candidate)},
+                deadline_monotonic=time.monotonic() + 5,
+                cps_store=store,
+                communication="blackboard",
+            )
+            env = session.__enter__()
+            session_closed = False
+
+            def delayed_operation(*args: object, **kwargs: object) -> dict[str, object]:
+                entered_operation.set()
+                release_operation.wait(timeout=1)
+                return original_operation(*args, **kwargs)  # type: ignore[arg-type]
+
+            def search() -> None:
+                try:
+                    results.append(
+                        _post(env["CONTEXTSWARM_JUDGE_URL"], "cps_search", {})
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    errors.append(exc)
+
+            worker = threading.Thread(target=search)
+            try:
+                with patch.object(broker, "_cps_operation", side_effect=delayed_operation):
+                    worker.start()
+                    self.assertTrue(entered_operation.wait(timeout=1))
+                    session.__exit__(None, None, None)
+                    session_closed = True
+                    release_operation.set()
+                    worker.join(timeout=1)
+                    self.assertFalse(worker.is_alive())
+            finally:
+                release_operation.set()
+                if worker.is_alive():
+                    worker.join(timeout=1)
+                if not session_closed:
+                    session.__exit__(None, None, None)
+                broker.close()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(results[0]["status"], "TASK_CANCELLED")
+            self.assertEqual(store.search(task_id="task"), [])
 
     def test_candidate_must_be_result_inside_assigned_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

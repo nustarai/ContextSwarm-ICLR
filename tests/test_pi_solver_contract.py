@@ -120,7 +120,10 @@ class PiSolverContractTests(unittest.TestCase):
                 actor_id="actor",
                 workdir=Path(temporary),
                 extra_env={
-                    "CONTEXTSWARM_JUDGE_URL": "http://127.0.0.1:1234/token",
+                    "CONTEXTSWARM_JUDGE_URL": (
+                        "http://127.0.0.1:1234/"
+                        "abcdefghijklmnopqrstuvwxyzABCDEFGH_12345678"
+                    ),
                     "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "2000000000000",
                 },
             )
@@ -133,7 +136,7 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertNotIn("CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", broker_env)
         self.assertEqual(
             broker_env["CONTEXTSWARM_JUDGE_URL"],
-            "http://127.0.0.1:1234/token",
+            "http://127.0.0.1:1234/abcdefghijklmnopqrstuvwxyzABCDEFGH_12345678",
         )
         self.assertEqual(
             broker_env["CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"],
@@ -141,6 +144,37 @@ class PiSolverContractTests(unittest.TestCase):
         )
         self.assertEqual(raw_env["TMPDIR"], str(Path(temporary) / ".tmp"))
         self.assertEqual(tmp_mode, 0o700)
+
+    def test_solver_environment_rejects_unbound_or_raw_judge_capabilities(self) -> None:
+        agent = PiAgent(load_config("configs/smoke.toml", ROOT))
+        token = "abcdefghijklmnopqrstuvwxyzABCDEFGH_12345678"
+        invalid = (
+            {
+                "CONTEXTSWARM_JUDGE_URL": f"http://127.0.0.1:1234/{token}",
+                "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "2000000000000",
+                "LEAN_AUTH_TOKEN": "must-not-reenter",
+            },
+            {
+                "CONTEXTSWARM_JUDGE_URL": f"https://judge.invalid/{token}",
+                "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "2000000000000",
+            },
+            {
+                "CONTEXTSWARM_JUDGE_URL": "http://127.0.0.1:1234/short-token",
+                "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "2000000000000",
+            },
+            {
+                "CONTEXTSWARM_JUDGE_URL": f"http://127.0.0.1:1234/{token}",
+            },
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for extra_env in invalid:
+                with self.subTest(keys=sorted(extra_env)), self.assertRaises(ValueError):
+                    agent.environment(
+                        task_id="task",
+                        actor_id="actor",
+                        workdir=Path(temporary),
+                        extra_env=extra_env,
+                    )
 
     def test_fast_mode_accepts_only_hash_declared_bundled_extensions(self) -> None:
         config = load_config("configs/cps_fast.toml", ROOT)
@@ -203,7 +237,11 @@ class PiSolverContractTests(unittest.TestCase):
                 actor_id="contract-probe",
                 workdir=workdir,
                 extra_env={
-                    "CONTEXTSWARM_JUDGE_URL": "http://127.0.0.1:9/test-capability"
+                    "CONTEXTSWARM_JUDGE_URL": (
+                        "http://127.0.0.1:9/"
+                        "abcdefghijklmnopqrstuvwxyzABCDEFGH_12345678"
+                    ),
+                    "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "2000000000000",
                 },
             )
             env["PI_OFFLINE"] = "1"

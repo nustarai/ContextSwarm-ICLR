@@ -345,6 +345,7 @@ def _stage_arm(root: Path, arm: str) -> Path:
             "drained": True,
             "active_handlers": 0,
             "fifo_depth": 0,
+            "remote_unsettled_jobs": 0,
         },
     )
     _write_json(
@@ -906,8 +907,9 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
                 {
                     "schema_version": "contextswarm_judge_broker_closeout_v1",
                     "drained": False,
-                    "active_handlers": 1,
-                    "fifo_depth": 1,
+                    "active_handlers": 0,
+                    "fifo_depth": 0,
+                    "remote_unsettled_jobs": 1,
                 },
             )
             agent_events = _events("agent")
@@ -940,7 +942,11 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
             )
             for arm, status in zip(
                 ARMS,
-                ("EVALUATOR_ERROR", "NETWORK_ERROR", "REJECTED_OVERLOADED"),
+                (
+                    "REMOTE_SETTLEMENT_UNCONFIRMED",
+                    "NETWORK_ERROR",
+                    "REJECTED_OVERLOADED",
+                ),
             ):
                 row = {
                     "event": "judge_check",
@@ -958,6 +964,7 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         report = json.loads(result.stdout)
         self.assertIn("judge_check_failure_status", _codes(report, "uniform"))
+        self.assertIn("judge_check_control_failure", _codes(report, "uniform"))
         self.assertIn("judge_check_candidate_hash_missing", _codes(report, "uniform"))
         self.assertIn("judge_check_failure_status", _codes(report, "formula"))
         self.assertIn("judge_check_failure_status", _codes(report, "agent"))

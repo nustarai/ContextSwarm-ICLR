@@ -95,6 +95,7 @@ def _stage(root: Path) -> Path:
             "drained": True,
             "active_handlers": 0,
             "fifo_depth": 0,
+            "remote_unsettled_jobs": 0,
         },
     )
     _write_json(
@@ -203,7 +204,8 @@ class CanaryCloseoutTests(unittest.TestCase):
             closeout = json.loads(
                 (run / "judge_broker_closeout.json").read_text(encoding="utf-8")
             )
-            closeout["active_handlers"] = 1
+            closeout["drained"] = False
+            closeout["remote_unsettled_jobs"] = 1
             _write_json(run / "judge_broker_closeout.json", closeout)
             _write_jsonl(run / "events.jsonl", [{"event": "elastic_worker_error"}])
             report = audit_canary(run)
@@ -220,6 +222,26 @@ class CanaryCloseoutTests(unittest.TestCase):
             }.issubset(codes),
             report,
         )
+
+    def test_remote_settlement_status_and_event_are_hard_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run = _stage(Path(raw))
+            checks = [
+                json.loads(line)
+                for line in (run / "judge_checks.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            checks[0]["status"] = "REMOTE_SETTLEMENT_UNCONFIRMED"
+            _write_jsonl(run / "judge_checks.jsonl", checks)
+            events = [
+                json.loads(line)
+                for line in (run / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            events.append({"event": "remote_settlement_unconfirmed"})
+            _write_jsonl(run / "events.jsonl", events)
+            report = audit_canary(run)
+
+        self.assertIn("accepted_judge_check_failed", _codes(report))
+        self.assertIn("runner_worker_or_broker_error", _codes(report))
 
     def test_reports_delete_when_a_real_cancellation_is_present(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
