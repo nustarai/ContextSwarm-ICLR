@@ -16,3 +16,8 @@ enabled = false
 [pi]
 fast_mode = false
 timeout_seconds = 10
+
+[formal_tools]
+# Offline orchestration smoke still stages both shims, but it has no Mathlib
+# service/index contract to validate.
+require_decl_index = false

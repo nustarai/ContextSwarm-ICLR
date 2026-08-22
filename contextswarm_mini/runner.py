@@ -35,6 +35,14 @@ from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
 from .evaluator import LeanEvaluator, MockEvaluator, sanitize_worker_text
 from .elastic_scheduler import AgentAssignment, ElasticScheduler
+from .formal_tools import (
+    DeclarationIndex,
+    FormalToolPolicy,
+    ToolCapability,
+    prepare_declaration_index,
+    stage_worker_tools,
+    tool_surface_provenance,
+)
 from .judge_broker import CandidateSnapshot, JudgeBroker, JudgeBrokerDrainError
 from .launch_contract import LaunchContractError, verify_manifest_binding
 from .models import AgentResult, Task, Verdict
@@ -376,28 +384,47 @@ def _retryable_closeout_infrastructure_failure(verdict: Verdict) -> bool:
     )
 
 
-def _reuse_authority_after_infrastructure_failure(
+def _mark_closeout_infrastructure_incomplete(
+    task: Task,
+    candidate: _FrozenCandidate,
     prior: Verdict,
     observed: Verdict,
 ) -> Verdict:
-    response = dict(prior.response)
+    """Return a zero-score fresh-closeout failure, never a reused proof.
+
+    A solver-phase Judge receipt can explain why the frozen candidate was
+    selected, but it cannot stand in for the independent outer closeout.  Do
+    not copy its ``PROVED`` status, score, or job id into the final verdict.
+    """
+
+    response = dict(observed.response)
     response["closeout_infra_incomplete"] = {
         "observed_status": _normalized_verdict_status(observed),
         "error_kind": _response_value(observed.response, "error_kind"),
         "terminal_reason": _response_value(observed.response, "terminal_reason"),
         "retryable": True,
     }
+    response["prior_authoritative_proof_available"] = True
+    response["fresh_closeout_confirmed"] = False
+    candidate_sha = _normalized_sha256(observed.candidate_sha256)
+    if candidate_sha is None:
+        candidate_sha = _normalized_sha256(candidate.sha256)
+    contract_sha = _normalized_sha256(observed.task_contract_sha256)
+    if contract_sha is None:
+        contract_sha = _normalized_sha256(prior.task_contract_sha256)
     return Verdict(
-        task_id=prior.task_id,
-        status="PROVED",
-        score=1.0,
-        elapsed_seconds=prior.elapsed_seconds,
+        task_id=task.slug,
+        status=_normalized_verdict_status(observed) or "CLOSEOUT_INCOMPLETE",
+        score=0.0,
+        elapsed_seconds=observed.elapsed_seconds,
         response=response,
-        error=prior.error,
-        candidate_sha256=prior.candidate_sha256,
-        task_contract_sha256=prior.task_contract_sha256,
-        judge_job_id=prior.judge_job_id,
-        cache_reused=prior.cache_reused,
+        error=observed.error or "fresh outer closeout did not complete",
+        candidate_sha256=candidate_sha,
+        task_contract_sha256=contract_sha,
+        # Keep only the fresh observation's receipt; the prior solver receipt
+        # is deliberately not promoted to final authority.
+        judge_job_id=observed.judge_job_id,
+        cache_reused=observed.cache_reused,
     )
 
 
@@ -1126,9 +1153,49 @@ def run_experiment(
         _write_final(run_dir, config, {}, [], status="DRY_RUN", cps_summary=None)
         return run_dir
 
+    declaration_index: DeclarationIndex
+    if config.formal_tools_enabled:
+        try:
+            declaration_index = prepare_declaration_index(
+                config,
+                run_dir / ".private" / "formal_tools",
+            )
+        except OSError as exc:
+            error = PreflightError(
+                "formal declaration-index snapshot preparation failed"
+            )
+            logger.event(
+                "preflight_failed",
+                **_exception_artifact_fields(error, config),
+            )
+            _write_final(
+                run_dir,
+                config,
+                {},
+                [],
+                status="PREFLIGHT_FAILED",
+                cps_summary=None,
+            )
+            raise error from exc
+    else:
+        declaration_index = DeclarationIndex(None)
+
     if not mock_agent:
         try:
-            run_preflight(config, run_dir)
+            # Keep the run-private index bound to the preflight when the
+            # production function supports that keyword.  A few downstream
+            # harnesses replace ``run_preflight`` with the historical
+            # two-argument probe; preserving that narrow seam avoids turning a
+            # diagnostic test double into a runtime failure.
+            preflight_parameters = inspect.signature(run_preflight).parameters
+            if "declaration_index" in preflight_parameters:
+                run_preflight(
+                    config,
+                    run_dir,
+                    declaration_index=declaration_index,
+                )
+            else:
+                run_preflight(config, run_dir)
         except PreflightError as exc:
             logger.event(
                 "preflight_failed",
@@ -1173,13 +1240,51 @@ def run_experiment(
         # double.  This marker is never set for a real experiment evaluator.
         setattr(evaluator, "_contextswarm_legacy_test_mock", True)
     evaluator_gate = threading.BoundedSemaphore(config.lean_max_concurrent_evaluations)
+    formal_policy = FormalToolPolicy(
+        enabled=config.formal_tools_enabled,
+        surface_version=config.formal_tools_version,
+        evaluate_calls_per_task=config.formal_tools_evaluate_calls_per_task,
+        evaluate_backend_jobs_per_task=(
+            config.formal_tools_evaluate_backend_jobs_per_task
+        ),
+        query_calls_per_task=config.formal_tools_query_calls_per_task,
+        query_backend_probes_per_task=(
+            config.formal_tools_query_backend_probes_per_task
+        ),
+        max_candidate_bytes=config.formal_tools_max_candidate_bytes,
+        command_timeout_seconds=config.formal_tools_command_timeout_seconds,
+        declaration_index=declaration_index,
+    )
     judge_broker = JudgeBroker(
         evaluator,
         evaluator_gate,
         audit_path=run_dir / "judge_checks.jsonl",
+        formal_policy=formal_policy,
+        formal_audit_path=run_dir / "formal_tool_calls.jsonl",
     ).start()
     (run_dir / "judge_broker_policy.json").write_text(
         json.dumps(judge_broker.public_policy(), ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "formal_tools_contract.json").write_text(
+        json.dumps(
+            {
+                "enabled": config.formal_tools_enabled,
+                "authority": "diagnostic_only",
+                "quota_scope": "task_across_all_sessions",
+                "declaration_index": declaration_index.info.public_dict(),
+                "surface": tool_surface_provenance(
+                    config.formal_tools_version,
+                    solver_extension_path=Path(__file__).with_name(
+                        "pi_solver_tools.mjs"
+                    ),
+                ),
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
         + "\n",
         encoding="utf-8",
     )
@@ -1287,10 +1392,32 @@ def run_experiment(
             }
         broker_state = {"drained": False, **observed}
 
-    terminal_failure = run_failure or broker_failure
+    formal_summary_failure: BaseException | None = None
+    formal_summary_failure_fields: dict[str, str] | None = None
+    try:
+        (run_dir / "formal_tools_summary.json").write_text(
+            json.dumps(
+                judge_broker.formal_summary(),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except BaseException as exc:
+        formal_summary_failure = exc
+        formal_summary_failure_fields = _exception_artifact_fields(
+            exc,
+            config,
+            traceback_bytes=4_000,
+        )
+
+    terminal_failure = run_failure or broker_failure or formal_summary_failure
     terminal_failure_fields = (
         run_failure_fields
         or broker_failure_fields
+        or formal_summary_failure_fields
     )
     if terminal_failure is None:
         try:
@@ -1482,9 +1609,14 @@ def _run_mono(
     worker_dir = run_dir / "workers" / "mono"
     worker_dir.mkdir(parents=True, exist_ok=True)
     for task in tasks:
-        _stage_task(task, worker_dir / "tasks" / task.slug)
+        _stage_task(task, worker_dir / "tasks" / task.slug, config=config)
     _write_mono_bundle(worker_dir, tasks)
-    prompt = build_mono_prompt(tasks, workspace=str(worker_dir), communication_enabled=False)
+    prompt = build_mono_prompt(
+        tasks,
+        workspace=str(worker_dir),
+        communication_enabled=False,
+        formal_tools_enabled=config.formal_tools_enabled,
+    )
     early_lock = threading.RLock()
     early_proofs: dict[str, _EarlyProofCredit] = {}
     expected_contracts = {
@@ -2123,7 +2255,7 @@ def _run_elastic_cps(
 
     def prepare_workspace(state: _ElasticTaskState, assignment: AgentAssignment) -> tuple[Path, Path]:
         workdir = state.task_root / "agents" / assignment.agent_id
-        _stage_task(state.task, workdir)
+        _stage_task(state.task, workdir, config=config)
         assert state.best_candidate is not None
         with state.lock:
             shutil.copy2(state.best_candidate, workdir / "result.lean")
@@ -2291,6 +2423,7 @@ def _run_elastic_cps(
             agent_id=actor,
             episode=assignment.generation,
             communication_enabled=policy.enabled,
+            formal_tools_enabled=config.formal_tools_enabled,
             digest=digest,
         )
         prompt += (
@@ -2752,7 +2885,7 @@ def _run_task_workers(
 
     def execute(task: Task) -> tuple[AgentResult, Verdict]:
         workdir = run_dir / "workers" / task.slug
-        _stage_task(task, workdir)
+        _stage_task(task, workdir, config=config)
         best_result: AgentResult | None = None
         best_verdict: Verdict | None = None
         actor = f"worker-{task.slug}-e0"
@@ -2819,6 +2952,7 @@ def _run_task_workers(
                 agent_id=actor,
                 episode=episode,
                 communication_enabled=policy.enabled,
+                formal_tools_enabled=config.formal_tools_enabled,
                 digest=digest,
             )
             if mock_agent:
@@ -2931,7 +3065,12 @@ def _run_task_workers(
     return results
 
 
-def _stage_task(task: Task, destination: Path) -> None:
+def _stage_task(
+    task: Task,
+    destination: Path,
+    *,
+    config: ExperimentConfig,
+) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "problem.md").write_text(task.problem_text, encoding="utf-8")
     baseline_dir = destination / "baseline"
@@ -2945,6 +3084,15 @@ def _stage_task(task: Task, destination: Path) -> None:
     result = destination / "result.lean"
     if not result.exists():
         shutil.copy2(baseline_source, result)
+    if config.formal_tools_enabled:
+        stage_worker_tools(
+            destination,
+            capability=ToolCapability(
+                task_id=task.slug,
+                surface_version=config.formal_tools_version,
+            ),
+            baseline_names=[baseline_source.name],
+        )
 
 
 def _within_horizon(verdict: Verdict, deadline: float) -> Verdict:
@@ -3314,10 +3462,15 @@ def _run_closeout(
             )
         if _retryable_closeout_infrastructure_failure(observed):
             return _CloseoutDecision(
-                _reuse_authority_after_infrastructure_failure(prior, observed),
+                _mark_closeout_infrastructure_incomplete(
+                    task,
+                    candidate,
+                    prior,
+                    observed,
+                ),
                 observed,
                 prior,
-                "retryable_infra_reused",
+                "retryable_infra_unconfirmed",
             )
         return _CloseoutDecision(
             _authority_conflict_verdict(task, prior, observed),
@@ -3344,7 +3497,7 @@ def _run_closeout(
                     candidate_sha256=frozen[task.slug].sha256,
                     **decision.authority_mismatch,
                 )
-            if decision.disposition == "retryable_infra_reused":
+            if decision.disposition == "retryable_infra_unconfirmed":
                 logger.event(
                     "closeout_infra_incomplete",
                     task_id=task.slug,
@@ -3362,6 +3515,8 @@ def _run_closeout(
                     observed_retryable=True,
                     final_status=verdict.status,
                     final_score=verdict.score,
+                    prior_authoritative_proof_available=True,
+                    fresh_closeout_confirmed=False,
                 )
             elif decision.disposition == "authority_confirmed":
                 logger.event(
@@ -3410,14 +3565,22 @@ def _run_closeout(
                 agent_id="closeout",
                 episode=0,
                 observed_status=_normalized_verdict_status(decision.observed),
-                reused_authoritative_verdict=(
-                    decision.disposition == "retryable_infra_reused"
-                ),
+                # A prior solver proof is diagnostic linkage only.  It is never
+                # reused as the final official verdict when fresh closeout is
+                # incomplete.
+                reused_authoritative_verdict=False,
                 authoritative_proof_confirmed=(
                     decision.disposition == "authority_confirmed"
                 ),
                 closeout_infra_incomplete=(
-                    decision.disposition == "retryable_infra_reused"
+                    decision.disposition == "retryable_infra_unconfirmed"
+                ),
+                prior_authoritative_proof_available=(
+                    decision.prior_authority is not None
+                    and decision.disposition == "retryable_infra_unconfirmed"
+                ),
+                fresh_closeout_confirmed=(
+                    decision.disposition == "authority_confirmed"
                 ),
                 authority_conflict=(
                     decision.disposition == "authority_conflict"
@@ -3428,16 +3591,19 @@ def _run_closeout(
     logger.event(
         "closeout_finished",
         score=sum(verdict.score for verdict in ordered.values()),
-        reused_authoritative_verdicts=disposition_counts.get(
-            "retryable_infra_reused",
-            0,
-        ),
+        # Kept for schema compatibility; no authoritative verdict is reused
+        # when fresh closeout is incomplete.
+        reused_authoritative_verdicts=0,
         authoritative_proofs_confirmed=disposition_counts.get(
             "authority_confirmed",
             0,
         ),
         closeout_infra_incomplete=disposition_counts.get(
-            "retryable_infra_reused",
+            "retryable_infra_unconfirmed",
+            0,
+        ),
+        closeout_infra_unconfirmed=disposition_counts.get(
+            "retryable_infra_unconfirmed",
             0,
         ),
         authority_conflicts=disposition_counts.get("authority_conflict", 0),

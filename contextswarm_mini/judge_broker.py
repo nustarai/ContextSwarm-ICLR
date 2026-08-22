@@ -31,7 +31,9 @@ from .evaluator import (
     sanitize_worker_identifier,
     sanitize_worker_text,
 )
+from .formal_tools import FormalToolPolicy, sanitize_public_text
 from .models import Task, Verdict
+from .secure_io import DEFAULT_MAX_CANDIDATE_BYTES, read_regular_bytes
 
 
 _MAX_REQUEST_BYTES = 32 * 1024
@@ -40,6 +42,34 @@ _MIN_PROBE_INTERVAL_SECONDS = 1.0
 _PROBE_ADMISSION_TIMEOUT_SECONDS: float | None = None
 _BROKER_DRAIN_TIMEOUT_SECONDS = 5.0
 _RUNNER_ONLY_CPS_KINDS = frozenset({"validation_result"})
+_LEAN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.₀-₉ⁿ¹²³@]*$")
+_IMPORT_LINE = re.compile(r"(?m)^\s*import\s+[^\n]+\s*$")
+_DEFAULT_TACTICS = (
+    "exact?",
+    "simp",
+    "simp_all",
+    "omega",
+    "norm_num",
+    "positivity",
+    "linarith",
+    "ring",
+    "aesop",
+    "decide",
+)
+_FORMAL_NONCACHEABLE_STATUSES = frozenset(
+    {
+        "BUDGET_EXHAUSTED",
+        "BROKER_ERROR",
+        "EVALUATOR_ERROR",
+        "EVALUATOR_TIMEOUT",
+        "INFRASTRUCTURE_ERROR",
+        "NETWORK_ERROR",
+        "OUT_OF_HORIZON",
+        "REMOTE_SETTLEMENT_UNCONFIRMED",
+        "REJECTED_OVERLOADED",
+        "TASK_CANCELLED",
+    }
+)
 
 
 class JudgeBrokerDrainError(RuntimeError):
@@ -74,6 +104,7 @@ class CandidateSnapshot:
 
 @dataclass
 class _SessionClaim:
+    broker: Any
     actor_id: str
     workdir: Path
     candidates: dict[str, _CandidateBinding]
@@ -155,6 +186,8 @@ class JudgeBroker:
         min_probe_interval_seconds: float = _MIN_PROBE_INTERVAL_SECONDS,
         probe_admission_timeout_seconds: float | None = _PROBE_ADMISSION_TIMEOUT_SECONDS,
         drain_timeout_seconds: float = _BROKER_DRAIN_TIMEOUT_SECONDS,
+        formal_policy: FormalToolPolicy | None = None,
+        formal_audit_path: Path | None = None,
     ):
         self.evaluator = evaluator
         self.evaluator_gate = evaluator_gate
@@ -170,6 +203,17 @@ class JudgeBroker:
         if not math.isfinite(normalized_drain_timeout) or normalized_drain_timeout <= 0:
             raise ValueError("broker drain timeout must be finite and positive")
         self.drain_timeout_seconds = normalized_drain_timeout
+        self.formal_policy = formal_policy
+        self.formal_audit_path = Path(
+            formal_audit_path
+            if formal_audit_path is not None
+            else self.audit_path.with_name("formal_tool_calls.jsonl")
+        )
+        self._formal_lock = threading.RLock()
+        self._formal_counts: dict[tuple[str, str], int] = {}
+        self._formal_serials: dict[tuple[str, str], int] = {}
+        self._formal_evaluate_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self._formal_query_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._claims: dict[str, _SessionClaim] = {}
         self._claims_lock = threading.RLock()
         self._audit_lock = threading.Lock()
@@ -205,6 +249,9 @@ class JudgeBroker:
 
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         self.audit_path.touch(exist_ok=True)
+        if self.formal_policy is not None and self.formal_policy.enabled:
+            self.formal_audit_path.parent.mkdir(parents=True, exist_ok=True)
+            self.formal_audit_path.touch(exist_ok=True)
         self._server = _BrokerHTTPServer(("127.0.0.1", 0), Handler)
         self._server._broker = self
         self._thread = threading.Thread(
@@ -334,7 +381,7 @@ class JudgeBroker:
                 self._handler_condition.wait(timeout=min(remaining, 0.05))
 
     def public_policy(self) -> dict[str, Any]:
-        return {
+        policy: dict[str, Any] = {
             "transport": "runner_owned_loopback_capability",
             "response_profile": LEAN_PROBE_RESPONSE_PROFILE,
             "max_probe_calls_per_session": self.max_probe_calls_per_session,
@@ -349,6 +396,38 @@ class JudgeBroker:
             "closeout_requires_fifo_depth": 0,
             "closeout_requires_remote_unsettled_jobs": 0,
             "drain_timeout_seconds": self.drain_timeout_seconds,
+        }
+        formal = self.formal_policy
+        policy["formal_tools"] = (
+            {
+                "enabled": True,
+                "surface_version": formal.surface_version,
+                "transport": "same_session_loopback_capability",
+                "evaluate_authority": "diagnostic_only",
+                "quota_scope": "task_across_all_sessions",
+                "evaluate_calls_per_task": formal.evaluate_calls_per_task,
+                "evaluate_backend_jobs_per_task": formal.evaluate_backend_jobs_per_task,
+                "query_calls_per_task": formal.query_calls_per_task,
+                "query_backend_probes_per_task": formal.query_backend_probes_per_task,
+                "max_candidate_bytes": formal.max_candidate_bytes,
+                "declaration_index": formal.declaration_index.info.public_dict(),
+            }
+            if formal is not None and formal.enabled
+            else {"enabled": False}
+        )
+        return policy
+
+    def formal_summary(self) -> dict[str, Any]:
+        """Return public run-global counters after broker capabilities are silent."""
+
+        with self._formal_lock:
+            counts: dict[str, dict[str, int]] = {}
+            for (task_id, counter), value in sorted(self._formal_counts.items()):
+                counts.setdefault(task_id, {})[counter] = max(0, int(value))
+        return {
+            "enabled": bool(self.formal_policy and self.formal_policy.enabled),
+            "quota_scope": "task_across_all_sessions",
+            "tasks": counts,
         }
 
     @contextmanager
@@ -416,6 +495,7 @@ class JudgeBroker:
         deadline_epoch_ms = int((time.time() + remaining_seconds) * 1_000)
         token = secrets.token_urlsafe(32)
         claim = _SessionClaim(
+            broker=self,
             actor_id=str(actor_id),
             workdir=resolved_workdir,
             candidates=bindings,
@@ -479,6 +559,10 @@ class JudgeBroker:
         try:
             if operation == "judge_check":
                 result = self._judge_check(claim, payload)
+            elif operation == "evaluate_local":
+                result = self._evaluate_local(claim, payload)
+            elif operation == "formal_query":
+                result = self._formal_query(claim, payload)
             elif operation.startswith("cps_"):
                 result = self._cps_operation(claim, operation, payload)
             else:
@@ -500,6 +584,14 @@ class JudgeBroker:
                     else "__invalid__"
                 )
                 self._audit(claim, audit_task, result, accepted=False)
+            elif operation in {"evaluate_local", "formal_query"}:
+                self._formal_audit(
+                    claim,
+                    operation,
+                    "__invalid__",
+                    result,
+                    accepted=False,
+                )
         self._send_json(handler, 200, result)
 
     def _judge_check(
@@ -596,7 +688,15 @@ class JudgeBroker:
             # result.lean while queued, but neither the request nor its audit
             # hash can then drift to a different file state.
             try:
-                snapshot = _candidate_snapshot(binding.path)
+                snapshot = _candidate_snapshot(
+                    binding.path,
+                    trusted_root=claim.workdir,
+                    max_bytes=(
+                        self.formal_policy.max_candidate_bytes
+                        if self.formal_policy is not None
+                        else DEFAULT_MAX_CANDIDATE_BYTES
+                    ),
+                )
             except (OSError, UnicodeError):
                 result = _control_result(
                     "CANDIDATE_SNAPSHOT_ERROR",
@@ -1021,6 +1121,830 @@ class JudgeBroker:
             candidate_sha256=candidate_sha256,
         )
         return normalized
+
+    def _evaluate_local(
+        self,
+        claim: _SessionClaim,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Evaluate exact runner-bound bytes without creating proof authority."""
+
+        started = time.monotonic()
+        if self.formal_policy is None or not self.formal_policy.enabled:
+            return _control_result(
+                "FORMAL_TOOLS_DISABLED",
+                "The manifest does not enable the bounded formal tool surface.",
+                retryable=False,
+            )
+        if set(payload) - {"task_id"}:
+            result = _control_result(
+                "INVALID_REQUEST",
+                "evaluate_local accepts only the runner-bound task selection.",
+                retryable=False,
+            )
+            self._formal_audit(claim, "evaluate_local", "__invalid__", result, accepted=False)
+            return result
+        try:
+            task_id = _select_task_id(claim, payload.get("task_id"))
+        except ValueError as exc:
+            result = _control_result(
+                "INVALID_TASK_SELECTION",
+                _safe_error(exc),
+                retryable=False,
+            )
+            self._formal_audit(claim, "evaluate_local", "__invalid__", result, accepted=False)
+            return result
+        call_number = self._formal_increment(task_id, "evaluate_calls")
+        if call_number > self.formal_policy.evaluate_calls_per_task:
+            result = {
+                **_control_result(
+                    "BUDGET_EXHAUSTED",
+                    "The task-global evaluate.py call budget is exhausted.",
+                    retryable=False,
+                ),
+                "call_number": call_number,
+                "advisory_only": True,
+                "official_score_eligible": False,
+            }
+            self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
+            return result
+        capability_failure = _formal_capability_failure(claim)
+        if capability_failure is not None:
+            result = {
+                **capability_failure,
+                "call_number": call_number,
+                "advisory_only": True,
+                "official_score_eligible": False,
+            }
+            self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
+            return result
+
+        binding = claim.candidates[task_id]
+        try:
+            source_bytes = read_regular_bytes(
+                binding.path,
+                trusted_root=claim.workdir,
+                max_bytes=self.formal_policy.max_candidate_bytes,
+            )
+            source = source_bytes.decode("utf-8")
+        except (OSError, UnicodeError):
+            result = {
+                **_control_result(
+                    "CANDIDATE_SNAPSHOT_ERROR",
+                    "The runner could not freeze result.lean for diagnostic evaluation.",
+                    retryable=True,
+                ),
+                "call_number": call_number,
+                "advisory_only": True,
+                "official_score_eligible": False,
+            }
+            self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
+            return result
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        cache_key = (
+            task_id,
+            binding.expected_task_contract_sha256,
+            source_sha256,
+        )
+        with self._formal_lock:
+            cached = self._formal_evaluate_cache.get(cache_key)
+            cached_result = _json_clone(cached) if cached is not None else None
+        if cached_result is not None:
+            cached_result.update(
+                {
+                    "call_number": call_number,
+                    "cache_hit": True,
+                    "backend_job_number": None,
+                    "accepted": True,
+                }
+            )
+            self._formal_audit(
+                claim,
+                "evaluate_local",
+                task_id,
+                cached_result,
+                accepted=True,
+                candidate_sha256=source_sha256,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            return cached_result
+
+        backend_number = self._formal_reserve(
+            task_id,
+            "evaluate_backend_jobs",
+            self.formal_policy.evaluate_backend_jobs_per_task,
+        )
+        if backend_number is None:
+            result = {
+                **_control_result(
+                    "BUDGET_EXHAUSTED",
+                    "The task-global evaluate.py backend-job budget is exhausted.",
+                    retryable=False,
+                ),
+                "call_number": call_number,
+                "candidate_sha256": source_sha256,
+                "advisory_only": True,
+                "official_score_eligible": False,
+            }
+            self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
+            return result
+
+        gate_started = time.monotonic()
+        acquired = False
+        retain_evaluator_gate = False
+        evaluator_call_started = False
+        evaluator_unsettled_before = 0
+        verdict: Verdict | None = None
+        try:
+            acquired = self._acquire_evaluator_gate(
+                claim.deadline_monotonic,
+                claim=claim,
+            )
+            if not acquired:
+                self._formal_release(task_id, "evaluate_backend_jobs", backend_number)
+                backend_number = None
+                result = _formal_gate_failure(claim, self._remote_settlement_unconfirmed())
+            else:
+                probe_source = getattr(self.evaluator, "probe_source", None)
+                if not callable(probe_source):
+                    self._formal_release(task_id, "evaluate_backend_jobs", backend_number)
+                    backend_number = None
+                    result = _control_result(
+                        "EVALUATOR_ERROR",
+                        "The evaluator lacks immutable diagnostic-source support.",
+                        retryable=False,
+                    )
+                else:
+                    options: dict[str, Any] = {
+                        "deadline_monotonic": claim.deadline_monotonic,
+                    }
+                    if _accepts_cancel_event(probe_source):
+                        options["cancel_event"] = _ClaimCancelEvent(claim)
+                    evaluator_unsettled_before = _nonnegative_count(
+                        getattr(self.evaluator, "remote_unsettled_jobs", 0)
+                    )
+                    evaluator_call_started = True
+                    verdict = probe_source(binding.task, source, **options)
+                    evaluator_unsettled_after = _nonnegative_count(
+                        getattr(self.evaluator, "remote_unsettled_jobs", 0)
+                    )
+                    if (
+                        evaluator_unsettled_after > evaluator_unsettled_before
+                        or _has_unsettled_remote_work(
+                            _safe_verdict_status(verdict.status),
+                            verdict.response,
+                        )
+                    ):
+                        retain_evaluator_gate = True
+                        self._mark_remote_unsettled()
+                        result = _remote_settlement_control_result()
+                    else:
+                        result = _formal_worker_verdict(verdict)
+        except Exception:
+            evaluator_unsettled_after = _nonnegative_count(
+                getattr(self.evaluator, "remote_unsettled_jobs", 0)
+            )
+            if (
+                evaluator_call_started
+                and evaluator_unsettled_after > evaluator_unsettled_before
+            ):
+                retain_evaluator_gate = True
+                self._mark_remote_unsettled()
+                result = _remote_settlement_control_result()
+            else:
+                result = _control_result(
+                    "EVALUATOR_ERROR",
+                    "The controlled diagnostic evaluation failed.",
+                    retryable=False,
+                )
+        finally:
+            if acquired and not retain_evaluator_gate:
+                self._release_evaluator_gate()
+
+        if not retain_evaluator_gate and verdict is not None and (
+            verdict.cache_reused or _verdict_proves_no_backend_job(verdict)
+        ) and backend_number is not None:
+            self._formal_release(task_id, "evaluate_backend_jobs", backend_number)
+            backend_number = None
+        result.update(
+            {
+                "accepted": verdict is not None,
+                "call_number": call_number,
+                "backend_job_number": backend_number,
+                "candidate_sha256": source_sha256,
+                "cache_hit": bool(
+                    verdict and verdict.cache_reused and not retain_evaluator_gate
+                ),
+                "advisory_only": True,
+                "official_score_eligible": False,
+                "note": (
+                    "Agent-local feedback never selects a candidate or writes the score; "
+                    "outer closeout submits frozen bytes independently."
+                ),
+            }
+        )
+        if (
+            not retain_evaluator_gate
+            and
+            verdict is not None
+            and _safe_verdict_status(verdict.status) not in _FORMAL_NONCACHEABLE_STATUSES
+        ):
+            with self._formal_lock:
+                self._formal_evaluate_cache[cache_key] = _json_clone(result)
+        self._formal_audit(
+            claim,
+            "evaluate_local",
+            task_id,
+            result,
+            accepted=verdict is not None,
+            candidate_sha256=source_sha256,
+            gate_wait_seconds=max(0.0, time.monotonic() - gate_started),
+            elapsed_seconds=time.monotonic() - started,
+            backend_number=backend_number,
+        )
+        return result
+
+    def _formal_query(
+        self,
+        claim: _SessionClaim,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Serve one bounded search/elaboration query under task-global quotas."""
+
+        started = time.monotonic()
+        formal = self.formal_policy
+        if formal is None or not formal.enabled:
+            return _control_result(
+                "FORMAL_TOOLS_DISABLED",
+                "The manifest does not enable the bounded formal tool surface.",
+                retryable=False,
+            )
+        allowed_fields = {
+            "task_id",
+            "command",
+            "query",
+            "limit",
+            "snippet",
+            "tactics",
+            "tactic",
+            "timeout",
+        }
+        if set(payload) - allowed_fields:
+            result = _control_result(
+                "INVALID_REQUEST",
+                "formal_query received unsupported fields.",
+                retryable=False,
+            )
+            self._formal_audit(claim, "formal_query", "__invalid__", result, accepted=False)
+            return result
+        try:
+            task_id = _select_task_id(claim, payload.get("task_id"))
+        except ValueError as exc:
+            result = _control_result(
+                "INVALID_TASK_SELECTION",
+                _safe_error(exc),
+                retryable=False,
+            )
+            self._formal_audit(claim, "formal_query", "__invalid__", result, accepted=False)
+            return result
+        command = str(payload.get("command") or "").strip().lower()
+        if command not in {"search", "decl", "check", "type", "axioms", "deps"}:
+            result = _control_result(
+                "INVALID_REQUEST",
+                "Unsupported formal_query command.",
+                retryable=False,
+            )
+            self._formal_audit(claim, "formal_query", task_id, result, accepted=False)
+            return result
+        call_number = self._formal_increment(task_id, "query_calls")
+        if call_number > formal.query_calls_per_task:
+            result = {
+                "ok": False,
+                "status": "scout_call_budget_exhausted",
+                "call_number": call_number,
+                "advisory_only": True,
+                "final_verify_required": True,
+            }
+            self._formal_audit(claim, "formal_query", task_id, result, accepted=False)
+            return result
+        capability_failure = _formal_capability_failure(claim)
+        if capability_failure is not None:
+            result = {
+                **capability_failure,
+                "call_number": call_number,
+                "advisory_only": True,
+                "final_verify_required": True,
+            }
+            self._formal_audit(claim, "formal_query", task_id, result, accepted=False)
+            return result
+
+        raw_query = payload.get("query")
+        query_values = raw_query if isinstance(raw_query, list) else []
+        query = [sanitize_public_text(str(value), limit=400) for value in query_values[:12]]
+        query_text = " ".join(query).strip()
+        limit = _bounded_limit(payload.get("limit"), default=12, maximum=24)
+        timeout = _bounded_limit(payload.get("timeout"), default=30, maximum=120)
+        binding = claim.candidates[task_id]
+        guarded = {binding.task.theorem_name, binding.task.problem_id, binding.task.slug}
+        backend_probes = 0
+        cache_hits = 0
+
+        if command == "search":
+            public = self._formal_search_public(binding.path.parent, query, limit=limit)
+            matches = formal.declaration_index.search(
+                query_text,
+                limit=limit,
+                guarded_names=guarded,
+            )
+            result: dict[str, Any] = {
+                "status": "ok" if formal.declaration_index.info.compatible else "index_unavailable",
+                "query_kind": "search",
+                "public_results": public,
+                "mathlib_matches": matches,
+                "search_corpus_revision": formal.declaration_index.info.mathlib_revision,
+                "index_contract": formal.declaration_index.info.public_dict(),
+                "hint": "Index names are advisory; verify a name with ./formal_query check <name>.",
+            }
+        elif command == "decl":
+            matches = formal.declaration_index.search(
+                query_text,
+                limit=limit,
+                guarded_names=guarded,
+            )
+            result = {
+                "status": "searched" if formal.declaration_index.info.compatible else "index_unavailable",
+                "query_kind": "decl",
+                "matches": matches,
+                "result_count": len(matches),
+                "search_corpus_revision": formal.declaration_index.info.mathlib_revision,
+                "index_contract": formal.declaration_index.info.public_dict(),
+                "hint": "Verify candidate names with ./formal_query check <name>.",
+            }
+        elif command == "deps":
+            exact = formal.declaration_index.search(
+                query_text,
+                limit=6,
+                guarded_names=guarded,
+            )
+            related = formal.declaration_index.search(
+                query_text.replace(".", " ").replace("_", " "),
+                limit=10,
+                guarded_names=guarded,
+            )
+            result = {
+                "status": "searched" if formal.declaration_index.info.compatible else "index_unavailable",
+                "query_kind": "deps",
+                "query": query_text,
+                "exact_matches": exact,
+                "related_declarations": related,
+                "semantics": "index_related_premises_not_dependency_graph",
+                "hint": "Verify related declarations individually with check.",
+            }
+        else:
+            result, backend_probes, cache_hits = self._formal_kernel_query(
+                claim,
+                binding,
+                command,
+                query,
+                payload,
+                timeout=timeout,
+                guarded=guarded,
+            )
+        result.update(
+            {
+                "advisory_only": True,
+                "final_verify_required": True,
+                "call_number": call_number,
+                "backend_probe_count": backend_probes,
+                "cache_hit_count": cache_hits,
+                "surface_version": formal.surface_version,
+            }
+        )
+        self._formal_audit(
+            claim,
+            "formal_query",
+            task_id,
+            result,
+            accepted=True,
+            elapsed_seconds=time.monotonic() - started,
+            backend_number=backend_probes,
+            command=command,
+        )
+        return result
+
+    def _formal_kernel_query(
+        self,
+        claim: _SessionClaim,
+        binding: _CandidateBinding,
+        command: str,
+        query: list[str],
+        request: Mapping[str, Any],
+        *,
+        timeout: int,
+        guarded: set[str],
+    ) -> tuple[dict[str, Any], int, int]:
+        task = binding.task
+        query_text = " ".join(query).strip()
+        snippet = request.get("snippet")
+        tactics = request.get("tactics")
+        if any(name and _contains_guarded(query_text, name) for name in guarded):
+            return {"status": "guarded_declaration_refused", "query_kind": command}, 0, 0
+        imports = "\n".join(
+            match.group(0).strip() for match in _IMPORT_LINE.finditer(task.baseline_code)
+        )
+        if command == "check" and isinstance(snippet, str) and snippet.strip():
+            code = snippet.strip()[:8_000]
+            if any(name and _contains_guarded(code, name) for name in guarded):
+                return {"status": "guarded_declaration_refused", "query_kind": "check_snippet"}, 0, 0
+            probe, consumed, cache_hit = self._formal_kernel_probe(
+                claim,
+                binding,
+                f"{imports}\n\n{code}\n",
+                timeout=timeout,
+            )
+            return (
+                {
+                    **probe,
+                    "query_kind": "check_snippet",
+                    "contains_sorry": bool(
+                        re.search(r"(?<![A-Za-z0-9_])sorry(?![A-Za-z0-9_])", code)
+                    ),
+                },
+                int(consumed),
+                int(cache_hit),
+            )
+        if command == "check" and isinstance(tactics, str) and tactics.strip():
+            header = tactics.strip()[:4_000]
+            if any(name and _contains_guarded(header, name) for name in guarded):
+                return {"status": "guarded_declaration_refused", "query_kind": "check_tactics"}, 0, 0
+            raw_tactics = request.get("tactic")
+            portfolio = (
+                [str(value).strip()[:500] for value in raw_tactics[:12] if str(value).strip()]
+                if isinstance(raw_tactics, list)
+                else []
+            ) or list(_DEFAULT_TACTICS)
+            attempts: list[dict[str, Any]] = []
+            closing: list[str] = []
+            remote_unsettled = False
+            probes = 0
+            hits = 0
+            for tactic in portfolio:
+                if re.search(
+                    r"(?<![A-Za-z0-9_])(?:sorry|admit)(?![A-Za-z0-9_])",
+                    tactic,
+                ):
+                    attempts.append(
+                        {
+                            "tactic": tactic,
+                            "outcome": "placeholder_refused",
+                            "diagnostics": [],
+                            "cache_hit": False,
+                        }
+                    )
+                    continue
+                probe, consumed, cache_hit = self._formal_kernel_probe(
+                    claim,
+                    binding,
+                    f"{imports}\n\n{header} := by\n  {tactic}\n",
+                    timeout=timeout,
+                )
+                probes += int(consumed)
+                hits += int(cache_hit)
+                closed = (
+                    probe.get("status") == "elaborated"
+                    and probe.get("is_valid_no_sorry") is True
+                )
+                attempts.append(
+                    {
+                        "tactic": tactic,
+                        "outcome": "closed" if closed else str(probe.get("status") or "failed"),
+                        "diagnostics": list(probe.get("diagnostics") or [])[:4],
+                        "elapsed_ms": probe.get("elapsed_ms"),
+                        "cache_hit": cache_hit,
+                    }
+                )
+                if closed:
+                    closing.append(tactic)
+                    break
+                if probe.get("status") == "probe_budget_exhausted":
+                    break
+                if probe.get("status") in {
+                    "REMOTE_SETTLEMENT_UNCONFIRMED",
+                    "probe_remote_settlement_unconfirmed",
+                }:
+                    remote_unsettled = True
+                    break
+            return (
+                {
+                    "status": (
+                        "REMOTE_SETTLEMENT_UNCONFIRMED"
+                        if remote_unsettled
+                        else "closed" if closing else "not_closed"
+                    ),
+                    "retryable": False if remote_unsettled else None,
+                    "query_kind": "check_tactics",
+                    "closing_tactics": closing,
+                    "attempts": attempts,
+                    "note": "Each uncached tactic attempt consumes one task-global backend-probe unit.",
+                },
+                probes,
+                hits,
+            )
+        if command == "axioms":
+            name = query[0].strip() if query else ""
+            if not _LEAN_NAME.fullmatch(name):
+                return {"status": "invalid_query", "query_kind": "axioms"}, 0, 0
+            try:
+                candidate = read_regular_bytes(
+                    binding.path,
+                    trusted_root=claim.workdir,
+                    max_bytes=self.formal_policy.max_candidate_bytes,
+                ).decode("utf-8")
+            except (OSError, UnicodeError):
+                return {"status": "candidate_unavailable", "query_kind": "axioms"}, 0, 0
+            probe, consumed, cache_hit = self._formal_kernel_probe(
+                claim,
+                binding,
+                f"{candidate}\n\n#print axioms {name}\n",
+                timeout=timeout,
+            )
+            probe.update(
+                {
+                    "query_kind": "axioms",
+                    "query": name,
+                    "candidate_context_included": True,
+                }
+            )
+            return probe, int(consumed), int(cache_hit)
+        if not query_text:
+            return {"status": "empty_query", "query_kind": command}, 0, 0
+        if command == "check" and all(_LEAN_NAME.fullmatch(name) for name in query[:8]):
+            code = "\n".join(f"#check {name}" for name in query[:8])
+        else:
+            code = f"#check {query_text}"
+        probe, consumed, cache_hit = self._formal_kernel_probe(
+            claim,
+            binding,
+            f"{imports}\n\n{code}\n",
+            timeout=timeout,
+        )
+        probe.update({"query_kind": command, "query": query_text})
+        return probe, int(consumed), int(cache_hit)
+
+    def _formal_kernel_probe(
+        self,
+        claim: _SessionClaim,
+        binding: _CandidateBinding,
+        source: str,
+        *,
+        timeout: int,
+    ) -> tuple[dict[str, Any], bool, bool]:
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        cache_key = (
+            binding.task.slug,
+            binding.expected_task_contract_sha256,
+            digest,
+        )
+        with self._formal_lock:
+            cached = self._formal_query_cache.get(cache_key)
+            cached_result = _json_clone(cached) if cached is not None else None
+        if cached_result is not None:
+            cached_result["cache_hit"] = True
+            return cached_result, False, True
+        backend_number = self._formal_reserve(
+            binding.task.slug,
+            "query_backend_probes",
+            self.formal_policy.query_backend_probes_per_task,
+        )
+        if backend_number is None:
+            return {"status": "probe_budget_exhausted", "cache_hit": False}, False, False
+
+        deadline = min(
+            claim.deadline_monotonic,
+            time.monotonic() + max(10, int(timeout)) + 30.0,
+        )
+        acquired = False
+        retain_evaluator_gate = False
+        evaluator_call_started = False
+        evaluator_unsettled_before = 0
+        verdict: Verdict | None = None
+        try:
+            acquired = self._acquire_evaluator_gate(deadline, claim=claim)
+            if not acquired:
+                self._formal_release(
+                    binding.task.slug,
+                    "query_backend_probes",
+                    backend_number,
+                )
+                return {
+                    "status": (
+                        "REMOTE_SETTLEMENT_UNCONFIRMED"
+                        if self._remote_settlement_unconfirmed()
+                        else "probe_admission_closed"
+                    ),
+                    "probe_status": (
+                        "probe_remote_settlement_unconfirmed"
+                        if self._remote_settlement_unconfirmed()
+                        else "probe_admission_closed"
+                    ),
+                    "retryable": False,
+                    "cache_hit": False,
+                }, False, False
+            probe_source = getattr(self.evaluator, "probe_source", None)
+            if not callable(probe_source):
+                self._formal_release(
+                    binding.task.slug,
+                    "query_backend_probes",
+                    backend_number,
+                )
+                return {"status": "probe_transport_error", "cache_hit": False}, False, False
+            metadata = dict(binding.task.metadata)
+            metadata["theorem_name"] = ""
+            import_contract = "\n".join(
+                match.group(0).strip() for match in _IMPORT_LINE.finditer(source)
+            )
+            probe_task = Task(
+                slug=binding.task.slug,
+                root=binding.task.root,
+                problem_text="",
+                baseline_code=f"{import_contract}\n" if import_contract else "",
+                metadata=metadata,
+            )
+            options: dict[str, Any] = {"deadline_monotonic": deadline}
+            if _accepts_cancel_event(probe_source):
+                options["cancel_event"] = _ClaimCancelEvent(claim)
+            evaluator_unsettled_before = _nonnegative_count(
+                getattr(self.evaluator, "remote_unsettled_jobs", 0)
+            )
+            evaluator_call_started = True
+            verdict = probe_source(probe_task, source, **options)
+            evaluator_unsettled_after = _nonnegative_count(
+                getattr(self.evaluator, "remote_unsettled_jobs", 0)
+            )
+            if (
+                evaluator_unsettled_after > evaluator_unsettled_before
+                or _has_unsettled_remote_work(
+                    _safe_verdict_status(verdict.status),
+                    verdict.response,
+                )
+            ):
+                retain_evaluator_gate = True
+                self._mark_remote_unsettled()
+                result = {
+                    "status": "REMOTE_SETTLEMENT_UNCONFIRMED",
+                    "probe_status": "probe_remote_settlement_unconfirmed",
+                    "retryable": False,
+                    "cache_hit": False,
+                }
+            else:
+                result = _formal_probe_result(verdict)
+        except Exception:
+            evaluator_unsettled_after = _nonnegative_count(
+                getattr(self.evaluator, "remote_unsettled_jobs", 0)
+            )
+            if (
+                evaluator_call_started
+                and evaluator_unsettled_after > evaluator_unsettled_before
+            ):
+                retain_evaluator_gate = True
+                self._mark_remote_unsettled()
+                result = {
+                    "status": "REMOTE_SETTLEMENT_UNCONFIRMED",
+                    "probe_status": "probe_remote_settlement_unconfirmed",
+                    "retryable": False,
+                    "cache_hit": False,
+                }
+            else:
+                result = {"status": "probe_transport_error", "cache_hit": False}
+        finally:
+            if acquired and not retain_evaluator_gate:
+                self._release_evaluator_gate()
+
+        consumed = True
+        if not retain_evaluator_gate and verdict is not None and (
+            verdict.cache_reused or _verdict_proves_no_backend_job(verdict)
+        ):
+            self._formal_release(
+                binding.task.slug,
+                "query_backend_probes",
+                backend_number,
+            )
+            consumed = False
+        result.update(
+            {
+                "cache_hit": bool(
+                    verdict and verdict.cache_reused and not retain_evaluator_gate
+                ),
+                "probe_number": backend_number if consumed else None,
+            }
+        )
+        if (
+            not retain_evaluator_gate
+            and
+            verdict is not None
+            and _safe_verdict_status(verdict.status) not in _FORMAL_NONCACHEABLE_STATUSES
+        ):
+            with self._formal_lock:
+                self._formal_query_cache[cache_key] = _json_clone(result)
+        return result, consumed, bool(verdict and verdict.cache_reused)
+
+    def _formal_search_public(
+        self,
+        workspace: Path,
+        terms: list[str],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        candidates = [workspace / "problem.md", workspace / "result.lean"]
+        candidates.extend(sorted((workspace / "baseline").glob("*.lean")))
+        lowered_terms = [term.lower() for term in terms if term]
+        rows: list[dict[str, Any]] = []
+        for path in candidates:
+            try:
+                text = read_regular_bytes(
+                    path,
+                    trusted_root=workspace,
+                    max_bytes=self.formal_policy.max_candidate_bytes,
+                ).decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                lowered = line.lower()
+                if lowered_terms and not all(term in lowered for term in lowered_terms):
+                    continue
+                rows.append(
+                    {
+                        "file": str(path.relative_to(workspace)),
+                        "line": line_number,
+                        "text": sanitize_public_text(line.strip(), limit=260),
+                    }
+                )
+                if len(rows) >= limit:
+                    return rows
+        return rows
+
+    def _formal_increment(self, task_id: str, counter: str) -> int:
+        with self._formal_lock:
+            key = (task_id, counter)
+            value = self._formal_counts.get(key, 0) + 1
+            self._formal_counts[key] = value
+            return value
+
+    def _formal_reserve(self, task_id: str, counter: str, limit: int) -> int | None:
+        with self._formal_lock:
+            key = (task_id, counter)
+            current = self._formal_counts.get(key, 0)
+            if current >= max(0, int(limit)):
+                return None
+            serial = self._formal_serials.get(key, 0) + 1
+            self._formal_serials[key] = serial
+            self._formal_counts[key] = current + 1
+            return serial
+
+    def _formal_release(self, task_id: str, counter: str, serial: int) -> None:
+        del serial
+        with self._formal_lock:
+            key = (task_id, counter)
+            self._formal_counts[key] = max(0, self._formal_counts.get(key, 0) - 1)
+
+    def _formal_audit(
+        self,
+        claim: _SessionClaim,
+        operation: str,
+        task_id: str,
+        result: Mapping[str, Any],
+        *,
+        accepted: bool,
+        candidate_sha256: str | None = None,
+        gate_wait_seconds: float = 0.0,
+        elapsed_seconds: float = 0.0,
+        backend_number: int | None = None,
+        command: str | None = None,
+    ) -> None:
+        if self.formal_policy is None or not self.formal_policy.enabled:
+            return
+        row = {
+            "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "event": operation,
+            "actor_id": claim.actor_id,
+            "task_id": task_id,
+            "command": command,
+            "accepted": bool(accepted),
+            "status": str(result.get("status") or "UNKNOWN")[:120],
+            "call_number": result.get("call_number"),
+            "backend_number": backend_number,
+            "backend_probe_count": result.get("backend_probe_count"),
+            "cache_hit": result.get("cache_hit") is True,
+            "cache_hit_count": result.get("cache_hit_count"),
+            "candidate_sha256": _safe_hash(candidate_sha256),
+            "gate_wait_seconds": round(max(0.0, gate_wait_seconds), 6),
+            "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
+            "advisory_only": True,
+            "official_score_eligible": False,
+        }
+        with self._audit_lock:
+            with self.formal_audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
     def _cps_operation(
         self,
@@ -1564,8 +2488,187 @@ def _is_authoritative_proof(
     )
 
 
-def _candidate_snapshot(path: Path) -> CandidateSnapshot:
-    raw = path.read_bytes()
+def _formal_capability_failure(claim: _SessionClaim) -> dict[str, Any] | None:
+    # A failed cancellation/unknown remote terminal is run-global. Do not let
+    # cache-only search or declaration lookup continue while a remote job may
+    # still be consuming the shared Judge slot.
+    broker = getattr(claim, "broker", None)
+    if broker is not None and broker._remote_settlement_unconfirmed():
+        return _remote_settlement_control_result()
+    if time.monotonic() >= claim.deadline_monotonic:
+        return _control_result(
+            "OUT_OF_HORIZON",
+            "The experiment horizon has elapsed.",
+            retryable=False,
+        )
+    if _claim_cancelled(claim):
+        return _control_result(
+            "TASK_CANCELLED",
+            "This solver task no longer accepts formal-tool work.",
+            retryable=False,
+        )
+    return None
+
+
+def _formal_gate_failure(
+    claim: _SessionClaim,
+    remote_unsettled: bool,
+) -> dict[str, Any]:
+    if remote_unsettled:
+        return _remote_settlement_control_result()
+    failure = _formal_capability_failure(claim)
+    if failure is not None:
+        return failure
+    return _control_result(
+        "JUDGE_ADMISSION_TIMEOUT",
+        "The controlled Judge remained busy until the formal-tool deadline.",
+        retryable=True,
+    )
+
+
+def _json_clone(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {}
+    return json.loads(json.dumps(dict(value), ensure_ascii=False))
+
+
+def _recursive_value(payload: Any, name: str, *, depth: int = 0) -> Any:
+    if not isinstance(payload, Mapping) or depth > 4:
+        return None
+    if payload.get(name) is not None:
+        return payload.get(name)
+    for nested_name in ("response", "canonical_verdict", "lean_environment"):
+        nested = payload.get(nested_name)
+        found = _recursive_value(nested, name, depth=depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def _formal_diagnostics(response: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw = _recursive_value(response, "probe_diagnostics")
+    items = raw.get("items") if isinstance(raw, Mapping) else raw
+    if not isinstance(items, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in items[:24]:
+        if not isinstance(item, Mapping):
+            continue
+        result.append(
+            {
+                "severity": sanitize_public_text(str(item.get("severity") or "info"), limit=32),
+                "message": sanitize_public_text(
+                    str(item.get("data") or item.get("message") or ""),
+                    limit=1_024,
+                ),
+                "line": item.get("line") if isinstance(item.get("line"), int) else 0,
+                "column": item.get("column") if isinstance(item.get("column"), int) else 0,
+            }
+        )
+    return result
+
+
+def _formal_worker_verdict(verdict: Verdict) -> dict[str, Any]:
+    response = safe_worker_response(verdict.response)
+    errors: list[str] = []
+    nested_error = _recursive_value(response, "error_message")
+    if isinstance(nested_error, str) and nested_error.strip():
+        errors.append(sanitize_public_text(nested_error, limit=1_024))
+    if verdict.error:
+        errors.append(sanitize_public_text(verdict.error, limit=1_024))
+    return {
+        "ok": _safe_verdict_status(verdict.status) not in _FORMAL_NONCACHEABLE_STATUSES,
+        "status": _safe_verdict_status(verdict.status),
+        "score": 0.0,
+        "diagnostics": _formal_diagnostics(response),
+        "error_messages": errors[:24],
+        "reason": sanitize_public_text(
+            str(_recursive_value(response, "reason") or verdict.error or ""),
+            limit=1_024,
+        ),
+        "elapsed_ms": int(max(0.0, verdict.elapsed_seconds) * 1_000),
+    }
+
+
+def _formal_probe_result(verdict: Verdict) -> dict[str, Any]:
+    response = safe_worker_response(verdict.response)
+    normalized = _safe_verdict_status(verdict.status)
+    if normalized in {"PROVED", "COMPILES_WITH_SORRY", "ELABORATED"}:
+        status = "elaborated"
+    elif normalized in {"VERIFY_FAIL", "LOCAL_REJECTED", "ELAB_FAILED"}:
+        status = "elab_failed"
+    elif normalized == "REJECTED_OVERLOADED":
+        status = "probe_admission_closed"
+    elif normalized in {"OUT_OF_HORIZON", "TASK_CANCELLED"}:
+        status = "probe_admission_closed"
+    elif normalized == "REMOTE_SETTLEMENT_UNCONFIRMED":
+        status = "probe_remote_settlement_unconfirmed"
+    else:
+        status = "probe_transport_error" if normalized == "EVALUATOR_ERROR" else normalized.lower()
+    errors: list[str] = []
+    nested_error = _recursive_value(response, "error_message")
+    if isinstance(nested_error, str) and nested_error.strip():
+        errors.append(sanitize_public_text(nested_error, limit=1_024))
+    if verdict.error:
+        errors.append(sanitize_public_text(verdict.error, limit=1_024))
+    result: dict[str, Any] = {
+        "status": status,
+        "is_valid_with_sorry": _recursive_value(response, "is_valid_with_sorry") is True,
+        "is_valid_no_sorry": _recursive_value(response, "is_valid_no_sorry") is True,
+        "diagnostics": _formal_diagnostics(response),
+        "error_messages": errors[:24],
+        "elapsed_ms": int(max(0.0, verdict.elapsed_seconds) * 1_000),
+    }
+    for key in ("mathlib_revision", "lean_version"):
+        value = _recursive_value(response, key)
+        if isinstance(value, str) and value.strip():
+            result[key] = sanitize_public_text(value, limit=256)
+    environment = _recursive_value(response, "lean_environment")
+    if isinstance(environment, Mapping):
+        safe_environment: dict[str, str] = {}
+        for key in ("mathlib_revision", "lean_version"):
+            value = environment.get(key)
+            if isinstance(value, str) and value.strip():
+                safe_environment[key] = sanitize_public_text(value, limit=256)
+        if safe_environment:
+            result["lean_environment"] = safe_environment
+    return result
+
+
+def _verdict_proves_no_backend_job(verdict: Verdict) -> bool:
+    if sanitize_worker_identifier(verdict.judge_job_id) is not None:
+        return False
+    if _has_unsettled_remote_work(_safe_verdict_status(verdict.status), verdict.response):
+        return False
+    status = _safe_verdict_status(verdict.status)
+    if status in {"LOCAL_REJECTED", "OUT_OF_HORIZON", "TASK_CANCELLED"}:
+        return True
+    return status == "REJECTED_OVERLOADED" and _nested_response_bool(
+        verdict.response,
+        "retryable",
+    )
+
+
+def _contains_guarded(text: str, name: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9_']){re.escape(name)}(?![A-Za-z0-9_'])",
+            text,
+        )
+    )
+
+
+def _candidate_snapshot(
+    path: Path,
+    *,
+    trusted_root: Path,
+    max_bytes: int = DEFAULT_MAX_CANDIDATE_BYTES,
+) -> CandidateSnapshot:
+    raw = read_regular_bytes(
+        path,
+        trusted_root=trusted_root,
+        max_bytes=max_bytes,
+    )
     return CandidateSnapshot(
         source=raw.decode("utf-8"),
         sha256=hashlib.sha256(raw).hexdigest(),

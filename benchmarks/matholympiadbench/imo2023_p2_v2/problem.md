@@ -53,6 +53,8 @@ task.
 - Follow the mandatory execution and verification contract in the worker prompt.
 - Treat this as offline proof construction. The sole checking exception is
   `judge_check`, the experiment-provided controlled external Judge interface.
+- If the manifest exposes `evaluate.py` or `formal_query`, use them only as bounded
+  advisory diagnostics; they never establish official success or select a candidate.
 - Never execute local Lean/lake/elan, install or download Lean/Mathlib/toolchains,
   run a local verifier or proof search, perform resource-heavy computation, or
   start background or parallel processes. Never call raw Judge HTTP endpoints.
@@ -62,3 +64,11 @@ task.
   shared candidate, or helper tool explicitly named by the runner's worker prompt.
   Do not browse any other home, system, runtime, worker, or session artifacts.
 - Edit `result.lean` only within the allowed proof surface described above.
+
+## Advisory formal helpers
+
+When the manifest exposes them, `python3 evaluate.py` and `./formal_query ...`
+are bounded diagnostic helpers. `evaluate.py` reports Lean diagnostics for the
+current candidate but is never official score evidence; `formal_query` provides
+advisory declaration search and bounded `check`, `type`, `axioms`, and `deps`
+queries. The outer Judge independently evaluates the immutable frozen bytes.

@@ -126,9 +126,9 @@ function relativeInside(path, cwd) {
 
 function isReadableFile(rel) {
   return (
-    ["problem.md", "result.lean", "metadata.json"].includes(rel) ||
+    ["problem.md", "result.lean", "metadata.json", "PUBLIC_FILES.md"].includes(rel) ||
     /^baseline\/[^/]+\.lean$/.test(rel) ||
-    /^tasks\/[^/]+\/(?:problem\.md|result\.lean|metadata\.json)$/.test(rel) ||
+    /^tasks\/[^/]+\/(?:problem\.md|result\.lean|metadata\.json|PUBLIC_FILES\.md)$/.test(rel) ||
     /^tasks\/[^/]+\/baseline\/[^/]+\.lean$/.test(rel)
   );
 }
@@ -156,6 +156,89 @@ function guardedRelative(rawPath, ctx) {
   }
   const target = normalizeExistingPath(rawPath, cwd);
   return target ? relativeInside(target, cwd) : null;
+}
+
+function boundedShellTokens(command) {
+  if (typeof command !== "string" || command.length < 1 || command.length > 16_000) return null;
+  const tokens = [];
+  let token = "";
+  let quote = null;
+  let tokenStarted = false;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (char === "\0" || char === "\n" || char === "\r") return null;
+    if (quote === "'") {
+      if (char === "'") quote = null;
+      else token += char;
+      tokenStarted = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (char === '"') {
+        quote = null;
+      } else {
+        // Double-quoted shell text still performs substitutions and escapes.
+        if (char === "$" || char === "`" || char === "\\") return null;
+        token += char;
+      }
+      tokenStarted = true;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      tokenStarted = true;
+      continue;
+    }
+    if (/\s/.test(char)) {
+      if (tokenStarted) tokens.push(token);
+      token = "";
+      tokenStarted = false;
+      continue;
+    }
+    // Reject every shell control, substitution, redirection, globbing, and
+    // expansion character. Quoted Lean snippets remain ordinary argv text.
+    if (/[;&|<>`$\\*?\[\](){}#]/.test(char)) return null;
+    token += char;
+    tokenStarted = true;
+  }
+  if (quote !== null) return null;
+  if (tokenStarted) tokens.push(token);
+  if (tokens.length < 1 || tokens.length > 80 || tokens.some((value) => value.length > 8_000)) {
+    return null;
+  }
+  return tokens;
+}
+
+function formalHelperRelative(rawTarget, ctx) {
+  const configured = String(process.env.CONTEXTSWARM_WORKDIR ?? "").trim();
+  let cwd;
+  try {
+    cwd = realpathSync(configured || ctx.cwd);
+  } catch {
+    return null;
+  }
+  const target = normalizeExistingPath(rawTarget, cwd);
+  return target ? relativeInside(target, cwd) : null;
+}
+
+function isAllowedFormalCommand(command, ctx) {
+  const tokens = boundedShellTokens(command);
+  if (!tokens) return false;
+  const mode = String(process.env.CONTEXTSWARM_EXPERIMENT_MODE ?? "").trim().toLowerCase();
+  if (tokens[0] === "python3") {
+    // ``python3`` is intentionally a short spelling in the public helper
+    // contract, so bind its resolution to the supervisor's fixed PATH.  A
+    // worker-controlled PATH (or a same-named executable in the workspace)
+    // must not turn this into arbitrary code execution.
+    if (process.env.PATH !== "/usr/local/bin:/usr/bin:/bin" || tokens.length !== 2) return false;
+    const rel = formalHelperRelative(tokens[1], ctx);
+    return rel === "evaluate.py" || (mode === "mono" && /^tasks\/[^/]+\/evaluate\.py$/.test(rel ?? ""));
+  }
+  // A slash is required so the shell executes the exact path we validated,
+  // rather than resolving a same-named executable from PATH afterward.
+  if (!tokens[0].includes("/")) return false;
+  const rel = formalHelperRelative(tokens[0], ctx);
+  return rel === "formal_query" || (mode === "mono" && /^tasks\/[^/]+\/formal_query$/.test(rel ?? ""));
 }
 
 function installPathGuard(pi) {
@@ -210,6 +293,22 @@ function installPathGuard(pi) {
       if (!rel || !isSafeSearchDirectory(rel)) {
         return { block: true, reason: "ls is restricted to safe assigned task directories" };
       }
+      return;
+    }
+    if (event.toolName === "bash") {
+      const command = typeof input.command === "string" ? input.command : input.cmd;
+      if (!isAllowedFormalCommand(command, ctx)) {
+        return {
+          block: true,
+          reason: "bash is restricted to the staged evaluate.py and formal_query helpers",
+        };
+      }
+      const configuredTimeout = Number(
+        process.env.CONTEXTSWARM_FORMAL_COMMAND_TIMEOUT_SECONDS ?? "420",
+      );
+      input.timeout = Number.isFinite(configuredTimeout)
+        ? Math.max(1, Math.min(3_600, Math.trunc(configuredTimeout)))
+        : 420;
     }
   });
 }

@@ -38,6 +38,9 @@ allocation_decisions.jsonl   # 自适应分配决策及当时的因果快照
 allocation_summary.json      # policy 延迟、fallback、token 与 slot 利用率
 closeout_candidates.json   # 三种模式统一的冻结候选索引与 SHA-256
 closeout_candidates/<task>/result.lean # feedback-free 最终评分快照
+formal_tool_calls.jsonl  # formal helper 调用审计
+formal_tools_contract.json # helper/index 的公开版本合同
+formal_tools_summary.json # 每题、跨 session 的 quota 计数
 workers/<task>/result.lean # parallel
 workers/<task>/agents/<actor>/result.lean # elastic CPS attempts
 workers/<task>/best/result.lean # elastic CPS best candidate
@@ -71,6 +74,9 @@ manifest 中打开 fast mode。
 2. NuRouter node/coordinator 配置（默认读取 `~/.nurouter/node.toml`）；
 3. 可访问的 MathOlympiadBench Lean Judge，并在宿主环境中设置
    `CONTEXTSWARM_JUDGE_URL`。Judge 地址不会写入 tracked manifest。
+4. 与 Judge 的 Mathlib revision 完全一致的 declaration-index SQLite；通过
+   `CONTEXTSWARM_MINI_DECL_INDEX` 指向宿主文件。启动器会计算并绑定 SHA-256、
+   只读挂载到容器，并要求 index、health、kernel probe 三方 revision 一致。
 
 正式 allocation 和 canary manifest 还要求 supervisor 注入
 `CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL`。它必须指向同一 Judge backend 的
@@ -287,12 +293,56 @@ scripts/run_docker.sh --config configs/cps_fast.toml preflight
 
 ## CPS 接口
 
-CPS worker 没有 shell 或本地 `context_piece` CLI。它只能通过 runner 注入的受控
+CPS worker 没有通用 shell 或本地 `context_piece` CLI。它只能通过 runner 注入的受控
 tools 使用 CPS：`cps_search`、`cps_publish`、`cps_inbox`、`cps_send`、`cps_ack`
 和 `cps_actors`。这些调用都经过 session-bound loopback broker；agent 不能直接读取
 SQLite、跨 workspace 浏览，或自行发起网络请求。
 
-`communication = none` 的 Mono/Parallel workspace 不会创建共享数据库或 helper，避免 baseline 意外获得通信能力。CPS 的实现集中在 `contextswarm_mini/cps.py`，后续可以只替换 policy、ranking 或 digest，而不改 NuRouter/Pi transport。
+`communication = none` 的 Mono/Parallel workspace 不会创建共享数据库或 CPS
+helper，避免 baseline 意外获得通信能力。下面的 formal helpers 则由同一 manifest
+为 Mono、Parallel、CPS 等同启用，不构成 agent 间通信。CPS 的实现集中在
+`contextswarm_mini/cps.py`，后续可以只替换 policy、ranking 或 digest，而不改
+NuRouter/Pi transport。
+
+## Formal helper surface
+
+`[formal_tools].enabled = true` 时，每个 task workspace 都会得到完全相同的两个
+有界 helper；Mono 使用 `tasks/<slug>/...` 下对应版本：
+
+```text
+python3 evaluate.py
+./formal_query search <terms...>
+./formal_query decl <terms...>
+./formal_query check <name...>
+./formal_query type <expression...>
+./formal_query check --snippet '<small Lean snippet>'
+./formal_query check --tactics '<declaration header>' [--tactic '<tactic>']
+./formal_query axioms <helper-name>
+./formal_query deps <terms...>
+```
+
+`evaluate.py` 把当前 `result.lean` 的不可变字节快照送到真实 Lean/Mathlib 环境，
+只返回有界 diagnostics；即使返回 `PROVED`，它仍固定 `score = 0`、
+`official_score_eligible = false`，不会选择候选或写入正式分数。`formal_query` 是
+受限的 Lean API/LSP scout：`search/decl/deps` 只查公开 task 文件和 revision-bound
+声明索引；`check/type/axioms` 及 snippet/tactic portfolio 通过同一受控 kernel
+capability elaboration。`deps` 表示相关候选 premises，不声称提供完整依赖图。
+
+四类 quota（evaluate calls/backend jobs、query calls/backend probes）都由
+run-global JudgeBroker 以 task 为键统计，所有 CPS agent/episode 共享同一公平预算；
+精确 cache hit 不消耗新的 backend quota。helper 不能读取 raw endpoint/token，Bash
+guard 只允许上述精确命令，并拒绝 pipe、redirect、substitution、glob、后台任务和
+任意 Python。任何无法确认远端终态的调用都会保留 semaphore permit、熔断该 run
+的后续 admission，并返回 `REMOTE_SETTLEMENT_UNCONFIRMED`。
+
+正式 preflight 先把 operator index 流式复制成 run-private、content-addressed、0400
+snapshot，再由 preflight 和 Broker 共同使用这一份 snapshot。SHA/schema 或
+configured/index/endpoint revision 任一缺失或不一致都会 fail closed。最终候选仍
+按 Mono/Parallel/CPS 原有策略在 horizon 后冻结；helper 反馈不会改变 freeze source，
+正式分数只来自 broker revoke+drain 之后、对冻结字节发起的独立 fresh closeout。
+当 cache-health 使用独立 endpoint 时，preflight 还要求它和实际执行 Judge
+公布同一个稳定 deployment identity；没有 identity 或 identity 不匹配会拒绝运行，
+避免把旁路 backend 的 cache 状态当成执行 backend 的证据。
 
 ## Lean evaluator contract
 

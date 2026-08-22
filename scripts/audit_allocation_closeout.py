@@ -1703,11 +1703,31 @@ def _check_closeout_lifecycle(
         elif flags == (False, True, False, False, False):
             disposition = "confirmed"
             valid = status == "PROVED" and observed_status == "PROVED"
+        elif flags == (False, False, True, False, False):
+            disposition = "retryable_unconfirmed"
+            valid = (
+                status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+                and float(row.get("score", 0.0)) == 0.0
+                and observed_status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+                and row.get("reused_authoritative_verdict") is False
+                and row.get("prior_authoritative_proof_available") is True
+                and row.get("fresh_closeout_confirmed") is False
+            )
         elif flags == (True, False, True, False, False):
+            # Preserve read-only audit compatibility for artifacts emitted by
+            # the pre-fresh-closeout contract.  New runner artifacts never
+            # take this branch (they explicitly set
+            # ``reused_authoritative_verdict`` false and carry a zero-score,
+            # fresh-confirmation marker), so this does not weaken the current
+            # run contract while allowing historical bundles to be audited.
             disposition = "retryable_reused"
             valid = (
                 status == "PROVED"
+                and isinstance(row.get("score"), (int, float))
+                and not isinstance(row.get("score"), bool)
+                and float(row.get("score")) == 1.0
                 and observed_status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+                and row.get("reused_authoritative_verdict") is True
             )
         elif flags == (False, False, False, True, True):
             disposition = "conflict"
@@ -1748,7 +1768,7 @@ def _check_closeout_lifecycle(
             evidence.direct_keys.add(key)
             if _has_positive_score(row):
                 evidence.positive_direct_keys[key] += 1
-        elif disposition in {"confirmed", "retryable_reused"} and key is not None:
+        elif disposition in {"confirmed", "retryable_unconfirmed"} and key is not None:
             evidence.prior_authority_keys.add(key)
         if row.get("cache_reused") is True and key is not None:
             evidence.cache_reused_keys.add(key)
@@ -1778,7 +1798,11 @@ def _check_closeout_lifecycle(
         issues,
         "closeout_authority_chain_mismatch",
     )
-    expected_infra = {task for task, value in dispositions.items() if value == "retryable_reused"}
+    expected_infra = {
+        task
+        for task, value in dispositions.items()
+        if value in {"retryable_unconfirmed", "retryable_reused"}
+    }
     expected_confirmed = {task for task, value in dispositions.items() if value == "confirmed"}
     expected_conflict = {task for task, value in dispositions.items() if value == "conflict"}
     if set(infra_rows) != expected_infra or set(confirmed_rows) != expected_confirmed or set(conflict_rows) != expected_conflict:
@@ -1789,7 +1813,8 @@ def _check_closeout_lifecycle(
         special = infra_rows.get(task_id, {})
         raw_detail = _response_mapping(row).get("closeout_infra_incomplete")
         detail = raw_detail if isinstance(raw_detail, Mapping) else {}
-        if (
+        new_contract = dispositions.get(task_id) == "retryable_unconfirmed"
+        common_infra_mismatch = (
             not isinstance(raw_detail, Mapping)
             or special.get("observed_retryable") is not True
             or _normalize_status(special.get("observed_status"))
@@ -1805,7 +1830,23 @@ def _check_closeout_lifecycle(
             or detail.get("retryable") is not True
             or _normalize_status(detail.get("observed_status"))
             != _normalize_status(row.get("observed_status"))
-        ):
+        )
+        if new_contract:
+            contract_mismatch = (
+                common_infra_mismatch
+                or row.get("score") != 0.0
+                or _response_mapping(row).get("prior_authoritative_proof_available") is not True
+                or _response_mapping(row).get("fresh_closeout_confirmed") is not False
+            )
+        else:
+            # Legacy bundles explicitly recorded a reused proof and a positive
+            # final score.  Keep validating their complete linkage, but do not
+            # reinterpret them as current-run fresh authority.
+            contract_mismatch = common_infra_mismatch or (
+                row.get("score") != 1.0
+                or row.get("reused_authoritative_verdict") is not True
+            )
+        if contract_mismatch:
             _add_issue(issues, "closeout_authority_chain_mismatch")
 
     for task_id in expected_confirmed:
@@ -1882,19 +1923,34 @@ def _check_closeout_lifecycle(
     if len(finished_rows) == 1:
         finished = finished_rows[0]
         expected_counts = {
-            "reused_authoritative_verdicts": sum(value == "retryable_reused" for value in dispositions.values()),
+            "reused_authoritative_verdicts": sum(
+                value == "retryable_reused" for value in dispositions.values()
+            ),
             "authoritative_proofs_confirmed": sum(value == "confirmed" for value in dispositions.values()),
-            "closeout_infra_incomplete": sum(value == "retryable_reused" for value in dispositions.values()),
+            "closeout_infra_incomplete": sum(
+                value in {"retryable_unconfirmed", "retryable_reused"}
+                for value in dispositions.values()
+            ),
+            "closeout_infra_unconfirmed": sum(value == "retryable_unconfirmed" for value in dispositions.values()),
             "authority_conflicts": sum(value == "conflict" for value in dispositions.values()),
             "remote_settlement_unconfirmed": sum(value == "remote" for value in dispositions.values()),
         }
-        counts_valid = all(
-            isinstance(finished.get(name), int)
-            and not isinstance(finished.get(name), bool)
-            and finished.get(name) >= 0
-            and finished.get(name) == expected
-            for name, expected in expected_counts.items()
-        )
+        counts_valid = True
+        for name, expected in expected_counts.items():
+            observed = finished.get(name)
+            # ``closeout_infra_unconfirmed`` was added with the fresh
+            # confirmation contract.  A missing zero is equivalent for
+            # historical bundles; a nonzero expected value must be explicit.
+            if name == "closeout_infra_unconfirmed" and observed is None and expected == 0:
+                continue
+            if not (
+                isinstance(observed, int)
+                and not isinstance(observed, bool)
+                and observed >= 0
+                and observed == expected
+            ):
+                counts_valid = False
+                break
         expected_score = sum(
             float(row.get("score", 0.0))
             for row in closeout_rows.values()

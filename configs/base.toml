@@ -88,6 +88,24 @@ verification_profile = "formal_proof"
 judge_mode = "fast"
 require_result_cache_disabled = false
 
+[formal_tools]
+enabled = true
+surface_version = "contextswarm_mini_formal_tools_v1"
+evaluate_calls_per_task = 120
+evaluate_backend_jobs_per_task = 120
+query_calls_per_task = 60
+query_backend_probes_per_task = 120
+max_candidate_bytes = 2097152
+# Pi's Bash tool must not terminate a legal 300-second Judge call first.
+command_timeout_seconds = 420
+# Supply a revision-matched index through an operator-local manifest or
+# CONTEXTSWARM_MINI_DECL_INDEX. Formal preflight fails closed while this is
+# required but missing; no paper run silently claims declaration search.
+decl_index = ""
+decl_index_sha256 = ""
+mathlib_revision = ""
+require_decl_index = true
+
 [docker]
 image = "contextswarm-iclr-mini:latest"
 memory_mb = 16384
