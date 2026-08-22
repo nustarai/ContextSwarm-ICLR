@@ -7,6 +7,7 @@ import copy
 import math
 import os
 from pathlib import Path
+import re
 import tomllib
 from typing import Any, Mapping
 
@@ -179,6 +180,18 @@ class ExperimentConfig:
     lean_verification_profile: str
     lean_judge_mode: str
     lean_require_result_cache_disabled: bool
+    formal_tools_enabled: bool
+    formal_tools_version: str
+    formal_tools_evaluate_calls_per_task: int
+    formal_tools_evaluate_backend_jobs_per_task: int
+    formal_tools_query_calls_per_task: int
+    formal_tools_query_backend_probes_per_task: int
+    formal_tools_max_candidate_bytes: int
+    formal_tools_command_timeout_seconds: int
+    formal_tools_decl_index: str
+    formal_tools_decl_index_sha256: str
+    formal_tools_mathlib_revision: str
+    formal_tools_require_decl_index: bool
     docker_image: str
     docker_memory_mb: int
     docker_internet: str
@@ -248,6 +261,18 @@ class ExperimentConfig:
             "lean_verification_profile": self.lean_verification_profile,
             "lean_judge_mode": self.lean_judge_mode,
             "lean_require_result_cache_disabled": self.lean_require_result_cache_disabled,
+            "formal_tools_enabled": self.formal_tools_enabled,
+            "formal_tools_version": self.formal_tools_version,
+            "formal_tools_evaluate_calls_per_task": self.formal_tools_evaluate_calls_per_task,
+            "formal_tools_evaluate_backend_jobs_per_task": self.formal_tools_evaluate_backend_jobs_per_task,
+            "formal_tools_query_calls_per_task": self.formal_tools_query_calls_per_task,
+            "formal_tools_query_backend_probes_per_task": self.formal_tools_query_backend_probes_per_task,
+            "formal_tools_max_candidate_bytes": self.formal_tools_max_candidate_bytes,
+            "formal_tools_command_timeout_seconds": self.formal_tools_command_timeout_seconds,
+            "formal_tools_decl_index_configured": bool(self.formal_tools_decl_index),
+            "formal_tools_decl_index_sha256": self.formal_tools_decl_index_sha256,
+            "formal_tools_mathlib_revision": self.formal_tools_mathlib_revision,
+            "formal_tools_require_decl_index": self.formal_tools_require_decl_index,
             "docker_image": self.docker_image,
             "docker_memory_mb": self.docker_memory_mb,
             "docker_internet": self.docker_internet,
@@ -280,6 +305,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         aisw_payload = payload.get("nurouter")
     aisw = _as_dict(aisw_payload, "aisw")
     lean = _as_dict(payload.get("lean"), "lean")
+    formal_tools = _as_dict(payload.get("formal_tools"), "formal_tools")
     docker = _as_dict(payload.get("docker"), "docker")
     allocation = _as_dict(payload.get("allocation"), "allocation")
     allocation_formula = _as_dict(allocation.get("formula"), "allocation.formula")
@@ -443,6 +469,25 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     require_result_cache_disabled = bool(
         lean.get("require_result_cache_disabled", False)
     )
+    formal_tools_enabled = bool(formal_tools.get("enabled", True))
+    formal_tools_version = _text(
+        formal_tools.get("surface_version"),
+        "contextswarm_mini_formal_tools_v1",
+    )
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}", formal_tools_version):
+        raise ConfigError("formal_tools.surface_version has an invalid format")
+    formal_tools_decl_index_sha256 = _text(
+        formal_tools.get("decl_index_sha256")
+    ).lower()
+    if formal_tools_decl_index_sha256 and not re.fullmatch(
+        r"[0-9a-f]{64}", formal_tools_decl_index_sha256
+    ):
+        raise ConfigError("formal_tools.decl_index_sha256 must be a SHA-256 digest")
+    formal_tools_mathlib_revision = _text(
+        formal_tools.get("mathlib_revision")
+    )
+    if len(formal_tools_mathlib_revision) > 256:
+        raise ConfigError("formal_tools.mathlib_revision is too long")
     docker_network = _text(docker.get("network"), "host").lower()
     if docker_network not in {"host", "bridge"}:
         raise ConfigError("docker.network must be host or bridge")
@@ -494,6 +539,44 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         lean_verification_profile=profile,
         lean_judge_mode=judge_mode,
         lean_require_result_cache_disabled=require_result_cache_disabled,
+        formal_tools_enabled=formal_tools_enabled,
+        formal_tools_version=formal_tools_version,
+        formal_tools_evaluate_calls_per_task=_positive_int(
+            formal_tools.get("evaluate_calls_per_task"),
+            "formal_tools.evaluate_calls_per_task",
+            120,
+        ),
+        formal_tools_evaluate_backend_jobs_per_task=_positive_int(
+            formal_tools.get("evaluate_backend_jobs_per_task"),
+            "formal_tools.evaluate_backend_jobs_per_task",
+            120,
+        ),
+        formal_tools_query_calls_per_task=_positive_int(
+            formal_tools.get("query_calls_per_task"),
+            "formal_tools.query_calls_per_task",
+            60,
+        ),
+        formal_tools_query_backend_probes_per_task=_positive_int(
+            formal_tools.get("query_backend_probes_per_task"),
+            "formal_tools.query_backend_probes_per_task",
+            120,
+        ),
+        formal_tools_max_candidate_bytes=_positive_int(
+            formal_tools.get("max_candidate_bytes"),
+            "formal_tools.max_candidate_bytes",
+            2 * 1024 * 1024,
+        ),
+        formal_tools_command_timeout_seconds=_positive_int(
+            formal_tools.get("command_timeout_seconds"),
+            "formal_tools.command_timeout_seconds",
+            max(420, lean_timeout + 120),
+        ),
+        formal_tools_decl_index=_text(formal_tools.get("decl_index")),
+        formal_tools_decl_index_sha256=formal_tools_decl_index_sha256,
+        formal_tools_mathlib_revision=formal_tools_mathlib_revision,
+        formal_tools_require_decl_index=bool(
+            formal_tools.get("require_decl_index", True)
+        ),
         docker_image=_text(docker.get("image"), "contextswarm-iclr-mini:latest"),
         docker_memory_mb=_positive_int(docker.get("memory_mb"), "docker.memory_mb", 16384),
         docker_internet=_text(docker.get("internet"), "online"),

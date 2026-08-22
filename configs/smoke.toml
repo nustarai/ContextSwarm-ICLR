@@ -17,9 +17,6 @@ enabled = false
 fast_mode = false
 timeout_seconds = 10
 
-[lean]
-agent_local_cutoff_seconds = 0
-
 [formal_tools]
 # Offline orchestration smoke still stages both shims, but it has no Mathlib
 # service/index contract to validate.

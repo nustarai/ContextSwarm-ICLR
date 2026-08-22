@@ -28,6 +28,7 @@ RUN groupadd --system --gid 65532 contextswarm \
     && install -d -m 0755 \
         /opt/contextswarm-input/aisw \
         /opt/contextswarm-input/aisw-private \
+        /opt/contextswarm-input/formal \
         /opt/contextswarm-input/codex-home \
     && touch \
         /opt/contextswarm-input/aisw/pi \

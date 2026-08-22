@@ -9,8 +9,12 @@ from .models import Task
 
 SOLVER_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
 - Use only `judge_check`, the experiment-provided controlled Judge interface, for
-  Lean checking. `CONTEXTSWARM_JUDGE_URL` is reserved for that tool: do not read,
-  print, modify, or use it to contact the Judge yourself.
+  authoritative Lean checking. When the manifest exposes the bounded formal-helper
+  surface, `python3 evaluate.py` and `./formal_query ...` are advisory diagnostics
+  only; they never select a candidate or establish official success.
+  `CONTEXTSWARM_JUDGE_URL` is reserved for that tool; runner-owned helpers share
+  the same capability boundary. You must
+  not read, print, modify, or use it to contact the Judge yourself.
 - Never invoke local `lean`, `lake`, `elan`, a local verifier, proof-search service,
   or any other local proof checker. Do not install or download Lean, Mathlib,
   toolchains, packages, caches, compilers, or solver infrastructure.
@@ -36,6 +40,8 @@ SOLVER_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
 PROBLEM_WORK_MODE_CONTRACT = """- Follow the mandatory execution and verification contract in the worker prompt.
 - Treat this as offline proof construction. The sole checking exception is
   `judge_check`, the experiment-provided controlled external Judge interface.
+- If the manifest exposes `evaluate.py` or `formal_query`, use them only as bounded
+  advisory diagnostics; they never establish official success or select a candidate.
 - Never execute local Lean/lake/elan, install or download Lean/Mathlib/toolchains,
   run a local verifier or proof search, perform resource-heavy computation, or
   start background or parallel processes. Never call raw Judge HTTP endpoints.
@@ -72,6 +78,16 @@ script. Never include credentials, absolute host paths, or full transcripts in a
 piece or message."""
 
 
+def _formal_tools_instructions(enabled: bool) -> str:
+    if not enabled:
+        return ""
+    return """This manifest may expose a bounded formal-helper surface documented in
+PUBLIC_FILES.md. Use only the exact staged helper commands named there; they are
+advisory diagnostics and never official score or candidate-selection authority.
+Do not inspect helper source, alter capability metadata, or use any other shell
+command."""
+
+
 def build_task_prompt(
     task: Task,
     *,
@@ -79,6 +95,7 @@ def build_task_prompt(
     agent_id: str,
     episode: int,
     communication_enabled: bool,
+    formal_tools_enabled: bool = False,
     digest: str = "",
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
@@ -96,6 +113,8 @@ from intuition, a text scan, or a local proof process.
 
 {_communication_instructions(communication_enabled)}
 
+{_formal_tools_instructions(formal_tools_enabled)}
+
 Relevant shared context (possibly empty):
 ---
 {context}
@@ -107,7 +126,13 @@ When feedback is useful, check one candidate at a time with `judge_check`.
 """
 
 
-def build_mono_prompt(tasks: Iterable[Task], *, workspace: str, communication_enabled: bool) -> str:
+def build_mono_prompt(
+    tasks: Iterable[Task],
+    *,
+    workspace: str,
+    communication_enabled: bool,
+    formal_tools_enabled: bool = False,
+) -> str:
     task_lines = "\n".join(f"- {task.slug}: tasks/{task.slug}/" for task in tasks)
     return f"""You are the Mono baseline worker for a fixed MathOlympiadBench latest12 bundle.
 
@@ -122,6 +147,8 @@ evaluates every candidate after this session and counts only canonical PROVED ve
 {SOLVER_EXECUTION_CONTRACT}
 
 {_communication_instructions(communication_enabled)}
+
+{_formal_tools_instructions(formal_tools_enabled)}
 
 Use the available wall-clock budget on concrete proof construction. Leave every
 task directory with its best candidate, even if some targets remain incomplete.

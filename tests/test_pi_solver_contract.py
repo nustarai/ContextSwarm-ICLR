@@ -44,7 +44,7 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertEqual(config.lean_server_url, "")
         self.assertFalse(config.public_dict()["lean_server_configured"])
 
-    def test_cps_solver_has_controlled_tools_and_no_shell(self) -> None:
+    def test_cps_solver_has_controlled_formal_tools(self) -> None:
         command = PiAgent(load_config("configs/smoke.toml", ROOT)).command()
         for flag in (
             "--no-context-files",
@@ -55,12 +55,12 @@ class PiSolverContractTests(unittest.TestCase):
         ):
             self.assertIn(flag, command)
         tools = _tool_allowlist(command)
-        self.assertNotIn("bash", tools)
+        self.assertIn("bash", tools)
         system_prompt = command[command.index("--system-prompt") + 1]
         self.assertIn("not a general-purpose coding agent", system_prompt)
         self.assertIn("Do not execute shell commands", system_prompt)
-        self.assertIn("All dynamic Lean verification must use", system_prompt)
-        self.assertIn("judge_check", system_prompt)
+        self.assertIn("bounded helper commands", system_prompt)
+        self.assertIn("loopback capability", system_prompt)
         self.assertEqual(
             {
                 "judge_check",
@@ -81,12 +81,12 @@ class PiSolverContractTests(unittest.TestCase):
         ]
         self.assertTrue(any(path.endswith("pi_solver_tools.mjs") for path in extensions))
 
-    def test_parallel_solver_has_no_cps_capability(self) -> None:
+    def test_parallel_solver_has_no_cps_capability_and_has_formal_tools(self) -> None:
         command = PiAgent(load_config("configs/parallel.toml", ROOT)).command()
         tools = _tool_allowlist(command)
         self.assertIn("judge_check", tools)
         self.assertFalse(any(name.startswith("cps_") for name in tools))
-        self.assertNotIn("bash", tools)
+        self.assertIn("bash", tools)
 
     def test_isolated_scheduler_has_no_tools_and_a_read_only_system_prompt(self) -> None:
         command = PiAgent(load_config("configs/smoke.toml", ROOT)).command(isolated=True)

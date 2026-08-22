@@ -2236,6 +2236,8 @@ def safe_worker_response(
         "error_code",
         "error_kind",
         "terminal_reason",
+        "mathlib_revision",
+        "lean_version",
     ):
         value = payload.get(key)
         if isinstance(value, str):
@@ -2285,6 +2287,18 @@ def safe_worker_response(
         result["probe_diagnostics"] = _safe_probe_diagnostics(
             payload.get("probe_diagnostics")
         )
+    lean_environment = payload.get("lean_environment")
+    if isinstance(lean_environment, Mapping):
+        safe_environment: dict[str, str] = {}
+        for key in ("mathlib_revision", "lean_version"):
+            value = lean_environment.get(key)
+            if isinstance(value, str):
+                safe_environment[key] = sanitize_worker_text(
+                    value,
+                    _MAX_WORKER_STATUS_BYTES,
+                )
+        if safe_environment:
+            result["lean_environment"] = safe_environment
     failure = payload.get("evaluator_failure")
     if isinstance(failure, Mapping):
         safe_failure: dict[str, Any] = {

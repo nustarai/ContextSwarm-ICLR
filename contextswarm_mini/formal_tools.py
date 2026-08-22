@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import stat
 import threading
@@ -33,10 +34,23 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 
 @dataclass(frozen=True)
 class ToolCapability:
-    socket_path: str
-    token: str
     task_id: str
     surface_version: str
+
+
+@dataclass(frozen=True)
+class FormalToolPolicy:
+    """Run-global formal capability contract owned by ``JudgeBroker``."""
+
+    enabled: bool
+    surface_version: str
+    evaluate_calls_per_task: int
+    evaluate_backend_jobs_per_task: int
+    query_calls_per_task: int
+    query_backend_probes_per_task: int
+    max_candidate_bytes: int
+    command_timeout_seconds: int
+    declaration_index: "DeclarationIndex"
 
 
 @dataclass(frozen=True)
@@ -152,6 +166,18 @@ class DeclarationIndex:
             if self._records is not None:
                 return self._records
             assert self.path is not None
+            try:
+                metadata = self.path.lstat()
+            except OSError as exc:
+                raise OSError("declaration-index snapshot is unavailable") from exc
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or self.info.sha256 is None
+                or _sha256(self.path) != self.info.sha256
+            ):
+                raise OSError("declaration-index snapshot changed after validation")
             connection = sqlite3.connect(f"file:{self.path}?mode=ro&immutable=1", uri=True)
             try:
                 rows = connection.execute(
@@ -191,7 +217,11 @@ def inspect_declaration_index(
         return DeclarationIndexInfo(False, False, False, None, None, None, None, None, "not configured")
     try:
         metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_nlink != 1
+        ):
             raise OSError("declaration index must be a regular non-symlink file")
         digest = _sha256(path)
         connection = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
@@ -237,22 +267,192 @@ def inspect_declaration_index(
         return DeclarationIndexInfo(True, False, False, None, None, None, None, None, type(exc).__name__)
 
 
+def configured_declaration_index(config: Any) -> Path | None:
+    raw = (
+        os.environ.get("CONTEXTSWARM_MINI_DECL_INDEX", "").strip()
+        or os.environ.get("MINI_SWARM_DECL_INDEX", "").strip()
+        or str(getattr(config, "formal_tools_decl_index", "") or "").strip()
+    )
+    if not raw:
+        return None
+    # ``ExperimentConfig.resolve_runtime_path`` canonicalizes with
+    # ``Path.resolve()``.  That is useful for ordinary manifests but would
+    # erase the fact that an operator supplied a symlink.  Preserve the
+    # lexical path and reject symlinks in every component before opening it.
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        repo_root = Path(getattr(config, "repo_root", Path.cwd()))
+        manifest_parent = Path(getattr(config, "manifest_path", repo_root)).parent
+        repo_candidate = repo_root / candidate
+        candidate = repo_candidate if repo_candidate.exists() else manifest_parent / candidate
+    candidate = candidate.absolute()
+    current = Path(candidate.anchor or os.sep)
+    for part in candidate.parts[1:] if candidate.is_absolute() else candidate.parts:
+        current = current / part
+        try:
+            if current.is_symlink():
+                raise OSError("declaration index path must not contain symlinks")
+        except OSError:
+            raise
+    return candidate
+
+
+def effective_declaration_index_sha256(config: Any) -> str:
+    return (
+        os.environ.get("CONTEXTSWARM_MINI_DECL_INDEX_SHA256", "").strip().lower()
+        or str(getattr(config, "formal_tools_decl_index_sha256", "") or "").strip().lower()
+    )
+
+
+def effective_mathlib_revision(config: Any) -> str:
+    return (
+        os.environ.get("CONTEXTSWARM_MINI_MATHLIB_REVISION", "").strip()
+        or str(getattr(config, "formal_tools_mathlib_revision", "") or "").strip()
+    )
+
+
+def prepare_declaration_index(config: Any, private_root: Path) -> DeclarationIndex:
+    """Copy the operator index once into a run-private content-addressed snapshot.
+
+    The source descriptor is hashed while it is copied and its identity is
+    compared before and after the stream.  All later SQLite reads use only the
+    mode-0400 snapshot, never the host bind inode that preflight inspected.
+    """
+
+    source = configured_declaration_index(config)
+    expected_sha256 = effective_declaration_index_sha256(config)
+    expected_revision = effective_mathlib_revision(config)
+    if source is None:
+        return DeclarationIndex(
+            None,
+            expected_sha256=expected_sha256,
+            expected_revision=expected_revision,
+        )
+    if expected_sha256 and re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise OSError("declaration-index SHA-256 contract is invalid")
+
+    root = Path(private_root)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    source_path = Path(source)
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    source_fd = os.open(source_path, source_flags)
+    temporary = root / f".decl-index-{os.getpid()}-{secrets.token_hex(12)}.tmp"
+    destination_fd: int | None = None
+    digest = hashlib.sha256()
+    copied = 0
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise OSError("declaration index must be a single-link regular non-symlink file")
+        destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        destination_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        destination_fd = os.open(temporary, destination_flags, 0o600)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            copied += len(chunk)
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_fd, chunk[offset:])
+                if written <= 0:
+                    raise OSError("declaration-index snapshot write made no progress")
+                offset += written
+        after = os.fstat(source_fd)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after or copied != before.st_size:
+            raise OSError("declaration index changed while it was being snapshotted")
+        observed_sha256 = digest.hexdigest()
+        if expected_sha256 and observed_sha256 != expected_sha256:
+            raise OSError("declaration-index SHA-256 contract mismatch")
+        os.fchmod(destination_fd, 0o400)
+        os.fsync(destination_fd)
+        os.close(destination_fd)
+        destination_fd = None
+
+        directory = root / observed_sha256
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(directory, 0o700)
+        snapshot = directory / "decl-index.sqlite3"
+        if snapshot.exists():
+            snapshot_stat = snapshot.lstat()
+            if (
+                not stat.S_ISREG(snapshot_stat.st_mode)
+                or stat.S_ISLNK(snapshot_stat.st_mode)
+                or snapshot_stat.st_nlink != 1
+                or _sha256(snapshot) != observed_sha256
+            ):
+                raise OSError("content-addressed declaration-index snapshot is corrupt")
+            temporary.unlink()
+        else:
+            os.replace(temporary, snapshot)
+        os.chmod(snapshot, 0o400)
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+    index = DeclarationIndex(
+        snapshot,
+        expected_sha256=expected_sha256 or observed_sha256,
+        expected_revision=expected_revision,
+    )
+    if not index.info.available or index.info.sha256 != observed_sha256:
+        raise OSError("declaration-index snapshot verification failed")
+    return index
+
+
 def sanitize_public_text(value: str, *, limit: int = 2_048) -> str:
     return _PRIVATE_TEXT.sub("[redacted]", str(value or ""))[: max(1, int(limit))]
 
 
-def tool_surface_provenance(surface_version: str, *, guard_path: Path | None = None) -> dict[str, Any]:
+def tool_surface_provenance(
+    surface_version: str,
+    *,
+    solver_extension_path: Path | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "surface_version": surface_version,
         "broker_client_sha256": hashlib.sha256(_CLIENT_SCRIPT.encode("utf-8")).hexdigest(),
         "evaluate_shim_sha256": hashlib.sha256(_EVALUATE_SCRIPT.encode("utf-8")).hexdigest(),
         "formal_query_shim_sha256": hashlib.sha256(_FORMAL_QUERY_SCRIPT.encode("utf-8")).hexdigest(),
     }
-    if guard_path is not None and guard_path.is_file():
+    if solver_extension_path is not None and solver_extension_path.is_file():
         try:
-            payload["pi_worker_guard_sha256"] = _sha256(guard_path)
+            payload["pi_solver_tools_sha256"] = _sha256(solver_extension_path)
         except OSError:
-            payload["pi_worker_guard_sha256"] = "unavailable"
+            payload["pi_solver_tools_sha256"] = "unavailable"
     return payload
 
 
@@ -269,7 +469,6 @@ def stage_worker_tools(
     *,
     capability: ToolCapability,
     baseline_names: Iterable[str],
-    context_piece_enabled: bool,
 ) -> None:
     """Stage identical manifest-selected shims for Mono, Parallel, and CPS."""
 
@@ -278,8 +477,6 @@ def stage_worker_tools(
         destination / TOOL_CAPABILITY_FILENAME,
         {
             "schema_version": "contextswarm_mini_tool_capability_v1",
-            "socket_path": capability.socket_path,
-            "token": capability.token,
             "task_id": capability.task_id,
             "surface_version": capability.surface_version,
         },
@@ -292,7 +489,6 @@ def stage_worker_tools(
         destination / PUBLIC_FILES_FILENAME,
         public_files_manifest(
             baseline_names=baseline_names,
-            context_piece_enabled=context_piece_enabled,
         ),
         mode=0o444,
     )
@@ -301,7 +497,6 @@ def stage_worker_tools(
 def public_files_manifest(
     *,
     baseline_names: Iterable[str],
-    context_piece_enabled: bool,
 ) -> str:
     files = [
         "problem.md",
@@ -313,8 +508,6 @@ def public_files_manifest(
         EVALUATE_FILENAME,
         FORMAL_QUERY_FILENAME,
     ]
-    if context_piece_enabled:
-        files.append("context_piece")
     lines = [
         "# Public Formal Worker Files",
         "",
@@ -327,7 +520,7 @@ def public_files_manifest(
         "## Formal capabilities",
         "",
         "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. Its result is agent-local feedback, never the official score.",
-        "- `./formal_query --help` describes bounded `search`, `decl`, `check`, `type`, `axioms`, and `deps` queries.",
+        "- `./formal_query --help` describes bounded `search`, `decl`, `check`, `type`, `axioms`, and `deps` queries. `search` scans only `problem.md`, `result.lean`, `baseline/*.lean`, and the revision-bound declaration index.",
         "- `deps` returns index-related candidate premises, not a dependency graph. Verify names with `check`.",
         "- The final score comes only from the feedback-free outer evaluation of an immutable candidate snapshot.",
         "",
@@ -340,40 +533,55 @@ def public_files_manifest(
 _CLIENT_SCRIPT = r'''# Run-local broker client. This file is an executable boundary, not public context.
 from __future__ import annotations
 import json
+import os
 from pathlib import Path
-import socket
+import re
+import time
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 _MAX_RESPONSE_BYTES = 1024 * 1024
 
-def request(script_file: str, payload: dict) -> dict:
+def request(script_file: str, operation: str, payload: dict) -> dict:
     root = Path(script_file).resolve().parent
     capability_path = root / ".contextswarm_tool_capability.json"
     capability = json.loads(capability_path.read_text(encoding="utf-8"))
+    base_url = str(os.environ.get("CONTEXTSWARM_JUDGE_URL") or "").strip().rstrip("/")
+    parsed = urlsplit(base_url)
+    token = parsed.path.removeprefix("/")
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != f"/{token}"
+        or re.fullmatch(r"[A-Za-z0-9_-]{43}", token) is None
+    ):
+        raise RuntimeError("controlled formal-tool capability is unavailable")
     message = {
-        "schema_version": "contextswarm_mini_broker_request_v1",
-        "token": capability["token"],
         "task_id": capability["task_id"],
         **payload,
     }
-    encoded = json.dumps(message, ensure_ascii=False).encode("utf-8") + b"\n"
+    encoded = json.dumps(message, ensure_ascii=False).encode("utf-8")
     if len(encoded) > 128 * 1024:
         raise RuntimeError("formal tool request is too large")
-    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.settimeout(480)
-    try:
-        connection.connect(capability["socket_path"])
-        connection.sendall(encoded)
-        chunks = bytearray()
-        while b"\n" not in chunks:
-            chunk = connection.recv(65536)
-            if not chunk:
-                break
-            chunks.extend(chunk)
-            if len(chunks) > _MAX_RESPONSE_BYTES:
-                raise RuntimeError("formal tool response is too large")
-    finally:
-        connection.close()
-    raw = bytes(chunks).split(b"\n", 1)[0]
+    raw_deadline = str(os.environ.get("CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS") or "")
+    deadline_seconds = 480.0
+    if raw_deadline.isascii() and raw_deadline.isdigit():
+        deadline_seconds = max(0.1, min(480.0, (int(raw_deadline) / 1000.0) - time.time() + 10.0))
+    request = Request(
+        f"{base_url}/{operation}",
+        data=encoded,
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=deadline_seconds) as response:
+        raw = response.read(_MAX_RESPONSE_BYTES + 1)
+    if len(raw) > _MAX_RESPONSE_BYTES:
+        raise RuntimeError("formal tool response is too large")
     response = json.loads(raw.decode("utf-8"))
     if not isinstance(response, dict):
         raise RuntimeError("formal tool broker returned a non-object")
@@ -389,7 +597,7 @@ from _contextswarm_tool_client import request
 
 def main() -> int:
     try:
-        response = request(__file__, {"op": "evaluate_local"})
+        response = request(__file__, "evaluate_local", {})
     except Exception as error:
         print(json.dumps({"status": "EVALUATOR_ERROR", "message": type(error).__name__}, indent=2))
         return 2
@@ -449,7 +657,6 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     payload = {
-        "op": "formal_query",
         "command": args.command,
         "query": list(getattr(args, "query", []) or []),
         "limit": int(getattr(args, "limit", 12)),
@@ -459,7 +666,7 @@ def main() -> int:
         "timeout": int(getattr(args, "timeout", 30)),
     }
     try:
-        response = request(__file__, payload)
+        response = request(__file__, "formal_query", payload)
     except Exception as error:
         response = {"status": "scout_failed", "message": type(error).__name__, "advisory_only": True}
     print(json.dumps(response, ensure_ascii=False, indent=2, sort_keys=True))
@@ -474,11 +681,16 @@ __all__ = [
     "DeclarationIndex",
     "DeclarationIndexInfo",
     "EVALUATE_FILENAME",
+    "FormalToolPolicy",
     "FORMAL_QUERY_FILENAME",
     "PUBLIC_FILES_FILENAME",
     "TOOL_CAPABILITY_FILENAME",
     "ToolCapability",
+    "configured_declaration_index",
+    "effective_declaration_index_sha256",
+    "effective_mathlib_revision",
     "inspect_declaration_index",
+    "prepare_declaration_index",
     "public_files_manifest",
     "sanitize_public_text",
     "stage_worker_tools",

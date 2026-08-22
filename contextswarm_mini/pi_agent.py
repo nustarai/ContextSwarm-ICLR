@@ -30,6 +30,21 @@ _CPS_SHARED_TOOLS = ("cps_search", "cps_publish", "cps_actors")
 _CPS_DIRECT_TOOLS = ("cps_inbox", "cps_send", "cps_ack")
 _SOLVER_EXTENSION_NAME = "pi_solver_tools.mjs"
 _FAST_MODE_EXTENSION_NAME = "pi_fast_mode.mjs"
+# Keep the helper interpreter lookup deterministic.  In particular, a worker
+# must not be able to put a same-named executable in its workspace ahead of the
+# system interpreter when it invokes the manifest-selected ``python3`` helper.
+_CONTROLLED_PATH = "/usr/local/bin:/usr/bin:/bin"
+_SAFE_PARENT_ENVIRONMENT_KEYS = frozenset(
+    {
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "TERM",
+        "TZ",
+    }
+)
 _BROKER_ENVIRONMENT_KEYS = frozenset(
     {
         "CONTEXTSWARM_JUDGE_URL",
@@ -45,6 +60,17 @@ requests. All dynamic Lean verification must use the runner-provided judge_check
 If that tool is busy or unavailable, continue static proof reasoning or leave the best
 candidate for the runner; never create a local or raw-network fallback. The user prompt
 defines the assigned proof task and, when present, the controlled CPS protocol."""
+_FORMAL_SOLVER_SYSTEM_PROMPT = """You are a bounded formal-proof construction worker, not a general-purpose coding agent.
+Work only on the assigned result.lean and use only the explicitly provided tools.
+Do not execute shell commands except the exact bounded helper commands documented
+in PUBLIC_FILES.md. Do not inspect their implementation or capability metadata.
+Do not spawn background or parallel processes, run a local Lean/verifier/proof-search
+service, install or download software, or make raw network requests. The only permitted
+shell surface is the pair of bounded helper commands documented in PUBLIC_FILES.md;
+all dynamic Lean work still flows through the runner-provided loopback capability.
+If a controlled tool is busy or unavailable, continue static proof reasoning or leave
+the best candidate for the runner; never create a local or raw-network fallback. The
+user prompt defines the assigned proof task and, when present, the controlled CPS protocol."""
 _ISOLATED_SYSTEM_PROMPT = """You are a read-only allocation decision component in a bounded experiment.
 Use only the snapshot in the user prompt. You have no tools and must not inspect files,
 execute commands, spawn processes, use the network, or change run state. Return only the
@@ -128,7 +154,13 @@ class PiAgent:
             "--thinking",
             self.config.thinking,
             "--system-prompt",
-            _ISOLATED_SYSTEM_PROMPT if isolated else _SOLVER_SYSTEM_PROMPT,
+            (
+                _ISOLATED_SYSTEM_PROMPT
+                if isolated
+                else _FORMAL_SOLVER_SYSTEM_PROMPT
+                if self.config.formal_tools_enabled
+                else _SOLVER_SYSTEM_PROMPT
+            ),
         ]
         if session_dir is not None:
             command.extend(["--session-dir", str(session_dir)])
@@ -209,6 +241,8 @@ class PiAgent:
 
     def solver_tools(self) -> tuple[str, ...]:
         tools = [*_FILE_TOOLS, "judge_check"]
+        if self.config.formal_tools_enabled:
+            tools.append("bash")
         if self.config.uses_cps:
             tools.extend(_CPS_SHARED_TOOLS)
             tools.extend(_CPS_DIRECT_TOOLS)
@@ -222,18 +256,14 @@ class PiAgent:
         workdir: Path,
         extra_env: Mapping[str, str] | None = None,
     ) -> dict[str, str]:
-        env = dict(os.environ)
-        # The supervisor alone owns raw Judge credentials and endpoints.  A
-        # session-scoped broker capability may be injected below via extra_env.
-        for key in tuple(env):
-            if (
-                _is_evaluator_environment_key(key)
-                or key.startswith("CONTEXTSWARM_JUDGE_")
-                or key.startswith("CONTEXTSWARM_MANIFEST_")
-                or key == "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED"
-                or key == "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"
-            ):
-                env.pop(key, None)
+        # Start from a deliberately tiny parent-environment allowlist.  This
+        # prevents ambient PATH/PYTHONPATH and operator credentials from
+        # becoming an alternate helper, evaluator, or import boundary.
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key in _SAFE_PARENT_ENVIRONMENT_KEYS and isinstance(value, str)
+        }
         # A notebook/operator shell may still carry variables from a previous
         # CPS run.  Baselines inherit the ordinary process environment, but
         # never an implicit communication surface; CPS call sites explicitly
@@ -244,22 +274,32 @@ class PiAgent:
         private_tmp = workdir / ".tmp"
         private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(private_tmp, 0o700)
+        private_home = workdir / ".runtime" / "home"
+        for directory in (private_home, private_tmp):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(directory, 0o700)
         env.update(
             {
+                "HOME": str(private_home),
+                "PATH": _CONTROLLED_PATH,
                 "PI_BIN": self.binary(),
                 "EXPERIMENT_PI_BINARY": self.binary(),
                 "CONTEXTSWARM_TASK_ID": task_id,
                 "CONTEXTSWARM_ACTOR_ID": actor_id,
                 "CONTEXTSWARM_WORKDIR": str(workdir),
+                "CONTEXTSWARM_EXPERIMENT_MODE": self.config.mode,
                 "CONTEXTSWARM_EXPERIMENT_SEED": str(self.config.seed),
+                "CONTEXTSWARM_FORMAL_COMMAND_TIMEOUT_SECONDS": str(
+                    self.config.formal_tools_command_timeout_seconds
+                ),
                 "TMPDIR": str(private_tmp),
                 "AISW_LEASE_WAIT_SECONDS": str(self.config.aisw_lease_wait_seconds),
                 "AISW_LEASE_RETRY_INTERVAL_SECONDS": str(self.config.aisw_lease_retry_interval_seconds),
             }
         )
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        repo_path = str(self.config.repo_root)
-        env["PYTHONPATH"] = repo_path if not existing_pythonpath else f"{repo_path}{os.pathsep}{existing_pythonpath}"
+        # Do not append an operator-supplied PYTHONPATH.  The runner package is
+        # the only import root required by the controlled helper/client path.
+        env["PYTHONPATH"] = str(self.config.repo_root)
         if self.config.aisw_enabled:
             env["AISW_HOME"] = env.get("AISW_HOME", "/run/contextswarm-aisw")
             env["CONTEXTSWARM_AISW_PRIVATE_HOME_REQUIRED"] = "1"

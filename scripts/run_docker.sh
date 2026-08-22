@@ -73,11 +73,17 @@ if ! RESOLVED_RUNTIME_CONFIG="$(
   PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
     python3 - "${CONFIG_PATH}" "${ROOT_DIR}" "${FORMAL_LAUNCH}" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 from contextswarm_mini.launch_contract import (
     LaunchContractError,
     resolve_launch_contract,
+)
+from contextswarm_mini.formal_tools import (
+    configured_declaration_index,
+    effective_declaration_index_sha256,
+    effective_mathlib_revision,
 )
 
 try:
@@ -97,12 +103,27 @@ print(config.docker_network)
 print("1" if config.lean_require_result_cache_disabled else "0")
 print(contract.container_manifest)
 print(contract.manifest_sha256)
+print("1" if config.formal_tools_enabled else "0")
+print("1" if config.formal_tools_require_decl_index else "0")
+index = configured_declaration_index(config)
+index_text = str(index) if index is not None else "__EMPTY__"
+if any(char in index_text for char in "\r\n"):
+    raise SystemExit("formal declaration-index path contains a line break")
+print(index_text)
+index_sha = effective_declaration_index_sha256(config)
+if index_sha and not re.fullmatch(r"[0-9a-f]{64}", index_sha):
+    raise SystemExit("formal declaration-index SHA-256 is invalid")
+print(index_sha or "__EMPTY__")
+revision = effective_mathlib_revision(config)
+if revision and not re.fullmatch(r"[A-Za-z0-9_.:/+@-]{1,256}", revision):
+    raise SystemExit("formal Mathlib revision contains unsupported characters")
+print(revision or "__EMPTY__")
 PY
 )"; then
   exit 2
 fi
 mapfile -t RESOLVED_RUNTIME_VALUES <<<"${RESOLVED_RUNTIME_CONFIG}"
-if [[ "${#RESOLVED_RUNTIME_VALUES[@]}" -ne 6 ]]; then
+if [[ "${#RESOLVED_RUNTIME_VALUES[@]}" -ne 11 ]]; then
   echo "runtime manifest resolution returned an invalid payload" >&2
   exit 2
 fi
@@ -113,6 +134,14 @@ NETWORK="${RESOLVED_RUNTIME_VALUES[2]}"
 CACHE_DISABLED_REQUIRED="${RESOLVED_RUNTIME_VALUES[3]}"
 CONFIG="${RESOLVED_RUNTIME_VALUES[4]}"
 MANIFEST_SHA256="${RESOLVED_RUNTIME_VALUES[5]}"
+FORMAL_TOOLS_ENABLED="${RESOLVED_RUNTIME_VALUES[6]}"
+FORMAL_DECL_INDEX_REQUIRED="${RESOLVED_RUNTIME_VALUES[7]}"
+DECL_INDEX_SOURCE="${RESOLVED_RUNTIME_VALUES[8]}"
+DECL_INDEX_SHA256="${RESOLVED_RUNTIME_VALUES[9]}"
+DECL_INDEX_REVISION="${RESOLVED_RUNTIME_VALUES[10]}"
+[[ "${DECL_INDEX_SOURCE}" == "__EMPTY__" ]] && DECL_INDEX_SOURCE=""
+[[ "${DECL_INDEX_SHA256}" == "__EMPTY__" ]] && DECL_INDEX_SHA256=""
+[[ "${DECL_INDEX_REVISION}" == "__EMPTY__" ]] && DECL_INDEX_REVISION=""
 if [[ "${#IMAGE}" -gt 512 || ! "${IMAGE}" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$ ]]; then
   echo "invalid Docker image from manifest or CONTEXTSWARM_MINI_IMAGE" >&2
   exit 2
@@ -144,6 +173,11 @@ if (( PIDS_LIMIT < 1 )); then
   exit 2
 fi
 
+if [[ "${FORMAL_TOOLS_ENABLED}" != "0" && "${FORMAL_TOOLS_ENABLED}" != "1" ]] ||
+   [[ "${FORMAL_DECL_INDEX_REQUIRED}" != "0" && "${FORMAL_DECL_INDEX_REQUIRED}" != "1" ]]; then
+  echo "runtime formal-tools contract returned an invalid enablement" >&2
+  exit 2
+fi
 NEEDS_JUDGE="${FORMAL_LAUNCH}"
 if (( NEEDS_JUDGE == 1 )) && [[ -z "${CONTEXTSWARM_JUDGE_URL:-}" ]]; then
   echo "CONTEXTSWARM_JUDGE_URL must be set for a real run or preflight" >&2
@@ -170,6 +204,44 @@ if [[ -n "${CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL:-}" ]]; then
       exit 2
       ;;
   esac
+fi
+
+if (( FORMAL_LAUNCH == 1 )) && [[ "${FORMAL_TOOLS_ENABLED}" == "1" ]] && [[ "${FORMAL_DECL_INDEX_REQUIRED}" == "1" ]]; then
+  # The runner's preflight is the authoritative admission gate for a required
+  # index.  The launcher only validates and mounts an operator-supplied source;
+  # leaving it empty here preserves the useful early endpoint diagnostics and
+  # lets preflight report the missing-index contract inside the run artifact.
+  if [[ -z "${DECL_INDEX_SOURCE}" ]]; then
+    :
+  elif [[ ! -f "${DECL_INDEX_SOURCE}" || -L "${DECL_INDEX_SOURCE}" ]]; then
+    echo "formal declaration index source is unavailable" >&2
+    exit 2
+  else
+  if [[ -z "${DECL_INDEX_SHA256}" ]]; then
+    DECL_INDEX_SHA256="$(sha256sum "${DECL_INDEX_SOURCE}" | awk '{print $1}')"
+  fi
+  if [[ ! "${DECL_INDEX_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "formal declaration index SHA-256 contract is invalid" >&2
+    exit 2
+  fi
+  if [[ -z "${DECL_INDEX_REVISION}" ]]; then
+    DECL_INDEX_REVISION="$(python3 - "${DECL_INDEX_SOURCE}" <<'PY'
+import sqlite3
+import sys
+try:
+    with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as db:
+        row = db.execute("SELECT value FROM meta WHERE key = 'mathlib_revision'").fetchone()
+    print(row[0].strip() if row and isinstance(row[0], str) else "")
+except Exception:
+    print("")
+PY
+)"
+  fi
+    if [[ -z "${DECL_INDEX_REVISION}" || "${#DECL_INDEX_REVISION}" -gt 256 ]]; then
+      echo "formal declaration index Mathlib revision is unavailable" >&2
+      exit 2
+    fi
+  fi
 fi
 
 IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${IMAGE}" 2>/dev/null || true)"
@@ -297,6 +369,17 @@ if (( MOCK == 0 )); then
     -v "${AISW_BINARY}:/opt/contextswarm-input/aisw/pi:ro"
     -v "${NODE_CONFIG}:/opt/contextswarm-input/aisw-private/node.toml:ro"
   )
+  if [[ "${FORMAL_TOOLS_ENABLED}" == "1" ]] && [[ -n "${DECL_INDEX_SOURCE}" ]]; then
+    export CONTEXTSWARM_MINI_DECL_INDEX="/opt/contextswarm-input/formal/decl-index.sqlite3"
+    export CONTEXTSWARM_MINI_DECL_INDEX_SHA256="${DECL_INDEX_SHA256,,}"
+    export CONTEXTSWARM_MINI_MATHLIB_REVISION="${DECL_INDEX_REVISION}"
+    DOCKER_ARGS+=(
+      -v "${DECL_INDEX_SOURCE}:/opt/contextswarm-input/formal/decl-index.sqlite3:ro"
+      -e CONTEXTSWARM_MINI_DECL_INDEX
+      -e CONTEXTSWARM_MINI_DECL_INDEX_SHA256
+      -e CONTEXTSWARM_MINI_MATHLIB_REVISION
+    )
+  fi
   if [[ -n "${AISW_METADATA}" ]]; then
     DOCKER_ARGS+=("-v" "${AISW_METADATA}:/opt/contextswarm-input/aisw/$(basename "${AISW_METADATA}"):ro")
   fi

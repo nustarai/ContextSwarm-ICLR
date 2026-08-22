@@ -40,6 +40,8 @@ that might be typed.
         - Follow the mandatory execution and verification contract in the worker prompt.
         - Treat this as offline proof construction. The sole checking exception is
           `judge_check`, the experiment-provided controlled external Judge interface.
+        - If the manifest exposes `evaluate.py` or `formal_query`, use them only as bounded
+          advisory diagnostics; they never establish official success or select a candidate.
         - Never execute local Lean/lake/elan, install or download Lean/Mathlib/toolchains,
           run a local verifier or proof search, perform resource-heavy computation, or
           start background or parallel processes. Never call raw Judge HTTP endpoints.

@@ -84,16 +84,6 @@ env_id = "formal_matholympiadbench"
 timeout_seconds = 300
 max_lifecycle_seconds = 3600
 max_concurrent_evaluations = 4
-# One slot remains available to feedback-free outer closeout whenever total
-# capacity is greater than one. This reservation is run-local; experiment
-# cells still share the same external Judge service as before.
-official_reserved_evaluations = 1
-# Stop admitting optional solver feedback near the one-hour boundary so
-# already-running probes can settle and the candidate set can freeze cleanly.
-agent_local_cutoff_seconds = 330
-# Solving still stops at experiment.time_limit_seconds. This separate bound is
-# only for evaluating the already-frozen candidates.
-closeout_timeout_seconds = 14400
 verification_profile = "formal_proof"
 judge_mode = "fast"
 require_result_cache_disabled = false
@@ -115,7 +105,6 @@ decl_index = ""
 decl_index_sha256 = ""
 mathlib_revision = ""
 require_decl_index = true
-pi_guard_extension = "contextswarm_mini/pi_worker_guard.mjs"
 
 [docker]
 image = "contextswarm-iclr-mini:latest"
