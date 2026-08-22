@@ -2,7 +2,7 @@
 // The trusted evaluator broker remains the authority; this extension prevents
 // ordinary model tool calls from reaching sibling workspaces, private config,
 // helper source, raw network clients, or aggregate run artifacts.
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { basename, dirname, relative, resolve, sep } from "node:path";
 
 const enabled = String(process.env.CONTEXTSWARM_WORKER_GUARD ?? "") === "1";
@@ -102,6 +102,7 @@ function shellTokens(segment) {
   for (let index = 0; index < segment.length; index += 1) {
     const char = segment[index];
     if (escaped) {
+      if (char === "\n" || char === "\r") return null;
       token += char;
       escaped = false;
       continue;
@@ -138,6 +139,7 @@ function splitShell(command) {
     const char = command[index];
     const next = command[index + 1] ?? "";
     if (escaped) {
+      if (char === "\n" || char === "\r") return null;
       current += char;
       escaped = false;
       continue;
@@ -169,6 +171,10 @@ function splitShell(command) {
       || char === ")"
       || char === "{"
       || char === "}"
+      || char === "*"
+      || char === "?"
+      || char === "["
+      || char === "]"
     ) return null;
     if (char === "&" && next !== "&") return null;
     if (char === ";" || char === "|" || (char === "&" && next === "&")) {
@@ -188,12 +194,81 @@ function looksLikePath(token) {
   return (
     token.includes("/")
     || token.startsWith(".")
-    || /\.(?:lean|md|json|toml|txt)$/.test(token)
+    || /\.(?:lean|md|json|toml|txt|py)$/.test(token)
+    || new Set(["evaluate.py", "formal_query", "context_piece"]).has(token)
     || token === "PUBLIC_FILES.md"
     || token === "result.lean"
     || token === "problem.md"
     || token === "metadata.json"
   );
+}
+
+const searchFlags = new Set([
+  "-n", "--line-number",
+  "-i", "--ignore-case",
+  "-s", "--case-sensitive",
+  "-S", "--smart-case",
+  "-F", "--fixed-strings",
+  "-w", "--word-regexp",
+  "-x", "--line-regexp",
+  "-v", "--invert-match",
+  "-o", "--only-matching",
+  "-q", "--quiet",
+  "-H", "--with-filename",
+  "-N", "--no-line-number",
+  "--heading", "--no-heading",
+  "--count", "--count-matches",
+  "--color=never", "--color=always", "--color=auto",
+]);
+
+function checkSearchCommand(tokens, cwd) {
+  let index = 1;
+  while (index < tokens.length && searchFlags.has(tokens[index])) index += 1;
+  let optionsEnded = false;
+  if (tokens[index] === "--") {
+    optionsEnded = true;
+    index += 1;
+  }
+  if (index >= tokens.length) return false;
+  if (!optionsEnded && tokens[index].startsWith("-")) return false;
+  index += 1; // one literal pattern
+  const paths = tokens.slice(index);
+  return paths.length > 0 && paths.every((path) => !path.startsWith("-") && allowedRead(path, cwd));
+}
+
+function checkHeadTail(tokens, cwd, piped) {
+  let index = 1;
+  while (index < tokens.length) {
+    const token = tokens[index];
+    if (token === "-n" || token === "-c") {
+      if (index + 1 >= tokens.length || !/^-?\d+$/.test(tokens[index + 1])) return false;
+      index += 2;
+      continue;
+    }
+    if (/^--(?:lines|bytes)=-?\d+$/.test(token)) {
+      index += 1;
+      continue;
+    }
+    break;
+  }
+  const paths = tokens.slice(index);
+  return (piped || paths.length > 0) && paths.every((path) => allowedRead(path, cwd));
+}
+
+function checkWc(tokens, cwd, piped) {
+  let index = 1;
+  const flags = new Set(["-l", "-w", "-c", "-m", "-L"]);
+  while (index < tokens.length && flags.has(tokens[index])) index += 1;
+  const paths = tokens.slice(index);
+  return (piped || paths.length > 0) && paths.every((path) => allowedRead(path, cwd));
+}
+
+function checkDiff(tokens, cwd) {
+  let index = 1;
+  const flags = new Set(["-u", "--unified", "-q", "--brief", "-w", "--ignore-all-space"]);
+  while (index < tokens.length && flags.has(tokens[index])) index += 1;
+  const paths = tokens.slice(index);
+  return paths.length === 2 && paths.every((path) => allowedRead(path, cwd));
 }
 
 function checkReadCommand(tokens, cwd, piped) {
@@ -216,16 +291,15 @@ function checkReadCommand(tokens, cwd, piped) {
     }
     return { ok: allowedRead(tokens[3], cwd), cwd };
   }
-  if (
-    command === "rg"
-    && tokens.some((token) => token === "--pre" || token.startsWith("--pre="))
-  ) return { ok: false, cwd };
-  if (tokens.some((token) => token === "--files" || token === "--hidden" || token === "-R" || token === "-r")) {
-    return { ok: false, cwd };
+  if (command === "rg" || command === "grep") {
+    return { ok: checkSearchCommand(tokens, cwd), cwd };
   }
-  const paths = tokens.slice(1).filter(looksLikePath);
-  if (paths.length === 0) return { ok: piped && new Set(["head", "tail", "wc"]).has(command), cwd };
-  return { ok: paths.every((path) => allowedRead(path, cwd)), cwd };
+  if (command === "head" || command === "tail") {
+    return { ok: checkHeadTail(tokens, cwd, piped), cwd };
+  }
+  if (command === "wc") return { ok: checkWc(tokens, cwd, piped), cwd };
+  if (command === "diff") return { ok: checkDiff(tokens, cwd), cwd };
+  return { ok: false, cwd };
 }
 
 function checkBash(command) {
@@ -241,7 +315,13 @@ function checkBash(command) {
       const target = resolve(cwd, tokens[1]);
       const rel = relative(workerRoot, target).replaceAll(sep, "/");
       const allowedDirectory = target === workerRoot || /^tasks\/[^/]+$/.test(rel) || /^(?:tasks\/[^/]+\/)?scratch(?:\/.*)?$/.test(rel);
-      if (!inside(target, workerRoot) || !allowedDirectory) return false;
+      let realDirectory = false;
+      try {
+        realDirectory = statSync(target).isDirectory();
+      } catch {
+        realDirectory = false;
+      }
+      if (!inside(target, workerRoot) || !allowedDirectory || !realDirectory) return false;
       cwd = target;
       piped = false;
       continue;
@@ -258,9 +338,9 @@ function checkBash(command) {
       continue;
     }
     if (helper === "context_piece") {
-      // argparse accepts unique long-option abbreviations by default, so
-      // block --body-f... as well as the full spelling.
-      if (tokens.some((token) => token.startsWith("--body-f"))) {
+      // File-backed bodies are not part of the model-facing CPS surface.
+      // Reject the exact option, assignment form, and any future variant.
+      if (tokens.some((token) => token.startsWith("--body-"))) {
         return false;
       }
       piped = false;

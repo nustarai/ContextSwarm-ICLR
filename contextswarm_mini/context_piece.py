@@ -17,6 +17,14 @@ import time
 from .cps import CPSStore
 
 
+class _NoAbbrevArgumentParser(argparse.ArgumentParser):
+    """Keep long options exact across the top-level and nested CPS parsers."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+
 def _runtime() -> tuple[CPSStore, str, str]:
     db = os.environ.get("CONTEXTSWARM_CPS_DB", "").strip()
     task = os.environ.get("CONTEXTSWARM_TASK_ID", "").strip()
@@ -51,7 +59,7 @@ def _require_open_horizon() -> int | None:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="context_piece")
+    parser = _NoAbbrevArgumentParser(prog="context_piece")
     sub = parser.add_subparsers(dest="command", required=True)
     search = sub.add_parser("search", help="search shared context pieces")
     search.add_argument("--query", default="")

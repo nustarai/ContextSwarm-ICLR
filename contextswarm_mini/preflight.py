@@ -85,6 +85,9 @@ def run_preflight(config: ExperimentConfig, output_dir: Path) -> dict[str, Any]:
             )
         if report["lean"].get("workspace_ready") is False:
             raise PreflightError("Lean router workspace is not ready")
+        guard_path = config.resolve_runtime_path(config.pi_guard_extension)
+        if not guard_path.is_file():
+            raise PreflightError("Pi worker workspace guard extension is unavailable")
         if config.formal_tools_enabled:
             index_raw = (
                 os.environ.get("CONTEXTSWARM_MINI_DECL_INDEX", "").strip()
@@ -105,9 +108,6 @@ def run_preflight(config: ExperimentConfig, output_dir: Path) -> dict[str, Any]:
                 expected_sha256=expected_index_sha256,
                 expected_revision=expected_mathlib_revision,
             )
-            guard_path = config.resolve_runtime_path(config.pi_guard_extension)
-            if not guard_path.is_file():
-                raise PreflightError("formal Pi worker guard extension is unavailable")
             report["formal_tools"] = {
                 **tool_surface_provenance(
                     config.formal_tools_version,

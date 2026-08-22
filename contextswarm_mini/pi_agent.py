@@ -90,10 +90,10 @@ class PiAgent:
             command.extend(["--session-dir", str(session_dir)])
         if session_id:
             command.extend(["--session-id", session_id])
-        if self.config.formal_tools_enabled and self.config.pi_guard_extension.strip():
+        if self.config.pi_guard_extension.strip():
             guard_path = self.config.resolve_runtime_path(self.config.pi_guard_extension)
             if not guard_path.is_file():
-                raise ValueError(f"formal worker guard extension is unavailable: {guard_path}")
+                raise ValueError(f"worker workspace guard extension is unavailable: {guard_path}")
             command.extend(["--extension", str(guard_path)])
         extension = self.config.pi_extension.strip()
         if self.config.fast_mode and extension:
@@ -139,7 +139,10 @@ class PiAgent:
                 "CONTEXTSWARM_WORKDIR": str(workdir),
                 "CONTEXTSWARM_EXPERIMENT_MODE": self.config.mode,
                 "CONTEXTSWARM_EXPERIMENT_SEED": str(self.config.seed),
-                "CONTEXTSWARM_WORKER_GUARD": "1" if self.config.formal_tools_enabled else "0",
+                # The guard is a workspace isolation boundary, not a formal-tool
+                # feature toggle. Disabling the shims must not expose sibling or
+                # runner-owned files to the model process.
+                "CONTEXTSWARM_WORKER_GUARD": "1",
                 "CONTEXTSWARM_WORKER_MAX_WRITE_BYTES": str(
                     self.config.formal_tools_max_candidate_bytes
                 ),

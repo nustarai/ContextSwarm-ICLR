@@ -21,8 +21,11 @@ DECLARATION = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_'.₀-₉ⁿ¹²³]*)\b"
 )
 NAMESPACE = re.compile(r"^\s*namespace\s+([A-Za-z_][A-Za-z0-9_'.]*)\s*$")
-SECTION = re.compile(r"^\s*section(?:\s+[A-Za-z_][A-Za-z0-9_']*)?\s*$")
+SECTION = re.compile(
+    r"^\s*(?:noncomputable\s+)?section(?:\s+([A-Za-z_][A-Za-z0-9_'.]*))?\s*$"
+)
 END = re.compile(r"^\s*end(?:\s+([A-Za-z_][A-Za-z0-9_'.]*))?\s*$")
+MUTUAL = re.compile(r"^\s*mutual\s*$")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -96,21 +99,37 @@ def declarations(source_root: Path) -> Iterable[tuple[str, str, str, int, str, s
                 block_comment_depth -= line.count("-/")
                 block_comment_depth = max(0, block_comment_depth)
                 continue
+            line = _strip_line_comment(line)
             namespace = NAMESPACE.match(line)
             if namespace:
                 scopes.append(("namespace", namespace.group(1)))
                 continue
-            if SECTION.match(line):
-                scopes.append(("section", ""))
+            section = SECTION.match(line)
+            if section:
+                scopes.append(("section", section.group(1) or ""))
+                continue
+            if MUTUAL.match(line):
+                scopes.append(("mutual", ""))
                 continue
             end = END.match(line)
             if end:
                 named = end.group(1)
                 if named:
-                    while scopes:
-                        kind, value = scopes.pop()
-                        if kind == "namespace" and value == named:
-                            break
+                    match_index = next(
+                        (
+                            position
+                            for position in range(len(scopes) - 1, -1, -1)
+                            if scopes[position][1]
+                            and (
+                                scopes[position][1] == named
+                                or scopes[position][1].endswith(f".{named}")
+                                or named.endswith(f".{scopes[position][1]}")
+                            )
+                        ),
+                        None,
+                    )
+                    if match_index is not None:
+                        del scopes[match_index:]
                 elif scopes:
                     scopes.pop()
                 continue

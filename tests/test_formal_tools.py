@@ -209,6 +209,49 @@ def _stage_fixture(
 
 
 class FormalToolBrokerTests(unittest.TestCase):
+    def test_cps_handoff_does_not_consume_agent_formal_tool_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = _config(
+                formal_tools_evaluate_calls_per_task=1,
+                formal_tools_evaluate_backend_jobs_per_task=1,
+            )
+            broker, fake, task, workspace, _capability = _stage_fixture(
+                Path(temporary),
+                config=config,
+            )
+            try:
+                handoff = broker.evaluate_handoff(
+                    task,
+                    workspace / "result.lean",
+                    trusted_root=workspace,
+                    scope_id="runner:worker-task",
+                    actor_id="worker-task",
+                )
+                local = broker.evaluate_local(
+                    task,
+                    workspace / "result.lean",
+                    trusted_root=workspace,
+                    scope_id="worker-capability",
+                    actor_id="worker-task",
+                )
+                exhausted = broker.evaluate_local(
+                    task,
+                    workspace / "result.lean",
+                    trusted_root=workspace,
+                    scope_id="worker-capability",
+                    actor_id="worker-task",
+                )
+
+                self.assertEqual(handoff.status, "PROVED")
+                self.assertEqual(handoff.response["lane"], "cps_handoff")
+                self.assertEqual(local.status, "PROVED")
+                self.assertEqual(local.response["lane"], "agent_local")
+                self.assertEqual(local.response["call_number"], 1)
+                self.assertEqual(exhausted.status, "BUDGET_EXHAUSTED")
+                self.assertEqual(fake.evaluation_calls, 2)
+            finally:
+                broker.close()
+
     def test_shims_use_broker_and_only_outer_lane_scores(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             broker, fake, task, workspace, _capability = _stage_fixture(Path(temporary))
@@ -612,7 +655,17 @@ class DeclarationIndexTests(unittest.TestCase):
             (source / "Demo.lean").write_text(
                 (
                     "namespace Demo\n"
+                    "section Inner\n"
                     "lemma useful (n : Nat) : n = n := by rfl\n"
+                    "end Inner -- retain the outer namespace\n"
+                    "noncomputable section LinearEquiv.finsuppUnique\n"
+                    "lemma dottedSection : True := by trivial\n"
+                    "end LinearEquiv.finsuppUnique\n"
+                    "mutual\n"
+                    "def mutualFirst : Nat := 1\n"
+                    "def mutualSecond : Nat := 2\n"
+                    "end\n"
+                    "lemma afterMutual : True := by trivial\n"
                     "@[simp] theorem tagged : True := by trivial\n"
                     "private lemma hidden : True := by trivial\n"
                     "end Demo\n"
@@ -639,7 +692,7 @@ class DeclarationIndexTests(unittest.TestCase):
                 timeout=10,
             )
             report = json.loads(built.stdout)
-            self.assertEqual(report["declaration_count"], 2)
+            self.assertEqual(report["declaration_count"], 6)
             index = DeclarationIndex(
                 output,
                 expected_sha256=report["sha256"],
@@ -652,6 +705,14 @@ class DeclarationIndexTests(unittest.TestCase):
             self.assertEqual(
                 [row["name"] for row in index.search("tagged", limit=5)],
                 ["Demo.tagged"],
+            )
+            self.assertEqual(
+                [row["name"] for row in index.search("dottedSection", limit=5)],
+                ["Demo.dottedSection"],
+            )
+            self.assertEqual(
+                [row["name"] for row in index.search("afterMutual", limit=5)],
+                ["Demo.afterMutual"],
             )
             self.assertEqual(index.search("hidden", limit=5), [])
 
@@ -844,6 +905,20 @@ process.stdout.write(JSON.stringify(result ?? null));
                     {"command": "./context_piece search --query induction"},
                 )
             )
+            self.assertIsNone(
+                self._guard(
+                    workspace,
+                    "bash",
+                    {"command": "sed -n '1,10p' problem.md | head -n 1"},
+                )
+            )
+            self.assertIsNone(
+                self._guard(
+                    workspace,
+                    "bash",
+                    {"command": "rg -n problem problem.md"},
+                )
+            )
             blocked = (
                 ("read", {"path": "/etc/passwd"}),
                 ("write", {"path": "../escape", "content": "x"}),
@@ -859,6 +934,26 @@ process.stdout.write(JSON.stringify(result ?? null));
                 ("bash", {"command": "sed -n 'e id' problem.md"}),
                 ("bash", {"command": "head problem.md & id"}),
                 ("bash", {"command": "rg --pre=id pattern problem.md"}),
+                ("bash", {"command": "rg problem.md"}),
+                ("bash", {"command": "grep --recursive problem.md"}),
+                ("bash", {"command": "rg pattern --replace problem.md"}),
+                ("bash", {"command": "rg --hostname-bin=env pattern problem.md"}),
+                ("bash", {"command": "rg --hostname-b=env pattern problem.md"}),
+                ("bash", {"command": "rg --host\\\nname-bin=env pattern problem.md"}),
+                ("bash", {"command": "pwd | head *"}),
+                ("bash", {"command": "pwd | head evaluate.py"}),
+                ("bash", {"command": "grep import evaluate.py problem.md"}),
+                ("bash", {"command": "diff problem.md evaluate.py"}),
+                ("bash", {"command": "cd scratch/missing; head ../../problem.md"}),
+                (
+                    "bash",
+                    {
+                        "command": (
+                            "./context_piece create --title leak "
+                            "--bo\\\ndy-file /etc/passwd"
+                        )
+                    },
+                ),
                 (
                     "bash",
                     {
@@ -874,6 +969,15 @@ process.stdout.write(JSON.stringify(result ?? null));
                         "command": (
                             "./context_piece create --title leak "
                             "--body-f=/etc/passwd"
+                        )
+                    },
+                ),
+                (
+                    "bash",
+                    {
+                        "command": (
+                            "./context_piece create --title leak "
+                            "--body-=/etc/passwd"
                         )
                     },
                 ),

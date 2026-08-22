@@ -444,8 +444,10 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
             "lean.agent_local_cutoff_seconds must be smaller than "
             "experiment.time_limit_seconds while formal tools are enabled"
         )
-    if formal_tools_enabled and not pi_guard_extension:
-        raise ConfigError("formal_tools.pi_guard_extension is required when tools are enabled")
+    if not pi_guard_extension:
+        raise ConfigError(
+            "formal_tools.pi_guard_extension is required as the worker workspace guard"
+        )
 
     cfg = ExperimentConfig(
         manifest_path=manifest_path,

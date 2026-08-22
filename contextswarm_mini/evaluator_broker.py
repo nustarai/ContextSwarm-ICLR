@@ -72,7 +72,7 @@ class _PriorityAdmission:
 
     @contextmanager
     def acquire(self, role: str, *, deadline: float) -> Iterator[int]:
-        if role not in {"agent_local", "formal_query", "official"}:
+        if role not in {"agent_local", "cps_handoff", "formal_query", "official"}:
             raise ValueError(f"unsupported evaluator admission role: {role}")
         official = role == "official"
         started = time.monotonic()
@@ -144,7 +144,13 @@ class _BrokerRequestHandler(socketserver.StreamRequestHandler):
         encoded = json.dumps(response, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
         if len(encoded) > _MAX_RESPONSE_BYTES:
             encoded = b'{"status":"BROKER_ERROR","message":"response exceeded bound"}\n'
-        self.wfile.write(encoded)
+        try:
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            # A bounded Pi command may be terminated at the solver horizon
+            # while its broker request is settling. The response is advisory;
+            # a vanished client must not emit an unhandled server traceback.
+            return
 
 
 class EvaluatorBroker:
@@ -331,17 +337,76 @@ class EvaluatorBroker:
         actor_id: str,
         episode: int = 0,
     ) -> Verdict:
+        """Run an agent-requested ``evaluate.py`` call against its tool quota."""
+
+        return self._evaluate_diagnostic(
+            task,
+            source,
+            trusted_root=trusted_root,
+            scope_id=scope_id,
+            actor_id=actor_id,
+            episode=episode,
+            lane="agent_local",
+            call_counter="evaluate_calls",
+            backend_counter="evaluate_backend_jobs",
+            budget_label="agent-local formal-tool",
+        )
+
+    def evaluate_handoff(
+        self,
+        task: Task,
+        source: Path,
+        *,
+        trusted_root: Path,
+        scope_id: str,
+        actor_id: str,
+        episode: int = 0,
+    ) -> Verdict:
+        """Evaluate a CPS handoff without consuming the agent-facing tool quota.
+
+        CPS used runner-owned attempt evaluation before the formal tools were
+        introduced. Keep that policy on an independently bounded broker lane
+        so ``evaluate.py`` has the same per-task allowance in every cell.
+        """
+
+        return self._evaluate_diagnostic(
+            task,
+            source,
+            trusted_root=trusted_root,
+            scope_id=scope_id,
+            actor_id=actor_id,
+            episode=episode,
+            lane="cps_handoff",
+            call_counter="cps_handoff_evaluate_calls",
+            backend_counter="cps_handoff_backend_jobs",
+            budget_label="CPS handoff",
+        )
+
+    def _evaluate_diagnostic(
+        self,
+        task: Task,
+        source: Path,
+        *,
+        trusted_root: Path,
+        scope_id: str,
+        actor_id: str,
+        episode: int,
+        lane: str,
+        call_counter: str,
+        backend_counter: str,
+        budget_label: str,
+    ) -> Verdict:
         started = time.monotonic()
-        call_number = self._increment(task.slug, "evaluate_calls")
+        call_number = self._increment(task.slug, call_counter)
         if call_number > self.config.formal_tools_evaluate_calls_per_task:
             verdict = Verdict(
                 task.slug,
                 "BUDGET_EXHAUSTED",
                 0.0,
                 time.monotonic() - started,
-                {"reason": "agent-local evaluate call budget exhausted", "call_number": call_number},
+                {"reason": f"{budget_label} evaluate call budget exhausted", "call_number": call_number},
             )
-            self._log_evaluation("agent_local", verdict, actor_id=actor_id, episode=episode, cache_hit=False)
+            self._log_evaluation(lane, verdict, actor_id=actor_id, episode=episode, cache_hit=False)
             return verdict
         try:
             snapshot = self.snapshot_store.capture(
@@ -358,7 +423,7 @@ class EvaluatorBroker:
                 time.monotonic() - started,
                 {"reason": sanitize_public_text(str(exc), limit=400), "call_number": call_number},
             )
-            self._log_evaluation("agent_local", verdict, actor_id=actor_id, episode=episode, cache_hit=False)
+            self._log_evaluation(lane, verdict, actor_id=actor_id, episode=episode, cache_hit=False)
             return verdict
         try:
             candidate_text = snapshot.payload.decode("utf-8")
@@ -375,7 +440,7 @@ class EvaluatorBroker:
                 },
                 error=sanitize_public_text(str(exc), limit=400),
             )
-            self._log_evaluation("agent_local", verdict, actor_id=actor_id, episode=episode, cache_hit=False)
+            self._log_evaluation(lane, verdict, actor_id=actor_id, episode=episode, cache_hit=False)
             return verdict
         contract_error = _local_contract_error(task, candidate_text, task.baseline_code)
         if contract_error:
@@ -390,7 +455,7 @@ class EvaluatorBroker:
                     "call_number": call_number,
                 },
             )
-            self._log_evaluation("agent_local", verdict, actor_id=actor_id, episode=episode, cache_hit=False)
+            self._log_evaluation(lane, verdict, actor_id=actor_id, episode=episode, cache_hit=False)
             return verdict
         if time.monotonic() >= self.local_admission_deadline:
             verdict = Verdict(
@@ -404,20 +469,20 @@ class EvaluatorBroker:
                     "call_number": call_number,
                 },
             )
-            self._log_evaluation("agent_local", verdict, actor_id=actor_id, episode=episode, cache_hit=False)
+            self._log_evaluation(lane, verdict, actor_id=actor_id, episode=episode, cache_hit=False)
             return verdict
-        key = ("agent_local", scope_id, task.slug, snapshot.sha256)
+        key = (lane, scope_id, task.slug, snapshot.sha256)
         with self._state_lock:
             cached = self._evaluation_cache.get(key)
         if cached is not None:
             verdict = _clone_verdict(cached)
             verdict.elapsed_seconds = time.monotonic() - started
             verdict.response.update({"cache_hit": True, "call_number": call_number})
-            self._log_evaluation("agent_local", verdict, actor_id=actor_id, episode=episode, cache_hit=True)
+            self._log_evaluation(lane, verdict, actor_id=actor_id, episode=episode, cache_hit=True)
             return verdict
         if not self._budget_available(
             task.slug,
-            "evaluate_backend_jobs",
+            backend_counter,
             self.config.formal_tools_evaluate_backend_jobs_per_task,
         ):
             verdict = Verdict(
@@ -426,12 +491,12 @@ class EvaluatorBroker:
                 0.0,
                 time.monotonic() - started,
                 {
-                    "reason": "agent-local evaluator backend-job budget exhausted",
+                    "reason": f"{budget_label} evaluator backend-job budget exhausted",
                     "candidate_sha256": snapshot.sha256,
                     "call_number": call_number,
                 },
             )
-            self._log_evaluation("agent_local", verdict, actor_id=actor_id, episode=episode, cache_hit=False)
+            self._log_evaluation(lane, verdict, actor_id=actor_id, episode=episode, cache_hit=False)
             return verdict
         backend_number: int | None = None
         call_context: dict[str, Any] | None = None
@@ -441,12 +506,12 @@ class EvaluatorBroker:
         )
         try:
             with self._admission.acquire(
-                "agent_local",
+                lane,
                 deadline=min(self.local_admission_deadline, call_deadline),
             ) as waited_ms:
                 backend_number = self._reserve_budget(
                     task.slug,
-                    "evaluate_backend_jobs",
+                    backend_counter,
                     self.config.formal_tools_evaluate_backend_jobs_per_task,
                 )
                 if backend_number is None:
@@ -456,14 +521,14 @@ class EvaluatorBroker:
                         0.0,
                         time.monotonic() - started,
                         {
-                            "reason": "agent-local evaluator backend-job budget exhausted",
+                            "reason": f"{budget_label} evaluator backend-job budget exhausted",
                             "candidate_sha256": snapshot.sha256,
                             "call_number": call_number,
                         },
                     )
                 else:
                     call_context = {
-                        "lane": "agent_local",
+                        "lane": lane,
                         "task_id": task.slug,
                         "candidate_sha256": snapshot.sha256,
                         "submitted_jobs": 0,
@@ -490,7 +555,7 @@ class EvaluatorBroker:
         ):
             self._release_budget(
                 task.slug,
-                "evaluate_backend_jobs",
+                backend_counter,
                 serial=backend_number,
             )
             backend_number = None
@@ -500,7 +565,7 @@ class EvaluatorBroker:
         verdict.response.update(
             {
                 "candidate_sha256": snapshot.sha256,
-                "lane": "agent_local",
+                "lane": lane,
                 "authority": "diagnostic_only",
                 "official_score_eligible": False,
                 "diagnostic_score": diagnostic_score,
@@ -522,14 +587,14 @@ class EvaluatorBroker:
                 self._evaluation_cache[key] = _clone_verdict(verdict)
         self._journal(
             "evaluation_complete",
-            lane="agent_local",
+            lane=lane,
             task_id=task.slug,
             binding_id=scope_id,
             candidate_sha256=snapshot.sha256,
             cache_eligible=cache_eligible,
             verdict=verdict.as_dict(),
         )
-        self._log_evaluation("agent_local", verdict, actor_id=actor_id, episode=episode, cache_hit=False)
+        self._log_evaluation(lane, verdict, actor_id=actor_id, episode=episode, cache_hit=False)
         return verdict
 
     def evaluate_official(
@@ -627,6 +692,30 @@ class EvaluatorBroker:
 
         snapshot = self.snapshot_store.load(task_id=task_id, sha256=sha256)
         atomic_write_bytes(destination, snapshot.payload, mode=0o600)
+
+    def capture_handoff_candidate(
+        self,
+        task: Task,
+        source: Path,
+        *,
+        trusted_root: Path,
+    ) -> CandidateSnapshot:
+        """Freeze and locally validate candidate bytes before CPS selection."""
+
+        snapshot = self.snapshot_store.capture(
+            task_id=task.slug,
+            source=source,
+            trusted_root=trusted_root,
+            captured_at_monotonic=time.monotonic(),
+        )
+        try:
+            candidate_text = snapshot.payload.decode("utf-8")
+        except UnicodeError as exc:
+            raise BrokerError("candidate is not valid UTF-8") from exc
+        contract_error = _local_contract_error(task, candidate_text, task.baseline_code)
+        if contract_error:
+            raise BrokerError(contract_error)
+        return snapshot
 
     def formal_query(self, binding: WorkerBinding, request: Mapping[str, Any]) -> dict[str, Any]:
         started = time.monotonic()
@@ -1155,7 +1244,7 @@ class EvaluatorBroker:
                 if lane and binding_id and sha and task_id:
                     if lane == "official" or row.get("cache_eligible") is not False:
                         self._evaluation_cache[(lane, binding_id, task_id, sha)] = verdict
-                    if lane == "agent_local" and verdict.status == "PROVED":
+                    if lane in {"agent_local", "cps_handoff"} and verdict.status == "PROVED":
                         try:
                             snapshot = self.snapshot_store.load(
                                 task_id=task_id,

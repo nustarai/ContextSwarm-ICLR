@@ -22,6 +22,7 @@ from contextswarm_mini.runner import (
     _freeze_closeout_candidates,
     _mock_result,
     _write_final,
+    _select_candidate_sha,
     load_tasks,
     run_experiment,
 )
@@ -110,6 +111,121 @@ class _CancelledEvaluator(_SlowEvaluator):
 
 
 class CloseoutLifecycleTests(unittest.TestCase):
+    def test_context_piece_rejects_abbreviated_body_file_option(self) -> None:
+        with patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                context_piece_main(
+                    ["create", "--title", "leak", "--body-=/etc/passwd"]
+                )
+
+    def test_candidate_registry_restores_strongest_after_pending_resolves(self) -> None:
+        baseline = Verdict(
+            "task",
+            "BASELINE_CANDIDATE",
+            0.0,
+            0.0,
+            {"candidate_sha256": "baseline"},
+        )
+        old_fail = Verdict(
+            "task",
+            "VERIFY_FAIL",
+            0.0,
+            0.0,
+            {"candidate_sha256": "old"},
+        )
+        latest_pending = Verdict(
+            "task",
+            "UNEVALUATED_CANDIDATE",
+            0.0,
+            0.0,
+            {"candidate_sha256": "latest"},
+        )
+        latest_fail = Verdict(
+            "task",
+            "VERIFY_FAIL",
+            0.0,
+            0.0,
+            {"candidate_sha256": "latest"},
+        )
+        old_proved = Verdict(
+            "task",
+            "PROVED",
+            0.0,
+            0.0,
+            {"candidate_sha256": "old"},
+        )
+
+        old_compiles = Verdict(
+            "task",
+            "COMPILES_WITH_SORRY",
+            0.0,
+            0.0,
+            {"candidate_sha256": "old"},
+        )
+        verdicts = {"baseline": baseline, "old": old_compiles, "latest": latest_pending}
+        order = {"baseline": 0, "old": 1, "latest": 2}
+
+        self.assertEqual(_select_candidate_sha(verdicts, order), "latest")
+        verdicts["latest"] = latest_fail
+        self.assertEqual(_select_candidate_sha(verdicts, order), "old")
+        verdicts["latest"] = Verdict(
+            "task",
+            "LOCAL_REJECTED",
+            0.0,
+            0.0,
+            {"candidate_sha256": "latest"},
+        )
+        self.assertEqual(_select_candidate_sha(verdicts, order), "old")
+        verdicts["old"] = old_proved
+        verdicts["latest"] = latest_pending
+        self.assertEqual(_select_candidate_sha(verdicts, order), "old")
+        verdicts["old"] = old_fail
+        self.assertEqual(_select_candidate_sha(verdicts, order), "latest")
+
+    def test_candidate_selection_is_independent_of_verdict_receipt_order(self) -> None:
+        baseline = Verdict(
+            "task",
+            "BASELINE_CANDIDATE",
+            0.0,
+            0.0,
+            {"candidate_sha256": "baseline"},
+        )
+        pending = {
+            sha: Verdict(
+                "task",
+                "UNEVALUATED_CANDIDATE",
+                0.0,
+                0.0,
+                {"candidate_sha256": sha},
+            )
+            for sha in ("first", "second")
+        }
+        receipts = {
+            "first": Verdict(
+                "task",
+                "VERIFY_FAIL",
+                0.0,
+                0.0,
+                {"candidate_sha256": "first"},
+            ),
+            "second": Verdict(
+                "task",
+                "COMPILES_WITH_SORRY",
+                0.0,
+                0.0,
+                {"candidate_sha256": "second"},
+            ),
+        }
+        order = {"baseline": 0, "first": 1, "second": 2}
+        selections = []
+        for receipt_order in (("first", "second"), ("second", "first")):
+            verdicts = {"baseline": baseline, **pending}
+            for sha in receipt_order:
+                verdicts[sha] = receipts[sha]
+            selections.append(_select_candidate_sha(verdicts, order))
+
+        self.assertEqual(selections, ["second", "second"])
+
     def test_final_fills_missing_official_rows_without_shrinking_max_score(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -22,7 +22,7 @@ from contextswarm_mini.evaluator import (
     _is_proved,
     normalize_base_url,
 )
-from contextswarm_mini.runner import load_tasks, run_experiment
+from contextswarm_mini.runner import _mock_result, load_tasks, run_experiment
 from contextswarm_mini.pi_agent import (
     PiAgent,
     _event_text,
@@ -185,6 +185,56 @@ class MiniRuntimeTests(unittest.TestCase):
                     len(list((run_dir / "workers").rglob("formal_query"))),
                     task_count,
                 )
+
+    def test_disabling_formal_tools_stages_no_worker_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output_root = Path(temporary)
+            config = replace(
+                load_config("configs/smoke.toml", ROOT),
+                formal_tools_enabled=False,
+                max_tasks=1,
+                max_parallel=1,
+                initial_agents_per_task=1,
+                max_attempts_per_task=1,
+                time_limit_seconds=1,
+            )
+
+            def tampering_mock(agent_id: str, task_id: str, episode: int):
+                best = next(
+                    output_root.glob(f"*/workers/{task_id}/best/result.lean")
+                )
+                best.write_text("tampered outside the registry\n", encoding="utf-8")
+                return _mock_result(agent_id, task_id, episode)
+
+            with patch("contextswarm_mini.runner._mock_result", tampering_mock):
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=True,
+                    output_override=output_root,
+                )
+
+            workers = run_dir / "workers"
+            self.assertEqual(list(workers.rglob("evaluate.py")), [])
+            self.assertEqual(list(workers.rglob("formal_query")), [])
+            self.assertEqual(list(workers.rglob("PUBLIC_FILES.md")), [])
+            journal = (run_dir / ".broker_private" / "journal.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn('"event": "worker_registered"', journal)
+            agent = PiAgent(config)
+            guard = str(config.resolve_runtime_path(config.pi_guard_extension))
+            command = agent.command()
+            self.assertIn(guard, command)
+            worker = next((workers / "imo2024_p1" / "agents").iterdir())
+            environment = agent.environment(
+                task_id="imo2024_p1",
+                actor_id="guard-check",
+                workdir=worker,
+            )
+            self.assertEqual(environment["CONTEXTSWARM_WORKER_GUARD"], "1")
+            task = load_tasks(config)[0]
+            frozen = run_dir / "closeout_candidates" / task.slug / "result.lean"
+            self.assertEqual(frozen.read_text(encoding="utf-8"), task.baseline_code)
 
     def test_baseline_child_environment_drops_stale_cps_capabilities(self) -> None:
         stale = {

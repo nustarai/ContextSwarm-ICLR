@@ -28,17 +28,23 @@ def build_task_prompt(
     agent_id: str,
     episode: int,
     communication_enabled: bool,
+    formal_tools_enabled: bool = True,
     digest: str = "",
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
+    capability_instructions = (
+        "PUBLIC_FILES.md lists the complete public file and capability surface "
+        "for this task."
+        if formal_tools_enabled
+        else "No formal-tool helper surface is enabled for this run."
+    )
     return f"""You are worker {agent_id}, episode {episode}, in a bounded formal-proof experiment.
 
 Task: {task.slug}
 Workspace: {task_workspace}
 The public statement is in problem.md. The immutable starting skeleton is in baseline/.
 Write your candidate proof only to result.lean and preserve the theorem statement,
-imports, namespace, and source contract. PUBLIC_FILES.md lists the complete public
-file and capability surface for this task.
+imports, namespace, and source contract. {capability_instructions}
 
 {_communication_instructions(communication_enabled)}
 
@@ -52,8 +58,19 @@ concrete candidate, and leave the best candidate in result.lean before ending.
 """
 
 
-def build_mono_prompt(tasks: Iterable[Task], *, workspace: str, communication_enabled: bool) -> str:
+def build_mono_prompt(
+    tasks: Iterable[Task],
+    *,
+    workspace: str,
+    communication_enabled: bool,
+    formal_tools_enabled: bool = True,
+) -> str:
     task_lines = "\n".join(f"- {task.slug}: tasks/{task.slug}/" for task in tasks)
+    capability_instructions = (
+        "Each task directory has a PUBLIC_FILES.md capability manifest."
+        if formal_tools_enabled
+        else "No formal-tool helper surface is enabled for this run."
+    )
     return f"""You are the Mono baseline worker for a fixed MathOlympiadBench latest12 bundle.
 
 One Pi session must work through the following task directories serially:
@@ -63,7 +80,7 @@ For each task, read its problem.md and baseline/*.lean, then write the candidate
 tasks/<slug>/result.lean (the runner also maintains the aggregate result.json bundle).
 Do not modify the source statement or baseline. The runner
 evaluates every candidate after this session and counts only canonical PROVED verdicts.
-Each task directory has a PUBLIC_FILES.md capability manifest.
+{capability_instructions}
 
 {_communication_instructions(communication_enabled)}
 
