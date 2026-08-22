@@ -105,7 +105,7 @@ def _finite_number(value: Any, field: str, *, nonnegative: bool = True) -> float
 def _canonical_sha256(value: Any) -> str:
     payload = json.dumps(
         value,
-        ensure_ascii=True,
+        ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -209,14 +209,27 @@ def _validate_contract(contract: Mapping[str, Any], summary: Mapping[str, Any]) 
     model = _contract_value(contract, "model")
     task_order = _contract_value(contract, "tasks", "task_order", "ordered_task_ids")
     evaluator = _contract_value(contract, "evaluator", "evaluator_contract", "judge_contract")
+    dataset = _contract_value(contract, "dataset", "dataset_identity")
+    selector_config = _contract_value(contract, "selector_config_sha256", "selector.config_sha256", "selection.selection_config_id")
+    inference = _contract_value(contract, "inference_settings", "inference")
+    runtime_limits = _contract_value(contract, "runtime_limits", "effective_runtime_limits")
     horizon = _contract_value(contract, "horizon_seconds", "horizon")
     capacity = _contract_value(contract, "total_capacity", "capacity", "cps_capacity")
     initial = _contract_value(contract, "initial_allocation", "initial_assignment", "initial_pool")
     transfer = _contract_value(contract, "candidate_transfer", "candidate_solution_transfer")
     stopping = _contract_value(contract, "stopping", "stopping_rule")
+    communication = _contract_value(contract, "communication", "communication_mode")
     direct = _contract_value(contract, "direct_messages", "direct_messages_enabled", "direct_message", "communication.direct_messages")
     if not isinstance(model, str) or not model or not isinstance(evaluator, (str, Mapping)) or not evaluator:
         raise ValueError("model and evaluator contracts must be non-empty")
+    if not isinstance(dataset, (str, Mapping)) or not dataset:
+        raise ValueError("dataset contract must be non-empty")
+    if not isinstance(selector_config, str) or not selector_config:
+        raise ValueError("selector configuration identity must be non-empty")
+    if not isinstance(inference, Mapping) or not isinstance(runtime_limits, Mapping):
+        raise ValueError("inference settings and runtime limits must be objects")
+    if not isinstance(communication, (str, Mapping)) or not communication:
+        raise ValueError("communication contract must be non-empty")
     if not isinstance(task_order, (list, tuple)) or list(task_order) != list(_task_order(summary)):
         raise ValueError("comparison contract task order mismatch")
     if horizon != summary["horizon_seconds"] or capacity != summary["total_capacity"] or initial != summary["initial_allocation"]:

@@ -10,16 +10,21 @@ from scripts.audit_figure4 import POLICIES, SUMMARY_SCHEMA, _canonical_sha256, a
 
 TASKS = ["task-a", "task-b"]
 CONTRACT = {
+    "dataset": "matholympiadbench",
     "selector_identity": "selector-v1",
+    "selector_config_sha256": "b" * 64,
     "selector_visibility": "project_shared",
     "model": "paper-model",
     "tasks": TASKS,
     "evaluator": {"kind": "judge", "profile": "formal"},
+    "inference_settings": {"thinking": "max"},
+    "runtime_limits": {"pi_timeout_seconds": 60},
     "horizon_seconds": 60,
     "total_capacity": 4,
     "initial_allocation": {"task-a": 2, "task-b": 2},
     "candidate_transfer": False,
     "stopping": "full_score_or_horizon",
+    "communication": "blackboard",
     "direct_messages": False,
 }
 
