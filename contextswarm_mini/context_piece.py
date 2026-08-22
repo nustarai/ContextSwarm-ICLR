@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 from .cps import CPSStore
 
@@ -34,6 +35,19 @@ def _actors() -> list[dict[str, object]]:
     except (OSError, json.JSONDecodeError):
         return []
     return payload if isinstance(payload, list) else []
+
+
+def _require_open_horizon() -> int | None:
+    raw = os.environ.get("CONTEXTSWARM_HORIZON_EPOCH_MS", "").strip()
+    if not raw:
+        return None
+    try:
+        deadline_epoch_ms = int(raw)
+    except ValueError as exc:
+        raise RuntimeError("invalid CPS communication horizon") from exc
+    if int(time.time() * 1_000) >= deadline_epoch_ms:
+        raise RuntimeError("CPS communication horizon has elapsed")
+    return deadline_epoch_ms
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -71,6 +85,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        deadline_epoch_ms = _require_open_horizon()
         store, task, actor = _runtime()
         if args.command == "actor":
             roster = _actors()
@@ -98,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
                 title=args.title,
                 body=body,
                 tags=args.tag,
+                deadline_epoch_ms=deadline_epoch_ms,
             )
         elif args.command == "message":
             if args.message_command == "send":
@@ -106,11 +122,18 @@ def main(argv: list[str] | None = None) -> int:
                     sender=actor,
                     recipient=args.to,
                     body=args.body,
+                    deadline_epoch_ms=deadline_epoch_ms,
                 )
             elif args.message_command == "inbox":
                 result = store.inbox(task_id=task, recipient=actor, limit=args.limit)
             else:
-                result = {"acked": store.ack_message(args.message_id, actor)}
+                result = {
+                    "acked": store.ack_message(
+                        args.message_id,
+                        actor,
+                        deadline_epoch_ms=deadline_epoch_ms,
+                    )
+                }
         else:  # pragma: no cover - argparse enforces this branch away.
             raise ValueError(f"unknown command {args.command}")
     except (OSError, ValueError, RuntimeError) as exc:
