@@ -192,6 +192,44 @@ class _SnapshotStore:
         return page
 
 
+class _ContradictorySnapshotStore:
+    def __init__(self):
+        self.calls = []
+
+    def read_allocation_projection_snapshot(
+        self, task_ids, *, as_of_watermark, cursor, limit
+    ):
+        self.calls.append((tuple(task_ids), as_of_watermark, cursor, limit))
+        if not cursor:
+            return TraceProjectionSnapshotPage(
+                records=(
+                    {
+                        "sequence": 1,
+                        "record_id": "same-id",
+                        "task_id": "task-a",
+                        "kind": "frontier",
+                        "lineage_id": "lineage-a",
+                    },
+                ),
+                trace_watermark="W",
+                next_cursor="c1",
+                complete=False,
+            )
+        return TraceProjectionSnapshotPage(
+            records=(
+                {
+                    "sequence": 1,
+                    "record_id": "same-id",
+                    "task_id": "task-a",
+                    "kind": "frontier",
+                    "lineage_id": "lineage-b",
+                },
+            ),
+            trace_watermark="W",
+            complete=True,
+        )
+
+
 class AllocationTraceBridgeTests(unittest.TestCase):
     def test_only_trace_state_and_llm_scheduler_may_read_trace(self) -> None:
         self.assertFalse(policy_reads_trace("uniform_refill"))
@@ -390,6 +428,13 @@ class AllocationTraceBridgeTests(unittest.TestCase):
         )
         view = TraceProjectionBridge().read(["task-a"], store=unsafe_legacy)
         self.assertEqual(view.source, "zero")
+
+    def test_contradictory_replay_inside_pinned_snapshot_fails_closed(self) -> None:
+        source = _ContradictorySnapshotStore()
+        view = TraceProjectionBridge().read(["task-a"], store=source)
+        self.assertEqual(view.source, "zero")
+        self.assertTrue(view.for_task("task-a").is_zero)
+        self.assertTrue(view.fallback_reason.startswith("projection_unavailable:ValueError"))
 
     def test_selection_runtime_adapter_is_explicit_and_rejects_cursor_replay(self) -> None:
         class Runtime:

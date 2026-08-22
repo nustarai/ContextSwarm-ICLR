@@ -538,6 +538,50 @@ def _record_evidence_id(record: Any) -> str:
     return str(getattr(record, "evidence_id", "") or "").strip()
 
 
+def _projection_record(record: Any) -> TraceProjectionRecord:
+    """Normalize a source row without retaining its unbounded payload.
+
+    Snapshot sources are untrusted adapters.  Normalizing at the bridge
+    boundary gives duplicate/cursor validation the same bounded identity
+    semantics as the projection adapter and prevents a source-specific row
+    object from leaking into later artifact code.
+    """
+
+    if isinstance(record, TraceProjectionRecord):
+        return record
+    if isinstance(record, Mapping):
+        return TraceProjectionRecord.from_mapping(record)
+    raise TypeError("trace projection snapshot records must be records or mappings")
+
+
+def _projection_record_identity(record: TraceProjectionRecord) -> tuple[str, ...]:
+    """Return an identity scoped to task/source for replay validation."""
+
+    if record.record_id:
+        return ("id", record.task_id, record.source, record.record_id)
+    return tuple(record.canonical_identity)
+
+
+def _validate_snapshot_records(records: Sequence[Any]) -> None:
+    """Reject contradictory duplicate rows inside one pinned snapshot.
+
+    Exact replay of a row is harmless and is deduplicated by the projection
+    adapter.  A stable record identity carrying different fields is not
+    harmless: accepting whichever page happened to arrive first makes the
+    allocation state depend on pagination/retry order.  Such a source cannot
+    provide a causal snapshot and must fail closed.
+    """
+
+    seen: dict[tuple[str, ...], TraceProjectionRecord] = {}
+    for raw in records:
+        record = _projection_record(raw)
+        identity = _projection_record_identity(record)
+        previous = seen.get(identity)
+        if previous is not None and previous != record:
+            raise ValueError("snapshot contains contradictory duplicate records")
+        seen[identity] = record
+
+
 def _record_task_id(record: Any) -> str:
     if isinstance(record, Mapping):
         return str(record.get("task_id") or "").strip()
@@ -738,6 +782,11 @@ class TraceProjectionBridge:
                     records.extend(page.records)
                     if len(records) > self.limits.max_records:
                         raise OverflowError("snapshot projection exceeds its record bound")
+                    # A page may be replayed after a transient transport
+                    # retry.  Exact replay is deduplicated later, but a
+                    # same-ID row with changed topology would make the
+                    # materialized state depend on page order; reject it.
+                    _validate_snapshot_records(records)
                     if page.complete:
                         if page.next_cursor:
                             raise ValueError("complete snapshot returned a cursor")
@@ -778,6 +827,7 @@ class TraceProjectionBridge:
                 )
                 if not _legacy_batch_is_complete(raw_batch):
                     raise ValueError("legacy projection source lacks a complete pinned snapshot")
+                _validate_snapshot_records(raw_batch.records)
                 batch = _project_complete_records(
                     self.adapter,
                     ordered,
