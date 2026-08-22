@@ -40,6 +40,10 @@ REGISTRY_ORDER = POLICIES
 DEFAULT_BOOTSTRAP_DRAWS = 10_000
 DEFAULT_BOOTSTRAP_SEED = 39039
 DEFAULT_TARGET_K = 6
+# Comparisons in the frozen numeric guardrails use a tiny absolute tolerance
+# for serialization/rounding noise.  Keep this explicit and shared by the
+# per-repeat and aggregate checks.
+COMPARISON_EPSILON = 1e-12
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE_KEY = re.compile(
     r"(?:api[_-]?key|access[_-]?token|secret|password|credential|authorization|"

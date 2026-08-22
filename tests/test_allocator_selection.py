@@ -32,7 +32,10 @@ def _contract(repeat_id: str, seed: int) -> dict[str, object]:
         "paired_repeat_id": repeat_id,
         "paired_seed": seed,
         "selector_identity": "nustigmergy-v1",
-        "selector_config_sha256": "s" * 64,
+        # Selector identity is a canonical SHA-256 digest in the paired
+        # comparison contract.  Keep the fixture deterministic while using
+        # valid lowercase hexadecimal rather than a placeholder character.
+        "selector_config_sha256": "a" * 64,
         "selector_visibility": "project_shared",
         "model": "paper-model",
         "inference_settings": {"thinking": "max", "temperature": 0},
