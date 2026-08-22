@@ -76,6 +76,46 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(dict(task_decision.scores), dict(trace_decision.scores))
         self.assertEqual(dict(trace_decision.trace_increments), {"a": 0.0, "b": 0.0})
 
+    def test_canonical_policies_fail_closed_at_capacity_and_horizon(self) -> None:
+        # Deterministic arms must not manufacture a task when no physical
+        # solver slot remains.  The LLM arm also must not call its invoker.
+        calls: list[str] = []
+        policies = (
+            UniformRefillAllocationPolicy(),
+            TaskStateAllocationPolicy(),
+            TraceStateAllocationPolicy(),
+            ReadOnlyLLMSchedulerPolicy(
+                lambda _snapshot, prompt: calls.append(prompt)
+                or LLMSchedulerResponse("{}")
+            ),
+        )
+        full = snapshot(task("a", active=1), free=0)
+        for policy in policies:
+            with self.subTest(policy=type(policy).__name__, condition="capacity"):
+                decision = policy.choose(full)
+                self.assertEqual(decision.selected_task_id, "")
+        self.assertEqual(calls, [])
+
+        # A scheduler-owned reservation permits the LLM arm to use a full
+        # physical pool, but it cannot extend an exhausted run horizon.
+        horizon = AllocationStateSnapshot(
+            "d-horizon",
+            1,
+            10.0,
+            0.0,
+            2,
+            1,
+            1,
+            0,
+            (task("a", active=1),),
+            owned_scheduler_reservation_slots=1,
+        )
+        for policy in policies:
+            with self.subTest(policy=type(policy).__name__, condition="horizon"):
+                decision = policy.choose(horizon)
+                self.assertEqual(decision.selected_task_id, "")
+        self.assertEqual(calls, [])
+
     def test_state_id_is_reproducible_and_tamper_evident(self) -> None:
         snap = snapshot(task("a"), task("b"))
         public = snap.public_dict()

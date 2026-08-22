@@ -1045,12 +1045,45 @@ def _highest_score(scores: Mapping[str, float]) -> str:
     return min(scores, key=lambda task_id: (-scores[task_id], task_id)) if scores else ""
 
 
+def _admission_capacity_available(
+    snapshot: AllocationStateSnapshot,
+    *,
+    allow_owned_scheduler_reservation: bool = False,
+) -> bool:
+    """Return whether a policy may request one more solver admission.
+
+    ``free_slots`` is physical solver capacity.  The LLM scheduler may use
+    ``owned_scheduler_reservation_slots`` when its invocation already holds
+    the one reserved slot, but a reservation never extends the fixed horizon.
+    Keeping this gate in the pure policy layer prevents callers that bypass the
+    runner from manufacturing assignments after capacity or time is exhausted.
+    """
+
+    if snapshot.remaining_seconds <= 0.0:
+        return False
+    if snapshot.free_slots > 0:
+        return True
+    return bool(
+        allow_owned_scheduler_reservation
+        and snapshot.owned_scheduler_reservation_slots > 0
+    )
+
+
 class UniformRefillAllocationPolicy:
     """Refill the eligible task with the fewest current active leases."""
 
     name = POLICY_UNIFORM_REFILL
 
     def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
+        if not _admission_capacity_available(snapshot):
+            return AllocationDecision(
+                decision_id=snapshot.decision_id,
+                state_id=snapshot.state_id,
+                decision_index=snapshot.decision_index,
+                policy=self.name,
+                selected_task_id="",
+                reason="no eligible admission capacity",
+            )
         active = {task.task_id: float(task.active_allocations) for task in snapshot.eligible_tasks}
         selected = min(active, key=lambda task_id: (active[task_id], task_id)) if active else ""
         return AllocationDecision(
@@ -1071,6 +1104,15 @@ class TaskStateAllocationPolicy:
         self.scorer = scorer or TaskStateScorer()
 
     def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
+        if not _admission_capacity_available(snapshot):
+            return AllocationDecision(
+                decision_id=snapshot.decision_id,
+                state_id=snapshot.state_id,
+                decision_index=snapshot.decision_index,
+                policy=self.name,
+                selected_task_id="",
+                reason="no eligible admission capacity",
+            )
         scores = self.scorer.score_snapshot(snapshot)
         selected = _highest_score(scores)
         return AllocationDecision(
@@ -1092,6 +1134,15 @@ class TraceStateAllocationPolicy:
         self.scorer = scorer or TraceStateScorer()
 
     def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
+        if not _admission_capacity_available(snapshot):
+            return AllocationDecision(
+                decision_id=snapshot.decision_id,
+                state_id=snapshot.state_id,
+                decision_index=snapshot.decision_index,
+                policy=self.name,
+                selected_task_id="",
+                reason="no eligible admission capacity",
+            )
         task_scores = self.scorer.task_scorer.score_snapshot(snapshot)
         increments = self.scorer.increments(snapshot)
         scores = {task_id: task_scores[task_id] + increments[task_id] for task_id in task_scores}
@@ -1305,9 +1356,9 @@ class ReadOnlyLLMSchedulerPolicy:
         )
 
     def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
-        if not snapshot.eligible_task_ids or (
-            snapshot.free_slots == 0
-            and snapshot.owned_scheduler_reservation_slots == 0
+        if not snapshot.eligible_task_ids or not _admission_capacity_available(
+            snapshot,
+            allow_owned_scheduler_reservation=True,
         ):
             return AllocationDecision(
                 decision_id=snapshot.decision_id,
