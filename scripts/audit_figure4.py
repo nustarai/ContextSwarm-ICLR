@@ -208,7 +208,7 @@ def _validate_contract(contract: Mapping[str, Any], summary: Mapping[str, Any]) 
         raise ValueError("selector visibility must be project_shared")
     model = _contract_value(contract, "model")
     task_order = _contract_value(contract, "tasks", "task_order", "ordered_task_ids")
-    evaluator = _contract_value(contract, "evaluator", "evaluator_contract", "judge_contract")
+    evaluator = _contract_value(contract, "evaluator", "evaluator_contract", "evaluator_contract_sha256", "judge_contract")
     dataset = _contract_value(contract, "dataset", "dataset_identity")
     selector_config = _contract_value(contract, "selector_config_sha256", "selector.config_sha256", "selection.selection_config_id")
     inference = _contract_value(contract, "inference_settings", "inference")
@@ -219,6 +219,8 @@ def _validate_contract(contract: Mapping[str, Any], summary: Mapping[str, Any]) 
     transfer = _contract_value(contract, "candidate_transfer", "candidate_solution_transfer")
     stopping = _contract_value(contract, "stopping", "stopping_rule")
     communication = _contract_value(contract, "communication", "communication_mode")
+    contract_repeat = _contract_value(contract, "paired_repeat_id")
+    contract_seed = _contract_value(contract, "paired_seed")
     direct = _contract_value(contract, "direct_messages", "direct_messages_enabled", "direct_message", "communication.direct_messages")
     if not isinstance(model, str) or not model or not isinstance(evaluator, (str, Mapping)) or not evaluator:
         raise ValueError("model and evaluator contracts must be non-empty")
@@ -230,6 +232,10 @@ def _validate_contract(contract: Mapping[str, Any], summary: Mapping[str, Any]) 
         raise ValueError("inference settings and runtime limits must be objects")
     if not isinstance(communication, (str, Mapping)) or not communication:
         raise ValueError("communication contract must be non-empty")
+    summary_repeat = summary.get("repeat", summary.get("paired_repeat_id"))
+    summary_seed = summary.get("paired_seed", summary.get("seed"))
+    if str(contract_repeat) != str(summary_repeat) or contract_seed != summary_seed:
+        raise ValueError("comparison contract paired identity mismatch")
     if not isinstance(task_order, (list, tuple)) or list(task_order) != list(_task_order(summary)):
         raise ValueError("comparison contract task order mismatch")
     if horizon != summary["horizon_seconds"] or capacity != summary["total_capacity"] or initial != summary["initial_allocation"]:

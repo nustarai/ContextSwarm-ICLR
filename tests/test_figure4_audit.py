@@ -14,6 +14,8 @@ CONTRACT = {
     "selector_identity": "selector-v1",
     "selector_config_sha256": "b" * 64,
     "selector_visibility": "project_shared",
+    "paired_repeat_id": "1",
+    "paired_seed": 7,
     "model": "paper-model",
     "tasks": TASKS,
     "evaluator": {"kind": "judge", "profile": "formal"},
