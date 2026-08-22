@@ -532,6 +532,12 @@ class LeanEvaluator:
                     break
             time.sleep(min(self.poll_interval_seconds, max(0.0, deadline - time.monotonic())))
 
+        # Publish an unresolved timeout before dropping the pending watcher.
+        # This prevents closeout from observing a transient all-zero state
+        # between the two accounting domains.
+        if not settled:
+            self._mark_remote_unsettled()
+
         callbacks: list[Any] = []
         with self._deferred_settlement_lock:
             current_record = self._deferred_settlements.pop(job_id, None)
@@ -541,7 +547,6 @@ class LeanEvaluator:
             # The identity was known, but the bounded watcher still could not
             # prove termination.  At this point fail closed exactly as for an
             # unknown/transport-ambiguous submission.
-            self._mark_remote_unsettled()
             return
         for callback in callbacks:
             try:
