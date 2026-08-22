@@ -76,6 +76,7 @@ _FORMAL_NONCACHEABLE_STATUSES = frozenset(
 _JUDGE_CHECKPOINT_TERMINAL_STATUSES = frozenset(
     {"PROVED", "COMPILES_WITH_SORRY", "VERIFY_FAIL", "LOCAL_REJECTED"}
 )
+_CHECKPOINT_VALUE_UNSET = object()
 
 
 class JudgeBrokerDrainError(RuntimeError):
@@ -718,6 +719,11 @@ class JudgeBroker:
         authoritative_verdict: Verdict | None = None
         evaluator_unsettled_before = 0
         evaluator_call_started = False
+        # Keep the evaluator's raw provenance beside the sanitized public
+        # result.  In particular, ``sanitize_worker_identifier`` deliberately
+        # maps malformed values to ``None``; that must not turn a malformed
+        # remote id into a valid LOCAL_REJECTED checkpoint.
+        raw_judge_job_id: Any = _CHECKPOINT_VALUE_UNSET
         try:
             # Freeze exactly what this capability call submits before waiting
             # for the shared Judge gate.  The worker may continue editing its
@@ -875,6 +881,7 @@ class JudgeBroker:
                     candidate_argument,
                     **evaluator_kwargs,
                 )
+                raw_judge_job_id = verdict.judge_job_id
                 verdict_status = _safe_verdict_status(verdict.status)
                 safe_job_id = sanitize_worker_identifier(verdict.judge_job_id)
                 safe_response = safe_worker_response(verdict.response)
@@ -1097,7 +1104,11 @@ class JudgeBroker:
             judge_job_id=result.get("judge_job_id"),
             cache_reused=result.get("cache_reused") is True,
         )
-        if _valid_judge_checkpoint(result):
+        if _valid_judge_checkpoint(
+            result,
+            raw_judge_job_id=raw_judge_job_id,
+            expected_task_contract_sha256=binding.expected_task_contract_sha256,
+        ):
             with claim.lock:
                 claim.judge_checkpoint_reached = True
         return result
@@ -2529,7 +2540,12 @@ def _safe_verdict_status(value: Any) -> str:
     return {"PASS": "PROVED", "AC": "PROVED", "PASSED": "PROVED"}.get(text, text)
 
 
-def _valid_judge_checkpoint(result: Mapping[str, Any]) -> bool:
+def _valid_judge_checkpoint(
+    result: Mapping[str, Any],
+    *,
+    raw_judge_job_id: Any = _CHECKPOINT_VALUE_UNSET,
+    expected_task_contract_sha256: str | None = None,
+) -> bool:
     """Recognize valid feedback without treating admission as verification."""
 
     if result.get("accepted") is not True:
@@ -2537,17 +2553,27 @@ def _valid_judge_checkpoint(result: Mapping[str, Any]) -> bool:
     status = _safe_verdict_status(result.get("status"))
     if status not in _JUDGE_CHECKPOINT_TERMINAL_STATUSES:
         return False
-    if _safe_hash(result.get("candidate_sha256")) is None or _safe_hash(
-        result.get("task_contract_sha256")
-    ) is None:
+    if _safe_hash(result.get("candidate_sha256")) is None:
         return False
+    contract_hash = _safe_hash(result.get("task_contract_sha256"))
+    if contract_hash is None:
+        return False
+    if expected_task_contract_sha256 is not None:
+        expected_hash = _safe_hash(expected_task_contract_sha256)
+        if expected_hash is None or contract_hash != expected_hash:
+            return False
+    if raw_judge_job_id is _CHECKPOINT_VALUE_UNSET:
+        # Preserve the helper's standalone behavior for callers/tests that
+        # already hold a complete result mapping.  The broker call site passes
+        # the unsanitized Verdict field explicitly.
+        raw_judge_job_id = result.get("judge_job_id")
     if status == "LOCAL_REJECTED":
         # LOCAL_REJECTED is a supervisor-local result and must carry no remote
         # identity at all.  Checking the raw field is intentional: an invalid
         # or empty non-None value must not disappear during sanitization and
         # accidentally satisfy the local-only contract.
-        return result.get("judge_job_id") is None
-    return sanitize_worker_identifier(result.get("judge_job_id")) is not None
+        return raw_judge_job_id is None
+    return sanitize_worker_identifier(raw_judge_job_id) is not None
 
 
 def _safe_finite_float(value: Any) -> float:

@@ -103,6 +103,39 @@ class _SequenceEvaluator(_RecordingEvaluator):
         )
 
 
+class _CheckpointEvaluator(_RecordingEvaluator):
+    """Return one deliberately controlled checkpoint provenance tuple."""
+
+    def __init__(
+        self,
+        status: str,
+        *,
+        judge_job_id: object = None,
+        task_contract_sha256: str = "a" * 64,
+    ) -> None:
+        super().__init__()
+        self.status = status
+        self.judge_job_id = judge_job_id
+        self.task_contract_sha256 = task_contract_sha256
+
+    def probe(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None,
+    ) -> Verdict:
+        self.calls.append((task, candidate, deadline_monotonic))
+        return Verdict(
+            task.slug,
+            self.status,
+            0.0,
+            0.0,
+            task_contract_sha256=self.task_contract_sha256,
+            judge_job_id=self.judge_job_id,  # type: ignore[arg-type]
+        )
+
+
 class _BlockingEvaluator(_RecordingEvaluator):
     def __init__(self) -> None:
         super().__init__()
@@ -366,6 +399,81 @@ def _wait_for_queue_depth(broker: JudgeBroker, depth: int) -> bool:
 
 
 class JudgeBrokerTests(unittest.TestCase):
+    def _run_checkpoint_gate_case(
+        self, evaluator: _CheckpointEvaluator
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof", encoding="utf-8")
+            store = CPSStore(root / "cps.sqlite3")
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=root / "audit.jsonl",
+                min_probe_interval_seconds=0,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="bound-agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3,
+                    cps_store=store,
+                    communication="blackboard",
+                ) as env:
+                    url = env["CONTEXTSWARM_JUDGE_URL"]
+                    checkpoint = _post(url, "judge_check", {})
+                    searched = _post(url, "cps_search", {})
+                    return checkpoint, searched
+            finally:
+                broker.close()
+
+    def test_checkpoint_gate_binds_raw_job_id_and_task_contract(self) -> None:
+        cases = (
+            (
+                "malformed local job id",
+                _CheckpointEvaluator(
+                    "LOCAL_REJECTED",
+                    judge_job_id="bad job id",
+                ),
+                False,
+            ),
+            (
+                "wrong local task contract",
+                _CheckpointEvaluator(
+                    "LOCAL_REJECTED",
+                    task_contract_sha256="b" * 64,
+                ),
+                False,
+            ),
+            (
+                "valid local checkpoint",
+                _CheckpointEvaluator("LOCAL_REJECTED"),
+                True,
+            ),
+            (
+                "valid remote checkpoint",
+                _CheckpointEvaluator(
+                    "VERIFY_FAIL",
+                    judge_job_id="job-1",
+                ),
+                True,
+            ),
+        )
+        for label, evaluator, allowed in cases:
+            with self.subTest(case=label):
+                checkpoint, searched = self._run_checkpoint_gate_case(evaluator)
+                self.assertTrue(checkpoint["accepted"])
+                self.assertEqual(checkpoint["status"], evaluator.status)
+                if allowed:
+                    self.assertTrue(searched["ok"])
+                else:
+                    self.assertEqual(searched["status"], "JUDGE_CHECK_REQUIRED")
+                    self.assertFalse(searched["accepted"])
+
     def test_local_rejected_checkpoint_requires_raw_job_id_to_be_absent(self) -> None:
         base = {
             "accepted": True,
