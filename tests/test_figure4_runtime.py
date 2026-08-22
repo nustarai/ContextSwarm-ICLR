@@ -209,11 +209,27 @@ class Figure4RuntimeTests(unittest.TestCase):
                 "not_admitted_ineligible",
             },
         )
+        if fallback["assigned_agent_id"] is None:
+            # A peer can finish while the provider-error fallback is being
+            # computed.  Global LLM revalidation must reject that now-stale
+            # decision, release its reservation, and enter a fresh decision
+            # iteration instead of forcing the fallback through admission.
+            self.assertEqual(fallback["disposition"], "not_admitted_stale")
+            self.assertTrue(
+                any(
+                    row["disposition"] == "assigned"
+                    and int(row["decision_index"])
+                    > int(fallback["decision_index"])
+                    for row in decisions
+                ),
+                 decisions,
+             )
         scheduler_state = json.loads(
             (run_dir / "elastic_scheduler_state.json").read_text(encoding="utf-8")
         )
         self.assertEqual(scheduler_state["reservation_slots"], 0)
         self.assertEqual(scheduler_state["occupied_slots"], 0)
+        self.assertEqual(scheduler_state.get("reservations", {}), {})
         final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
         self.assertNotIn("runner_or_worker_error", final["health"]["issues"])
         self.assertNotIn("scheduler_reservations_not_released", final["health"]["issues"])
