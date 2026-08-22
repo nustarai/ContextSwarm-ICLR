@@ -7,12 +7,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${CONTEXTSWARM_MINI_IMAGE:-contextswarm-iclr-mini:latest}"
 AISW_BINARY="${CONTEXTSWARM_NUROUTER_BINARY:-${CONTEXTSWARM_AISW_BINARY:-${HOME}/.local/share/contextswarm/aisw-linux-aarch64}}"
 NODE_CONFIG="${CONTEXTSWARM_NUROUTER_NODE_CONFIG:-${CONTEXTSWARM_AISW_NODE_CONFIG:-}}"
 AISW_METADATA="${CONTEXTSWARM_AISW_LAUNCHER_METADATA:-}"
 CODEX_HOME="${CONTEXTSWARM_CODEX_HOME:-}"
-MEMORY="${CONTEXTSWARM_MINI_MEMORY:-16g}"
 PIDS_LIMIT="${CONTEXTSWARM_MINI_PIDS_LIMIT:-768}"
 RUNTIME_TMPFS_SIZE="${CONTEXTSWARM_MINI_RUNTIME_TMPFS_SIZE:-1g}"
 TMP_TMPFS_SIZE="${CONTEXTSWARM_MINI_TMP_TMPFS_SIZE:-2g}"
@@ -67,18 +65,44 @@ if [[ -f "${ROOT_DIR}/${CONFIG}" ]]; then
 else
   CONFIG_PATH="${CONFIG}"
 fi
-CACHE_DISABLED_REQUIRED="$(
-  python3 - "${CONFIG_PATH}" "${ROOT_DIR}" <<'PY'
+if ! RESOLVED_RUNTIME_CONFIG="$(
+  PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 - "${CONFIG_PATH}" "${ROOT_DIR}" <<'PY'
 from pathlib import Path
 import sys
 
-sys.path.insert(0, sys.argv[2])
-from contextswarm_mini.config import load_config
+from contextswarm_mini.config import ConfigError, load_config
 
-config = load_config(Path(sys.argv[1]), Path(sys.argv[2]))
+try:
+    config = load_config(Path(sys.argv[1]), Path(sys.argv[2]))
+except (ConfigError, OSError, ValueError) as exc:
+    print(f"runtime manifest resolution failed: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+print(config.docker_image)
+print(config.docker_memory_mb)
 print("1" if config.lean_require_result_cache_disabled else "0")
 PY
-)"
+)"; then
+  exit 2
+fi
+mapfile -t RESOLVED_RUNTIME_VALUES <<<"${RESOLVED_RUNTIME_CONFIG}"
+if [[ "${#RESOLVED_RUNTIME_VALUES[@]}" -ne 3 ]]; then
+  echo "runtime manifest resolution returned an invalid payload" >&2
+  exit 2
+fi
+
+IMAGE="${CONTEXTSWARM_MINI_IMAGE:-${RESOLVED_RUNTIME_VALUES[0]}}"
+MEMORY="${CONTEXTSWARM_MINI_MEMORY:-${RESOLVED_RUNTIME_VALUES[1]}m}"
+CACHE_DISABLED_REQUIRED="${RESOLVED_RUNTIME_VALUES[2]}"
+if [[ "${#IMAGE}" -gt 512 || ! "${IMAGE}" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$ ]]; then
+  echo "invalid Docker image from manifest or CONTEXTSWARM_MINI_IMAGE" >&2
+  exit 2
+fi
+if [[ "${#MEMORY}" -gt 32 || ! "${MEMORY}" =~ ^[1-9][0-9]*([bBkKmMgG])?$ ]]; then
+  echo "invalid Docker memory from manifest or CONTEXTSWARM_MINI_MEMORY" >&2
+  exit 2
+fi
 
 for numeric_value in "${RUN_UID}" "${RUN_GID}" "${PIDS_LIMIT}"
 do
