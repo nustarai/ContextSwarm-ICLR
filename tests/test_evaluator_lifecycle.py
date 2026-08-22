@@ -8,8 +8,14 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
-from contextswarm_mini.evaluator import LeanEvaluator, _safe_response, _terminal
+from contextswarm_mini.evaluator import (
+    LeanEvaluator,
+    _safe_response,
+    _terminal,
+    safe_worker_response,
+)
 from contextswarm_mini.models import Task
 
 
@@ -18,6 +24,7 @@ class _LifecycleServer:
         self.mode = mode
         self.submitted_at = 0.0
         self.deletes = 0
+        self.get_seen = threading.Event()
         self.post_count = 0
         self.post_payloads: list[dict[str, object]] = []
         owner = self
@@ -97,6 +104,16 @@ class _LifecycleServer:
                             "status": "succeeded",
                             "formal_status": "PROVED",
                             "correct": True,
+                        }
+                    )
+                elif owner.mode == "cache_reused":
+                    self._send(
+                        {
+                            "job_id": "job-cache-hit",
+                            "status": "succeeded",
+                            "formal_status": "PROVED",
+                            "correct": True,
+                            "cache_reused": True,
                         }
                     )
                 elif (
@@ -207,6 +224,7 @@ class _LifecycleServer:
                     self._send({"job_id": "job-1", "status": "queued"})
 
             def do_GET(self) -> None:  # noqa: N802
+                owner.get_seen.set()
                 elapsed = time.monotonic() - owner.submitted_at
                 if owner.mode in {
                     "queued_rejected_then_proved",
@@ -239,6 +257,15 @@ class _LifecycleServer:
                 elif owner.mode == "terminal_without_receipt_job_id":
                     self._send(
                         {
+                            "status": "succeeded",
+                            "formal_status": "PROVED",
+                            "correct": True,
+                        }
+                    )
+                elif owner.mode == "terminal_with_wrong_receipt_job_id":
+                    self._send(
+                        {
+                            "job_id": "job-other",
                             "status": "succeeded",
                             "formal_status": "PROVED",
                             "correct": True,
@@ -363,6 +390,21 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(verdict.response["error_kind"], "memory_limit_exceeded")
         self.assertEqual(verdict.response["queue_wait_ms"], 4)
 
+    def test_remote_cache_reuse_receipt_propagates_to_verdict(self) -> None:
+        for method in ("evaluate", "probe"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                server = _LifecycleServer("cache_reused")
+                with server.running() as url:
+                    evaluator = LeanEvaluator(url, lean_env_id="test")
+                    verdict = getattr(evaluator, method)(
+                        _task(root), self._candidate(root)
+                    )
+
+                self.assertEqual(verdict.status, "PROVED")
+                self.assertTrue(verdict.response["cache_reused"])
+                self.assertTrue(verdict.cache_reused)
+
     def test_horizon_abandonment_cancels_job_and_returns_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -385,6 +427,209 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(verdict.score, 0.0)
         self.assertEqual(server.deletes, 1)
         self.assertTrue(verdict.response["cancel_requested"])
+
+    def test_cancel_reconciles_returned_status_capability_before_success(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.2,
+        )
+        calls: list[tuple[str, str, float]] = []
+
+        def request(
+            method: str,
+            path: str,
+            *_args: object,
+            timeout_seconds: float,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            calls.append((method, path, timeout_seconds))
+            if method == "DELETE":
+                return {
+                    "job_id": "job-1",
+                    "status": "cancel_requested",
+                    "cancel_requested": True,
+                    "status_endpoint": "/settlement/capability?opaque=receipt",
+                }
+            return {
+                "job_id": "job-1",
+                "status": "cancelled",
+                "terminal_reason": "cancelled",
+            }
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={"job_id": "job-1", "status": "running"},
+                cancel_endpoint="/cancel/capability?opaque=cancel",
+            )
+
+        self.assertEqual(calls[0][0:2], ("DELETE", "/cancel/capability?opaque=cancel"))
+        self.assertEqual(calls[1][0], "GET")
+        self.assertTrue(
+            calls[1][1].startswith(
+                "/settlement/capability?opaque=receipt&wait_ms="
+            )
+        )
+        self.assertEqual(
+            summary,
+            {
+                "attempted": True,
+                "succeeded": True,
+                "settled": True,
+                "unconfirmed": False,
+                "failure_category": None,
+            },
+        )
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+
+    def test_cancel_2xx_is_unconfirmed_without_job_bound_terminal_receipt(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.12,
+        )
+        calls: list[tuple[str, str, float]] = []
+
+        def request(
+            method: str,
+            path: str,
+            *_args: object,
+            timeout_seconds: float,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            calls.append((method, path, timeout_seconds))
+            if method == "DELETE":
+                time.sleep(0.07)
+                return {
+                    "job_id": "job-1",
+                    "status": "cancel_requested",
+                    "cancel_requested": True,
+                    "status_endpoint": "/settlement/job-1",
+                }
+            # A terminal receipt for a different job is not authoritative.
+            return {"job_id": "job-other", "status": "cancelled"}
+
+        started = time.monotonic()
+        with patch.object(evaluator, "_request", side_effect=request):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={"job_id": "job-1", "status": "running"},
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(any(method == "GET" for method, _path, _timeout in calls))
+        delete_timeout = calls[0][2]
+        first_get_timeout = next(
+            timeout for method, _path, timeout in calls if method == "GET"
+        )
+        self.assertLess(first_get_timeout, delete_timeout)
+        self.assertLess(elapsed, 0.25)
+        self.assertEqual(
+            summary,
+            {
+                "attempted": True,
+                "succeeded": False,
+                "settled": False,
+                "unconfirmed": True,
+                "failure_category": "cancel_settlement_unconfirmed",
+            },
+        )
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+        self.assertEqual(
+            safe_worker_response({"judge_cancellation": summary})[
+                "judge_cancellation"
+            ],
+            summary,
+        )
+
+    def test_cancel_event_waits_for_bounded_remote_settlement_reconcile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("never_terminal")
+            cancelled = threading.Event()
+            verdicts = []
+            with server.running() as url:
+                evaluator = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    timeout_seconds=5,
+                    poll_interval_seconds=0.01,
+                    cancel_grace_seconds=0.12,
+                )
+                worker = threading.Thread(
+                    target=lambda: verdicts.append(
+                        evaluator.probe_source(
+                            _task(root),
+                            self._candidate(root).read_text(encoding="utf-8"),
+                            deadline_monotonic=time.monotonic() + 2,
+                            cancel_event=cancelled,
+                        )
+                    )
+                )
+                worker.start()
+                self.assertTrue(server.get_seen.wait(timeout=1))
+                cancel_started = time.monotonic()
+                cancelled.set()
+                worker.join(timeout=1)
+                cancel_elapsed = time.monotonic() - cancel_started
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(server.deletes, 1)
+        self.assertGreaterEqual(cancel_elapsed, 0.08)
+        self.assertLess(cancel_elapsed, 0.4)
+        self.assertEqual(verdicts[0].status, "TASK_CANCELLED")
+        self.assertEqual(
+            verdicts[0].response["judge_cancellation"],
+            {
+                "attempted": True,
+                "succeeded": False,
+                "settled": False,
+                "unconfirmed": True,
+                "failure_category": "cancel_settlement_unconfirmed",
+            },
+        )
+
+    def test_global_latch_wakes_and_settles_an_inflight_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("cancel_terminal")
+            verdicts = []
+            with server.running() as url:
+                evaluator = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    timeout_seconds=5,
+                    poll_interval_seconds=0.01,
+                    settlement_grace_seconds=1.0,
+                    cancel_grace_seconds=0.2,
+                )
+                worker = threading.Thread(
+                    target=lambda: verdicts.append(
+                        evaluator.evaluate(_task(root), self._candidate(root))
+                    )
+                )
+                worker.start()
+                self.assertTrue(server.get_seen.wait(timeout=1))
+                evaluator._mark_remote_unsettled()  # noqa: SLF001
+                worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(server.deletes, 1)
+        self.assertEqual(verdicts[0].status, "TASK_CANCELLED")
+        self.assertEqual(
+            verdicts[0].response["judge_cancellation"],
+            {
+                "attempted": True,
+                "succeeded": True,
+                "settled": True,
+                "unconfirmed": False,
+                "failure_category": None,
+            },
+        )
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
 
     def test_raw_failure_never_scores_stale_proved_marker(self) -> None:
         expected = {
@@ -422,16 +667,24 @@ class EvaluatorLifecycleTests(unittest.TestCase):
             root = Path(temporary)
             server = _LifecycleServer("missing_job_id")
             with server.running() as url:
-                verdict = LeanEvaluator(url, lean_env_id="test").evaluate(
+                evaluator = LeanEvaluator(url, lean_env_id="test")
+                verdict = evaluator.evaluate(
                     _task(root), self._candidate(root)
                 )
 
-        self.assertEqual(verdict.status, "EVALUATOR_ERROR")
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
         self.assertEqual(verdict.score, 0.0)
         self.assertEqual(verdict.response["last_observed_lifecycle"], "queued")
-        self.assertIn("without a job id", verdict.error or "")
+        self.assertIs(verdict.response["remote_settlement_unconfirmed"], True)
+        self.assertEqual(
+            verdict.response["evaluator_failure"]["category"],
+            "missing_job_identifier",
+        )
+        self.assertIn("bindable job id", verdict.error or "")
         self.assertEqual(server.post_count, 1)
         self.assertEqual(server.deletes, 0)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+        self.assertTrue(evaluator.remote_settlement_event.is_set())
 
     def test_definitive_admission_overload_is_retried(self) -> None:
         for mode in (
@@ -510,38 +763,67 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(server.post_count, 2)
         self.assertEqual(verdict.response["evaluator_overload_resubmissions"], 1)
 
-    def test_unconfirmed_http_error_is_not_resubmitted(self) -> None:
-        for mode in ("unconfirmed_429", "unconfirmed_503"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                server = _LifecycleServer(mode)
-                with server.running() as url:
-                    verdict = LeanEvaluator(
-                        url,
-                        lean_env_id="test",
-                        admission_retry_seconds=1.0,
-                    ).evaluate(_task(root), self._candidate(root))
+    def test_unconfirmed_proxy_503_is_not_resubmitted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("unconfirmed_503")
+            with server.running() as url:
+                evaluator = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    admission_retry_seconds=1.0,
+                )
+                verdict = evaluator.evaluate(_task(root), self._candidate(root))
 
-                self.assertEqual(verdict.status, "EVALUATOR_ERROR")
-                self.assertEqual(verdict.score, 0.0)
-                self.assertEqual(server.post_count, 1)
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
+        self.assertEqual(verdict.score, 0.0)
+        self.assertIs(verdict.response["remote_settlement_unconfirmed"], True)
+        self.assertEqual(server.post_count, 1)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+        self.assertTrue(evaluator.remote_settlement_event.is_set())
+
+    def test_unstructured_http_429_is_not_resubmitted_and_is_latched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("unconfirmed_429")
+            with server.running() as url:
+                evaluator = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    admission_retry_seconds=1.0,
+                )
+                verdict = evaluator.evaluate(_task(root), self._candidate(root))
+
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
+        self.assertEqual(verdict.score, 0.0)
+        self.assertIs(verdict.response["remote_settlement_unconfirmed"], True)
+        self.assertEqual(server.post_count, 1)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+        self.assertTrue(evaluator.remote_settlement_event.is_set())
 
     def test_huge_finite_lifecycle_deadline_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             server = _LifecycleServer("huge_lifecycle_deadline")
             with server.running() as url:
-                verdict = LeanEvaluator(
+                evaluator = LeanEvaluator(
                     url,
                     lean_env_id="test",
                     cancel_grace_seconds=0.1,
                     max_lifecycle_seconds=60.0,
-                ).evaluate(_task(root), self._candidate(root))
+                )
+                verdict = evaluator.evaluate(_task(root), self._candidate(root))
 
-        self.assertEqual(verdict.status, "EVALUATOR_ERROR")
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
         self.assertEqual(verdict.score, 0.0)
         self.assertEqual(server.deletes, 1)
+        self.assertIs(verdict.response["remote_settlement_unconfirmed"], True)
+        self.assertEqual(
+            verdict.response["settlement_error"],
+            "cancel_settlement_unconfirmed",
+        )
         self.assertIn("client safety cap", verdict.error or "")
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
 
     def test_queue_time_does_not_consume_backend_execution_budget(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -580,25 +862,53 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(verdict.candidate_sha256)
         self.assertIsNotNone(verdict.task_contract_sha256)
 
+    def test_terminal_poll_with_wrong_job_id_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("terminal_with_wrong_receipt_job_id")
+            with server.running() as url:
+                evaluator = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    timeout_seconds=1,
+                    max_lifecycle_seconds=1,
+                    poll_interval_seconds=0.01,
+                    settlement_grace_seconds=0.05,
+                    cancel_grace_seconds=0.1,
+                )
+                verdict = evaluator.evaluate(_task(root), self._candidate(root))
+
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
+        self.assertEqual(verdict.score, 0.0)
+        self.assertEqual(server.deletes, 1)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+
     def test_unsettled_cancel_never_persists_running(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             server = _LifecycleServer("never_terminal")
             with server.running() as url:
-                verdict = LeanEvaluator(
+                evaluator = LeanEvaluator(
                     url,
                     lean_env_id="test",
                     timeout_seconds=1,
                     poll_interval_seconds=0.01,
                     settlement_grace_seconds=0.1,
                     cancel_grace_seconds=0.1,
-                ).evaluate(_task(root), self._candidate(root))
+                )
+                verdict = evaluator.evaluate(_task(root), self._candidate(root))
 
-        self.assertEqual(verdict.status, "EVALUATOR_TIMEOUT")
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
         self.assertEqual(server.deletes, 1)
-        self.assertEqual(verdict.response["reason"], "judge_settlement_timeout")
+        self.assertEqual(verdict.response["reason"], "remote_settlement_unconfirmed")
+        self.assertIs(verdict.response["remote_settlement_unconfirmed"], True)
+        self.assertEqual(
+            verdict.response["settlement_error"],
+            "cancel_settlement_unconfirmed",
+        )
         self.assertNotIn("status", verdict.response)
         self.assertEqual(verdict.response["last_observed_lifecycle"], "running")
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
 
     def test_contradictory_terminal_envelope_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

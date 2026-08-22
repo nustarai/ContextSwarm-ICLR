@@ -1,12 +1,72 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # NuRouter/AISW managed launchers require adjacent owner-only metadata. Host
 # files are input only; copy them into a container-private root first.
 RUNTIME_ROOT="${MINI_SWARM_RUNTIME_ROOT:-/run/contextswarm-mini}"
+RUNTIME_HOME="${MINI_SWARM_HOME:-${RUNTIME_ROOT}/home}"
 INPUT_ROOT="${MINI_SWARM_AISW_INPUT_ROOT:-/opt/contextswarm-input/aisw}"
 INPUT_BINARY="${MINI_SWARM_PI_INPUT_BINARY:-${INPUT_ROOT}/pi}"
 INPUT_NODE_CONFIG="${MINI_SWARM_AISW_INPUT_NODE_CONFIG:-/opt/contextswarm-input/aisw-private/node.toml}"
+INPUT_CODEX_HOME="${MINI_SWARM_CODEX_INPUT_HOME:-/opt/contextswarm-input/codex-home}"
+
+install -d -m 0700 \
+  "${RUNTIME_ROOT}" \
+  "${RUNTIME_HOME}" \
+  "${RUNTIME_ROOT}/cache" \
+  "${RUNTIME_ROOT}/config" \
+  "${RUNTIME_ROOT}/data" \
+  "${RUNTIME_ROOT}/xdg" \
+  "${RUNTIME_HOME}/.codex"
+
+export HOME="${RUNTIME_HOME}"
+export XDG_CACHE_HOME="${RUNTIME_ROOT}/cache"
+export XDG_CONFIG_HOME="${RUNTIME_ROOT}/config"
+export XDG_DATA_HOME="${RUNTIME_ROOT}/data"
+export XDG_RUNTIME_DIR="${RUNTIME_ROOT}/xdg"
+export TMPDIR="${TMPDIR:-/tmp}"
+
+CODEX_RUNTIME_HOME="${RUNTIME_HOME}/.codex"
+if [[ "${MINI_SWARM_CODEX_INPUT_ENABLED:-0}" == "1" ]]; then
+  if [[ ! -d "${INPUT_CODEX_HOME}" ]]; then
+    echo "configured Codex home mount is unavailable" >&2
+    exit 2
+  fi
+  CODEX_RUNTIME_HOME="${INPUT_CODEX_HOME}"
+fi
+export CODEX_HOME="${CODEX_RUNTIME_HOME}"
+
+MANIFEST_BINDING_REQUIRED="${CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED:-0}"
+MANIFEST_PATH="${CONTEXTSWARM_MANIFEST_PATH:-}"
+MANIFEST_SHA256="${CONTEXTSWARM_MANIFEST_SHA256:-}"
+if [[ "${MANIFEST_BINDING_REQUIRED}" != "0" && "${MANIFEST_BINDING_REQUIRED}" != "1" ]]; then
+  echo "container manifest binding requirement is invalid" >&2
+  exit 2
+fi
+if [[ "${MANIFEST_BINDING_REQUIRED}" == "1" || -n "${MANIFEST_PATH}" || -n "${MANIFEST_SHA256}" ]]; then
+  if [[ -z "${MANIFEST_PATH}" || -z "${MANIFEST_SHA256}" ]]; then
+    echo "container manifest binding is incomplete" >&2
+    exit 2
+  fi
+  python3 - "${MANIFEST_PATH}" "${MANIFEST_SHA256}" <<'PY'
+from pathlib import Path
+import sys
+
+from contextswarm_mini.launch_contract import (
+    LaunchContractError,
+    verify_manifest_binding,
+)
+
+manifest = sys.argv[1]
+expected = sys.argv[2]
+try:
+    verify_manifest_binding(manifest, Path("/opt/contextswarm"), expected)
+except (LaunchContractError, OSError, ValueError):
+    print("container manifest binding verification failed", file=sys.stderr)
+    raise SystemExit(2)
+PY
+fi
 
 if [[ -x "${INPUT_BINARY}" ]]; then
   install -d -m 0700 "${RUNTIME_ROOT}/bin" "${RUNTIME_ROOT}/aisw"
@@ -50,14 +110,16 @@ PY
   export AISW_DISABLE_LOCAL_FALLBACK=1
 fi
 
-if [[ -f "${INPUT_NODE_CONFIG}" ]]; then
+if [[ -s "${INPUT_NODE_CONFIG}" ]]; then
   install -d -m 0700 "${RUNTIME_ROOT}/aisw"
   install -m 0600 "${INPUT_NODE_CONFIG}" "${RUNTIME_ROOT}/aisw/node.toml"
-  python3 - "${RUNTIME_ROOT}/aisw/node.toml" <<'PY'
+  python3 - "${RUNTIME_ROOT}/aisw/node.toml" "${CODEX_RUNTIME_HOME}" <<'PY'
+import json
 from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
+codex_home = sys.argv[2]
 lines = path.read_text(encoding="utf-8").splitlines()
 table = ""
 seen_pi = False
@@ -73,7 +135,7 @@ for index, line in enumerate(lines):
         lines[index] = 'real_codex = "/usr/local/bin/codex"'
         seen_codex = True
     elif table == "shared_codex_home" and stripped.startswith("path") and "=" in stripped:
-        lines[index] = 'path = "/root/.codex"'
+        lines[index] = f"path = {json.dumps(codex_home)}"
 if not seen_pi:
     lines.append('real_pi = "/usr/local/bin/pi"')
 if not seen_codex:

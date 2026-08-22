@@ -14,22 +14,36 @@ RUN_DOCKER = ROOT / "scripts" / "run_docker.sh"
 
 class RunDockerManifestTests(unittest.TestCase):
     def setUp(self) -> None:
+        (ROOT / "runs").mkdir(exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(
             prefix=".test-run-docker-",
-            dir=ROOT,
+            dir=ROOT / "runs",
         )
         self.temp = Path(self.temporary.name)
         self.bin_dir = self.temp / "bin"
         self.bin_dir.mkdir()
         self.capture = self.temp / "docker-argv.json"
+        self.inspect_capture = self.temp / "docker-inspects.jsonl"
 
         fake_docker = self.bin_dir / "docker"
         fake_docker.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys\n"
-            "pathlib.Path(os.environ['FAKE_DOCKER_CAPTURE']).write_text(\n"
-            "    json.dumps(sys.argv[1:]), encoding='utf-8'\n"
-            ")\n",
+            "args = sys.argv[1:]\n"
+            "if args[:2] == ['image', 'inspect']:\n"
+            "    with pathlib.Path(os.environ['FAKE_DOCKER_INSPECT_CAPTURE']).open(\n"
+            "        'a', encoding='utf-8'\n"
+            "    ) as stream:\n"
+            "        stream.write(json.dumps(args) + '\\n')\n"
+            "    fmt = args[args.index('--format') + 1]\n"
+            "    if fmt == '{{.Id}}':\n"
+            "        print('sha256:' + ('1' * 64))\n"
+            "    else:\n"
+            "        print('2' * 40)\n"
+            "else:\n"
+            "    pathlib.Path(os.environ['FAKE_DOCKER_CAPTURE']).write_text(\n"
+            "        json.dumps(args), encoding='utf-8'\n"
+            "    )\n",
             encoding="utf-8",
         )
         fake_docker.chmod(0o755)
@@ -63,7 +77,7 @@ class RunDockerManifestTests(unittest.TestCase):
         network: str = "host",
     ) -> None:
         self.parent_manifest.write_text(
-            'extends = ["../configs/smoke.toml"]\n\n'
+            'extends = ["../../configs/smoke.toml"]\n\n'
             "[docker]\n"
             f'image = "{image}"\n'
             f"memory_mb = {memory_mb}\n"
@@ -71,9 +85,16 @@ class RunDockerManifestTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def _run(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        *,
+        config: Path | None = None,
+        **overrides: str,
+    ) -> subprocess.CompletedProcess[str]:
         if self.capture.exists():
             self.capture.unlink()
+        if self.inspect_capture.exists():
+            self.inspect_capture.unlink()
         env = os.environ.copy()
         env.pop("CONTEXTSWARM_MINI_IMAGE", None)
         env.pop("CONTEXTSWARM_MINI_MEMORY", None)
@@ -82,6 +103,7 @@ class RunDockerManifestTests(unittest.TestCase):
             {
                 "PATH": f"{self.bin_dir}:{env['PATH']}",
                 "FAKE_DOCKER_CAPTURE": str(self.capture),
+                "FAKE_DOCKER_INSPECT_CAPTURE": str(self.inspect_capture),
                 "CONTEXTSWARM_NUROUTER_BINARY": str(self.fake_nurouter),
             }
         )
@@ -90,7 +112,7 @@ class RunDockerManifestTests(unittest.TestCase):
                 "/bin/bash",
                 str(RUN_DOCKER),
                 "--config",
-                str(self.child_manifest.relative_to(ROOT)),
+                str((config or self.child_manifest).relative_to(ROOT)),
                 "--mock-agent",
             ],
             cwd=ROOT,
@@ -104,6 +126,12 @@ class RunDockerManifestTests(unittest.TestCase):
     def _captured_argv(self) -> list[str]:
         return json.loads(self.capture.read_text(encoding="utf-8"))
 
+    def _captured_inspects(self) -> list[list[str]]:
+        return [
+            json.loads(line)
+            for line in self.inspect_capture.read_text(encoding="utf-8").splitlines()
+        ]
+
     def test_inherited_manifest_resources_reach_actual_docker_argv(self) -> None:
         result = self._run()
 
@@ -114,7 +142,11 @@ class RunDockerManifestTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--network") + 1], "host")
         self.assertNotIn("--add-host", argv)
         config_index = argv.index("--config")
-        self.assertEqual(argv[config_index - 1], "research/contextswarm-mini:paper")
+        self.assertEqual(config_index - 1, argv.index("sha256:" + ("1" * 64)))
+        self.assertEqual(
+            self._captured_inspects()[0][-1],
+            "research/contextswarm-mini:paper",
+        )
         self.assertEqual(
             argv[config_index + 1],
             str(self.child_manifest.relative_to(ROOT)),
@@ -129,8 +161,9 @@ class RunDockerManifestTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         argv = self._captured_argv()
         self.assertEqual(argv[argv.index("--memory") + 1], "64g")
+        self.assertEqual(argv[argv.index("--config") - 1], "sha256:" + ("1" * 64))
         self.assertEqual(
-            argv[argv.index("--config") - 1],
+            self._captured_inspects()[0][-1],
             "registry.example:5000/paper/mini:operator",
         )
 
@@ -188,6 +221,21 @@ class RunDockerManifestTests(unittest.TestCase):
         result = self._run()
         self.assertEqual(result.returncode, 2)
         self.assertIn("invalid Docker image", result.stderr)
+        self.assertFalse(self.capture.exists())
+
+    def test_untracked_manifest_outside_runs_is_not_container_visible(self) -> None:
+        manifest = ROOT / ".untracked-launch-manifest.toml"
+        manifest.write_text(
+            'extends = ["configs/smoke.toml"]\n',
+            encoding="utf-8",
+        )
+        try:
+            result = self._run(config=manifest)
+        finally:
+            manifest.unlink(missing_ok=True)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("tracked or located below runs", result.stderr)
         self.assertFalse(self.capture.exists())
 
 

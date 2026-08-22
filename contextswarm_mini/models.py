@@ -39,6 +39,8 @@ class AgentResult:
     timed_out: bool = False
     cancelled: bool = False
     mocked: bool = False
+    decision_index: int | None = None
+    run_horizon_reached: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -55,6 +57,8 @@ class AgentResult:
             "timed_out": self.timed_out,
             "cancelled": self.cancelled,
             "mocked": self.mocked,
+            "decision_index": self.decision_index,
+            "run_horizon_reached": self.run_horizon_reached,
         }
 
 

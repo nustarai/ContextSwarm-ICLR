@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import copy
+import math
+import os
 from pathlib import Path
 import tomllib
 from typing import Any, Mapping
-from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
@@ -81,6 +82,55 @@ def _nonnegative_int(value: Any, name: str, default: int) -> int:
     return result
 
 
+def _number(value: Any, name: str, default: float) -> float:
+    try:
+        result = float(default if value is None else value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a finite number") from exc
+    if not math.isfinite(result):
+        raise ConfigError(f"{name} must be a finite number")
+    return result
+
+
+_FORMULA_DEFAULTS: dict[str, float] = {
+    "active_balance_weight": 2.0,
+    "candidate_quality_weight": 1.5,
+    "recent_progress_weight": 1.25,
+    "cps_evidence_weight": 0.75,
+    "starvation_weight": 1.0,
+    "failure_penalty": 0.75,
+    "duplication_penalty": 0.5,
+    "progress_window_seconds": 600.0,
+    "starvation_window_seconds": 600.0,
+    "evidence_saturation": 3.0,
+    "failure_saturation": 3.0,
+    "proved_quality": 1.0,
+    "compiles_with_sorry_quality": 0.8,
+    "verify_fail_quality": 0.35,
+    "other_status_quality": 0.0,
+}
+
+
+@dataclass(frozen=True)
+class AllocationConfig:
+    """Manifest-owned contract for post-initial CPS slot allocation."""
+
+    policy: str
+    piece_limit_per_task: int
+    piece_body_chars: int
+    agent_timeout_seconds: int
+    formula: dict[str, float]
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "policy": self.policy,
+            "piece_limit_per_task": self.piece_limit_per_task,
+            "piece_body_chars": self.piece_body_chars,
+            "agent_timeout_seconds": self.agent_timeout_seconds,
+            "formula": dict(sorted(self.formula.items())),
+        }
+
+
 @dataclass(frozen=True)
 class ExperimentConfig:
     manifest_path: Path
@@ -96,6 +146,7 @@ class ExperimentConfig:
     max_attempts_per_task: int
     cancel_on_proved: bool
     assignment_policy: str
+    allocation: AllocationConfig
     episodes_per_task: int
     max_tasks: int
     time_limit_seconds: int
@@ -127,6 +178,7 @@ class ExperimentConfig:
     lean_max_concurrent_evaluations: int
     lean_verification_profile: str
     lean_judge_mode: str
+    lean_require_result_cache_disabled: bool
     docker_image: str
     docker_memory_mb: int
     docker_internet: str
@@ -166,6 +218,7 @@ class ExperimentConfig:
             "max_attempts_per_task": self.max_attempts_per_task,
             "cancel_on_proved": self.cancel_on_proved,
             "assignment_policy": self.assignment_policy,
+            "allocation": self.allocation.public_dict(),
             "episodes_per_task": self.episodes_per_task,
             "max_tasks": self.max_tasks,
             "time_limit_seconds": self.time_limit_seconds,
@@ -187,13 +240,14 @@ class ExperimentConfig:
             "aisw_coordinator_configured": bool(self.aisw_coordinator_url),
             "aisw_account_configured": bool(self.aisw_account),
             "aisw_group_configured": bool(self.aisw_group),
-            "lean_server_url": _redact_endpoint(self.lean_server_url),
+            "lean_server_configured": bool(self.lean_server_url),
             "lean_env_id": self.lean_env_id,
             "lean_timeout_seconds": self.lean_timeout_seconds,
             "lean_max_lifecycle_seconds": self.lean_max_lifecycle_seconds,
             "lean_max_concurrent_evaluations": self.lean_max_concurrent_evaluations,
             "lean_verification_profile": self.lean_verification_profile,
             "lean_judge_mode": self.lean_judge_mode,
+            "lean_require_result_cache_disabled": self.lean_require_result_cache_disabled,
             "docker_image": self.docker_image,
             "docker_memory_mb": self.docker_memory_mb,
             "docker_internet": self.docker_internet,
@@ -227,6 +281,8 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     aisw = _as_dict(aisw_payload, "aisw")
     lean = _as_dict(payload.get("lean"), "lean")
     docker = _as_dict(payload.get("docker"), "docker")
+    allocation = _as_dict(payload.get("allocation"), "allocation")
+    allocation_formula = _as_dict(allocation.get("formula"), "allocation.formula")
 
     mode = _text(experiment.get("mode"), "cps").lower()
     if mode not in {"mono", "parallel", "cps"}:
@@ -262,6 +318,51 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     assignment_policy = _text(experiment.get("assignment_policy"), "least_active")
     if assignment_policy not in {"least_active", "round_robin"}:
         raise ConfigError("experiment.assignment_policy must be least_active or round_robin")
+    allocation_policy = _text(allocation.get("policy"), "uniform").lower()
+    if allocation_policy not in {"uniform", "formula", "agent"}:
+        raise ConfigError("allocation.policy must be uniform, formula, or agent")
+    unknown_formula = set(allocation_formula) - set(_FORMULA_DEFAULTS)
+    if unknown_formula:
+        raise ConfigError(
+            "unknown allocation.formula fields: " + ", ".join(sorted(unknown_formula))
+        )
+    formula_parameters = {
+        key: _number(allocation_formula.get(key), f"allocation.formula.{key}", default)
+        for key, default in _FORMULA_DEFAULTS.items()
+    }
+    for key in (
+        "failure_penalty",
+        "duplication_penalty",
+        "progress_window_seconds",
+        "starvation_window_seconds",
+        "evidence_saturation",
+        "failure_saturation",
+        "proved_quality",
+        "compiles_with_sorry_quality",
+        "verify_fail_quality",
+        "other_status_quality",
+    ):
+        if formula_parameters[key] < 0:
+            raise ConfigError(f"allocation.formula.{key} must not be negative")
+    allocation_config = AllocationConfig(
+        policy=allocation_policy,
+        piece_limit_per_task=_positive_int(
+            allocation.get("piece_limit_per_task"),
+            "allocation.piece_limit_per_task",
+            3,
+        ),
+        piece_body_chars=_positive_int(
+            allocation.get("piece_body_chars"),
+            "allocation.piece_body_chars",
+            1_200,
+        ),
+        agent_timeout_seconds=_positive_int(
+            allocation.get("agent_timeout_seconds"),
+            "allocation.agent_timeout_seconds",
+            120,
+        ),
+        formula=formula_parameters,
+    )
     episodes = _positive_int(experiment.get("episodes_per_task"), "experiment.episodes_per_task", 1)
     max_tasks = _nonnegative_int(experiment.get("max_tasks"), "experiment.max_tasks", 0)
     horizon = _positive_int(experiment.get("time_limit_seconds"), "experiment.time_limit_seconds", 3600)
@@ -318,7 +419,13 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         2,
     )
 
-    lean_url = _text(lean.get("server_url"), "http://127.0.0.1:18000")
+    # The raw endpoint is an operator secret/capability.  It must enter only
+    # through the supervisor environment, never through a tracked manifest.
+    if _text(lean.get("server_url")):
+        raise ConfigError(
+            "lean.server_url is not allowed in manifests; set CONTEXTSWARM_JUDGE_URL at runtime"
+        )
+    lean_url = _text(os.environ.get("CONTEXTSWARM_JUDGE_URL"))
     lean_env = _text(lean.get("env_id"), "formal_matholympiadbench")
     lean_timeout = _positive_int(lean.get("timeout_seconds"), "lean.timeout_seconds", 300)
     lean_max_lifecycle = _positive_int(
@@ -333,6 +440,9 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     )
     profile = _text(lean.get("verification_profile"), "formal_proof")
     judge_mode = _text(lean.get("judge_mode"), "fast")
+    require_result_cache_disabled = bool(
+        lean.get("require_result_cache_disabled", False)
+    )
     docker_network = _text(docker.get("network"), "host").lower()
     if docker_network not in {"host", "bridge"}:
         raise ConfigError("docker.network must be host or bridge")
@@ -351,6 +461,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         max_attempts_per_task=max_attempts,
         cancel_on_proved=cancel_on_proved,
         assignment_policy=assignment_policy,
+        allocation=allocation_config,
         episodes_per_task=episodes,
         max_tasks=max_tasks,
         time_limit_seconds=horizon,
@@ -382,6 +493,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         lean_max_concurrent_evaluations=lean_max_evaluations,
         lean_verification_profile=profile,
         lean_judge_mode=judge_mode,
+        lean_require_result_cache_disabled=require_result_cache_disabled,
         docker_image=_text(docker.get("image"), "contextswarm-iclr-mini:latest"),
         docker_memory_mb=_positive_int(docker.get("memory_mb"), "docker.memory_mb", 16384),
         docker_internet=_text(docker.get("internet"), "online"),
@@ -391,17 +503,3 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     if cfg.uses_cps and cfg.episodes_per_task < 1:
         raise ConfigError("CPS requires at least one episode per task")
     return cfg
-
-
-def _redact_endpoint(raw: str) -> str:
-    value = str(raw or "").strip()
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return "<configured>" if value else ""
-    if parsed.scheme and parsed.hostname:
-        host = parsed.hostname
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
-        return f"{parsed.scheme}://{host}"
-    return "<configured>" if value else ""

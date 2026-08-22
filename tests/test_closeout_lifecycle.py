@@ -17,6 +17,7 @@ from contextswarm_mini.context_piece import main as context_piece_main
 from contextswarm_mini.cps import CPSStore
 from contextswarm_mini.models import Task, Verdict
 from contextswarm_mini.runner import (
+    RemoteJudgeSettlementError,
     _FrozenCandidate,
     RunLogger,
     _freeze_closeout_candidates,
@@ -101,6 +102,62 @@ class _CancelledEvaluator(_SlowEvaluator):
         return Verdict(task.slug, "CANCELLED", 0.0, 0.0)
 
 
+class _TerminalResourceEvaluator(_SlowEvaluator):
+    retryable = False
+
+    def evaluate(
+        self,
+        task: Task,
+        _candidate: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Verdict:
+        del deadline_monotonic
+        return Verdict(
+            task.slug,
+            "RESOURCE_LIMIT",
+            0.0,
+            0.0,
+            {
+                "error_kind": "memory_limit_exceeded",
+                "retryable": self.retryable,
+            },
+        )
+
+
+class _RetryableResourceEvaluator(_TerminalResourceEvaluator):
+    retryable = True
+
+
+class _CloseoutUnsettledEvaluator(_SlowEvaluator):
+    closeout_calls = 0
+
+    def __init__(self, *, prove_without_sorry: bool = False):
+        del prove_without_sorry
+        self.remote_unsettled_jobs = 0
+        self.remote_settlement_event = threading.Event()
+
+    def evaluate(
+        self,
+        task: Task,
+        _candidate: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Verdict:
+        if deadline_monotonic is not None:
+            return Verdict(task.slug, "VERIFY_FAIL", 0.0, 0.0)
+        type(self).closeout_calls += 1
+        self.remote_unsettled_jobs += 1
+        self.remote_settlement_event.set()
+        return Verdict(
+            task.slug,
+            "REMOTE_SETTLEMENT_UNCONFIRMED",
+            0.0,
+            0.0,
+            {"remote_settlement_unconfirmed": True},
+        )
+
+
 class _SolverProofThenRetryableCloseout:
     calls: list[str] = []
     contract_sha256 = "a" * 64
@@ -148,6 +205,33 @@ class _SolverProofThenRetryableCloseout:
         )
 
 
+class _SolverProofThenConflictCloseout(_SolverProofThenRetryableCloseout):
+    def evaluate(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Verdict:
+        if deadline_monotonic is not None:
+            return super().evaluate(
+                task,
+                candidate,
+                deadline_monotonic=deadline_monotonic,
+            )
+        digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        return Verdict(
+            task.slug,
+            "VERIFY_FAIL",
+            0.0,
+            0.0,
+            {"error_kind": "verification_failed", "retryable": False},
+            candidate_sha256=digest,
+            task_contract_sha256=self.contract_sha256,
+            judge_job_id="closeout-conflict",
+        )
+
+
 class _FixedCloseoutEvaluator:
     def __init__(self, verdict: Verdict, contract_sha256: str):
         self.verdict = verdict
@@ -159,14 +243,43 @@ class _FixedCloseoutEvaluator:
 
     def evaluate(
         self,
-        _task: Task,
-        _candidate: Path,
+        task: Task,
+        candidate: Path,
         *,
         deadline_monotonic: float | None = None,
     ) -> Verdict:
         self.calls += 1
         self.assert_closeout(deadline_monotonic)
-        return self.verdict
+        observed = self.verdict
+        status = str(observed.status or "").strip().upper()
+        requires_receipt = status in {
+            "PROVED",
+            "AC",
+            "PASS",
+            "PASSED",
+            "COMPILES_WITH_SORRY",
+            "VERIFY_FAIL",
+        }
+        return Verdict(
+            task.slug,
+            observed.status,
+            observed.score,
+            observed.elapsed_seconds,
+            dict(observed.response),
+            error=observed.error,
+            candidate_sha256=(
+                observed.candidate_sha256
+                or hashlib.sha256(candidate.read_bytes()).hexdigest()
+            ),
+            task_contract_sha256=(
+                observed.task_contract_sha256 or self.contract_sha256
+            ),
+            judge_job_id=(
+                observed.judge_job_id
+                or ("closeout-observation" if requires_receipt else None)
+            ),
+            cache_reused=observed.cache_reused,
+        )
 
     @staticmethod
     def assert_closeout(deadline_monotonic: float | None) -> None:
@@ -197,6 +310,40 @@ class CloseoutLifecycleTests(unittest.TestCase):
         }
         evaluator = _FixedCloseoutEvaluator(observed, contract_sha256)
         return config, task, frozen, RunLogger(root), evaluator, digest
+
+    def test_closeout_unknown_remote_is_fatal_and_final_lifecycle_is_not_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_config("configs/parallel.toml", ROOT),
+                max_tasks=2,
+                max_parallel=1,
+                episodes_per_task=1,
+                time_limit_seconds=2,
+                lean_max_concurrent_evaluations=1,
+            )
+            _CloseoutUnsettledEvaluator.closeout_calls = 0
+            with patch(
+                "contextswarm_mini.runner.MockEvaluator",
+                _CloseoutUnsettledEvaluator,
+            ):
+                with self.assertRaises(RemoteJudgeSettlementError):
+                    run_experiment(
+                        config,
+                        mock_agent=True,
+                        output_override=Path(temporary),
+                    )
+            run_dir = next(Path(temporary).iterdir())
+            lifecycle = json.loads(
+                (run_dir / "judge_broker_closeout.json").read_text(encoding="utf-8")
+            )
+            final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(_CloseoutUnsettledEvaluator.closeout_calls, 1)
+        self.assertFalse(lifecycle["drained"])
+        self.assertEqual(lifecycle["active_handlers"], 0)
+        self.assertEqual(lifecycle["fifo_depth"], 0)
+        self.assertEqual(lifecycle["remote_unsettled_jobs"], 1)
+        self.assertEqual(final["status"], "ERROR")
 
     def test_retryable_closeout_infra_preserves_exact_solver_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -255,6 +402,121 @@ class CloseoutLifecycleTests(unittest.TestCase):
             ]
             self.assertEqual(len(scoreboard), 1)
             self.assertEqual(scoreboard[0]["judge_job_id"], "solver-authority")
+
+    def test_confirmed_closeout_keeps_original_exact_once_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contract = "9" * 64
+            observed = Verdict(
+                "imo2024_p1",
+                "PROVED",
+                1.0,
+                0.0,
+                {"formal_status": "PROVED"},
+                task_contract_sha256=contract,
+                judge_job_id="closeout-confirmation",
+            )
+            config, task, frozen, logger, evaluator, digest = self._direct_closeout_fixture(
+                root,
+                observed,
+                contract_sha256=contract,
+            )
+            prior = Verdict(
+                task.slug,
+                "PROVED",
+                1.0,
+                0.0,
+                {"formal_status": "PROVED"},
+                candidate_sha256=digest,
+                task_contract_sha256=contract,
+                judge_job_id="solver-authority",
+            )
+
+            result = _run_closeout(
+                config,
+                [task],
+                frozen,
+                logger,
+                evaluator,
+                threading.BoundedSemaphore(1),
+                reusable_verdicts=[prior],
+            )
+
+            final = result[task.slug]
+            self.assertEqual(evaluator.calls, 1)
+            self.assertEqual(final.status, "PROVED")
+            self.assertEqual(final.judge_job_id, "solver-authority")
+            self.assertEqual(
+                final.response["closeout_authority_confirmed"]["observed_status"],
+                "PROVED",
+            )
+            events = [
+                json.loads(line)
+                for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            confirmed = next(
+                row for row in events if row["event"] == "closeout_authority_confirmed"
+            )
+            self.assertEqual(confirmed["prior_judge_job_id"], "solver-authority")
+            self.assertEqual(
+                confirmed["observed_judge_job_id"],
+                "closeout-confirmation",
+            )
+            closeout = next(
+                row for row in events if row["event"] == "closeout_evaluation_finished"
+            )
+            self.assertTrue(closeout["authoritative_proof_confirmed"])
+            self.assertFalse(closeout["scoreboard_recorded"])
+
+    def test_remote_unknown_closeout_is_never_hidden_by_prior_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contract = "8" * 64
+            observed = Verdict(
+                "imo2024_p1",
+                "REMOTE_SETTLEMENT_UNCONFIRMED",
+                0.0,
+                0.0,
+                {"remote_settlement_unconfirmed": True},
+            )
+            config, task, frozen, logger, evaluator, digest = self._direct_closeout_fixture(
+                root,
+                observed,
+                contract_sha256=contract,
+            )
+            prior = Verdict(
+                task.slug,
+                "PROVED",
+                1.0,
+                0.0,
+                candidate_sha256=digest,
+                task_contract_sha256=contract,
+                judge_job_id="solver-authority",
+            )
+
+            result = _run_closeout(
+                config,
+                [task],
+                frozen,
+                logger,
+                evaluator,
+                threading.BoundedSemaphore(1),
+                reusable_verdicts=[prior],
+            )
+
+            final = result[task.slug]
+            self.assertEqual(final.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
+            self.assertEqual(final.score, 0.0)
+            events = [
+                json.loads(line)
+                for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            closeout = next(
+                row for row in events if row["event"] == "closeout_evaluation_finished"
+            )
+            self.assertFalse(closeout["reused_authoritative_verdict"])
+            self.assertFalse(closeout["authority_conflict"])
+            self.assertFalse(closeout["scoreboard_recorded"])
 
     def test_closeout_authority_sha_or_contract_mismatch_is_not_reused(self) -> None:
         for mismatch in ("candidate", "contract"):
@@ -403,6 +665,38 @@ class CloseoutLifecycleTests(unittest.TestCase):
             self.assertTrue(closeout["authority_conflict"])
             self.assertTrue(closeout["scoreboard_recorded"])
 
+    def test_authority_conflict_marks_integrated_run_degraded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_config("configs/smoke.toml", ROOT),
+                max_tasks=1,
+                max_parallel=1,
+                initial_agents_per_task=1,
+                max_attempts_per_task=1,
+                time_limit_seconds=2,
+                lean_max_concurrent_evaluations=1,
+            )
+            with patch(
+                "contextswarm_mini.runner.MockEvaluator",
+                _SolverProofThenConflictCloseout,
+            ):
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+
+            final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+            verdict = final["verdicts"]["imo2024_p1"]
+            self.assertEqual(final["status"], "DEGRADED")
+            self.assertFalse(final["health"]["ok"])
+            self.assertIn(
+                "closeout_authority_conflict",
+                final["health"]["issues"],
+            )
+            self.assertEqual(verdict["status"], "AUTHORITY_CONFLICT")
+            self.assertEqual(verdict["score"], 0.0)
+
     def test_all_modes_use_the_same_frozen_closeout_phase(self) -> None:
         for manifest in ("configs/mono.toml", "configs/parallel.toml", "configs/cps.toml"):
             with self.subTest(manifest=manifest), tempfile.TemporaryDirectory() as temporary:
@@ -502,6 +796,63 @@ class CloseoutLifecycleTests(unittest.TestCase):
             final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
             self.assertEqual(final["status"], "DEGRADED")
             self.assertEqual(final["verdicts"]["imo2024_p1"]["status"], "CANCELLED")
+
+    def test_terminal_nonretryable_resource_limit_is_a_complete_zero_score(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch(
+                "contextswarm_mini.runner.MockEvaluator",
+                _TerminalResourceEvaluator,
+            ):
+                config = replace(
+                    load_config("configs/parallel.toml", ROOT),
+                    max_tasks=1,
+                    max_parallel=1,
+                    time_limit_seconds=1,
+                )
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+            final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(final["status"], "COMPLETED")
+        self.assertEqual(final["score"], 0.0)
+        self.assertEqual(
+            final["verdicts"]["imo2024_p1"]["status"],
+            "RESOURCE_LIMIT",
+        )
+        self.assertNotIn("closeout_incomplete", final["health"]["issues"])
+        self.assertNotIn(
+            "evaluator_infrastructure_error",
+            final["health"]["issues"],
+        )
+
+    def test_retryable_resource_limit_keeps_closeout_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch(
+                "contextswarm_mini.runner.MockEvaluator",
+                _RetryableResourceEvaluator,
+            ):
+                config = replace(
+                    load_config("configs/parallel.toml", ROOT),
+                    max_tasks=1,
+                    max_parallel=1,
+                    time_limit_seconds=1,
+                )
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+            final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(final["status"], "DEGRADED")
+        self.assertIn("closeout_incomplete", final["health"]["issues"])
+        self.assertIn(
+            "evaluator_infrastructure_error",
+            final["health"]["issues"],
+        )
 
     def test_freeze_is_immutable_when_workspace_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -723,12 +1074,10 @@ class CloseoutLifecycleTests(unittest.TestCase):
 
     def test_paper_manifests_share_task_model_transport_and_evaluator_contract(self) -> None:
         groups = {
-            (3600, "http://127.0.0.1:18000"): (
+            3600: (
                 "configs/mono.toml",
                 "configs/parallel.toml",
                 "configs/cps.toml",
-            ),
-            (3600, "http://127.0.0.1:19000"): (
                 "configs/1h_mono.toml",
                 "configs/1h_parallel.toml",
                 "configs/1h_cps.toml",
@@ -738,7 +1087,7 @@ class CloseoutLifecycleTests(unittest.TestCase):
                 "configs/scale_1h_cps48.toml",
                 "configs/scale_1h_cps96.toml",
             ),
-            (180, "http://127.0.0.1:19000"): (
+            180: (
                 "configs/3min_mono.toml",
                 "configs/3min_parallel.toml",
                 "configs/3min_cps.toml",
@@ -752,50 +1101,56 @@ class CloseoutLifecycleTests(unittest.TestCase):
         expected_task_contract: tuple[tuple[str, str, str, str], ...] | None = None
         semantic_evaluator_contracts: set[tuple[object, ...]] = set()
         transport_contracts: set[tuple[object, ...]] = set()
+        runtime_endpoint = "http://127.0.0.1:65535/test-runtime-injection"
 
-        for (duration, endpoint), manifests in groups.items():
-            for manifest in manifests:
-                with self.subTest(manifest=manifest):
-                    config = load_config(manifest, ROOT)
-                    self.assertEqual(config.time_limit_seconds, duration)
-                    self.assertEqual(config.pi_timeout_seconds, duration)
-                    self.assertEqual(config.lean_server_url, endpoint)
-                    self.assertEqual(config.model, "openai-codex/gpt-5.6-sol")
-                    self.assertEqual(config.thinking, "max")
-                    self.assertFalse(config.fast_mode)
-                    tasks = load_tasks(config)
-                    self.assertEqual([task.slug for task in tasks], expected_ids)
-                    task_contract = tuple(
-                        (
-                            task.slug,
-                            task.problem_id,
-                            task.theorem_name,
-                            hashlib.sha256(task.baseline_code.encode("utf-8")).hexdigest(),
+        with patch.dict(
+            os.environ,
+            {"CONTEXTSWARM_JUDGE_URL": runtime_endpoint},
+            clear=False,
+        ):
+            for duration, manifests in groups.items():
+                for manifest in manifests:
+                    with self.subTest(manifest=manifest):
+                        config = load_config(manifest, ROOT)
+                        self.assertEqual(config.time_limit_seconds, duration)
+                        self.assertEqual(config.pi_timeout_seconds, duration)
+                        self.assertEqual(config.lean_server_url, runtime_endpoint)
+                        self.assertEqual(config.model, "openai-codex/gpt-5.6-sol")
+                        self.assertEqual(config.thinking, "max")
+                        self.assertFalse(config.fast_mode)
+                        tasks = load_tasks(config)
+                        self.assertEqual([task.slug for task in tasks], expected_ids)
+                        task_contract = tuple(
+                            (
+                                task.slug,
+                                task.problem_id,
+                                task.theorem_name,
+                                hashlib.sha256(task.baseline_code.encode("utf-8")).hexdigest(),
+                            )
+                            for task in tasks
                         )
-                        for task in tasks
-                    )
-                    if expected_task_contract is None:
-                        expected_task_contract = task_contract
-                    self.assertEqual(task_contract, expected_task_contract)
-                    semantic_evaluator_contracts.add(
-                        (
-                            config.lean_env_id,
-                            config.lean_timeout_seconds,
-                            config.lean_max_concurrent_evaluations,
-                            config.lean_verification_profile,
-                            config.lean_judge_mode,
+                        if expected_task_contract is None:
+                            expected_task_contract = task_contract
+                        self.assertEqual(task_contract, expected_task_contract)
+                        semantic_evaluator_contracts.add(
+                            (
+                                config.lean_env_id,
+                                config.lean_timeout_seconds,
+                                config.lean_max_concurrent_evaluations,
+                                config.lean_verification_profile,
+                                config.lean_judge_mode,
+                            )
                         )
-                    )
-                    transport_contracts.add(
-                        (
-                            config.pi_http_idle_timeout_ms,
-                            config.pi_retry_enabled,
-                            config.pi_retry_max_retries,
-                            config.pi_retry_base_delay_ms,
-                            config.pi_provider_max_retries,
-                            config.pi_provider_max_retry_delay_ms,
+                        transport_contracts.add(
+                            (
+                                config.pi_http_idle_timeout_ms,
+                                config.pi_retry_enabled,
+                                config.pi_retry_max_retries,
+                                config.pi_retry_base_delay_ms,
+                                config.pi_provider_max_retries,
+                                config.pi_provider_max_retry_delay_ms,
+                            )
                         )
-                    )
 
         self.assertEqual(len(semantic_evaluator_contracts), 1)
         self.assertEqual(semantic_evaluator_contracts.pop()[2], 4)
