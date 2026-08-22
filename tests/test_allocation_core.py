@@ -8,6 +8,7 @@ from contextswarm_mini.allocation_core import (
     AllocationStateSnapshot,
     LLM_SCHEDULER_PROMPT_MAX_BYTES,
     LLM_SCHEDULER_PROMPT_MAX_TOKENS,
+    LLMSchedulerCost,
     LLMSchedulerResponse,
     LLMSchedulerCost,
     ReadOnlyLLMSchedulerPolicy,
@@ -42,6 +43,125 @@ def snapshot(*tasks: TaskState, free: int = 1, decision_id: str = "d1") -> Alloc
 
 
 class AllocationCoreTests(unittest.TestCase):
+    @staticmethod
+    def scheduler_decision(**overrides) -> AllocationDecision:
+        values = {
+            "decision_id": "decision-1",
+            "state_id": "state-1",
+            "decision_index": 1,
+            "policy": "llm_scheduler",
+            "selected_task_id": "a",
+            "reason": "test decision",
+            "scheduler_cost": LLMSchedulerCost(),
+            "scheduler_outcome": "accepted",
+        }
+        values.update(overrides)
+        return AllocationDecision(**values)
+
+    def test_scheduler_outcomes_form_a_symmetric_closed_state_machine(self) -> None:
+        accepted = self.scheduler_decision()
+        self.assertEqual(accepted.scheduler_call_id, accepted.decision_id)
+
+        invalid = self.scheduler_decision(
+            scheduler_outcome="invalid_output",
+            invalid_output=True,
+            fallback=True,
+        )
+        provider = self.scheduler_decision(
+            scheduler_outcome="provider_error",
+            recoverable_invocation_error=True,
+            fallback=True,
+        )
+        timeout = self.scheduler_decision(
+            scheduler_outcome="policy_timeout",
+            fallback=True,
+        )
+        horizon = self.scheduler_decision(
+            scheduler_outcome="horizon_truncated",
+            selected_task_id="",
+            agent_run_horizon_reached=True,
+        )
+        not_invoked = self.scheduler_decision(
+            scheduler_cost=None,
+            scheduler_outcome="not_invoked",
+            selected_task_id="",
+        )
+
+        self.assertTrue(invalid.invalid_output)
+        self.assertTrue(provider.recoverable_invocation_error)
+        self.assertTrue(timeout.fallback)
+        self.assertTrue(horizon.run_horizon_reached)
+        self.assertFalse(not_invoked.scheduler_call_id)
+
+    def test_scheduler_outcome_rejects_missing_reverse_flags(self) -> None:
+        invalid_cases = (
+            {"scheduler_outcome": "invalid_output", "fallback": True},
+            {
+                "scheduler_outcome": "provider_error",
+                "fallback": True,
+            },
+            {
+                "scheduler_outcome": "horizon_truncated",
+                "selected_task_id": "",
+            },
+            {
+                "scheduler_outcome": "accepted",
+                "fallback": True,
+            },
+            {
+                "scheduler_outcome": "invalid_output",
+                "invalid_output": True,
+            },
+            {
+                "scheduler_outcome": "provider_error",
+                "recoverable_invocation_error": True,
+            },
+            {
+                "scheduler_outcome": "policy_timeout",
+            },
+        )
+        for values in invalid_cases:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.scheduler_decision(**values)
+
+    def test_scheduler_outcome_rejects_crossed_flags_and_cost_aliases(self) -> None:
+        invalid_cases = (
+            {
+                "scheduler_outcome": "invalid_output",
+                "invalid_output": True,
+                "recoverable_invocation_error": True,
+                "fallback": True,
+            },
+            {
+                "scheduler_outcome": "provider_error",
+                "recoverable_invocation_error": True,
+                "agent_run_horizon_reached": True,
+                "fallback": True,
+            },
+            {
+                "scheduler_outcome": "policy_timeout",
+                "invalid_output": True,
+                "fallback": True,
+            },
+            {
+                "scheduler_outcome": "not_invoked",
+                "scheduler_cost": None,
+                "fallback": True,
+            },
+            {
+                "scheduler_outcome": "not_invoked",
+                "scheduler_cost": None,
+                "scheduler_call_id": "forged-call",
+            },
+            {
+                "scheduler_outcome": "accepted",
+                "scheduler_cost": None,
+            },
+        )
+        for values in invalid_cases:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.scheduler_decision(**values)
+
     def test_uniform_refill_uses_live_count_and_lexical_tie(self) -> None:
         first = snapshot(task("z"), task("a"), free=1)
         second = snapshot(task("a"), task("z"), free=1)

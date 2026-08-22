@@ -1194,24 +1194,86 @@ class AllocationDecision:
         object.__setattr__(self, "run_horizon_reached", horizon)
         if self.scheduler_cost is not None and not self.scheduler_call_id:
             object.__setattr__(self, "scheduler_call_id", self.decision_id)
-        if self.invalid_output and self.scheduler_outcome != "invalid_output":
-            raise ValueError("invalid_output requires scheduler_outcome=invalid_output")
-        if self.recoverable_invocation_error and self.scheduler_outcome != "provider_error":
+        # Keep the outcome fields as one closed, symmetric state machine.  A
+        # decision artifact is consumed independently of the in-memory
+        # object, so checking only ``flag -> outcome`` permits a forged row
+        # such as ``outcome=provider_error, recoverable=false`` to pass core
+        # validation and be miscounted at closeout.  The inverse implications
+        # below make every representable outcome unambiguous and keep the
+        # cost/call/fallback lifecycle tied to the invocation itself.
+        costed = self.scheduler_cost is not None
+        if costed and not self.scheduler_call_id:
+            # The default above normally supplies the decision ID.  Retain an
+            # explicit guard for callers that pass a non-string falsey value.
+            raise ValueError("costed scheduler call requires scheduler_call_id")
+        if not costed and self.scheduler_call_id:
+            raise ValueError("scheduler_call_id requires scheduler cost")
+
+        if self.scheduler_outcome == "not_invoked":
+            if costed:
+                raise ValueError("not_invoked must not have scheduler cost")
+            if self.scheduler_call_id:
+                raise ValueError("not_invoked must not have scheduler_call_id")
+            if self.fallback or self.invalid_output or self.recoverable_invocation_error or horizon:
+                raise ValueError(
+                    "not_invoked cannot carry fallback, error, or horizon flags"
+                )
+            return
+
+        if not costed:
             raise ValueError(
-                "recoverable_invocation_error requires scheduler_outcome=provider_error"
+                f"{self.scheduler_outcome} requires one costed scheduler call"
             )
-        if horizon and self.scheduler_outcome != "horizon_truncated":
-            raise ValueError(
-                "run_horizon_reached requires scheduler_outcome=horizon_truncated"
-            )
-        if self.scheduler_outcome == "horizon_truncated" and (
-            self.scheduler_cost is None or self.fallback
-        ):
-            raise ValueError(
-                "horizon_truncated requires one costed, non-fallback scheduler call"
-            )
-        if self.scheduler_outcome == "not_invoked" and self.scheduler_cost is not None:
-            raise ValueError("not_invoked must not have scheduler cost")
+
+        if self.scheduler_outcome == "accepted":
+            if self.fallback or self.invalid_output or self.recoverable_invocation_error or horizon:
+                raise ValueError(
+                    "accepted cannot carry fallback, error, or horizon flags"
+                )
+            return
+
+        if self.scheduler_outcome == "invalid_output":
+            if not self.invalid_output:
+                raise ValueError(
+                    "scheduler_outcome=invalid_output requires invalid_output=True"
+                )
+            if self.recoverable_invocation_error or horizon or not self.fallback:
+                raise ValueError(
+                    "invalid_output requires fallback and no provider or horizon flag"
+                )
+            return
+
+        if self.scheduler_outcome == "provider_error":
+            if not self.recoverable_invocation_error:
+                raise ValueError(
+                    "scheduler_outcome=provider_error requires "
+                    "recoverable_invocation_error=True"
+                )
+            if self.invalid_output or horizon or not self.fallback:
+                raise ValueError(
+                    "provider_error requires fallback and no invalid or horizon flag"
+                )
+            return
+
+        if self.scheduler_outcome == "policy_timeout":
+            if self.invalid_output or self.recoverable_invocation_error or horizon or not self.fallback:
+                raise ValueError(
+                    "policy_timeout requires fallback and no invalid, provider, or horizon flag"
+                )
+            return
+
+        # The only remaining admitted value is horizon_truncated.  It is a
+        # charged invocation that must never be converted into a policy
+        # fallback or an assignment after the fixed horizon.
+        if self.scheduler_outcome == "horizon_truncated":
+            if not horizon:
+                raise ValueError(
+                    "scheduler_outcome=horizon_truncated requires run_horizon_reached=True"
+                )
+            if self.invalid_output or self.recoverable_invocation_error or self.fallback:
+                raise ValueError(
+                    "horizon_truncated requires one costed, non-fallback scheduler call"
+                )
 
     def public_dict(self) -> dict[str, Any]:
         return {
