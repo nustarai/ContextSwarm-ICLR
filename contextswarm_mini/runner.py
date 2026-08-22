@@ -29,6 +29,7 @@ from .allocation import (
     TaskProgress,
     TaskProgressSnapshot,
     UniformAllocationPolicy,
+    _combine_fallback_reasons,
     normalize_verdict_status,
 )
 from .allocation_core import (
