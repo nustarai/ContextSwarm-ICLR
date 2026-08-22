@@ -286,6 +286,67 @@ class Figure4RuntimeTests(unittest.TestCase):
         self.assertEqual(scheduler_state["reservation_slots"], 0)
         self.assertEqual(scheduler_state["occupied_slots"], 0)
 
+    def test_llm_rejected_reserved_admission_releases_and_retries_fresh_decision(self) -> None:
+        """A ``None`` reservation conversion is stale, never a hidden fallback."""
+
+        original_admit = ElasticScheduler.admit_reserved
+        admit_calls = 0
+
+        def reject_first(scheduler, reservation, task_id, *, now=None):
+            nonlocal admit_calls
+            admit_calls += 1
+            if admit_calls == 1:
+                # The scheduler intentionally leaves the reservation held on
+                # a rejected conversion. Runner code must release it before
+                # entering a fresh decision iteration.
+                return None
+            return original_admit(scheduler, reservation, task_id, now=now)
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.object(ElasticScheduler, "admit_reserved", reject_first):
+            run_dir = run_experiment(
+                _config("llm_scheduler", attempts=2),
+                mock_agent=True,
+                output_override=Path(temporary.name),
+            )
+
+        self.assertGreaterEqual(admit_calls, 2)
+        decisions = _rows(run_dir / "allocation_decisions.jsonl")
+        stale = [
+            row for row in decisions if row.get("disposition") == "not_admitted_stale"
+        ]
+        self.assertTrue(stale, decisions)
+        assignments = _rows(run_dir / "elastic_assignments.jsonl")
+        assigned_indices = {
+            int(row["decision_index"])
+            for row in assignments
+            if row.get("decision_index") is not None
+        }
+        self.assertTrue(
+            all(int(row["decision_index"]) not in assigned_indices for row in stale)
+        )
+        self.assertTrue(
+            any(
+                row.get("disposition") == "assigned"
+                and int(row["decision_index"]) > int(stale[0]["decision_index"])
+                for row in decisions
+            )
+        )
+        scheduler_state = json.loads(
+            (run_dir / "elastic_scheduler_state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(scheduler_state["reservation_slots"], 0)
+        self.assertEqual(scheduler_state["occupied_slots"], 0)
+        self.assertEqual(scheduler_state["reservations"], {})
+        events = _rows(run_dir / "events.jsonl")
+        self.assertFalse(
+            any(
+                row.get("event") in {"run_error", "elastic_worker_error"}
+                for row in events
+            )
+        )
+
     def test_candidate_terminal_failure_is_recorded_and_slot_refilled(self) -> None:
         """A job-bound terminal failure is one attempt, not an arm abort."""
 
