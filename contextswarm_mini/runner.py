@@ -348,10 +348,8 @@ _AUTHORITATIVE_PROVED_STATUSES = {"PROVED", "AC", "PASS", "PASSED"}
 _RETRYABLE_CLOSEOUT_INFRA_STATUSES = {
     "EVALUATOR_ERROR",
     "EVALUATOR_TIMEOUT",
-    "EXECUTION_TIMEOUT",
     "INFRASTRUCTURE_ERROR",
     "REJECTED_OVERLOADED",
-    "RESOURCE_LIMIT",
 }
 
 
@@ -645,6 +643,12 @@ def _verdict_priority(verdict: Verdict | None) -> tuple[int, float]:
 _AUTHORITATIVE_CANDIDATE_STATUSES = frozenset(
     {"PROVED", "COMPILES_WITH_SORRY", "VERIFY_FAIL"}
 )
+_JOB_BOUND_CANDIDATE_ATTEMPT_STATUSES = frozenset(
+    {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
+)
+_CANDIDATE_ATTEMPT_STATUSES = (
+    _AUTHORITATIVE_CANDIDATE_STATUSES | _JOB_BOUND_CANDIDATE_ATTEMPT_STATUSES
+)
 _INFRASTRUCTURE_VERDICT_STATUSES = frozenset(
     {
         "EVALUATOR_ERROR",
@@ -828,10 +832,31 @@ def _has_authoritative_provenance(
     expected_task_contract_sha256: str,
     allow_mock_provenance: bool,
 ) -> bool:
+    return bool(
+        normalize_verdict_status(verdict.status)
+        in _AUTHORITATIVE_CANDIDATE_STATUSES
+        and _has_candidate_attempt_provenance(
+            verdict,
+            candidate,
+            expected_task_contract_sha256=expected_task_contract_sha256,
+            allow_mock_provenance=allow_mock_provenance,
+        )
+    )
+
+
+def _has_candidate_attempt_provenance(
+    verdict: Verdict,
+    candidate: Path,
+    *,
+    expected_task_contract_sha256: str,
+    allow_mock_provenance: bool,
+) -> bool:
+    """Validate a terminal Judge receipt against exact candidate bytes."""
+
     candidate_hash = str(verdict.candidate_sha256 or "").lower()
     contract_hash = str(verdict.task_contract_sha256 or "").lower()
     return bool(
-        normalize_verdict_status(verdict.status) in _AUTHORITATIVE_CANDIDATE_STATUSES
+        normalize_verdict_status(verdict.status) in _CANDIDATE_ATTEMPT_STATUSES
         and _SHA256_RE.fullmatch(candidate_hash)
         and contract_hash == expected_task_contract_sha256
         and (
@@ -877,9 +902,9 @@ def _enforce_verdict_provenance(
 
     status = normalize_verdict_status(verdict.status)
     requires_provenance = (
-        status in _AUTHORITATIVE_CANDIDATE_STATUSES or float(verdict.score) > 0.0
+        status in _CANDIDATE_ATTEMPT_STATUSES or float(verdict.score) > 0.0
     )
-    if not requires_provenance or _has_authoritative_provenance(
+    if not requires_provenance or _has_candidate_attempt_provenance(
         verdict,
         candidate,
         expected_task_contract_sha256=expected_task_contract_sha256,
@@ -897,7 +922,7 @@ def _enforce_verdict_provenance(
             "reported_candidate_sha256": verdict.candidate_sha256,
             "actual_candidate_sha256": _file_sha256(candidate),
         },
-        error="authoritative or positive verdict failed candidate-bound provenance checks",
+        error="candidate attempt or positive verdict failed candidate-bound provenance checks",
         candidate_sha256=verdict.candidate_sha256,
         task_contract_sha256=verdict.task_contract_sha256,
         judge_job_id=verdict.judge_job_id,
@@ -955,7 +980,7 @@ def _publish_authoritative_validation(
     contract_hash = str(verdict.task_contract_sha256 or "").lower()
     if (
         not policy.enabled
-        or normalize_verdict_status(verdict.status) not in _AUTHORITATIVE_CANDIDATE_STATUSES
+        or normalize_verdict_status(verdict.status) not in _CANDIDATE_ATTEMPT_STATUSES
         or not _SHA256_RE.fullmatch(candidate_hash)
         or not _SHA256_RE.fullmatch(contract_hash)
         or not (verdict.judge_job_id or verdict.response.get("mock") is True)
@@ -3443,14 +3468,19 @@ def _run_elastic_cps(
                 allow_mock_provenance=allow_mock_provenance,
             )
 
-        candidate_is_usable = _has_authoritative_provenance(
+        candidate_attempt_is_bound = _has_candidate_attempt_provenance(
             verdict,
             candidate_path,
             expected_task_contract_sha256=expected_contracts[task.slug],
             allow_mock_provenance=allow_mock_provenance,
         )
+        candidate_can_promote = (
+            candidate_attempt_is_bound
+            and normalize_verdict_status(verdict.status)
+            in _AUTHORITATIVE_CANDIDATE_STATUSES
+        )
         feedback = _allocation_feedback(verdict)
-        proof_candidate = verdict.score >= 1.0 and candidate_is_usable
+        proof_candidate = verdict.score >= 1.0 and candidate_can_promote
         if proof_candidate:
             admitted = admit_task_proof(
                 verdict,
@@ -3512,7 +3542,7 @@ def _run_elastic_cps(
                 else:
                     prior_priority = _verdict_priority(state.best_verdict)
                     improved = (
-                        candidate_is_usable
+                        candidate_can_promote
                         and _verdict_priority(verdict) > prior_priority
                     )
                     state.last_verdict_status = verdict.status
@@ -3540,7 +3570,7 @@ def _run_elastic_cps(
                             prior_priority=list(prior_priority),
                             new_priority=list(_verdict_priority(verdict)),
                         )
-                    elif candidate_is_usable:
+                    elif candidate_attempt_is_bound:
                         state.consecutive_failures += 1
 
         if superseded:
@@ -4708,24 +4738,14 @@ def _run_health(
     }
     for verdict in verdicts.values():
         status = normalize_verdict_status(verdict.status)
-        retryable_closeout = _retryable_closeout_infrastructure_failure(verdict)
-        bound_candidate_closeout = (
-            _response_value(verdict.response, "closeout_candidate_attempt") is True
-        )
         if (
             status in incomplete_closeout_statuses
             or status in _NONTERMINAL_VERDICT_STATUSES
-            or (retryable_closeout and not bound_candidate_closeout)
         ):
             issues.add("closeout_incomplete")
         if status == "AUTHORITY_CONFLICT":
             issues.add("closeout_authority_conflict")
         if _is_infrastructure_verdict(verdict):
-            issues.add("evaluator_infrastructure_error")
-        # A retryable terminal receipt in the independent closeout phase is
-        # distinct from the same status during a solver attempt: there is no
-        # remaining candidate attempt to refill, so closeout remains degraded.
-        if retryable_closeout and not bound_candidate_closeout:
             issues.add("evaluator_infrastructure_error")
         if status == "PROVENANCE_INVALID":
             issues.add("verdict_provenance_invalid")
