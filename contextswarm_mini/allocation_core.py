@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, fields
 import hashlib
 import json
 import math
+import re
 import time
 from types import MappingProxyType
 from typing import Any, Callable, ClassVar, Mapping
@@ -23,6 +24,19 @@ POLICY_LLM_SCHEDULER = "llm_scheduler"
 MAX_SNAPSHOT_TASKS = 512
 MAX_TRACE_REFERENCES_PER_TASK = 100
 MAX_IDENTIFIER_CHARS = 512
+# The scheduler receives a bounded UTF-8 wire prompt.  The limit is a policy
+# input (and is therefore configurable by the runner), while this default keeps
+# direct users of the pure core safe when they do not have a manifest object.
+LLM_SCHEDULER_PROMPT_MAX_BYTES = 64 * 1024
+LLM_SCHEDULER_PROMPT_MAX_TOKENS = 64 * 1024
+
+
+class _SchedulerPromptError(ValueError):
+    """Internal bounded-prompt rejection with a non-sensitive stable kind."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 def _finite(name: str, value: float, *, minimum: float | None = None) -> float:
@@ -72,6 +86,220 @@ def _thaw_json(value: Any) -> Any:
         return {str(key): _thaw_json(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_thaw_json(item) for item in value]
+    return value
+
+
+def _scheduler_identifier_is_safe(value: str, *, allow_empty: bool = True) -> bool:
+    """Return whether an opaque ID can be shown to the read-only scheduler.
+
+    Task and trace IDs are needed verbatim in the scheduler response, so they
+    cannot be replaced with a redaction token.  Reject obvious path/URI and
+    multiline values instead; a rejected snapshot takes the deterministic
+    fallback path and never reaches the model.
+    """
+
+    if not isinstance(value, str) or (not value and not allow_empty) or len(value) > MAX_IDENTIFIER_CHARS:
+        return False
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        return False
+    # Canonical paired decision IDs may contain one slash (for example
+    # ``paired-007/decision-000042``).  Permit only that registered shape;
+    # absolute/relative paths and arbitrary path-like IDs fail closed.
+    if "/" in value and not re.fullmatch(
+        r"paired-[A-Za-z0-9_.-]+/decision-[A-Za-z0-9_.-]+", value
+    ):
+        return False
+    if "://" in value or value.startswith(("file:", "path:", "./", "../")):
+        return False
+    return True
+
+
+def _scheduler_parameter_key_is_safe(value: str) -> bool:
+    lowered = value.strip().lower()
+    if not lowered or len(lowered) > MAX_IDENTIFIER_CHARS:
+        return False
+    # Manifest parameter names are normally simple identifiers.  A future
+    # caller may attach arbitrary metadata to ``allocation_parameters``; those
+    # fields must not become a covert path/transcript channel.
+    sensitive = (
+        "path",
+        "transcript",
+        "secret",
+        "token",
+        "endpoint",
+        "private",
+        "payload",
+        "raw",
+        "content",
+    )
+    return not any(fragment in lowered for fragment in sensitive)
+
+
+def _scheduler_parameter_value(value: Any, *, key: str = "") -> Any:
+    """Copy manifest parameters into a JSON-safe, non-sensitive view.
+
+    Allocation parameters are expected to be numeric tables.  We retain
+    bounded scalar labels for forward compatibility, but redact suspicious
+    keys/values rather than serializing arbitrary caller-owned text.  The
+    redaction token is deterministic and contains no source material.
+    """
+
+    if key and not _scheduler_parameter_key_is_safe(key):
+        return "<redacted>"
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for raw_key, raw_value in sorted(value.items(), key=lambda item: str(item[0])):
+            child_key = str(raw_key).strip()
+            if not _scheduler_parameter_key_is_safe(child_key):
+                # Keep the shape auditable without retaining the field name or
+                # value, either of which may disclose private provenance.
+                continue
+            result[child_key] = _scheduler_parameter_value(raw_value, key=child_key)
+        return result
+    if isinstance(value, (tuple, list)):
+        if len(value) > MAX_TRACE_REFERENCES_PER_TASK:
+            return "<redacted>"
+        return [_scheduler_parameter_value(item) for item in value]
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+        if not math.isfinite(number):
+            return "<redacted>"
+        # Preserve integer JSON spelling for manifest hashes and exact state
+        # comparisons where possible.
+        return value
+    if isinstance(value, str):
+        # Registered allocation parameters are numeric tables.  Do not carry
+        # any caller-owned string into a model prompt, even when it happens to
+        # look identifier-like: a transcript/path can be encoded without
+        # whitespace or a URI marker.
+        return "<redacted>"
+    return "<redacted>"
+
+
+def _scheduler_state_dict(snapshot: "AllocationStateSnapshot") -> dict[str, Any]:
+    """Build the exact bounded state view allowed in an LLM prompt.
+
+    This intentionally mirrors :meth:`AllocationStateSnapshot.public_dict`
+    field-for-field for the core state and task/trace records.  It does not
+    include arbitrary Python objects or caller-owned raw payloads.  Unsafe IDs
+    fail closed because the scheduler must return the original ID verbatim.
+    """
+
+    def safe_id(value: str, field_name: str, *, allow_empty: bool = False) -> str:
+        if not _scheduler_identifier_is_safe(value, allow_empty=allow_empty):
+            raise ValueError(f"scheduler snapshot contains an unsafe {field_name}")
+        return value
+
+    # Start with the exact immutable snapshot projection.  This keeps the LLM
+    # arm's causal input identical to Trace-State; only unsafe caller-owned
+    # strings are replaced/removed from the wire representation.
+    public = snapshot.public_dict()
+    for task in snapshot.tasks:
+        safe_id(task.task_id, "task identifier", allow_empty=False)
+        for value in task.trace_reference_ids:
+            safe_id(value, "trace reference", allow_empty=False)
+    safe_id(snapshot.decision_id, "decision identifier", allow_empty=False)
+
+    # Opaque watermarks and outcome IDs are useful for audit identity but are
+    # never echoed by the scheduler.  Keep their shape while removing path,
+    # URI, control-character, and overlong values.
+    public["trace_watermark"] = (
+        snapshot.trace_watermark
+        if _scheduler_identifier_is_safe(snapshot.trace_watermark)
+        else "<opaque>"
+    )
+    public["allocation_config_sha256"] = (
+        snapshot.allocation_config_sha256
+        if _scheduler_identifier_is_safe(snapshot.allocation_config_sha256)
+        else "<opaque>"
+    )
+    for task in public.get("tasks", []):
+        if not isinstance(task, dict):
+            raise ValueError("scheduler snapshot task projection is malformed")
+        for key in (
+            "trace_source_outcome_ids",
+            "checker_outcome_ids",
+        ):
+            values = task.get(key, [])
+            if not isinstance(values, list):
+                raise ValueError("scheduler snapshot identifier projection is malformed")
+            task[key] = [
+                value if _scheduler_identifier_is_safe(value) else "<opaque>"
+                for value in values
+            ]
+    public["allocation_parameters"] = _scheduler_parameter_value(
+        _thaw_json(snapshot.allocation_parameters)
+    )
+    return public
+
+
+def _resolve_prompt_bytes(
+    *,
+    prompt_max_bytes: int | None = None,
+    max_prompt_bytes: int | None = None,
+    llm_scheduler_prompt_max_bytes: int | None = None,
+) -> int:
+    """Resolve compatibility aliases to one positive prompt bound."""
+
+    provided = [
+        value
+        for value in (
+            prompt_max_bytes,
+            max_prompt_bytes,
+            llm_scheduler_prompt_max_bytes,
+        )
+        if value is not None
+    ]
+    for value in provided:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("LLM scheduler prompt max bytes must be a positive integer")
+    if provided and any(value != provided[0] for value in provided[1:]):
+        raise ValueError("LLM scheduler prompt byte limits disagree")
+    value = provided[0] if provided else LLM_SCHEDULER_PROMPT_MAX_BYTES
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("LLM scheduler prompt max bytes must be a positive integer")
+    return value
+
+
+def _prompt_token_count(prompt: str) -> int:
+    """Deterministic tokenizer-independent upper bound for prompt tokens."""
+
+    # Provider tokenizers differ and are not available in the pure policy core.
+    # A four-byte UTF-8 chunk is a conservative *budget estimate* for ordinary
+    # JSON text.  The byte limit remains the hard transport bound; this second
+    # guard prevents a caller from selecting an unbounded provider context.
+    # A provider tokenizer is intentionally unavailable in this pure module.
+    # One token per UTF-8 byte is a conservative provider-independent budget
+    # ceiling (and makes the optional token guard fail closed rather than
+    # undercounting punctuation-heavy prompts).
+    return len(prompt.encode("utf-8"))
+
+
+def _resolve_prompt_tokens(
+    *,
+    prompt_max_tokens: int | None = None,
+    max_prompt_tokens: int | None = None,
+    llm_scheduler_prompt_max_tokens: int | None = None,
+) -> int:
+    provided = [
+        value
+        for value in (
+            prompt_max_tokens,
+            max_prompt_tokens,
+            llm_scheduler_prompt_max_tokens,
+        )
+        if value is not None
+    ]
+    for value in provided:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("LLM scheduler prompt max tokens must be a positive integer")
+    if provided and any(value != provided[0] for value in provided[1:]):
+        raise ValueError("LLM scheduler prompt token limits disagree")
+    value = provided[0] if provided else LLM_SCHEDULER_PROMPT_MAX_TOKENS
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("LLM scheduler prompt max tokens must be a positive integer")
     return value
 
 
@@ -765,20 +993,134 @@ class ReadOnlyLLMSchedulerPolicy:
         self,
         invoke: LLMSchedulerInvoker,
         fallback_policy: TaskStateAllocationPolicy | None = None,
+        *,
+        prompt_max_bytes: int | None = None,
+        max_prompt_bytes: int | None = None,
+        llm_scheduler_prompt_max_bytes: int | None = None,
+        prompt_max_tokens: int | None = None,
+        max_prompt_tokens: int | None = None,
+        llm_scheduler_prompt_max_tokens: int | None = None,
     ) -> None:
         if not callable(invoke):
             raise TypeError("invoke must be callable")
         self._invoke = invoke
         self._fallback = fallback_policy or TaskStateAllocationPolicy()
+        self._prompt_max_bytes = _resolve_prompt_bytes(
+            prompt_max_bytes=prompt_max_bytes,
+            max_prompt_bytes=max_prompt_bytes,
+            llm_scheduler_prompt_max_bytes=llm_scheduler_prompt_max_bytes,
+        )
+        self._prompt_max_tokens = _resolve_prompt_tokens(
+            prompt_max_tokens=prompt_max_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            llm_scheduler_prompt_max_tokens=llm_scheduler_prompt_max_tokens,
+        )
+
+    @property
+    def prompt_max_bytes(self) -> int:
+        """Manifest-owned UTF-8 byte ceiling for one scheduler prompt."""
+
+        return self._prompt_max_bytes
+
+    @property
+    def prompt_max_tokens(self) -> int:
+        """Manifest-owned conservative token ceiling for one prompt."""
+
+        return self._prompt_max_tokens
 
     @staticmethod
-    def prompt(snapshot: AllocationStateSnapshot) -> str:
-        state = json.dumps(snapshot.public_dict(), ensure_ascii=False, sort_keys=True)
-        return (
+    def prompt(
+        snapshot: AllocationStateSnapshot,
+        *,
+        max_bytes: int | None = None,
+        prompt_max_bytes: int | None = None,
+        max_prompt_bytes: int | None = None,
+        llm_scheduler_prompt_max_bytes: int | None = None,
+        prompt_max_tokens: int | None = None,
+        max_prompt_tokens: int | None = None,
+        llm_scheduler_prompt_max_tokens: int | None = None,
+    ) -> str:
+        """Render a bounded, read-only scheduler prompt.
+
+        The entire UTF-8 prompt is measured.  JSON is never sliced: callers
+        receive a ``ValueError`` when the complete causal snapshot cannot fit,
+        allowing the policy to record a charged deterministic fallback.
+        """
+
+        # ``max_bytes`` is the short spelling used by direct callers while
+        # the other names are compatibility aliases.  Resolve all spellings,
+        # including both long byte aliases, before validating agreement.
+        if (
+            prompt_max_bytes is not None
+            and max_prompt_bytes is not None
+            and prompt_max_bytes != max_prompt_bytes
+        ):
+            raise ValueError("LLM scheduler prompt byte limits disagree")
+        limit = _resolve_prompt_bytes(
+            prompt_max_bytes=max_bytes,
+            max_prompt_bytes=(
+                prompt_max_bytes
+                if prompt_max_bytes is not None
+                else max_prompt_bytes
+            ),
+            llm_scheduler_prompt_max_bytes=llm_scheduler_prompt_max_bytes,
+        )
+        token_limit = _resolve_prompt_tokens(
+            prompt_max_tokens=prompt_max_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            llm_scheduler_prompt_max_tokens=llm_scheduler_prompt_max_tokens,
+        )
+        state = json.dumps(
+            _scheduler_state_dict(snapshot),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        rendered = (
             "You are a read-only allocation scheduler. Decide only from SNAPSHOT; do not call "
             "tools or change state. Return exactly one JSON object with keys decision_id, task_id, "
             "reason, trace_reference_ids. task_id must be eligible; trace references must appear in "
             "the snapshot. No Markdown or extra keys.\nSNAPSHOT:\n" + state
+        )
+        prompt_bytes = len(rendered.encode("utf-8"))
+        if prompt_bytes > limit:
+            raise _SchedulerPromptError(
+                "size_limit",
+                f"scheduler prompt exceeds max bytes ({prompt_bytes}>{limit})",
+            )
+        prompt_tokens = _prompt_token_count(rendered)
+        if prompt_tokens > token_limit:
+            raise _SchedulerPromptError(
+                "token_limit",
+                f"scheduler prompt exceeds max tokens ({prompt_tokens}>{token_limit})",
+            )
+        return rendered
+
+    def _prompt(self, snapshot: AllocationStateSnapshot) -> str:
+        return self.prompt(
+            snapshot,
+            max_bytes=self._prompt_max_bytes,
+            max_prompt_tokens=self._prompt_max_tokens,
+        )
+
+    @staticmethod
+    def _charged_fallback_response(
+        *,
+        error: str,
+        latency_seconds: float = 0.0,
+    ) -> LLMSchedulerResponse:
+        """Represent a skipped/failed call as one auditable scheduler attempt."""
+
+        # The runner reserves capacity before invoking this policy.  A prompt
+        # construction failure still consumes that decision's scheduler call
+        # budget, but has no model tokens and no model wall time to charge.
+        del error  # The human-readable reason is stored on AllocationDecision.
+        return LLMSchedulerResponse(
+            "",
+            returncode=1,
+            latency_seconds=max(0.0, latency_seconds),
+            occupied_slot_seconds=max(0.0, latency_seconds),
         )
 
     def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
@@ -796,29 +1138,31 @@ class ReadOnlyLLMSchedulerPolicy:
             )
         started = time.monotonic()
         invocation_error = ""
+        response: LLMSchedulerResponse
         try:
-            response = self._invoke(snapshot, self.prompt(snapshot))
-        except Exception as exc:  # provider/coordinator noise is a recoverable decision failure
-            invocation_error = f"scheduler invocation failed: {type(exc).__name__}"
-            response = LLMSchedulerResponse(
-                "",
-                returncode=1,
-                latency_seconds=max(0.0, time.monotonic() - started),
-            )
+            prompt = self._prompt(snapshot)
+        except _SchedulerPromptError as exc:
+            # Snapshot privacy/bounds failures are deterministic candidate
+            # outcomes.  Do not leak exception text, paths, or transcripts to
+            # artifacts; retain only a stable category.
+            invocation_error = f"scheduler prompt rejected: {exc.kind}"
+            response = self._charged_fallback_response(error=invocation_error)
+        except Exception:
+            invocation_error = "scheduler prompt rejected: unsafe_snapshot"
+            response = self._charged_fallback_response(error=invocation_error)
+        else:
+            try:
+                response = self._invoke(snapshot, prompt)
+            except Exception as exc:  # provider/coordinator noise is recoverable
+                invocation_error = f"scheduler invocation failed: {type(exc).__name__}"
+                response = self._charged_fallback_response(
+                    error=invocation_error,
+                    latency_seconds=max(0.0, time.monotonic() - started),
+                )
         if not isinstance(response, LLMSchedulerResponse):
-            # A runner-owned provider adapter is untrusted at this boundary:
-            # a malformed transport result is still one attempted scheduler
-            # call, not an arm-level infrastructure failure.  Charge the
-            # bounded call and use the same deterministic fallback as other
-            # provider/JSON failures.
-            invocation_error = (
-                invocation_error
-                or "scheduler invoker returned invalid response: "
-                + type(response).__name__
-            )
-            response = LLMSchedulerResponse(
-                "",
-                returncode=1,
+            invocation_error = "scheduler invocation returned invalid response"
+            response = self._charged_fallback_response(
+                error=invocation_error,
                 latency_seconds=max(0.0, time.monotonic() - started),
             )
         # A call that crossed the fixed experiment horizon is a lifecycle
@@ -896,6 +1240,12 @@ def create_allocation_policy(
     task_weights: TaskScoreWeights = DEFAULT_TASK_SCORE_WEIGHTS,
     trace_weights: TraceScoreWeights = DEFAULT_TRACE_SCORE_WEIGHTS,
     llm_invoker: LLMSchedulerInvoker | None = None,
+    prompt_max_bytes: int | None = None,
+    max_prompt_bytes: int | None = None,
+    llm_scheduler_prompt_max_bytes: int | None = None,
+    prompt_max_tokens: int | None = None,
+    max_prompt_tokens: int | None = None,
+    llm_scheduler_prompt_max_tokens: int | None = None,
 ) -> Any:
     """Construct one registered policy from explicit manifest-owned settings."""
 
@@ -910,7 +1260,16 @@ def create_allocation_policy(
     if name == POLICY_LLM_SCHEDULER:
         if llm_invoker is None:
             raise ValueError("llm_scheduler requires llm_invoker")
-        return ReadOnlyLLMSchedulerPolicy(llm_invoker, TaskStateAllocationPolicy(task_scorer))
+        return ReadOnlyLLMSchedulerPolicy(
+            llm_invoker,
+            TaskStateAllocationPolicy(task_scorer),
+            prompt_max_bytes=prompt_max_bytes,
+            max_prompt_bytes=max_prompt_bytes,
+            llm_scheduler_prompt_max_bytes=llm_scheduler_prompt_max_bytes,
+            prompt_max_tokens=prompt_max_tokens,
+            max_prompt_tokens=max_prompt_tokens,
+            llm_scheduler_prompt_max_tokens=llm_scheduler_prompt_max_tokens,
+        )
     raise ValueError(f"unknown allocation policy: {policy}")
 
 
@@ -918,6 +1277,8 @@ __all__ = [
     "ALLOCATION_POLICY_REGISTRY",
     "DEFAULT_TASK_SCORE_WEIGHTS",
     "DEFAULT_TRACE_SCORE_WEIGHTS",
+    "LLM_SCHEDULER_PROMPT_MAX_BYTES",
+    "LLM_SCHEDULER_PROMPT_MAX_TOKENS",
     "POLICY_LLM_SCHEDULER",
     "POLICY_TASK_STATE",
     "POLICY_TRACE_STATE",

@@ -5,6 +5,8 @@ import unittest
 
 from contextswarm_mini.allocation_core import (
     AllocationStateSnapshot,
+    LLM_SCHEDULER_PROMPT_MAX_BYTES,
+    LLM_SCHEDULER_PROMPT_MAX_TOKENS,
     LLMSchedulerResponse,
     ReadOnlyLLMSchedulerPolicy,
     TaskState,
@@ -275,6 +277,96 @@ class AllocationCoreTests(unittest.TestCase):
                 (task("a"),),
                 owned_scheduler_reservation_slots=2,
             )
+    def test_llm_prompt_is_compact_utf8_bounded_and_private_data_free(self) -> None:
+        marker_path = "/operator/private/transcript.lean"
+        marker_transcript = "PRIVATE TRANSCRIPT SHOULD NEVER REACH MODEL"
+        snap = AllocationStateSnapshot(
+            "decision-é",
+            2,
+            1.5,
+            20.0,
+            2,
+            1,
+            0,
+            1,
+            (
+                TaskState(
+                    "任务-é",
+                    True,
+                    1,
+                    trace=TraceFeatures(actionability=0.5),
+                    trace_reference_ids=("trace-é",),
+                    checker_outcome_ids=("checker-1",),
+                ),
+            ),
+            trace_watermark=marker_path,
+            allocation_parameters={
+                "task_state": {"checker_quality": 1.0},
+                "private_path": marker_path,
+                "transcript": marker_transcript,
+            },
+        )
+        prompt = ReadOnlyLLMSchedulerPolicy.prompt(snap)
+        self.assertLessEqual(
+            len(prompt.encode("utf-8")), LLM_SCHEDULER_PROMPT_MAX_BYTES
+        )
+        self.assertLessEqual(
+            len(prompt.encode("utf-8")), LLM_SCHEDULER_PROMPT_MAX_TOKENS * 4
+        )
+        self.assertNotIn(marker_path, prompt)
+        self.assertNotIn(marker_transcript, prompt)
+        self.assertIn("任务-é", prompt)
+        self.assertIn("trace-é", prompt)
+        # The wire payload is compact JSON, not a byte-truncated fragment.
+        payload = json.loads(prompt.split("SNAPSHOT:\n", 1)[1])
+        self.assertEqual(payload["decision_id"], "decision-é")
+        self.assertEqual(payload["tasks"][0]["task_id"], "任务-é")
+
+    def test_llm_prompt_byte_overflow_is_charged_fallback_without_invocation(self) -> None:
+        snap = snapshot(task("a", checker_quality=0.9), task("b"))
+        calls: list[tuple[object, str]] = []
+
+        def invoke(current, prompt):
+            calls.append((current, prompt))
+            return LLMSchedulerResponse("{}")
+
+        decision = ReadOnlyLLMSchedulerPolicy(
+            invoke,
+            prompt_max_bytes=1,
+        ).choose(snap)
+        self.assertEqual(calls, [])
+        self.assertTrue(decision.fallback)
+        self.assertEqual(decision.fallback_reason, "scheduler prompt rejected: size_limit")
+        self.assertEqual(decision.selected_task_id, "a")
+        self.assertEqual(decision.scheduler_cost.calls, 1)
+        self.assertEqual(decision.scheduler_cost.input_tokens, 0)
+        self.assertEqual(decision.scheduler_cost.output_tokens, 0)
+
+    def test_llm_prompt_token_overflow_is_charged_fallback_without_invocation(self) -> None:
+        snap = snapshot(task("a", checker_quality=0.9), task("b"))
+        calls: list[str] = []
+        decision = ReadOnlyLLMSchedulerPolicy(
+            lambda current, prompt: calls.append(prompt),
+            prompt_max_tokens=1,
+        ).choose(snap)
+        self.assertEqual(calls, [])
+        self.assertTrue(decision.fallback)
+        self.assertEqual(decision.fallback_reason, "scheduler prompt rejected: token_limit")
+        self.assertEqual(decision.scheduler_cost.calls, 1)
+
+    def test_llm_unsafe_echo_identifier_fails_closed_without_leaking_value(self) -> None:
+        private_identifier = "/tmp/private/transcript"
+        snap = snapshot(TaskState(private_identifier, True, 0))
+        calls: list[str] = []
+        decision = ReadOnlyLLMSchedulerPolicy(
+            lambda current, prompt: calls.append(prompt),
+            prompt_max_bytes=LLM_SCHEDULER_PROMPT_MAX_BYTES,
+        ).choose(snap)
+        self.assertEqual(calls, [])
+        self.assertTrue(decision.fallback)
+        self.assertEqual(decision.fallback_reason, "scheduler prompt rejected: unsafe_snapshot")
+        self.assertNotIn(private_identifier, decision.fallback_reason)
+        self.assertEqual(decision.scheduler_cost.calls, 1)
 
 
 if __name__ == "__main__":
