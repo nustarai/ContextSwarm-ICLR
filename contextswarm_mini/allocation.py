@@ -193,6 +193,10 @@ class AllocationDecision:
     agent_task_id: str = ""
     agent_episode: int | None = None
     agent_run_horizon_reached: bool = False
+    scheduler_call_id: str = ""
+    scheduler_outcome: str = ""
+    invalid_output: bool = False
+    recoverable_invocation_error: bool = False
 
     def __post_init__(self) -> None:
         if not self.requested_task_id:
@@ -223,6 +227,10 @@ class AllocationDecision:
             "agent_task_id": self.agent_task_id,
             "agent_episode": self.agent_episode,
             "agent_run_horizon_reached": self.agent_run_horizon_reached,
+            "scheduler_call_id": self.scheduler_call_id,
+            "scheduler_outcome": self.scheduler_outcome,
+            "invalid_output": self.invalid_output,
+            "recoverable_invocation_error": self.recoverable_invocation_error,
         }
         if snapshot is not None:
             row["snapshot"] = snapshot.as_dict()

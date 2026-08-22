@@ -1792,6 +1792,10 @@ def _legacy_decision_from_core(core: Any) -> AllocationDecision:
         ),
         fallback=core.fallback,
         fallback_reason=core.fallback_reason,
+        agent_result_valid=(not core.invalid_output if core.scheduler_cost is not None and not core.agent_run_horizon_reached else None),
+        agent_id=(f"allocation-scheduler-{core.decision_index}" if core.scheduler_cost is not None else ""),
+        agent_task_id="__allocation__" if core.scheduler_cost is not None else "",
+        agent_episode=core.decision_index if core.scheduler_cost is not None else None,
         scores=dict(core.scores),
         features={
             task_id: {"task_score": float(core.task_scores.get(task_id, 0.0)),
@@ -1801,6 +1805,10 @@ def _legacy_decision_from_core(core: Any) -> AllocationDecision:
         agent_run_horizon_reached=bool(
             getattr(core, "agent_run_horizon_reached", False)
         ),
+        scheduler_call_id=core.scheduler_call_id,
+        scheduler_outcome=core.scheduler_outcome,
+        invalid_output=core.invalid_output,
+        recoverable_invocation_error=core.recoverable_invocation_error,
     )
 
 
@@ -3011,6 +3019,7 @@ def _run_elastic_cps(
     results_lock = threading.RLock()
     scheduler_results_lock = threading.RLock()
     scheduler_result_decisions: set[int] = set()
+    scheduler_unfinalized_results: dict[int, AgentResult] = {}
     evaluation_backlog_limit = max(
         2,
         config.max_parallel + config.lean_max_concurrent_evaluations,
@@ -3073,6 +3082,15 @@ def _run_elastic_cps(
             scheduler_result_sink.append(result)
         logger.event("allocation_scheduler_finished", **result.as_dict())
 
+    def stage_scheduler_result(result: AgentResult) -> None:
+        index = result.decision_index
+        if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+            raise RuntimeError("scheduler result is missing a valid decision index")
+        with scheduler_results_lock:
+            if index in scheduler_result_decisions or index in scheduler_unfinalized_results:
+                raise RuntimeError("duplicate scheduler result decision index")
+            scheduler_unfinalized_results[index] = result
+
     def reconcile_scheduler_result(decision: Any) -> None:
         """Materialize a bounded result when the policy caught an invoker error.
 
@@ -3090,22 +3108,25 @@ def _run_elastic_cps(
         index = int(decision.decision_index)
         with scheduler_results_lock:
             if index in scheduler_result_decisions:
-                return
-        now = utc_now()
-        result = AgentResult(
-            agent_id=f"allocation-scheduler-{index}",
-            task_id="__allocation__",
-            episode=index,
-            returncode=1,
-            started_at=now,
-            finished_at=now,
-            command=["<scheduler-invocation-failed>"],
-            error_tail="scheduler invocation ended before a process result was available",
-            mocked=mock_agent,
-            decision_index=index,
-            run_horizon_reached=time.monotonic() >= deadline,
-        )
-        record_scheduler_result(result)
+                raise RuntimeError("duplicate scheduler result decision index")
+            result = scheduler_unfinalized_results.pop(index, None)
+            if result is None:
+                now = utc_now()
+                result = AgentResult(
+                    agent_id=f"allocation-scheduler-{index}", task_id="__allocation__",
+                    episode=index, returncode=1, started_at=now, finished_at=now,
+                    command=["<scheduler-invocation-failed>"],
+                    error_tail="scheduler invocation ended before a process result was available",
+                    mocked=mock_agent, decision_index=index,
+                )
+            result.scheduler_call_id = str(decision.scheduler_call_id)
+            result.scheduler_outcome = str(decision.scheduler_outcome)
+            result.invalid_output = bool(decision.invalid_output)
+            result.recoverable_invocation_error = bool(decision.recoverable_invocation_error)
+            result.run_horizon_reached = bool(decision.agent_run_horizon_reached)
+            scheduler_result_decisions.add(index)
+            scheduler_result_sink.append(result)
+        logger.event("allocation_scheduler_finished", **result.as_dict())
 
     def invoke_scheduler_agent(
         snapshot: TaskProgressSnapshot,
@@ -3208,7 +3229,7 @@ def _run_elastic_cps(
                 and time.monotonic() >= deadline
             )
         result.decision_index = snapshot.decision_index
-        record_scheduler_result(result)
+        stage_scheduler_result(result)
         latency = max(0.0, time.monotonic() - started)
         return LLMSchedulerResponse(
             output=result.output_tail,
@@ -3284,16 +3305,22 @@ def _run_elastic_cps(
                 for item in self.decisions
                 if item.scheduler_cost is not None
             ]
+            charged = [item for item in self.decisions if item.scheduler_cost is not None]
+            outcomes = Counter(item.scheduler_outcome for item in charged)
             return {
                 "schema_version": "contextswarm_allocation_summary_v2",
                 "policy": config.allocation.policy,
                 "decision_count": len(self.decisions),
-                "fallback_count": sum(item.fallback for item in self.decisions),
-                "agent_calls": sum(item.scheduler_cost is not None for item in self.decisions),
+                "fallback_count": sum(item.fallback for item in charged),
+                "agent_calls": len(charged),
+                "invalid_outputs": sum(item.invalid_output for item in charged),
+                "provider_errors": outcomes.get("provider_error", 0),
+                "policy_timeouts": outcomes.get("policy_timeout", 0),
+                "horizon_truncations": outcomes.get("horizon_truncated", 0),
                 "total_latency_seconds": round(sum(latencies), 6),
                 "max_latency_seconds": round(max(latencies, default=0.0), 6),
                 "scheduler_cost": {
-                    "calls": sum(item.scheduler_cost is not None for item in self.decisions),
+                    "calls": len(charged),
                     "reserved_slot_seconds": round(
                         sum(
                             float(item.scheduler_cost.occupied_slot_seconds or 0.0)
@@ -3302,6 +3329,11 @@ def _run_elastic_cps(
                         ),
                         6,
                     ),
+                    "invalid_outputs": sum(item.invalid_output for item in charged),
+                    "fallback_count": sum(item.fallback for item in charged),
+                    "provider_errors": outcomes.get("provider_error", 0),
+                    "policy_timeouts": outcomes.get("policy_timeout", 0),
+                    "horizon_truncations": outcomes.get("horizon_truncated", 0),
                 },
             }
 
@@ -3499,6 +3531,10 @@ def _run_elastic_cps(
                         if core_decision.scheduler_cost is not None
                         else None
                     ),
+                    "scheduler_call_id": core_decision.scheduler_call_id,
+                    "scheduler_outcome": core_decision.scheduler_outcome,
+                    "invalid_output": core_decision.invalid_output,
+                    "recoverable_invocation_error": core_decision.recoverable_invocation_error,
                 }
             )
         if execution_snapshot is not None:
@@ -3522,6 +3558,10 @@ def _run_elastic_cps(
             agent_task_id=decision.agent_task_id,
             agent_episode=decision.agent_episode,
             agent_run_horizon_reached=decision.agent_run_horizon_reached,
+            scheduler_call_id=decision.scheduler_call_id,
+            scheduler_outcome=decision.scheduler_outcome,
+            invalid_output=decision.invalid_output,
+            recoverable_invocation_error=decision.recoverable_invocation_error,
             assigned_agent_id=assignment.agent_id if assignment is not None else None,
             disposition=disposition,
             selection_config_id=(
@@ -5979,9 +6019,51 @@ def _run_health(
             scheduler_event_indexes = Counter(
                 str(row.get("decision_index")) for row in scheduler_event_rows
             )
+            llm_result_call_ids = Counter(
+                str(item.scheduler_call_id or "") for item in scheduler_agents
+            )
+            llm_event_call_ids = Counter(
+                str(row.get("scheduler_call_id") or row.get("decision_id") or "")
+                for row in scheduler_event_rows
+            )
+            llm_decision_call_ids = Counter(
+                str(row.get("scheduler_call_id") or row.get("decision_id") or "")
+                for row in decisions
+                if str(row.get("policy") or "") == "llm_scheduler"
+                and row.get("scheduler_cost") is not None
+            )
+            llm_cost_errors = 0
+            llm_outcome_errors = 0
+            for row in decisions:
+                if str(row.get("policy") or "") != "llm_scheduler":
+                    continue
+                cost = row.get("scheduler_cost")
+                outcome = row.get("scheduler_outcome")
+                if cost is None:
+                    if outcome not in {"not_invoked", None}:
+                        llm_cost_errors += 1
+                    continue
+                if not isinstance(cost, Mapping) or cost.get("calls") != 1:
+                    llm_cost_errors += 1
+                invalid = bool(row.get("invalid_output"))
+                provider = bool(row.get("recoverable_invocation_error"))
+                horizon = bool(row.get("run_horizon_reached") or row.get("agent_run_horizon_reached"))
+                if invalid != (outcome == "invalid_output"):
+                    llm_outcome_errors += 1
+                if provider and outcome != "provider_error":
+                    llm_outcome_errors += 1
+                if horizon and outcome != "horizon_truncated":
+                    llm_outcome_errors += 1
+                if outcome == "horizon_truncated" and (not isinstance(cost, Mapping) or cost.get("calls") != 1 or row.get("fallback")):
+                    llm_outcome_errors += 1
             if (
                 scheduler_result_indexes != llm_decision_indexes
                 or scheduler_event_indexes != llm_decision_indexes
+                or llm_result_call_ids != llm_event_call_ids
+                or llm_result_call_ids != llm_decision_call_ids
+                or any(not key for key in llm_result_call_ids)
+                or llm_cost_errors
+                or llm_outcome_errors
                 or scheduler_summary_agent_calls != scheduler_charged_decisions
             ):
                 issues.add("allocation_scheduler_closeout_mismatch")
@@ -6470,10 +6552,20 @@ def _write_figure4_summary(
         "reserved_slot_seconds": float(
             allocation.get("scheduler_reserved_slot_seconds", 0.0)
         ),
-        "invalid_outputs": int(allocation.get("invalid_output_count", 0)),
-        "fallback_count": int(allocation.get("fallback_count", 0)),
+        "invalid_outputs": int(
+            raw_scheduler.get(
+                "invalid_outputs",
+                allocation.get("invalid_outputs", allocation.get("invalid_output_count", 0)),
+            )
+        ),
+        "fallback_count": int(raw_scheduler.get("fallback_count", allocation.get("fallback_count", 0))),
+        "provider_errors": int(raw_scheduler.get("provider_errors", allocation.get("provider_errors", 0))),
+        "policy_timeouts": int(raw_scheduler.get("policy_timeouts", allocation.get("policy_timeouts", 0))),
         "horizon_truncations": int(
-            allocation.get("horizon_truncation_count", 0)
+            raw_scheduler.get(
+                "horizon_truncations",
+                allocation.get("horizon_truncations", allocation.get("horizon_truncation_count", 0)),
+            )
         ),
     }
     decision_rows, _ = _read_jsonl_objects(run_dir / "allocation_decisions.jsonl")
@@ -6484,8 +6576,8 @@ def _write_figure4_summary(
         ),
         "fallbacks": sum(row.get("fallback") is True for row in decision_rows),
         "invalid_outputs": sum(
-            row.get("fallback") is True
-            and "scheduler output" in str(row.get("fallback_reason") or "")
+            bool(row.get("invalid_output"))
+            or row.get("scheduler_outcome") == "invalid_output"
             for row in decision_rows
         ),
         "horizon_truncations": sum(

@@ -158,6 +158,8 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(failed.selected_task_id, "b")
         self.assertIn("ConnectionError", failed.fallback_reason)
         self.assertEqual(failed.scheduler_cost.calls, 1)
+        self.assertEqual(failed.scheduler_outcome, "provider_error")
+        self.assertTrue(failed.recoverable_invocation_error)
 
     def test_llm_wire_level_parser_errors_are_deterministic_fallbacks(self) -> None:
         snap = snapshot(task("a", checker_quality=0.1), task("b", checker_quality=0.9))
@@ -249,6 +251,7 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(decision.selected_task_id, "b")
         self.assertEqual(decision.scheduler_cost.calls, 1)
         self.assertIn("invalid response", decision.fallback_reason)
+        self.assertEqual(decision.scheduler_outcome, "provider_error")
 
     def test_llm_horizon_truncation_is_not_a_policy_fallback(self) -> None:
         snap = snapshot(task("a", checker_quality=0.1), task("b", checker_quality=0.9))
@@ -261,6 +264,7 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertFalse(decision.fallback)
         self.assertEqual(decision.selected_task_id, "")
         self.assertEqual(decision.scheduler_cost.calls, 1)
+        self.assertEqual(decision.scheduler_outcome, "horizon_truncated")
 
     def test_llm_reason_is_bounded_and_cannot_inject_provenance(self) -> None:
         snap = snapshot(task("a", active=0))
@@ -377,6 +381,19 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(decision.selected_task_id, "a")
         self.assertFalse(decision.fallback)
+
+    def test_llm_timeout_and_malformed_output_have_distinct_outcomes(self) -> None:
+        snap = snapshot(task("a", checker_quality=0.1), task("b", checker_quality=0.9))
+        timeout = ReadOnlyLLMSchedulerPolicy(
+            lambda _current, _prompt: LLMSchedulerResponse("", returncode=124, timed_out=True)
+        ).choose(snap)
+        self.assertEqual(timeout.scheduler_outcome, "policy_timeout")
+        self.assertFalse(timeout.invalid_output)
+        malformed = ReadOnlyLLMSchedulerPolicy(
+            lambda _current, _prompt: LLMSchedulerResponse("not-json")
+        ).choose(snap)
+        self.assertEqual(malformed.scheduler_outcome, "invalid_output")
+        self.assertTrue(malformed.invalid_output)
 
     def test_owned_scheduler_reservation_is_validated_and_hashed(self) -> None:
         unowned = AllocationStateSnapshot(

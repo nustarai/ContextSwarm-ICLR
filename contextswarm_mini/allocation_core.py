@@ -22,6 +22,16 @@ POLICY_UNIFORM_REFILL = "uniform_refill"
 POLICY_TASK_STATE = "task_state"
 POLICY_TRACE_STATE = "trace_state"
 POLICY_LLM_SCHEDULER = "llm_scheduler"
+SCHEDULER_OUTCOMES = frozenset(
+    {
+        "accepted",
+        "invalid_output",
+        "provider_error",
+        "policy_timeout",
+        "horizon_truncated",
+        "not_invoked",
+    }
+)
 MAX_SNAPSHOT_TASKS = 512
 MAX_TRACE_REFERENCES_PER_TASK = 100
 MAX_IDENTIFIER_CHARS = 512
@@ -959,6 +969,7 @@ class LLMSchedulerResponse:
     # this bit to record ``not_admitted_horizon`` without charging a
     # deterministic policy fallback or admitting a late assignment.
     run_horizon_reached: bool = False
+    recoverable_invocation_error: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.output, str):
@@ -969,6 +980,8 @@ class LLMSchedulerResponse:
             raise ValueError("timed_out must be a boolean")
         if not isinstance(self.run_horizon_reached, bool):
             raise ValueError("run_horizon_reached must be a boolean")
+        if not isinstance(self.recoverable_invocation_error, bool):
+            raise ValueError("recoverable_invocation_error must be a boolean")
         LLMSchedulerCost(
             input_tokens=self.input_tokens,
             output_tokens=self.output_tokens,
@@ -1007,17 +1020,53 @@ class AllocationDecision:
     fallback: bool = False
     fallback_reason: str = ""
     scheduler_cost: LLMSchedulerCost | None = None
+    scheduler_outcome: str = "not_invoked"
+    scheduler_call_id: str = ""
+    invalid_output: bool = False
+    recoverable_invocation_error: bool = False
     # Kept in the legacy runner's terminology so the adapter can propagate a
     # horizon-truncated scheduler result without manufacturing a fallback.
     agent_run_horizon_reached: bool = False
+    run_horizon_reached: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "scores", _immutable_scores(self.scores))
         object.__setattr__(self, "task_scores", _immutable_scores(self.task_scores))
         object.__setattr__(self, "trace_increments", _immutable_scores(self.trace_increments))
         object.__setattr__(self, "trace_reference_ids", tuple(self.trace_reference_ids))
-        if not isinstance(self.agent_run_horizon_reached, bool):
-            raise ValueError("agent_run_horizon_reached must be a boolean")
+        if self.scheduler_outcome not in SCHEDULER_OUTCOMES:
+            raise ValueError("scheduler_outcome is not recognized")
+        for name in (
+            "invalid_output",
+            "recoverable_invocation_error",
+            "agent_run_horizon_reached",
+            "run_horizon_reached",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
+        horizon = self.agent_run_horizon_reached or self.run_horizon_reached
+        object.__setattr__(self, "agent_run_horizon_reached", horizon)
+        object.__setattr__(self, "run_horizon_reached", horizon)
+        if self.scheduler_cost is not None and not self.scheduler_call_id:
+            object.__setattr__(self, "scheduler_call_id", self.decision_id)
+        if self.invalid_output and self.scheduler_outcome != "invalid_output":
+            raise ValueError("invalid_output requires scheduler_outcome=invalid_output")
+        if self.recoverable_invocation_error and self.scheduler_outcome != "provider_error":
+            raise ValueError(
+                "recoverable_invocation_error requires scheduler_outcome=provider_error"
+            )
+        if horizon and self.scheduler_outcome != "horizon_truncated":
+            raise ValueError(
+                "run_horizon_reached requires scheduler_outcome=horizon_truncated"
+            )
+        if self.scheduler_outcome == "horizon_truncated" and (
+            self.scheduler_cost is None or self.fallback
+        ):
+            raise ValueError(
+                "horizon_truncated requires one costed, non-fallback scheduler call"
+            )
+        if self.scheduler_outcome == "not_invoked" and self.scheduler_cost is not None:
+            raise ValueError("not_invoked must not have scheduler cost")
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -1035,6 +1084,11 @@ class AllocationDecision:
             "fallback": self.fallback,
             "fallback_reason": self.fallback_reason,
             "agent_run_horizon_reached": self.agent_run_horizon_reached,
+            "run_horizon_reached": self.run_horizon_reached,
+            "scheduler_call_id": self.scheduler_call_id,
+            "scheduler_outcome": self.scheduler_outcome,
+            "invalid_output": self.invalid_output,
+            "recoverable_invocation_error": self.recoverable_invocation_error,
             "scheduler_cost": self.scheduler_cost.public_dict() if self.scheduler_cost else None,
         }
 
@@ -1341,6 +1395,7 @@ class ReadOnlyLLMSchedulerPolicy:
         *,
         error: str,
         latency_seconds: float = 0.0,
+        recoverable_invocation_error: bool = False,
     ) -> LLMSchedulerResponse:
         """Represent a skipped/failed call as one auditable scheduler attempt."""
 
@@ -1353,6 +1408,7 @@ class ReadOnlyLLMSchedulerPolicy:
             returncode=1,
             latency_seconds=max(0.0, latency_seconds),
             occupied_slot_seconds=max(0.0, latency_seconds),
+            recoverable_invocation_error=recoverable_invocation_error,
         )
 
     def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
@@ -1370,6 +1426,8 @@ class ReadOnlyLLMSchedulerPolicy:
             )
         started = time.monotonic()
         invocation_error = ""
+        prompt_rejected = False
+        invocation_exception = False
         response: LLMSchedulerResponse
         try:
             prompt = self._prompt(snapshot)
@@ -1378,24 +1436,30 @@ class ReadOnlyLLMSchedulerPolicy:
             # outcomes.  Do not leak exception text, paths, or transcripts to
             # artifacts; retain only a stable category.
             invocation_error = f"scheduler prompt rejected: {exc.kind}"
+            prompt_rejected = True
             response = self._charged_fallback_response(error=invocation_error)
         except Exception:
             invocation_error = "scheduler prompt rejected: unsafe_snapshot"
+            prompt_rejected = True
             response = self._charged_fallback_response(error=invocation_error)
         else:
             try:
                 response = self._invoke(snapshot, prompt)
             except Exception as exc:  # provider/coordinator noise is recoverable
+                invocation_exception = True
                 invocation_error = f"scheduler invocation failed: {type(exc).__name__}"
                 response = self._charged_fallback_response(
                     error=invocation_error,
                     latency_seconds=max(0.0, time.monotonic() - started),
+                    recoverable_invocation_error=True,
                 )
         if not isinstance(response, LLMSchedulerResponse):
+            invocation_exception = True
             invocation_error = "scheduler invocation returned invalid response"
             response = self._charged_fallback_response(
                 error=invocation_error,
                 latency_seconds=max(0.0, time.monotonic() - started),
+                recoverable_invocation_error=True,
             )
         # A call that crossed the fixed experiment horizon is a lifecycle
         # truncation, not a malformed model decision.  Preserve its one-call
@@ -1410,17 +1474,21 @@ class ReadOnlyLLMSchedulerPolicy:
                 selected_task_id="",
                 reason="scheduler call was truncated by the fixed run horizon",
                 scheduler_cost=response.cost,
+                scheduler_outcome="horizon_truncated",
                 agent_run_horizon_reached=True,
+                run_horizon_reached=True,
             )
         error = invocation_error
         selected = ""
         reason = ""
         references: tuple[str, ...] = ()
+        if not error and response.recoverable_invocation_error:
+            error = "scheduler invocation failed"
         if not error:
-            if response.returncode != 0:
-                error = f"scheduler returned {response.returncode}"
-            elif response.timed_out:
+            if response.timed_out:
                 error = "scheduler timed out"
+            elif response.returncode != 0:
+                error = f"scheduler returned {response.returncode}"
             else:
                 try:
                     selected, reason, references = parse_llm_scheduler_output(
@@ -1428,10 +1496,24 @@ class ReadOnlyLLMSchedulerPolicy:
                     )
                 except ValueError as exc:
                     error = str(exc)
+        outcome = "accepted"
+        invalid_output = False
+        recoverable_error = bool(response.recoverable_invocation_error)
         if error:
             fallback = self._fallback.choose(snapshot)
             selected = fallback.selected_task_id
             reason = "scheduler decision rejected; deterministic task-state fallback"
+            if recoverable_error or invocation_exception:
+                outcome = "provider_error"
+                recoverable_error = True
+            elif response.returncode != 0 and not response.timed_out and not prompt_rejected:
+                outcome = "provider_error"
+                recoverable_error = True
+            elif response.timed_out:
+                outcome = "policy_timeout"
+            else:
+                outcome = "invalid_output"
+                invalid_output = True
         task_scores = self._trace_scorer.task_scorer.score_snapshot(snapshot)
         trace_increments = self._trace_scorer.increments(snapshot)
         scores = {
@@ -1452,6 +1534,9 @@ class ReadOnlyLLMSchedulerPolicy:
             fallback=bool(error),
             fallback_reason=error,
             scheduler_cost=response.cost,
+            scheduler_outcome=outcome,
+            invalid_output=invalid_output,
+            recoverable_invocation_error=recoverable_error,
         )
 
 
