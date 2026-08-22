@@ -242,6 +242,47 @@ class AgentRecoveryTests(unittest.TestCase):
         self.assertTrue(result.run_horizon_reached)
         self.assertEqual(attempts, [0])
 
+    def test_expired_horizon_is_guarded_before_initial_invocation(self) -> None:
+        attempts: list[int] = []
+        result = run_with_recovery(
+            lambda recovery_attempt: (
+                attempts.append(recovery_attempt) or _result(0)
+            ),
+            task_id="task",
+            actor_id="worker-task-e1",
+            episode=1,
+            deadline_monotonic=time.monotonic() - 0.001,
+            max_restarts=1,
+            base_delay_seconds=0.0,
+        )
+
+        self.assertEqual(attempts, [])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(result.run_horizon_reached)
+        self.assertTrue(result.timed_out)
+
+    def test_cancelled_slot_is_guarded_before_recovery_relaunch(self) -> None:
+        attempts: list[int] = []
+        cancel_event = threading.Event()
+        cancel_event.set()
+        result = run_with_recovery(
+            lambda recovery_attempt: (
+                attempts.append(recovery_attempt) or _result(0)
+            ),
+            task_id="task",
+            actor_id="worker-task-e1",
+            episode=1,
+            deadline_monotonic=time.monotonic() + 5.0,
+            cancel_event=cancel_event,
+            max_restarts=1,
+            base_delay_seconds=0.0,
+        )
+
+        self.assertEqual(attempts, [])
+        self.assertEqual(result.returncode, 130)
+        self.assertTrue(result.cancelled)
+        self.assertFalse(result.run_horizon_reached)
+
     def test_nonzero_process_exit_after_global_deadline_is_normal_horizon_closeout(self) -> None:
         attempts: list[int] = []
         deadline = time.monotonic() + 0.01
