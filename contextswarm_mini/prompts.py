@@ -116,17 +116,27 @@ def render_problem_work_mode(*, indent: str = "        ") -> str:
     )
 
 
-def _communication_instructions(enabled: bool) -> str:
-    if not enabled:
+def _communication_instructions(
+    enabled: bool,
+    *,
+    direct_messages: bool = True,
+    selection_enabled: bool = False,
+) -> str:
+    if not enabled and not selection_enabled:
         return (
             "This is a no-communication baseline. Do not read or write any shared "
             "CPS/blackboard state; work only from the files in this workspace."
         )
-    return """This run exposes shared ContextSwarm state only through controlled CPS tools.
+    direct = """
+Use `cps_inbox` to receive direct messages, `cps_send` to send one, `cps_ack` to
+acknowledge one, and `cps_actors` only when recipient discovery is needed.""" if direct_messages else ""
+    selection = """
+Use `cps_feedback` only to record concise selection feedback for the runner-owned
+allocation state; it is not a direct-message channel.""" if selection_enabled else ""
+    return f"""This run exposes shared ContextSwarm state only through controlled CPS tools.
 Before trying a route, use `cps_search` to find relevant shared evidence. After a
 meaningful discovery, use `cps_publish` to leave a concise typed handoff. Use
-`cps_inbox` to receive direct messages, `cps_send` to send one, `cps_ack` to
-acknowledge one, and `cps_actors` only when recipient discovery is needed.
+{direct}{selection}
 Do not access CPS through a local CLI, database, filesystem search, or custom
 script. Never include credentials, absolute host paths, or full transcripts in a
 piece or message."""
@@ -168,6 +178,8 @@ def build_task_prompt(
     episode: int,
     communication_enabled: bool,
     formal_tools_enabled: bool = False,
+    direct_messages: bool = True,
+    selection_enabled: bool = False,
     digest: str = "",
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
@@ -192,7 +204,7 @@ or a local verification process.
 
 {_execution_contract(task)}
 
-{_communication_instructions(communication_enabled)}
+{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 
@@ -213,6 +225,8 @@ def build_mono_prompt(
     workspace: str,
     communication_enabled: bool,
     formal_tools_enabled: bool = False,
+    direct_messages: bool = True,
+    selection_enabled: bool = False,
 ) -> str:
     task_list = list(tasks)
     if not task_list:
@@ -244,7 +258,7 @@ Mono task-selection rule: this session owns multiple task directories. For every
 `{{"task_id": "<slug>"}}`; never make a no-argument call. A single-task
 Parallel worker may omit `task_id`, but Mono may not.
 
-{_communication_instructions(communication_enabled)}
+{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 

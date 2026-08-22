@@ -105,6 +105,12 @@ function registerBrokerTool(pi, definition) {
   });
 }
 
+function enabledCapability(name, defaultValue = false) {
+  const raw = String(process.env[name] ?? "").trim().toLowerCase();
+  if (!raw) return defaultValue;
+  return ["1", "true", "yes", "on"].includes(raw);
+}
+
 function normalizeExistingPath(rawPath, cwd) {
   if (typeof rawPath !== "string" || !rawPath.trim()) return null;
   const lexical = isAbsolute(rawPath) ? resolve(rawPath) : resolve(cwd, rawPath);
@@ -372,6 +378,11 @@ export default function registerContextSwarmSolverTools(pi) {
 
   const candidate = candidateFilename();
   const language = candidate === "result.cpp" ? "C++" : "Lean";
+  // Direct messaging was part of the original CPS contract, so its default
+  // remains enabled.  The runner sets these explicit, non-secret capability
+  // bits for allocation/selection experiments that must remain message-free.
+  const directMessages = enabledCapability("CONTEXTSWARM_CPS_DIRECT_MESSAGES", true);
+  const selectionEnabled = enabledCapability("CONTEXTSWARM_CPS_SELECTION_ENABLED");
 
   registerBrokerTool(pi, {
     name: "judge_check",
@@ -416,7 +427,7 @@ export default function registerContextSwarmSolverTools(pi) {
     ),
   });
 
-  registerBrokerTool(pi, {
+  if (directMessages) registerBrokerTool(pi, {
     name: "cps_inbox",
     label: "CPS Inbox",
     description: "Read bounded unacknowledged direct messages for this actor.",
@@ -424,7 +435,7 @@ export default function registerContextSwarmSolverTools(pi) {
     parameters: objectSchema({ limit: integerSchema("Maximum returned messages", 8) }),
   });
 
-  registerBrokerTool(pi, {
+  if (directMessages) registerBrokerTool(pi, {
     name: "cps_send",
     label: "Send CPS Message",
     description: "Send a bounded direct message using the runner-bound actor identity.",
@@ -439,7 +450,29 @@ export default function registerContextSwarmSolverTools(pi) {
     ),
   });
 
-  registerBrokerTool(pi, {
+  if (selectionEnabled) registerBrokerTool(pi, {
+    name: "cps_feedback",
+    label: "Record CPS Exposure Feedback",
+    description: "Record attributed feedback for one previously exposed ContextSwarm selection item. Supply the exposure identifiers exactly as returned by the selection surface.",
+    promptSnippet: "Record attributed feedback for an exposed CPS selection item",
+    parameters: objectSchema(
+      {
+        request_key: stringSchema("Idempotency key for this feedback event", 256),
+        exposure_item_id: stringSchema("Identifier of the previously exposed selection item", 256),
+        trace_id: stringSchema("Trace identifier returned with the exposed item", 256),
+        feedback_kind: {
+          type: "string",
+          enum: ["useful", "not_useful", "misleading", "stale", "unsafe", "duplicate", "diagnostic_useful", "needs_refinement", "not_used", "route_attempted", "route_improving"],
+          description: "Canonical attribution feedback kind",
+        },
+        value: { type: "number", description: "Optional numeric feedback value" },
+        note: stringSchema("Optional concise attribution note", 8_000),
+      },
+      ["request_key", "exposure_item_id", "trace_id", "feedback_kind"],
+    ),
+  });
+
+  if (directMessages) registerBrokerTool(pi, {
     name: "cps_ack",
     label: "Acknowledge CPS Message",
     description: "Acknowledge one message that is visible to this runner-bound actor.",
@@ -450,7 +483,7 @@ export default function registerContextSwarmSolverTools(pi) {
     ),
   });
 
-  registerBrokerTool(pi, {
+  if (directMessages) registerBrokerTool(pi, {
     name: "cps_actors",
     label: "List CPS Actors",
     description: "Inspect the bounded public actor roster for recipient discovery.",

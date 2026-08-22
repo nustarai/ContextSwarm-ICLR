@@ -34,6 +34,7 @@ from .evaluator import (
 from .formal_tools import FormalToolPolicy, sanitize_public_text
 from .models import Task, Verdict
 from .secure_io import DEFAULT_MAX_CANDIDATE_BYTES, read_regular_bytes
+from .selection_store import CANONICAL_FEEDBACK_KINDS, SelectionStore
 
 
 _MAX_REQUEST_BYTES = 32 * 1024
@@ -45,8 +46,11 @@ _PROBE_ADMISSION_TIMEOUT_SECONDS: float | None = None
 # formal arms revoke their sessions together: queued cancellation/receipt
 # reconciliation can take tens of seconds even after the remote service is
 # healthy.  Keep this bounded (and fail closed if it is genuinely stuck), but
-# leave enough time for the fixed Judge lifecycle to settle.
+# leave enough time for the fixed Judge lifecycle to settle.  The default is
+# extended below when the evaluator exposes its deferred-settlement horizon;
+# the extra margin covers the final poll/callback handoff.
 _BROKER_DRAIN_TIMEOUT_SECONDS = 120.0
+_BROKER_DRAIN_SETTLEMENT_MARGIN_SECONDS = 60.0
 _RUNNER_ONLY_CPS_KINDS = frozenset({"validation_result"})
 _ALLOWED_CANDIDATE_FILENAMES = frozenset({"result.lean", "result.cpp"})
 _LEAN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.₀-₉ⁿ¹²³@]*$")
@@ -104,6 +108,31 @@ _JUDGE_CHECKPOINT_TERMINAL_STATUSES = frozenset(
 _CHECKPOINT_VALUE_UNSET = object()
 
 
+def _default_drain_timeout_seconds(evaluator: Any) -> float:
+    """Choose a closeout deadline that covers deferred Judge settlement.
+
+    ``LeanEvaluator`` may retain a semaphore permit while a known cancelled
+    job is reconciled by a background watcher.  The broker must not give up
+    before that watcher has reached its own bounded deadline: doing so turns a
+    recoverable cancellation into a spurious ``JudgeBrokerDrainError``.  Keep
+    the historical 120-second floor for adapters without this optional
+    surface, and add a fixed handoff margin for evaluators that expose it.
+    """
+
+    try:
+        watcher_timeout = float(
+            getattr(evaluator, "deferred_settlement_timeout_seconds", 0.0)
+        )
+    except (TypeError, ValueError, OverflowError):
+        watcher_timeout = 0.0
+    if not math.isfinite(watcher_timeout) or watcher_timeout <= 0:
+        watcher_timeout = 0.0
+    return max(
+        _BROKER_DRAIN_TIMEOUT_SECONDS,
+        watcher_timeout + _BROKER_DRAIN_SETTLEMENT_MARGIN_SECONDS,
+    )
+
+
 class JudgeBrokerDrainError(RuntimeError):
     """The broker could not finish handler audit and FIFO drain in time."""
 
@@ -147,6 +176,10 @@ class _SessionClaim:
     deadline_epoch_ms: int
     cps_store: CPSStore | None = None
     communication: str = "none"
+    direct_messages_allowed: bool = True
+    selection_store: SelectionStore | None = None
+    selection_enabled: bool = False
+    selection_search: Callable[[Any, str, int], Mapping[str, Any]] | None = None
     roster_path: Path | None = None
     on_authoritative_verdict: (
         Callable[[Task, Verdict, CandidateSnapshot], None] | None
@@ -235,9 +268,13 @@ class JudgeBroker:
         max_probe_calls_per_session: int = _MAX_PROBE_CALLS_PER_SESSION,
         min_probe_interval_seconds: float = _MIN_PROBE_INTERVAL_SECONDS,
         probe_admission_timeout_seconds: float | None = _PROBE_ADMISSION_TIMEOUT_SECONDS,
-        drain_timeout_seconds: float = _BROKER_DRAIN_TIMEOUT_SECONDS,
+        drain_timeout_seconds: float | None = None,
         formal_policy: FormalToolPolicy | None = None,
         formal_audit_path: Path | None = None,
+        direct_messages_allowed: bool | None = None,
+        selection_store: SelectionStore | None = None,
+        selection_enabled: bool = False,
+        selection_search: Callable[[Any, str, int], Mapping[str, Any]] | None = None,
     ):
         self.evaluator = evaluator
         self.evaluator_gate = evaluator_gate
@@ -249,11 +286,31 @@ class JudgeBroker:
             if probe_admission_timeout_seconds is None
             else max(0.01, float(probe_admission_timeout_seconds))
         )
-        normalized_drain_timeout = float(drain_timeout_seconds)
+        if drain_timeout_seconds is None:
+            normalized_drain_timeout = _default_drain_timeout_seconds(evaluator)
+        else:
+            normalized_drain_timeout = float(drain_timeout_seconds)
         if not math.isfinite(normalized_drain_timeout) or normalized_drain_timeout <= 0:
             raise ValueError("broker drain timeout must be finite and positive")
         self.drain_timeout_seconds = normalized_drain_timeout
         self.formal_policy = formal_policy
+        if direct_messages_allowed is not None and not isinstance(
+            direct_messages_allowed, bool
+        ):
+            raise ValueError("direct_messages_allowed must be a boolean or None")
+        # ``None`` preserves the historical broker surface: every CPS-enabled
+        # session can use both shared and direct operations.  Callers can set a
+        # broker-wide default while a session remains able to narrow it.
+        self.direct_messages_allowed = direct_messages_allowed
+        if not isinstance(selection_enabled, bool):
+            raise ValueError("selection_enabled must be a boolean")
+        if selection_enabled and selection_store is None:
+            raise ValueError("selection_enabled requires a selection store")
+        self.selection_store = selection_store
+        self.selection_enabled = selection_enabled
+        if selection_search is not None and not callable(selection_search):
+            raise ValueError("selection_search must be callable or None")
+        self.selection_search = selection_search
         self.formal_audit_path = Path(
             formal_audit_path
             if formal_audit_path is not None
@@ -459,6 +516,17 @@ class JudgeBroker:
             "closeout_requires_fifo_depth": 0,
             "closeout_requires_remote_unsettled_jobs": 0,
             "drain_timeout_seconds": self.drain_timeout_seconds,
+            "direct_messages_allowed": (
+                self.direct_messages_allowed
+                if self.direct_messages_allowed is not None
+                else "legacy"
+            ),
+            "selection_feedback": {
+                "enabled": self.selection_enabled,
+                "origin": "worker_explicit",
+                "feedback_kinds": sorted(CANONICAL_FEEDBACK_KINDS),
+            },
+            "selection_search": self.selection_search is not None,
         }
         formal = self.formal_policy
         policy["formal_tools"] = (
@@ -503,6 +571,10 @@ class JudgeBroker:
         deadline_monotonic: float,
         cps_store: CPSStore | None = None,
         communication: str = "none",
+        direct_messages_allowed: bool | None = None,
+        selection_store: SelectionStore | None = None,
+        selection_enabled: bool | None = None,
+        selection_search: Callable[[Any, str, int], Mapping[str, Any]] | None = None,
         roster_path: Path | None = None,
         on_authoritative_verdict: (
             Callable[[Task, Verdict, CandidateSnapshot], None] | None
@@ -549,13 +621,57 @@ class JudgeBroker:
         if not bindings:
             raise ValueError("broker session requires at least one task candidate")
 
-        normalized_communication = str(communication or "none").strip().lower()
+        requested_communication = str(communication or "none").strip().lower()
+        normalized_communication = requested_communication
         if normalized_communication == "simple":
             normalized_communication = "blackboard"
         if normalized_communication not in {"none", "blackboard", "direct", "hybrid"}:
             raise ValueError("unsupported broker communication policy")
         if normalized_communication != "none" and (cps_store is None or len(bindings) != 1):
             raise ValueError("CPS broker sessions require one task and a CPS store")
+        if direct_messages_allowed is not None and not isinstance(
+            direct_messages_allowed, bool
+        ):
+            raise ValueError("direct_messages_allowed must be a boolean or None")
+        # Either scope may narrow the capability, but a session cannot widen a
+        # broker-wide denial.  With neither scope specified this remains True,
+        # exactly preserving the pre-gate CPS behavior.
+        effective_direct_messages_allowed = not (
+            self.direct_messages_allowed is False
+            or direct_messages_allowed is False
+        )
+        if selection_enabled is not None and not isinstance(selection_enabled, bool):
+            raise ValueError("selection_enabled must be a boolean or None")
+        effective_selection_enabled = (
+            self.selection_enabled
+            if selection_enabled is None
+            else selection_enabled
+        )
+        effective_selection_store = (
+            selection_store if selection_store is not None else self.selection_store
+        )
+        if selection_search is not None and not callable(selection_search):
+            raise ValueError("selection_search must be callable or None")
+        effective_selection_search = (
+            selection_search if selection_search is not None else self.selection_search
+        )
+        if effective_selection_enabled and effective_selection_store is None:
+            raise ValueError("selection_enabled requires a selection store")
+        if effective_selection_enabled:
+            # Selection experiments compare ranking only.  Accepting the
+            # direct/hybrid surfaces here would reintroduce a second treatment
+            # path even if the caller forgot to register the matching tool
+            # gate.  Check the requested spelling so the legacy ``simple``
+            # alias cannot silently enter a registered selection arm either.
+            if requested_communication != "blackboard":
+                raise ValueError(
+                    "selection-enabled broker sessions require "
+                    "communication = blackboard"
+                )
+            # Server-side authorization is authoritative.  A stale or
+            # contradictory caller flag must never widen a selection arm's
+            # direct-message capability.
+            effective_direct_messages_allowed = False
 
         normalized_deadline = float(deadline_monotonic)
         if not math.isfinite(normalized_deadline):
@@ -572,6 +688,10 @@ class JudgeBroker:
             deadline_epoch_ms=deadline_epoch_ms,
             cps_store=cps_store,
             communication=normalized_communication,
+            direct_messages_allowed=effective_direct_messages_allowed,
+            selection_store=effective_selection_store,
+            selection_enabled=effective_selection_enabled,
+            selection_search=effective_selection_search,
             roster_path=Path(roster_path).resolve() if roster_path is not None else None,
             on_authoritative_verdict=on_authoritative_verdict,
             cancel_event=cancel_event,
@@ -2089,6 +2209,20 @@ class JudgeBroker:
             # their solver cannot access.
             if claim.cps_store is None or claim.communication == "none":
                 return self._cps_operation_locked(claim, operation, payload)
+            if operation in {"cps_actors", "cps_send", "cps_inbox", "cps_ack"} and not (
+                claim.direct_messages_allowed
+            ):
+                return _control_result(
+                    "CPS_CAPABILITY_DENIED",
+                    "This solver session has no direct-message capability.",
+                    retryable=False,
+                )
+            if operation == "cps_feedback" and not claim.selection_enabled:
+                return _control_result(
+                    "CPS_CAPABILITY_DENIED",
+                    "This solver session has no selection-feedback capability.",
+                    retryable=False,
+                )
             with claim.lock:
                 checkpoint_reached = claim.judge_checkpoint_reached
             if not checkpoint_reached:
@@ -2130,6 +2264,14 @@ class JudgeBroker:
             "cps_send": {"recipient", "body", "scope"},
             "cps_inbox": {"limit"},
             "cps_ack": {"message_id"},
+            "cps_feedback": {
+                "request_key",
+                "exposure_item_id",
+                "trace_id",
+                "feedback_kind",
+                "value",
+                "note",
+            },
         }.get(operation)
         if allowed_fields is None:
             return _control_result(
@@ -2144,6 +2286,16 @@ class JudgeBroker:
         if operation == "cps_search":
             query = _bounded_string(payload.get("query"), 500)
             limit = _bounded_limit(payload.get("limit"), default=8, maximum=8)
+            if claim.selection_enabled and claim.selection_search is not None:
+                try:
+                    selected = claim.selection_search(claim, query, limit)
+                except Exception:
+                    return _control_result(
+                        "BROKER_ERROR",
+                        "The controlled selection search failed this capability call.",
+                        retryable=False,
+                    )
+                return _safe_selection_search_response(selected, limit=limit)
             return {
                 "ok": True,
                 "items": [
@@ -2231,6 +2383,72 @@ class JudgeBroker:
                     deadline_epoch_ms=claim.deadline_epoch_ms,
                     cancel_guard=lambda: _claim_cancelled(claim),
                 ),
+            }
+        if operation == "cps_feedback":
+            selection_store = claim.selection_store
+            if not claim.selection_enabled or selection_store is None:
+                return _control_result(
+                    "CPS_CAPABILITY_DENIED",
+                    "This solver session has no selection-feedback capability.",
+                    retryable=False,
+                )
+            request_key = _required_string(payload.get("request_key"), "request_key", 512)
+            exposure_item_id = _required_string(
+                payload.get("exposure_item_id"), "exposure_item_id", 512
+            )
+            trace_id = _required_string(payload.get("trace_id"), "trace_id", 512)
+            feedback_kind = _required_string(
+                payload.get("feedback_kind"), "feedback_kind", 64
+            )
+            if feedback_kind not in CANONICAL_FEEDBACK_KINDS:
+                return _control_result(
+                    "INVALID_REQUEST",
+                    "feedback_kind is not part of the registered feedback contract.",
+                    retryable=False,
+                )
+            feedback_payload: dict[str, Any] = {}
+            if "value" in payload:
+                value = payload.get("value")
+                if not _is_bounded_feedback_value(value):
+                    return _control_result(
+                        "INVALID_REQUEST",
+                        "value must be a bounded JSON scalar.",
+                        retryable=False,
+                    )
+                feedback_payload["value"] = value
+            if "note" in payload:
+                feedback_payload["note"] = _required_string(
+                    payload.get("note"), "note", 2_000
+                )
+            try:
+                recorded = selection_store.record_feedback(
+                    request_key=request_key,
+                    exposure_item_id=exposure_item_id,
+                    actor_id=claim.actor_id,
+                    trace_id=trace_id,
+                    feedback_kind=feedback_kind,
+                    origin="worker_explicit",
+                    terminal=True,
+                    payload=feedback_payload,
+                )
+            except ValueError:
+                return _control_result(
+                    "INVALID_FEEDBACK",
+                    "Feedback could not be bound to this solver's selected exposure.",
+                    retryable=False,
+                )
+            return {
+                "ok": True,
+                "status": str(recorded.get("status") or "RECORDED")[:64],
+                "feedback_event_id": _bounded_string(
+                    recorded.get("feedback_event_id"), 512
+                ),
+                "effective": recorded.get("effective") is True,
+                "idempotent": recorded.get("idempotent") is True,
+                "conflicts_with_feedback_event_id": _bounded_string(
+                    recorded.get("conflicts_with_feedback_event_id"), 512
+                )
+                or None,
             }
         return _control_result("UNKNOWN_CPS_OPERATION", "Unknown CPS operation.", retryable=False)
 
@@ -2445,6 +2663,61 @@ def _required_string(value: Any, name: str, maximum: int) -> str:
     if not text:
         raise ValueError(f"{name} is required")
     return text
+
+
+def _is_bounded_feedback_value(value: Any) -> bool:
+    if value is None or isinstance(value, (bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    return isinstance(value, str) and len(value) <= 2_000
+
+
+def _safe_selection_search_response(raw: Any, *, limit: int) -> dict[str, Any]:
+    """Bound the narrow ``selection_search(claim, query, limit)`` response."""
+
+    if not isinstance(raw, Mapping):
+        return _control_result(
+            "BROKER_ERROR",
+            "The controlled selection search returned an invalid response.",
+            retryable=False,
+        )
+    items = raw.get("items", [])
+    if not isinstance(items, (list, tuple)):
+        return _control_result(
+            "BROKER_ERROR",
+            "The controlled selection search returned an invalid response.",
+            retryable=False,
+        )
+    safe_items = [_bounded_json(item) for item in items[:limit]]
+    result: dict[str, Any] = {"ok": True, "items": safe_items}
+    for key in ("search_event_id", "exposure_id", "request_key"):
+        value = raw.get(key)
+        if isinstance(value, str) and len(value) <= 512:
+            result[key] = value
+    return result
+
+
+def _bounded_json(value: Any, *, _depth: int = 0) -> Any:
+    """Return a JSON-safe bounded value for callback-owned selection rows."""
+
+    if _depth >= 4:
+        return "<truncated>"
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        return value[:2_000]
+    if isinstance(value, Mapping):
+        return {
+            str(key)[:128]: _bounded_json(item, _depth=_depth + 1)
+            for key, item in list(value.items())[:64]
+            if isinstance(key, (str, int, float, bool))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_bounded_json(item, _depth=_depth + 1) for item in value[:100]]
+    return None
 
 
 def _bounded_limit(value: Any, *, default: int, maximum: int) -> int:

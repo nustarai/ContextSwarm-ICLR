@@ -68,6 +68,14 @@ base_delay_ms = 2000
 max_retries = 0
 max_retry_delay_ms = 60000
 
+# If the entire Pi RPC process/session exits after its internal provider retry
+# loop, resume the same logical actor once from its persisted session and
+# workspace. Recovery never extends the experiment horizon.
+[pi.recovery]
+enabled = true
+max_restarts = 1
+base_delay_ms = 1000
+
 [aisw]
 enabled = true
 binary = "~/.local/share/contextswarm/aisw-linux-aarch64"

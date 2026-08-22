@@ -26,8 +26,10 @@ from .models import AgentResult
 
 _STDERR_LINE_LIMIT_BYTES = 256 * 1024
 _FILE_TOOLS = ("read", "edit", "write", "grep", "find", "ls")
-_CPS_SHARED_TOOLS = ("cps_search", "cps_publish", "cps_actors")
+_CPS_SHARED_TOOLS = ("cps_search", "cps_publish")
 _CPS_DIRECT_TOOLS = ("cps_inbox", "cps_send", "cps_ack")
+_CPS_ACTOR_DISCOVERY_TOOL = "cps_actors"
+_CPS_SELECTION_TOOLS = ("cps_feedback",)
 _SOLVER_EXTENSION_NAME = "pi_solver_tools.mjs"
 _FAST_MODE_EXTENSION_NAME = "pi_fast_mode.mjs"
 # Keep the helper interpreter lookup deterministic.  In particular, a worker
@@ -182,6 +184,9 @@ class PiAgent:
         session_dir: Path | None = None,
         session_id: str | None = None,
         isolated: bool = False,
+        communication_enabled: bool | None = None,
+        direct_messages: bool = True,
+        selection_enabled: bool = False,
     ) -> list[str]:
         command = [
             self.binary(),
@@ -223,7 +228,13 @@ class PiAgent:
                     "--no-prompt-templates",
                     "--no-extensions",
                     "--tools",
-                    ",".join(self.solver_tools()),
+                    ",".join(
+                        self.solver_tools(
+                            communication_enabled=communication_enabled,
+                            direct_messages=direct_messages,
+                            selection_enabled=selection_enabled,
+                        )
+                    ),
                 ]
             )
             for _role, extension_path in self._trusted_extensions():
@@ -278,13 +289,31 @@ class PiAgent:
             "extensions": rows,
         }
 
-    def solver_tools(self) -> tuple[str, ...]:
+    def solver_tools(
+        self,
+        *,
+        communication_enabled: bool | None = None,
+        direct_messages: bool = True,
+        selection_enabled: bool = False,
+    ) -> tuple[str, ...]:
+        """Return the explicit solver capability allowlist.
+
+        Omitted arguments preserve the historical manifest-derived surface.  The
+        runner may opt into selection feedback independently and suppress direct
+        messaging without changing any non-CPS capability.
+        """
+
         tools = [*_FILE_TOOLS, "judge_check"]
         if self.config.formal_tools_enabled:
             tools.append("bash")
-        if self.config.uses_cps:
+        cps_enabled = self.config.uses_cps if communication_enabled is None else communication_enabled
+        if cps_enabled or selection_enabled:
             tools.extend(_CPS_SHARED_TOOLS)
-            tools.extend(_CPS_DIRECT_TOOLS)
+            if direct_messages:
+                tools.extend(_CPS_DIRECT_TOOLS)
+                tools.append(_CPS_ACTOR_DISCOVERY_TOOL)
+            if selection_enabled:
+                tools.extend(_CPS_SELECTION_TOOLS)
         return tuple(tools)
 
     def environment(
@@ -294,6 +323,9 @@ class PiAgent:
         actor_id: str,
         workdir: Path,
         extra_env: Mapping[str, str] | None = None,
+        communication_enabled: bool | None = None,
+        direct_messages: bool = True,
+        selection_enabled: bool = False,
     ) -> dict[str, str]:
         # Start from a deliberately tiny parent-environment allowlist.  This
         # prevents ambient PATH/PYTHONPATH and operator credentials from
@@ -343,6 +375,11 @@ class PiAgent:
                 "AISW_LEASE_RETRY_INTERVAL_SECONDS": str(self.config.aisw_lease_retry_interval_seconds),
             }
         )
+        # These public capability bits keep the extension's registered surface
+        # aligned with the Pi allowlist.  Defaults preserve the historical
+        # direct-message CPS surface for existing runner call sites.
+        env["CONTEXTSWARM_CPS_DIRECT_MESSAGES"] = "1" if direct_messages else "0"
+        env["CONTEXTSWARM_CPS_SELECTION_ENABLED"] = "1" if selection_enabled else "0"
         # Do not append an operator-supplied PYTHONPATH.  The runner package is
         # the only import root required by the controlled helper/client path.
         env["PYTHONPATH"] = str(self.config.repo_root)
@@ -410,9 +447,17 @@ class PiAgent:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
         isolated: bool = False,
+        communication_enabled: bool | None = None,
+        direct_messages: bool = True,
+        selection_enabled: bool = False,
     ) -> AgentResult:
         started = now_iso()
-        command = self.command(isolated=isolated)
+        command = self.command(
+            isolated=isolated,
+            communication_enabled=communication_enabled,
+            direct_messages=direct_messages,
+            selection_enabled=selection_enabled,
+        )
         output = _TailBuffer(6_000)
         errors = _TailBuffer(4_000)
         events = 0
@@ -582,6 +627,9 @@ class PiAgent:
                 session_dir=session_dir,
                 session_id=session_id,
                 isolated=isolated,
+                communication_enabled=communication_enabled,
+                direct_messages=direct_messages,
+                selection_enabled=selection_enabled,
             )
             if self.trace_path is not None:
                 self.trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -595,6 +643,9 @@ class PiAgent:
                     actor_id=actor_id,
                     workdir=workdir,
                     extra_env=extra_env,
+                    communication_enabled=communication_enabled,
+                    direct_messages=direct_messages,
+                    selection_enabled=selection_enabled,
                 ),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

@@ -269,6 +269,15 @@ class _DeferredOnlyEvaluator(_RecordingEvaluator):
         )
 
 
+class _PendingSettlementEvaluator(_RecordingEvaluator):
+    """Minimal evaluator surface for broker watcher-drain tests."""
+
+    def __init__(self, watcher_timeout: float) -> None:
+        super().__init__()
+        self.deferred_settlement_timeout_seconds = watcher_timeout
+        self.pending_settlement_watchers = 1
+
+
 class _NestedRemoteCacheEvaluator(_RecordingEvaluator):
     def probe(
         self,
@@ -1444,6 +1453,70 @@ class JudgeBrokerTests(unittest.TestCase):
                     gate.release()
             finally:
                 broker.close()
+
+    def test_default_closeout_deadline_covers_deferred_watcher_horizon(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "contextswarm_mini.judge_broker._BROKER_DRAIN_TIMEOUT_SECONDS",
+            0.02,
+        ), patch(
+            "contextswarm_mini.judge_broker._BROKER_DRAIN_SETTLEMENT_MARGIN_SECONDS",
+            0.02,
+        ):
+            evaluator = _PendingSettlementEvaluator(0.15)
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=Path(temporary) / "audit.jsonl",
+            )
+
+            def settle() -> None:
+                time.sleep(0.06)
+                evaluator.pending_settlement_watchers = 0
+
+            settlement = threading.Thread(target=settle)
+            settlement.start()
+            started = time.monotonic()
+            state = broker.close()
+            elapsed = time.monotonic() - started
+            settlement.join(timeout=1)
+
+            self.assertFalse(settlement.is_alive())
+            self.assertAlmostEqual(broker.drain_timeout_seconds, 0.17)
+            self.assertGreaterEqual(elapsed, 0.05)
+            self.assertEqual(
+                state,
+                {
+                    "drained": True,
+                    "active_handlers": 0,
+                    "fifo_depth": 0,
+                    "remote_unsettled_jobs": 0,
+                },
+            )
+
+    def test_explicit_close_timeout_reports_pending_settlement_watcher(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            evaluator = _PendingSettlementEvaluator(300.0)
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=Path(temporary) / "audit.jsonl",
+                drain_timeout_seconds=0.03,
+            )
+
+            with self.assertRaises(JudgeBrokerDrainError) as raised:
+                broker.close()
+
+            self.assertEqual(broker.drain_timeout_seconds, 0.03)
+            self.assertEqual(
+                raised.exception.state,
+                {
+                    "drained": False,
+                    "active_handlers": 0,
+                    "fifo_depth": 0,
+                    "remote_unsettled_jobs": 0,
+                    "pending_settlement_watchers": 1,
+                },
+            )
 
     def test_global_remote_latch_rejects_all_later_sessions_without_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
