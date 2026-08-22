@@ -23,6 +23,11 @@ from contextswarm_mini.pi_agent import (
     _redact_sensitive_text,
     _usage_fields,
 )
+from contextswarm_mini.prompts import (
+    build_finalization_prompt,
+    build_mono_prompt,
+    build_task_prompt,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -182,6 +187,14 @@ class MiniRuntimeTests(unittest.TestCase):
                     self.assertTrue(stale.keys().isdisjoint(env))
                     self.assertEqual(env["CONTEXTSWARM_TASK_ID"], "fresh-task")
                     self.assertEqual(env["CONTEXTSWARM_ACTOR_ID"], "fresh-actor")
+                    self.assertEqual(
+                        env["CONTEXTSWARM_LEAN_SERVER_URL"],
+                        agent.config.lean_server_url,
+                    )
+                    self.assertEqual(
+                        env["CONTEXTSWARM_LEAN_ENV_ID"],
+                        agent.config.lean_env_id,
+                    )
 
             cps_env = PiAgent(load_config("configs/cps.toml", ROOT)).environment(
                 task_id="task",
@@ -190,6 +203,80 @@ class MiniRuntimeTests(unittest.TestCase):
                 extra_env={"CONTEXTSWARM_CPS_DB": "/run/current.sqlite3"},
             )
             self.assertEqual(cps_env["CONTEXTSWARM_CPS_DB"], "/run/current.sqlite3")
+
+    def test_agent_route_is_manifest_bound_without_prompt_endpoint_leak(self) -> None:
+        config = replace(
+            load_config("configs/cps.toml", ROOT),
+            lean_server_url=(
+                "http://private-user:private-password@127.0.0.1:29999/"
+                "private-route?token=private-token"
+            ),
+            lean_env_id="isolated_test_env",
+            lean_verification_profile="isolated_profile",
+            lean_judge_mode="isolated_mode",
+            lean_timeout_seconds=321,
+            lean_max_lifecycle_seconds=6543,
+        )
+        stale = {
+            "CONTEXTSWARM_LEAN_SERVER_URL": "http://127.0.0.1:18000",
+            "CONTEXTSWARM_LEAN_ENV_ID": "stale_env",
+        }
+        with patch.dict(os.environ, stale, clear=False):
+            env = PiAgent(config).environment(
+                task_id="task",
+                actor_id="actor",
+                workdir=ROOT,
+                extra_env={
+                    "CONTEXTSWARM_LEAN_SERVER_URL": "http://127.0.0.1:18000",
+                    "CONTEXTSWARM_LEAN_ENV_ID": "extra_stale_env",
+                },
+            )
+        self.assertEqual(env["CONTEXTSWARM_LEAN_SERVER_URL"], config.lean_server_url)
+        self.assertEqual(env["CONTEXTSWARM_LEAN_ENV_ID"], config.lean_env_id)
+        self.assertEqual(
+            env["CONTEXTSWARM_LEAN_VERIFICATION_PROFILE"],
+            config.lean_verification_profile,
+        )
+        self.assertEqual(env["CONTEXTSWARM_LEAN_JUDGE_MODE"], config.lean_judge_mode)
+        self.assertEqual(env["CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS"], "321")
+        self.assertEqual(env["CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS"], "6543")
+
+        task = load_tasks(config)[0]
+        prompts = (
+            build_task_prompt(
+                task,
+                task_workspace="workspace",
+                agent_id="agent",
+                episode=1,
+                communication_enabled=True,
+            ),
+            build_task_prompt(
+                task,
+                task_workspace="workspace",
+                agent_id="agent",
+                episode=1,
+                communication_enabled=False,
+            ),
+            build_mono_prompt([task], workspace="workspace", communication_enabled=False),
+            build_finalization_prompt(task),
+        )
+        for prompt in prompts:
+            with self.subTest(prompt_head=prompt[:40]):
+                self.assertIn("$CONTEXTSWARM_LEAN_SERVER_URL", prompt)
+                self.assertIn("$CONTEXTSWARM_LEAN_ENV_ID", prompt)
+                self.assertIn("$CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS", prompt)
+                self.assertIn("$CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS", prompt)
+                self.assertIn("not an HTTP or whole-job timeout", prompt)
+                self.assertRegex(prompt, r"Do not probe or call any other\s+local Judge port")
+                self.assertNotIn(config.lean_server_url, prompt)
+                self.assertNotIn("127.0.0.1:18000", prompt)
+                self.assertNotIn("private-password", prompt)
+                self.assertNotIn("private-token", prompt)
+
+        public = config.public_dict()
+        self.assertEqual(public["lean_server_url"], "http://127.0.0.1:29999")
+        self.assertNotIn("private-password", json.dumps(public))
+        self.assertNotIn("private-token", json.dumps(public))
 
     def test_verdict_helpers(self) -> None:
         self.assertEqual(normalize_base_url("http://judge/api/lean/jobs"), "http://judge")

@@ -139,6 +139,24 @@ class PiAgent:
             )
         if extra_env:
             env.update({str(key): str(value) for key, value in extra_env.items()})
+        # The evaluator route is part of the manifest contract, not ambient
+        # operator or per-agent state.  Publish it after ``extra_env`` so a
+        # stale shell variable or communication payload cannot route an agent's
+        # optional checks to a different resident Judge stack.
+        env.update(
+            {
+                "CONTEXTSWARM_LEAN_SERVER_URL": self.config.lean_server_url,
+                "CONTEXTSWARM_LEAN_ENV_ID": self.config.lean_env_id,
+                "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE": self.config.lean_verification_profile,
+                "CONTEXTSWARM_LEAN_JUDGE_MODE": self.config.lean_judge_mode,
+                "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS": str(
+                    self.config.lean_timeout_seconds
+                ),
+                "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS": str(
+                    self.config.lean_max_lifecycle_seconds
+                ),
+            }
+        )
         return env
 
     def run(
