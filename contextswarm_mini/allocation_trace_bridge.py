@@ -198,23 +198,30 @@ class SelectionStoreTraceSource:
 
     @contextmanager
     def _read_db(self) -> Iterator[sqlite3.Connection]:
+        path = self.store if isinstance(self.store, (str, Path)) else getattr(self.store, "path", None)
+        if path is not None:
+            # Prefer a separate mode=ro connection even when the object also
+            # exposes SelectionStore._db().  The latter enables WAL and can
+            # mutate store metadata, which would violate this bridge's
+            # read-only boundary.
+            uri = Path(path).resolve().as_uri() + "?mode=ro"
+            db = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
+            db.row_factory = sqlite3.Row
+            try:
+                db.execute("PRAGMA query_only=ON")
+                yield db
+            finally:
+                db.close()
+            return
         factory = getattr(self.store, "_db", None)
         if callable(factory):
-            # The selection store's operation-scoped context owns this handle.
+            # A protocol-only test double may have no path.  Keep this fallback
+            # narrow; real SelectionStore instances always have a path.
             with factory() as db:
+                db.execute("PRAGMA query_only=ON")
                 yield db
             return
-        path = self.store if isinstance(self.store, (str, Path)) else getattr(self.store, "path", None)
-        if path is None:
-            raise TypeError("selection store has no read-only database surface")
-        uri = Path(path).resolve().as_uri() + "?mode=ro"
-        db = sqlite3.connect(uri, uri=True, timeout=5, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        try:
-            db.execute("PRAGMA query_only=ON")
-            yield db
-        finally:
-            db.close()
+        raise TypeError("selection store has no read-only database surface")
 
     @staticmethod
     def _schema_ok(db: sqlite3.Connection) -> bool:
@@ -249,6 +256,7 @@ class SelectionStoreTraceSource:
                               JOIN search_events AS search
                                 ON search.search_event_id = exposure.search_event_id
                              WHERE search.task_id IN ({placeholders})
+                               AND item.trace_id <> ''
                              ORDER BY search.task_id, item.exposure_item_id""",
                         ordered,
                     )
@@ -271,9 +279,12 @@ class SelectionStoreTraceSource:
                              WHERE feedback.event_class = 'worker_interaction'
                                AND feedback.terminal = 1
                                AND feedback.effective = 1
+                               AND feedback.actor_id = exposure.actor_id
+                               AND feedback.trace_id = item.trace_id
+                               AND feedback.feedback_kind IN ({','.join('?' for _ in _CANONICAL_FEEDBACK_KINDS)})
                                AND search.task_id IN ({placeholders})
                              ORDER BY search.task_id, feedback.feedback_event_id""",
-                        ordered,
+                        tuple(sorted(_CANONICAL_FEEDBACK_KINDS)) + ordered,
                     )
                 )
             finally:
