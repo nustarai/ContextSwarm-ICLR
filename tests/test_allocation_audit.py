@@ -38,6 +38,17 @@ class AuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "audit.jsonl"; path.write_text("not-json\n")
             with self.assertRaises(ValueError): read_allocation_audits(path)
+            tampered = _record().as_dict(); tampered["capacity_delta_sum"] = 1
+            path.write_text(json.dumps(tampered) + "\n")
+            with self.assertRaises(ValueError): read_allocation_audits(path)
+            path.write_text('{"schema_version":"x","schema_version":"y"}\n')
+            with self.assertRaises(ValueError): read_allocation_audits(path)
+
+    def test_vectors_include_ineligible_tasks_but_scores_do_not(self):
+        row = _record().as_dict(); row.pop("schema_version"); row.pop("capacity_delta_sum"); row.pop("capacity_conserved")
+        for key in ("allocation_before", "trace_state_allocation_after", "task_state_allocation_after"):
+            row[key]["ineligible"] = 0
+        self.assertIn("ineligible", AllocationAuditRecord.create(**row).allocation_before)
 
     def test_jsonl_and_metrics_cost_fields(self):
         with tempfile.TemporaryDirectory() as td:

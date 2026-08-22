@@ -7,7 +7,6 @@ helpers validate the resulting integer vectors before publishing JSONL/JSON.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -101,12 +100,14 @@ class AllocationAuditRecord:
         task_scores = _frozen_map(kwargs.pop("task_only_scores"))
         increments = _frozen_map(kwargs.pop("trace_increments"))
         totals = _frozen_map(kwargs.pop("trace_total_scores"))
-        _same_keys(before, task_scores, increments, totals)
+        _same_keys(task_scores, increments, totals)
         tasks = tuple(str(x) for x in kwargs.pop("eligible_task_ids"))
-        if len(set(tasks)) != len(tasks):
-            raise ValueError("eligible_task_ids must be unique")
+        if not tasks or any(not task for task in tasks) or len(set(tasks)) != len(tasks):
+            raise ValueError("eligible_task_ids must be non-empty, unique task IDs")
         if not set(tasks).issubset(before):
             raise ValueError("eligible task is absent from allocation vector")
+        if set(task_scores) != set(tasks):
+            raise ValueError("score maps must contain exactly the eligible task IDs")
         trace_selected = str(kwargs.pop("trace_state_selected_task_id", "") or "")
         task_selected = str(kwargs.pop("task_state_selected_task_id", "") or "")
         admitted = str(kwargs.pop("admitted_task_id", "") or "")
@@ -173,7 +174,9 @@ class AllocationAuditRecord:
     def from_dict(cls, row: Mapping[str, Any]) -> "AllocationAuditRecord":
         if row.get("schema_version") != AUDIT_SCHEMA:
             raise ValueError("unsupported allocation audit schema")
-        data = dict(row); data.pop("schema_version", None); data.pop("capacity_delta_sum", None); data.pop("capacity_conserved", None)
+        if row.get("capacity_delta_sum") != 0 or row.get("capacity_conserved") is not True:
+            raise ValueError("invalid emitted capacity-conservation result")
+        data = dict(row); data.pop("schema_version", None); data.pop("capacity_delta_sum"); data.pop("capacity_conserved")
         return cls.create(**data)
 
 
@@ -187,8 +190,14 @@ def read_allocation_audits(path: Path, *, expected_config_sha256: str | None = N
     try: lines = path.read_text(encoding="utf-8").splitlines()
     except OSError: return rows
     for index, line in enumerate(lines, 1):
-        try: raw = json.loads(line)
-        except json.JSONDecodeError as exc: raise ValueError(f"malformed audit JSONL line {index}") from exc
+        def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result: raise ValueError(f"duplicate JSON key {key!r}")
+                result[key] = value
+            return result
+        try: raw = json.loads(line, object_pairs_hook=unique_object, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid JSON number {value}")))
+        except (json.JSONDecodeError, ValueError) as exc: raise ValueError(f"malformed audit JSONL line {index}") from exc
         if not isinstance(raw, Mapping): raise ValueError(f"audit line {index} is not an object")
         record = AllocationAuditRecord.from_dict(raw)
         if expected_config_sha256 and record.allocation_config_sha256 != expected_config_sha256: raise ValueError(f"stale config at line {index}")
@@ -203,13 +212,14 @@ def validate_capacity_conservation(record: AllocationAuditRecord) -> bool:
 
 
 def _nauc(history: Sequence[Mapping[str, Any]], horizon: float, max_score: float) -> tuple[float, float | None, dict[str, float]]:
-    if horizon < 0 or max_score <= 0: raise ValueError("invalid horizon/max_score")
-    points = sorted((float(row["elapsed_seconds"]), float(row.get("accepted_score", row.get("score", 0)))) for row in history)
+    if not math.isfinite(horizon) or not math.isfinite(max_score) or horizon <= 0 or max_score <= 0: raise ValueError("invalid horizon/max_score")
+    points = [(float(row["elapsed_seconds"]), float(row.get("accepted_score", row.get("score", 0)))) for row in history]
     previous, score, area = 0.0, 0.0, 0.0
     first: float | None = None; times: dict[str, float] = {}
     for elapsed, value in points:
-        elapsed = min(max(0.0, elapsed), horizon); value = min(max(score, value), max_score)
-        area += score * max(0.0, elapsed - previous); score = max(score, value); previous = elapsed
+        if not math.isfinite(elapsed) or not math.isfinite(value) or elapsed < previous or elapsed < 0 or elapsed > horizon or value < score or value < 0 or value > max_score:
+            raise ValueError("accepted score history must be finite, bounded, and monotonic")
+        area += score * (elapsed - previous); score = value; previous = elapsed
         if score > 0 and first is None: first = elapsed
         for k in range(1, int(score) + 1): times.setdefault(str(k), elapsed)
     area += score * max(0.0, horizon - previous)
@@ -221,7 +231,7 @@ def build_figure4_run_summary(*, run_id: str, policy: str, paired_seed: int | st
     history = [dict(item) for item in accepted_score_history]
     final = max((float(item.get("accepted_score", item.get("score", 0))) for item in history), default=0.0)
     scheduler = dict(scheduler_cost or {})
-    scheduler.setdefault("calls", 0); scheduler.setdefault("input_tokens", 0); scheduler.setdefault("output_tokens", 0); scheduler.setdefault("total_tokens", 0); scheduler.setdefault("latency_seconds", 0.0); scheduler.setdefault("reserved_slot_seconds", scheduler.get("occupied_capacity_slot_seconds", 0.0))
+    scheduler.setdefault("calls", 0); scheduler.setdefault("input_tokens", 0); scheduler.setdefault("output_tokens", 0); scheduler.setdefault("total_tokens", int(scheduler["input_tokens"]) + int(scheduler["output_tokens"])); scheduler.setdefault("latency_seconds", 0.0); scheduler.setdefault("reserved_slot_seconds", scheduler.get("occupied_capacity_slot_seconds", 0.0))
     alloc = dict(allocation_metrics or {}); alloc.setdefault("decisions", 0); alloc.setdefault("fallbacks", alloc.get("fallback_decisions", 0)); alloc.setdefault("fallback_rate", alloc["fallbacks"] / alloc["decisions"] if alloc["decisions"] else 0.0)
     return {"schema_version": RUN_SCHEMA, "run_id": str(run_id), "policy": str(policy), "paired_seed": paired_seed, "repeat": repeat, "paired_repeat_id": str(repeat), "comparison_contract_id": comparison_contract_id, "comparison_contract": dict(comparison_contract or {}), "task_order": list(task_order), "horizon_seconds": float(horizon_seconds), "total_capacity": int(total_capacity), "initial_allocation": dict(initial_allocation), "accepted_score_history": history, "final_accepted_score": final, "max_score": float(max_score), "time_to_k": times, "time_to_k_seconds": times, "nauc": nauc, "solver_usage": dict(solver_usage or {}), "evaluator_usage": dict(evaluator_usage or {}), "scheduler_cost": scheduler, "llm_scheduler_cost": scheduler, "allocation_metrics": alloc, "allocation_decisions": alloc["decisions"], "fallback_decisions": alloc["fallbacks"], "fallback_rate": alloc["fallback_rate"], "allocation_parameters": dict(allocation_parameters or {}), "allocation_config_sha256": allocation_config_sha256, "comparison_contract_sha256": comparison_contract.get("sha256", "") if comparison_contract else ""}
 
