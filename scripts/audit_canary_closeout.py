@@ -69,6 +69,24 @@ OOM_RE = re.compile(
     r"(?:out of memory|oom(?:killed| kill)?|cannot allocate memory|memory limit exceeded)",
     re.IGNORECASE,
 )
+OOM_COUNT_FIELDS = {
+    "oom_or_exit_137_count",
+    "allocation_scheduler_oom_or_exit_137_count",
+}
+DIAGNOSTIC_TEXT_FIELDS = {
+    "detail",
+    "diagnostic",
+    "error",
+    "error_tail",
+    "message",
+    "output",
+    "output_tail",
+    "reason",
+    "stderr",
+    "stdout",
+    "traceback",
+    "traceback_tail",
+}
 
 
 @dataclass
@@ -197,6 +215,37 @@ def _delete_observed(*values: Any) -> bool:
     return False
 
 
+def _mapping_has_oom_text(value: Mapping[str, Any]) -> bool:
+    """Inspect diagnostic values without treating JSON field names as evidence."""
+
+    for raw_key, raw_value in value.items():
+        key = str(raw_key).strip().lower()
+        if key in DIAGNOSTIC_TEXT_FIELDS and isinstance(raw_value, str):
+            if OOM_RE.search(raw_value):
+                return True
+    return False
+
+
+def _oom_observed(*values: Any) -> bool:
+    """Recognize explicit OOM evidence while ignoring schema/key vocabulary."""
+
+    for value in values:
+        for item in _walk_mappings(value):
+            if item.get("returncode") == 137:
+                return True
+            for field_name in OOM_COUNT_FIELDS:
+                count = item.get(field_name)
+                if (
+                    isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count > 0
+                ):
+                    return True
+            if _mapping_has_oom_text(item):
+                return True
+    return False
+
+
 def audit_canary(run_dir: Path) -> dict[str, Any]:
     audit = Audit()
     if not run_dir.is_dir():
@@ -263,7 +312,7 @@ def audit_canary(run_dir: Path) -> dict[str, Any]:
                 audit.add("mock_solver_present")
             if agent.get("returncode") not in (0, None) and not agent.get("cancelled") and not agent.get("timed_out"):
                 audit.add("solver_process_error")
-            if agent.get("returncode") == 137 or OOM_RE.search(_serialized(agent)):
+            if agent.get("returncode") == 137 or _mapping_has_oom_text(agent):
                 audit.add("solver_oom_or_exit_137")
             _check_solver_command(agent, audit)
         verdicts = final.get("verdicts")
@@ -330,7 +379,7 @@ def audit_canary(run_dir: Path) -> dict[str, Any]:
     )
     if OVERLOAD_RE.search(combined):
         audit.add("judge_overload_or_429")
-    if OOM_RE.search(combined):
+    if _oom_observed(events, judge_checks, final or {}):
         audit.add("oom_observed")
     audit.remote_delete_observed = _delete_observed(events, judge_checks, final or {})
     return audit.public_dict()

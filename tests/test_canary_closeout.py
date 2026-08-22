@@ -104,7 +104,12 @@ def _stage(root: Path) -> Path:
             "status": "COMPLETED",
             "finished_at": "2026-08-22T00:03:00+00:00",
             "verdicts": {"task-1": {"status": "VERIFY_FAIL", "score": 0.0}},
-            "health": {"ok": True, "issues": []},
+            "health": {
+                "ok": True,
+                "issues": [],
+                "oom_or_exit_137_count": 0,
+                "allocation_scheduler_oom_or_exit_137_count": 0,
+            },
             "judge_result_cache": {
                 "required_disabled": True,
                 "enabled": False,
@@ -169,6 +174,27 @@ class CanaryCloseoutTests(unittest.TestCase):
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["counts"]["accepted_judge_checks"], 1)
         self.assertFalse(report["remote_delete_observed"])
+        self.assertNotIn("oom_observed", _codes(report))
+
+    def test_oom_detection_uses_explicit_values_not_health_field_names(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run = _stage(Path(raw))
+            zero_count = audit_canary(run)
+
+            final = json.loads((run / "final.json").read_text(encoding="utf-8"))
+            final["health"]["oom_or_exit_137_count"] = 1
+            _write_json(run / "final.json", final)
+            positive_count = audit_canary(run)
+
+            final["health"]["oom_or_exit_137_count"] = 0
+            final["agents"][0]["returncode"] = 137
+            _write_json(run / "final.json", final)
+            exit_137 = audit_canary(run)
+
+        self.assertNotIn("oom_observed", _codes(zero_count), zero_count)
+        self.assertIn("oom_observed", _codes(positive_count), positive_count)
+        self.assertIn("oom_observed", _codes(exit_137), exit_137)
+        self.assertIn("solver_oom_or_exit_137", _codes(exit_137), exit_137)
 
     def test_requires_accepted_probe_with_complete_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
