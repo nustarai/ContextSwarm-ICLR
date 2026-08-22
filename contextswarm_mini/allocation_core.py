@@ -704,8 +704,17 @@ def parse_llm_scheduler_output(
             object_pairs_hook=_pairs,
             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid JSON constant {value}")),
         )
-    except (AttributeError, json.JSONDecodeError) as exc:
-        raise ValueError("scheduler output must be exactly one JSON object") from exc
+    # ``object_pairs_hook`` and ``parse_constant`` intentionally raise
+    # ``ValueError`` for duplicate keys and non-finite JSON constants.  Keep
+    # those wire-level failures inside the parser boundary so the caller can
+    # apply its deterministic fallback instead of leaking an exception from
+    # an untrusted provider payload.
+    except (AttributeError, TypeError, ValueError) as exc:
+        detail = str(exc).strip()
+        message = "scheduler output must be exactly one JSON object"
+        if detail:
+            message += f": {detail}"
+        raise ValueError(message) from exc
     required = {"decision_id", "task_id", "reason", "trace_reference_ids"}
     if not isinstance(payload, dict) or set(payload) != required:
         raise ValueError("scheduler JSON must contain exactly decision_id, task_id, reason, trace_reference_ids")

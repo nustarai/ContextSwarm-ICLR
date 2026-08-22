@@ -115,6 +115,49 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertIn("ConnectionError", failed.fallback_reason)
         self.assertEqual(failed.scheduler_cost.calls, 1)
 
+    def test_llm_wire_level_parser_errors_are_deterministic_fallbacks(self) -> None:
+        snap = snapshot(task("a", checker_quality=0.1), task("b", checker_quality=0.9))
+
+        # Duplicate keys are rejected by the parser hook and must be treated
+        # like any other malformed provider response, not escape as ValueError
+        # from the policy boundary.
+        duplicate = (
+            '{"decision_id":"d1","task_id":"a","task_id":"b",'
+            '"reason":"route","trace_reference_ids":[]}'
+        )
+        with self.assertRaises(ValueError):
+            parse_llm_scheduler_output(duplicate, snap)
+        duplicate_decision = ReadOnlyLLMSchedulerPolicy(
+            lambda _current, _prompt: LLMSchedulerResponse(duplicate)
+        ).choose(snap)
+        self.assertTrue(duplicate_decision.fallback)
+        self.assertEqual(duplicate_decision.selected_task_id, "b")
+        self.assertIn("duplicate", duplicate_decision.fallback_reason)
+        self.assertEqual(duplicate_decision.scheduler_cost.calls, 1)
+
+        # Python's JSON decoder accepts NaN/Infinity unless parse_constant is
+        # supplied.  Both values are rejected and charged exactly once.
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            malformed = (
+                '{"decision_id":'
+                f'{constant},"task_id":"a","reason":"route",'
+                '"trace_reference_ids":[]}'
+            )
+            decision = ReadOnlyLLMSchedulerPolicy(
+                lambda _current, _prompt, output=malformed: LLMSchedulerResponse(output)
+            ).choose(snap)
+            self.assertTrue(decision.fallback)
+            self.assertEqual(decision.selected_task_id, "b")
+            self.assertEqual(decision.scheduler_cost.calls, 1)
+
+        # A non-string invoker result is another untrusted transport failure.
+        wrong_type = ReadOnlyLLMSchedulerPolicy(
+            lambda _current, _prompt: {"output": "not a response"}
+        ).choose(snap)
+        self.assertTrue(wrong_type.fallback)
+        self.assertEqual(wrong_type.selected_task_id, "b")
+        self.assertEqual(wrong_type.scheduler_cost.calls, 1)
+
     def test_llm_does_not_call_without_admission_capacity(self) -> None:
         calls = []
         snap = AllocationStateSnapshot("d", 1, 0, 1, 1, 1, 0, 0, (task("a"),))
