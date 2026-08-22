@@ -13,6 +13,7 @@ import json
 import math
 import re
 import time
+import unicodedata
 from types import MappingProxyType
 from typing import Any, Callable, ClassVar, Mapping
 
@@ -93,7 +94,7 @@ def _scheduler_identifier_is_safe(
     value: str,
     *,
     allow_empty: bool = True,
-    allow_paired_decision: bool = False,
+    allow_structured_decision: bool = False,
 ) -> bool:
     """Return whether an opaque ID can be shown to the read-only scheduler.
 
@@ -105,18 +106,24 @@ def _scheduler_identifier_is_safe(
 
     if not isinstance(value, str) or (not value and not allow_empty) or len(value) > MAX_IDENTIFIER_CHARS:
         return False
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+    if any(
+        ord(char) < 0x20
+        or ord(char) == 0x7F
+        or unicodedata.category(char) == "Cf"
+        for char in value
+    ):
         return False
     # Canonical paired decision IDs may contain one slash (for example
     # ``paired-007/decision-000042``).  Permit only that registered shape;
     # absolute/relative paths and arbitrary path-like IDs fail closed.
-    if "/" in value and not (
-        allow_paired_decision
-        and re.fullmatch(
-            r"paired-[A-Za-z0-9_.-]+/decision-[A-Za-z0-9_.-]+", value
-        )
-    ):
+    if "\\" in value or re.match(r"^[A-Za-z]:[\\/]", value):
         return False
+    if "/" in value:
+        if not allow_structured_decision or re.fullmatch(
+            r"paired-[A-Za-z0-9_.-]+/decision-[A-Za-z0-9_.-]+",
+            value,
+        ) is None:
+            return False
     if "://" in value or value.startswith(("file:", "path:", "./", "../")):
         return False
     return True
@@ -200,12 +207,12 @@ def _scheduler_state_dict(snapshot: "AllocationStateSnapshot") -> dict[str, Any]
         field_name: str,
         *,
         allow_empty: bool = False,
-        allow_paired_decision: bool = False,
+        allow_structured_decision: bool = False,
     ) -> str:
         if not _scheduler_identifier_is_safe(
             value,
             allow_empty=allow_empty,
-            allow_paired_decision=allow_paired_decision,
+            allow_structured_decision=allow_structured_decision,
         ):
             raise ValueError(f"scheduler snapshot contains an unsafe {field_name}")
         return value
@@ -222,7 +229,7 @@ def _scheduler_state_dict(snapshot: "AllocationStateSnapshot") -> dict[str, Any]
         snapshot.decision_id,
         "decision identifier",
         allow_empty=False,
-        allow_paired_decision=True,
+        allow_structured_decision=True,
     )
 
     # Opaque watermarks and outcome IDs are useful for audit identity but are

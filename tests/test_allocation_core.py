@@ -330,6 +330,26 @@ class AllocationCoreTests(unittest.TestCase):
         prompt = ReadOnlyLLMSchedulerPolicy.prompt(snap)
         self.assertIn("paired-007/decision-000042", prompt)
 
+    def test_llm_prompt_rejects_unregistered_or_unsafe_structured_decision_ids(self) -> None:
+        for decision_id in (
+            "foo/bar",
+            "paired-007/other-000042",
+            "paired-007/decision-000042/extra",
+            "paired-/decision-000042",
+            "paired-007/decision-",
+            r"paired-007\decision-000042",
+            r"C:\private\decision-000042",
+            "paired-\u202e007/decision-000042",
+        ):
+            with self.subTest(decision_id=decision_id):
+                with self.assertRaisesRegex(ValueError, "unsafe decision identifier"):
+                    ReadOnlyLLMSchedulerPolicy.prompt(
+                        snapshot(
+                            task("task-a", active=0),
+                            decision_id=decision_id,
+                        )
+                    )
+
     def test_llm_prompt_byte_overflow_is_charged_fallback_without_invocation(self) -> None:
         snap = snapshot(task("a", checker_quality=0.9), task("b"))
         calls: list[tuple[object, str]] = []
