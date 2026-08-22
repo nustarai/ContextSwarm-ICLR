@@ -2912,6 +2912,9 @@ def _run_elastic_cps(
                         config,
                         scheduler_reserved_slots=scheduler.reservation_slots,
                         owned_scheduler_reservation_slots=1,
+                        trace_view=allocation_trace_view(
+                            item.task_id for item in execution_snapshot.tasks
+                        ),
                     )
                     core_record = core_decisions.get(decision.decision_index)
                     invocation_core_snapshot = core_record[0] if core_record is not None else None
