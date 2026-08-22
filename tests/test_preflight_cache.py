@@ -208,6 +208,58 @@ class PreflightResultCacheTests(unittest.TestCase):
                     with self.assertRaises(PreflightError):
                         run_preflight(config, Path(raw))
 
+    def test_lean_health_distinguishes_disabled_group_capacity_from_direct_pool(self) -> None:
+        config = replace(
+            load_config("configs/smoke.toml", ROOT),
+            aisw_enabled=False,
+            lean_server_url="http://judge.invalid",
+            lean_require_result_cache_disabled=False,
+        )
+        health = {
+            "ok": True,
+            "workspace_ready": True,
+            "accepted_lean_env_ids": [config.lean_env_id],
+            "active_workers": 96,
+            "ready_workers": 96,
+            "available_service_units": 0,
+            "capacity_state": "DEGRADED",
+            "capacity_error_kind": "admission_disabled",
+            "group_admission": {"enabled": False, "status": "disabled"},
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                patch(
+                    "contextswarm_mini.preflight.PiAgent.binary",
+                    return_value="/bin/true",
+                ),
+                patch(
+                    "contextswarm_mini.preflight.LeanEvaluator.health",
+                    return_value=health,
+                ),
+            ):
+                report = run_preflight(config, Path(raw))
+        self.assertFalse(report["lean"]["group_admission_enabled"])
+        self.assertEqual(report["lean"]["ready_workers"], 96)
+        self.assertNotIn("available_service_units", report["lean"])
+        self.assertNotIn("capacity_state", report["lean"])
+
+        unavailable = dict(health)
+        unavailable["ready_workers"] = 0
+        unavailable["active_workers"] = 0
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                patch(
+                    "contextswarm_mini.preflight.PiAgent.binary",
+                    return_value="/bin/true",
+                ),
+                patch(
+                    "contextswarm_mini.preflight.LeanEvaluator.health",
+                    return_value=unavailable,
+                ),
+            ):
+                with self.assertRaises(PreflightError):
+                    run_preflight(config, Path(raw))
+
     def test_cache_health_accepts_base_or_healthz_and_keeps_only_safe_evidence(self) -> None:
         _HealthHandler.enabled = False
         _HealthHandler.ok = True
