@@ -225,7 +225,10 @@ class SelectionConfigTests(unittest.TestCase):
             _selection_table("nustigmergy").replace(
                 "candidate_transfer = false", "candidate_transfer = true"
             )
-            + "\n[experiment]\nfigure4_phase = \"formal\"\n"
+            .replace(
+                "[experiment]\nseed = 17",
+                "[experiment]\nseed = 17\nfigure4_phase = \"formal\"",
+            )
             + "\n[allocation]\npolicy = \"trace_state\"\n"
         )
         self.assertEqual(config.figure4_phase, "formal")
@@ -234,8 +237,10 @@ class SelectionConfigTests(unittest.TestCase):
     def test_explicit_development_figure4_requires_disabled_selector(self) -> None:
         with self.assertRaisesRegex(ConfigError, "selection.enabled = false"):
             self._load(
-                _selection_table()
-                + "\n[experiment]\nfigure4_phase = \"development\"\n"
+                _selection_table().replace(
+                    "[experiment]\nseed = 17",
+                    "[experiment]\nseed = 17\nfigure4_phase = \"development\"",
+                )
                 + "\n[allocation]\npolicy = \"trace_state\"\n"
             )
 
