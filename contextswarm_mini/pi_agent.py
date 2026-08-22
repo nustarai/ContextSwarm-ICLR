@@ -63,7 +63,9 @@ CONTEXTSWARM_JUDGE_URL value is injected by the runner only as a session-scoped
 capability for that tool; do not read it, construct another client, or contact it
 directly. All dynamic Lean verification must use judge_check.
 Complete a mandatory early Judge checkpoint after initial file inspection and before
-extended proof search or CPS communication; do not wait for a polished proof.
+extended proof search or CPS communication; do not wait for a polished proof. Any
+job-bound terminal candidate feedback, including a bounded resource or execution
+failure, is useful feedback even when it is not a proof.
 If that tool is busy or unavailable, continue static proof reasoning or leave the best
 candidate for the runner; never create a local or raw-network fallback. The user prompt
 defines the assigned proof task and, when present, the controlled CPS protocol."""
@@ -82,7 +84,8 @@ as a session-scoped capability for those controlled interfaces; do not read it,
 construct another client, or contact it directly.
 Complete a mandatory early judge_check checkpoint after initial file inspection and
 before helper diagnostics, extended proof search, or CPS communication; do not wait
-for a polished proof.
+for a polished proof. Any job-bound terminal candidate feedback, including a bounded
+resource or execution failure, is useful feedback even when it is not a proof.
 If a controlled tool is busy or unavailable, continue static proof reasoning or leave
 the best candidate for the runner; never create a local or raw-network fallback. The
 user prompt defines the assigned proof task and, when present, the controlled CPS

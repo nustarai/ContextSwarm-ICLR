@@ -582,24 +582,45 @@ class LeanEvaluator:
         if not settled:
             self._mark_remote_unsettled()
 
-        callbacks: list[Any] = []
-        with self._deferred_settlement_lock:
-            current_record = self._deferred_settlements.pop(job_id, None)
-            if current_record is not None:
-                callbacks = list(current_record.get("callbacks") or ())
         if not settled:
             # The identity was known, but the bounded watcher still could not
             # prove termination.  At this point fail closed exactly as for an
             # unknown/transport-ambiguous submission.
+            with self._deferred_settlement_lock:
+                current_record = self._deferred_settlements.pop(job_id, None)
             return
-        for callback in callbacks:
-            try:
-                callback()
-            except Exception:
-                # A permit-release callback is orchestration bookkeeping; a
-                # callback failure must not turn a proven remote receipt into
-                # an unsafe release or crash the watcher thread.
-                continue
+
+        # Keep the record visible while callbacks run.  A broker closeout may
+        # otherwise observe ``pending_settlement_watchers == 0`` and finish
+        # while the callback still owns the evaluator permit.  Drain callback
+        # batches outside the lock, then re-check the record so a concurrent
+        # duplicate cancellation can append another permit-release callback.
+        callback_failed = False
+        while True:
+            with self._deferred_settlement_lock:
+                current_record = self._deferred_settlements.get(job_id)
+                if current_record is None:
+                    callbacks = []
+                else:
+                    callbacks = list(current_record.get("callbacks") or ())
+                    current_record["callbacks"] = []
+            if not callbacks:
+                break
+            for callback in callbacks:
+                try:
+                    callback()
+                except Exception:
+                    # A permit-release callback is orchestration bookkeeping;
+                    # if it fails, retain the fail-closed latch so a leaked
+                    # permit cannot be mistaken for a drained run.
+                    callback_failed = True
+
+        if callback_failed:
+            self._mark_remote_unsettled()
+        with self._deferred_settlement_lock:
+            current_record = self._deferred_settlements.get(job_id)
+            if current_record is record:
+                self._deferred_settlements.pop(job_id, None)
 
     @staticmethod
     def _bind_watcher_receipt(
@@ -1578,16 +1599,18 @@ class LeanEvaluator:
                         )
             if job_id and not _terminal(response):
                 abandoned_by_client = True
-                response, cancel_error = self._cancel_and_reconcile(
-                    job_id,
-                    response,
-                    cancel_endpoint=cancel_endpoint,
-                    cancellation_reason=_cancel_reason(cancel_event),
-                    on_settled=settlement_callback,
+                response, cancel_error, cancel_attempted = (
+                    self._cancel_and_reconcile_details(
+                        job_id,
+                        response,
+                        cancel_endpoint=cancel_endpoint,
+                        cancellation_reason=_cancel_reason(cancel_event),
+                        on_settled=settlement_callback,
+                    )
                 )
                 if cancel_error == "cancel_settlement_deferred":
                     cancellation = {
-                        "attempted": True,
+                        "attempted": cancel_attempted,
                         "succeeded": False,
                         "settled": False,
                         "unconfirmed": False,
@@ -1754,16 +1777,18 @@ class LeanEvaluator:
                     cancellation=cancellation_summary,
                 )
             if job_id and not _terminal(response):
-                response, cancel_error = self._cancel_and_reconcile(
-                    str(job_id),
-                    response,
-                    cancel_endpoint=cancel_endpoint,
-                    cancellation_reason=_cancel_reason(cancel_event),
-                    on_settled=settlement_callback,
+                response, cancel_error, cancel_attempted = (
+                    self._cancel_and_reconcile_details(
+                        str(job_id),
+                        response,
+                        cancel_endpoint=cancel_endpoint,
+                        cancellation_reason=_cancel_reason(cancel_event),
+                        on_settled=settlement_callback,
+                    )
                 )
                 if cancel_error == "cancel_settlement_deferred":
                     cancellation_summary = {
-                        "attempted": True,
+                        "attempted": cancel_attempted,
                         "succeeded": False,
                         "settled": False,
                         "unconfirmed": False,
@@ -2008,10 +2033,10 @@ class LeanEvaluator:
                     max(0.0, deadline - time.monotonic()),
                 )
             )
-        if cancellation_reason == "task_solved_by_peer":
-            # The submission identity is known and the DELETE was accepted,
-            # but Lean worker reset may exceed the foreground grace window.
-            # Keep the job's capacity permit retained by the caller and let a
+        if cancellation_reason == "task_solved_by_peer" and attempted:
+            # The submission identity is known and a DELETE was attempted, but
+            # the terminal receipt may lag the foreground grace window. Keep
+            # the job's capacity permit retained by the caller and let a
             # bounded watcher release it only after a job-bound receipt.
             deferred = self._start_settlement_watcher(
                 job_id,

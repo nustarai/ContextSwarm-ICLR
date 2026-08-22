@@ -671,6 +671,113 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(evaluator.pending_settlement_watchers, 0)
         self.assertEqual(evaluator.remote_unsettled_jobs, 1)
 
+    def test_peer_cancel_watcher_keeps_gate_accounted_until_callback_finishes(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 1.0
+        gate = threading.BoundedSemaphore(1)
+        self.assertTrue(gate.acquire(timeout=0))
+        callback_started = threading.Event()
+        callback_release = threading.Event()
+        callback_finished = threading.Event()
+
+        def release_gate() -> None:
+            callback_started.set()
+            callback_release.wait(timeout=1)
+            gate.release()
+            callback_finished.set()
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            if method == "DELETE":
+                return {"job_id": "job-1", "status": "cancel_requested"}
+            return {"job_id": "job-1", "status": "cancelled"}
+
+        with patch.object(evaluator, "_request", side_effect=request):
+            self.assertTrue(
+                evaluator._start_settlement_watcher(  # noqa: SLF001
+                    "job-1",
+                    {"job_id": "job-1", "status": "running"},
+                    on_settled=release_gate,
+                )
+            )
+            self.assertTrue(callback_started.wait(timeout=1))
+            self.assertEqual(evaluator.pending_settlement_watchers, 1)
+            self.assertFalse(gate.acquire(blocking=False))
+            callback_release.set()
+            self.assertTrue(callback_finished.wait(timeout=1))
+
+        deadline = time.monotonic() + 1
+        while evaluator.pending_settlement_watchers and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(evaluator.pending_settlement_watchers, 0)
+        self.assertTrue(gate.acquire(blocking=False))
+
+    def test_peer_cancel_without_cancel_attempt_is_not_deferred(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        # Simulate a caller whose cancellation deadline has already elapsed.
+        evaluator.cancel_grace_seconds = 0.0
+        with patch.object(evaluator, "_request") as request:
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response={"job_id": "job-1", "status": "running"},
+                cancellation_reason="task_solved_by_peer",
+            )
+
+        request.assert_not_called()
+        self.assertFalse(summary.get("deferred", False))
+        self.assertTrue(summary["unconfirmed"])
+        self.assertEqual(summary["failure_category"], "cancel_settlement_unconfirmed")
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+
+    def test_peer_cancel_watcher_callback_failure_latches_remote_work(self) -> None:
+        evaluator = LeanEvaluator(
+            "https://judge.invalid",
+            lean_env_id="test",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        evaluator.deferred_settlement_timeout_seconds = 1.0
+        callback_finished = threading.Event()
+
+        def broken_callback() -> None:
+            callback_finished.set()
+            raise RuntimeError("permit release failed")
+
+        with patch.object(
+            evaluator,
+            "_request",
+            return_value={"job_id": "job-1", "status": "cancelled"},
+        ):
+            self.assertTrue(
+                evaluator._start_settlement_watcher(  # noqa: SLF001
+                    "job-1",
+                    {"job_id": "job-1", "status": "running"},
+                    on_settled=broken_callback,
+                )
+            )
+            self.assertTrue(callback_finished.wait(timeout=1))
+            deadline = time.monotonic() + 1
+            while evaluator.pending_settlement_watchers and time.monotonic() < deadline:
+                time.sleep(0.005)
+
+        self.assertEqual(evaluator.pending_settlement_watchers, 0)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+        self.assertTrue(evaluator.remote_settlement_event.is_set())
+
     def test_peer_cancel_watcher_rotates_capabilities_and_binds_idless_terminal(self) -> None:
         evaluator = LeanEvaluator(
             "https://judge.invalid",

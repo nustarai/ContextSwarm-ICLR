@@ -153,10 +153,13 @@ function writableRelative(rawPath, cwd) {
     current = resolve(current, parts[index]);
     try {
       if (lstatSync(current).isSymbolicLink()) return null;
-    } catch {
+    } catch (error) {
       // A missing final result.lean is valid, but a missing parent directory
-      // must not be accepted because the tool could recreate it elsewhere.
-      if (index !== parts.length - 1) return null;
+      // (or any non-ENOENT lookup failure) must not be accepted because the
+      // tool could otherwise operate on an unexpected path after the error is
+      // resolved.  In particular, ENOTDIR at the final component means a
+      // parent is a regular file, not that result.lean is safely absent.
+      if (index !== parts.length - 1 || error?.code !== "ENOENT") return null;
     }
   }
   return rel;

@@ -71,10 +71,19 @@ _FORMAL_NONCACHEABLE_STATUSES = frozenset(
     }
 )
 # CPS workers must first receive a real terminal Judge/local-contract result.
-# Admission, transport, provenance, and other control failures do not satisfy
-# this ordering contract.
+# These statuses are candidate-attempt feedback, including bounded resource or
+# execution failures; they do not confer score authority. Admission, transport,
+# provenance, and other control failures do not satisfy this ordering contract.
 _JUDGE_CHECKPOINT_TERMINAL_STATUSES = frozenset(
-    {"PROVED", "COMPILES_WITH_SORRY", "VERIFY_FAIL", "LOCAL_REJECTED"}
+    {
+        "PROVED",
+        "COMPILES_WITH_SORRY",
+        "VERIFY_FAIL",
+        "LOCAL_REJECTED",
+        "CHEATING",
+        "RESOURCE_LIMIT",
+        "EXECUTION_TIMEOUT",
+    }
 )
 _CHECKPOINT_VALUE_UNSET = object()
 
@@ -898,7 +907,7 @@ class JudgeBroker:
                 deferred_remote = _has_deferred_remote_work(
                     verdict_status, safe_response
                 )
-                if call_unsettled:
+                if call_unsettled or deferred_remote:
                     # Both unresolved classes retain the permit.  A deferred
                     # known-job cancellation is released by its watcher;
                     # an unknown job remains permanently fail-closed.
@@ -971,7 +980,7 @@ class JudgeBroker:
                     )
                     safe_response["settlement_deferred"] = True
                 proof_claimed = verdict_status == "PROVED" or _safe_score(verdict.score) >= 1.0
-                if call_unsettled:
+                if call_unsettled or deferred_remote:
                     authoritative_verdict = None
                 elif proof_claimed and time.monotonic() >= claim.deadline_monotonic:
                     result.update(
@@ -1378,7 +1387,7 @@ class JudgeBroker:
                     deferred_remote = _has_deferred_remote_work(
                         _safe_verdict_status(verdict.status), verdict.response
                     )
-                    if call_unsettled:
+                    if call_unsettled or deferred_remote:
                         retain_evaluator_gate = True
                     if call_unsettled and not deferred_remote:
                         self._mark_remote_unsettled()
@@ -1878,7 +1887,7 @@ class JudgeBroker:
             deferred_remote = _has_deferred_remote_work(
                 _safe_verdict_status(verdict.status), verdict.response
             )
-            if call_unsettled:
+            if call_unsettled or deferred_remote:
                 retain_evaluator_gate = True
             if call_unsettled and not deferred_remote:
                 self._mark_remote_unsettled()

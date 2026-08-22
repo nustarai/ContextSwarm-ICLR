@@ -219,6 +219,42 @@ class _GlobalUnsettledEvaluator(_RecordingEvaluator):
         )
 
 
+class _DeferredOnlyEvaluator(_RecordingEvaluator):
+    """Expose a deferred receipt without the legacy unsettled counter."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.settlement_callback: object | None = None
+
+    def probe(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None,
+        settlement_callback: object | None = None,
+    ) -> Verdict:
+        self.calls.append((task, candidate, deadline_monotonic))
+        self.settlement_callback = settlement_callback
+        return Verdict(
+            task.slug,
+            "TASK_CANCELLED",
+            0.0,
+            0.0,
+            {
+                "settlement_error": "cancel_settlement_deferred",
+                "judge_cancellation": {
+                    "attempted": False,
+                    "succeeded": False,
+                    "settled": False,
+                    "unconfirmed": False,
+                    "deferred": True,
+                },
+            },
+            judge_job_id="job-deferred",
+        )
+
+
 class _NestedRemoteCacheEvaluator(_RecordingEvaluator):
     def probe(
         self,
@@ -473,6 +509,20 @@ class JudgeBrokerTests(unittest.TestCase):
                 else:
                     self.assertEqual(searched["status"], "JUDGE_CHECK_REQUIRED")
                     self.assertFalse(searched["accepted"])
+
+    def test_candidate_terminal_feedback_statuses_unlock_cps_with_job_provenance(self) -> None:
+        for status in (
+            "CHEATING",
+            "RESOURCE_LIMIT",
+            "EXECUTION_TIMEOUT",
+        ):
+            with self.subTest(status=status):
+                checkpoint, searched = self._run_checkpoint_gate_case(
+                    _CheckpointEvaluator(status, judge_job_id="job-feedback")
+                )
+                self.assertTrue(checkpoint["accepted"])
+                self.assertEqual(checkpoint["status"], status)
+                self.assertTrue(searched["ok"])
 
     def test_local_rejected_checkpoint_requires_raw_job_id_to_be_absent(self) -> None:
         base = {
@@ -1269,6 +1319,41 @@ class JudgeBrokerTests(unittest.TestCase):
                 },
             )
             self.assertEqual(len(audit_path.read_text().splitlines()), 1)
+
+    def test_deferred_settlement_retains_gate_until_callback_releases_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text(
+                "import Mathlib\ntheorem task : True := by trivial\n"
+            )
+            evaluator = _DeferredOnlyEvaluator()
+            gate = threading.BoundedSemaphore(1)
+            broker = JudgeBroker(
+                evaluator,
+                gate,
+                audit_path=root / "audit.jsonl",
+                min_probe_interval_seconds=0,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 2,
+                ) as env:
+                    result = _post(env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {})
+                    self.assertEqual(result["status"], "TASK_CANCELLED")
+                    self.assertFalse(gate.acquire(blocking=False))
+                    callback = evaluator.settlement_callback
+                    self.assertTrue(callable(callback))
+                    callback()  # type: ignore[operator]
+                    self.assertTrue(gate.acquire(timeout=1))
+                    gate.release()
+            finally:
+                broker.close()
 
     def test_global_remote_latch_rejects_all_later_sessions_without_admission(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

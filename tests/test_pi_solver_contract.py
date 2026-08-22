@@ -424,6 +424,59 @@ process.stdout.write(JSON.stringify(result));
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertTrue(all(json.loads(completed.stdout).values()))
 
+    def test_solver_extension_write_guard_rejects_non_enoent_final_lookup(self) -> None:
+        """A final lstat failure other than missing result.lean is not writable."""
+        node_binary = shutil.which("node")
+        if not node_binary:
+            self.skipTest("Node.js is unavailable")
+        harness = r"""
+import { pathToFileURL } from "node:url";
+const [extensionPath, workdir] = process.argv.slice(1);
+const listeners = new Map();
+const pi = {
+  on(name, callback) { listeners.set(name, callback); },
+  registerTool(_definition) {},
+};
+const extension = await import(pathToFileURL(extensionPath).href);
+extension.default(pi);
+const guard = listeners.get("tool_call");
+if (typeof guard !== "function") throw new Error("tool_call guard was not registered");
+const result = await guard(
+  { toolName: "write", input: { path: "tasks/blocked/result.lean", content: "x" } },
+  { cwd: workdir },
+);
+process.stdout.write(JSON.stringify({ blocked: result?.block === true }));
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "workdir"
+            workdir.mkdir()
+            tasks = workdir / "tasks"
+            tasks.mkdir()
+            # lstat(tasks/blocked/result.lean) raises ENOTDIR: the final
+            # component is not safely absent, since its parent is a file.
+            (tasks / "blocked").write_text("not a directory\n", encoding="utf-8")
+            env = dict(os.environ)
+            env["CONTEXTSWARM_WORKDIR"] = str(workdir)
+            completed = subprocess.run(
+                [
+                    node_binary,
+                    "--input-type=module",
+                    "-e",
+                    harness,
+                    str(ROOT / "contextswarm_mini" / "pi_solver_tools.mjs"),
+                    str(workdir),
+                ],
+                cwd=workdir,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(json.loads(completed.stdout)["blocked"])
+
     def test_solver_broker_client_uses_runner_deadline_not_fixed_310_seconds(self) -> None:
         source = (ROOT / "contextswarm_mini" / "pi_solver_tools.mjs").read_text(
             encoding="utf-8"

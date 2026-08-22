@@ -23,9 +23,10 @@ SOLVER_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
   reading the theorem and current `result.lean`, immediately submit the current
   candidate through `judge_check` before any optional helper diagnostic,
   coordination, recipient discovery, or extended proof search.
-  Do not wait for a polished proof: `COMPILES_WITH_SORRY` or `VERIFY_FAIL` is useful
-  remote feedback. Afterward, keep checks serial and submit again only after a
-  material edit.
+  Do not wait for a polished proof: `COMPILES_WITH_SORRY`, `VERIFY_FAIL`, or another
+  job-bound terminal candidate outcome is useful remote feedback. Resource and
+  execution-limit outcomes are feedback rather than permission for a local fallback.
+  Afterward, keep checks serial and submit again only after a material edit.
 - Never invoke local `lean`, `lake`, `elan`, a local verifier, proof-search service,
   or any other local proof checker. Do not install or download Lean, Mathlib,
   toolchains, packages, caches, compilers, or solver infrastructure.
