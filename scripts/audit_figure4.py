@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -101,6 +102,57 @@ def _finite_number(value: Any, field: str, *, nonnegative: bool = True) -> float
     return result
 
 
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _integer(value: Any, field: str, *, nonnegative: bool = True) -> int:
+    number = _finite_number(value, field, nonnegative=nonnegative)
+    if int(number) != number:
+        raise ValueError(f"{field} must be an integer")
+    return int(number)
+
+
+def _lexical_argmax(scores: Mapping[str, Any], eligible: list[str], field: str) -> str:
+    numeric = {
+        task_id: _finite_number(scores[task_id], f"{field}.{task_id}", nonnegative=False)
+        for task_id in eligible
+    }
+    return min(eligible, key=lambda task_id: (-numeric[task_id], task_id))
+
+
+def _admitted_decision(row: Mapping[str, Any]) -> bool:
+    disposition = row.get("disposition")
+    assigned = row.get("assigned_agent_id")
+    has_agent = isinstance(assigned, str) and bool(assigned.strip())
+    admitted_task = row.get("admitted_task_id")
+    has_task = isinstance(admitted_task, str) and bool(admitted_task.strip())
+    if disposition is None:
+        return has_agent or has_task
+    if not isinstance(disposition, str) or not disposition.strip():
+        raise ValueError("decision disposition must be a non-empty string")
+    normalized = disposition.strip().lower().replace("-", "_")
+    admitted = normalized in {"admitted", "executed", "assigned", "dispatched"}
+    rejected = normalized in {
+        "not_admitted", "rejected", "stale", "horizon_reached", "no_capacity",
+        "cancelled", "invalid", "skipped",
+    }
+    if not admitted and not rejected:
+        raise ValueError(f"unsupported decision disposition {disposition!r}")
+    if admitted and not (has_agent or has_task):
+        raise ValueError("admitted decision lacks admission identity")
+    if rejected and (has_agent or has_task):
+        raise ValueError("rejected decision has an admission identity")
+    return admitted
+
+
 def _required(mapping: Mapping[str, Any], key: str, field: str | None = None) -> Any:
     if key not in mapping:
         raise ValueError(f"missing {field or key}")
@@ -175,6 +227,95 @@ def _validate_contract(contract: Mapping[str, Any], summary: Mapping[str, Any]) 
         raise ValueError("stopping rule must be non-empty")
     if direct is not False:
         raise ValueError("comparison contract must disable direct messages")
+
+
+def _validate_score_history(
+    history: Any, *, horizon: float, max_score: int, final_score: int,
+) -> float:
+    if not isinstance(history, list):
+        raise ValueError("accepted_score_history must be a list")
+    points: list[tuple[float, int]] = []
+    previous_time = -1.0
+    previous_score = 0
+    for row in history:
+        if not isinstance(row, Mapping):
+            raise ValueError("accepted_score_history rows must be objects")
+        elapsed = _finite_number(
+            _alias(row, "elapsed_seconds", "time_seconds"),
+            "history.elapsed_seconds",
+        )
+        score = _integer(_alias(row, "score", "accepted_score"), "history.score")
+        if elapsed < previous_time or elapsed > horizon:
+            raise ValueError("accepted score history times are not monotone/in horizon")
+        if score < previous_score or score > max_score:
+            raise ValueError("accepted score history is decreasing or out of bounds")
+        if elapsed == previous_time and points and score == previous_score:
+            raise ValueError("accepted score history contains a duplicate no-op point")
+        points.append((elapsed, score))
+        previous_time, previous_score = elapsed, score
+    terminal = points[-1][1] if points else 0
+    if terminal != final_score:
+        raise ValueError("final_accepted_score does not match history")
+    if horizon == 0 or max_score == 0:
+        return 0.0
+    area = 0.0
+    current_time = 0.0
+    current_score = 0
+    for elapsed, score in points:
+        area += current_score * (elapsed - current_time)
+        current_time, current_score = elapsed, score
+    area += current_score * (horizon - current_time)
+    return area / (max_score * horizon)
+
+
+def _validate_time_to_k(value: Any, history: list[Mapping[str, Any]], horizon: float) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("time_to_k must be an object")
+    points = [
+        (
+            _finite_number(_alias(row, "elapsed_seconds", "time_seconds"), "history.elapsed_seconds"),
+            _integer(_alias(row, "score", "accepted_score"), "history.score"),
+        )
+        for row in history
+    ]
+    for raw_k, reported in value.items():
+        try:
+            k = int(raw_k)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("time_to_k keys must be positive integers") from exc
+        if k <= 0 or str(k) != str(raw_k):
+            raise ValueError("time_to_k keys must be canonical positive integers")
+        observed = next((elapsed for elapsed, score in points if score >= k), None)
+        if reported is None:
+            if observed is not None:
+                raise ValueError("time_to_k is null for a reached score")
+            continue
+        elapsed = _finite_number(reported, f"time_to_k.{raw_k}")
+        if elapsed > horizon or observed is None or not math.isclose(elapsed, observed, abs_tol=1e-12):
+            raise ValueError("time_to_k is inconsistent with score history")
+
+
+def _validate_usage(summary: Mapping[str, Any], scheduler: Mapping[str, Any]) -> None:
+    solver = summary["solver_usage"]
+    evaluator = summary["evaluator_usage"]
+    for label, usage in (("solver_usage", solver), ("evaluator_usage", evaluator)):
+        for key, value in usage.items():
+            if key.endswith(("calls", "tokens", "admissions", "receipts")) or key in {
+                "calls", "input_tokens", "output_tokens", "total_tokens",
+            }:
+                _integer(value, f"{label}.{key}")
+            elif key.endswith(("seconds", "slot_seconds")):
+                _finite_number(value, f"{label}.{key}")
+    if "total_tokens" in solver and solver["total_tokens"] != solver["input_tokens"] + solver["output_tokens"]:
+        raise ValueError("solver_usage.total_tokens mismatch")
+    admissions = evaluator.get("admissions")
+    terminal = evaluator.get("terminal_receipts")
+    if admissions is not None and admissions > evaluator["calls"]:
+        raise ValueError("evaluator admissions exceed calls")
+    if terminal is not None and admissions is not None and terminal > admissions:
+        raise ValueError("evaluator terminal receipts exceed admissions")
+    if scheduler["total_tokens"] != scheduler["input_tokens"] + scheduler["output_tokens"]:
+        raise ValueError("scheduler total_tokens mismatch")
     # Top-level values are duplicated deliberately for paired-repeat analysis;
     # all arms must carry the same values even if a contract implementation
     # stores them under a nested object.
@@ -244,29 +385,20 @@ def _audit_arm(policy: str, run_dir: Path) -> dict[str, Any]:
         if initial_total > capacity:
             raise ValueError("initial allocation exceeds total capacity")
         history = summary["accepted_score_history"]
-        if not isinstance(history, list):
-            raise ValueError("accepted_score_history must be a list")
-        previous_time = -1.0
-        for row in history:
-            if not isinstance(row, Mapping):
-                raise ValueError("accepted_score_history rows must be objects")
-            elapsed = _finite_number(_alias(row, "elapsed_seconds", "time_seconds"), "history.elapsed_seconds")
-            if elapsed < previous_time or elapsed > horizon:
-                raise ValueError("accepted score history times are not monotone/in horizon")
-            previous_time = elapsed
-            _finite_number(_alias(row, "score", "accepted_score"), "history.score")
-        final = _finite_number(summary["final_accepted_score"], "final_accepted_score")
-        if history and final != _finite_number(_alias(history[-1], "score", "accepted_score"), "history.score"):
-            raise ValueError("final_accepted_score does not match history")
-        _finite_number(summary["nauc"], "nauc")
+        max_score = _integer(_required(summary, "max_score"), "max_score")
+        if max_score <= 0:
+            raise ValueError("max_score must be positive")
+        final = _integer(summary["final_accepted_score"], "final_accepted_score")
+        if final > max_score:
+            raise ValueError("final_accepted_score exceeds max_score")
+        expected_nauc = _validate_score_history(
+            history, horizon=horizon, max_score=max_score, final_score=final,
+        )
+        reported_nauc = _finite_number(summary["nauc"], "nauc")
+        if reported_nauc > 1 or not math.isclose(reported_nauc, expected_nauc, abs_tol=1e-12):
+            raise ValueError("nauc is out of bounds or inconsistent with score history")
         ttk = _alias(summary, "time_to_k", "time_to_k_seconds")
-        if not isinstance(ttk, Mapping):
-            raise ValueError("time_to_k must be an object")
-        for key, value in ttk.items():
-            if value is not None:
-                elapsed = _finite_number(value, f"time_to_k.{key}")
-                if elapsed > horizon:
-                    raise ValueError("time_to_k exceeds horizon")
+        _validate_time_to_k(ttk, history, horizon)
         for section, required_keys in {
             "solver_usage": ("calls", "input_tokens", "output_tokens"),
             "evaluator_usage": ("calls",),
@@ -281,6 +413,9 @@ def _audit_arm(policy: str, run_dir: Path) -> dict[str, Any]:
             raise ValueError("scheduler_cost must be an object")
         for key in ("calls", "input_tokens", "output_tokens", "total_tokens", "latency_seconds", "reserved_slot_seconds"):
             _finite_number(_required(scheduler, key, f"scheduler_cost.{key}"), f"scheduler_cost.{key}")
+        for key in ("calls", "input_tokens", "output_tokens", "total_tokens"):
+            _integer(scheduler[key], f"scheduler_cost.{key}")
+        _validate_usage(summary, scheduler)
         allocation_obj = summary.get("allocation_metrics")
         if allocation_obj is None:
             if "allocation_decisions" not in summary or "fallback_decisions" not in summary:
@@ -292,9 +427,7 @@ def _audit_arm(policy: str, run_dir: Path) -> dict[str, Any]:
         if not isinstance(allocation_obj, Mapping):
             raise ValueError("allocation_metrics must be an object")
         for key in ("decisions", "fallbacks"):
-            _finite_number(_required(allocation_obj, key, f"allocation_metrics.{key}"), f"allocation_metrics.{key}")
-        if scheduler["total_tokens"] != scheduler["input_tokens"] + scheduler["output_tokens"]:
-            raise ValueError("scheduler total_tokens mismatch")
+            _integer(_required(allocation_obj, key, f"allocation_metrics.{key}"), f"allocation_metrics.{key}")
         if policy != "llm_scheduler" and any(float(scheduler[key]) != 0.0 for key in (
             "calls", "input_tokens", "output_tokens", "total_tokens", "latency_seconds", "reserved_slot_seconds"
         )):
@@ -306,6 +439,7 @@ def _audit_arm(policy: str, run_dir: Path) -> dict[str, Any]:
         if int(allocation_obj["decisions"]) != len(decisions):
             raise ValueError("allocation_metrics.decisions does not match decision artifact")
         decision_ids: set[str] = set()
+        admitted_decision_ids: set[str] = set()
         for row in decisions:
             if not isinstance(row.get("policy"), str) or row["policy"] != policy:
                 raise ValueError("allocation decision policy mismatch")
@@ -315,17 +449,21 @@ def _audit_arm(policy: str, run_dir: Path) -> dict[str, Any]:
             if decision_id in decision_ids:
                 raise ValueError("duplicate allocation decision_id")
             decision_ids.add(decision_id)
+            if _admitted_decision(row):
+                admitted_decision_ids.add(decision_id)
         if policy == "trace_state":
             counts["trace_audit_rows"] = len(trace_rows)
-            if len(trace_rows) != len(decisions):
-                raise ValueError("every trace-state decision requires an audit row")
+            if len(trace_rows) != len(admitted_decision_ids):
+                raise ValueError("every admitted trace-state decision requires one audit row")
             audit_ids: set[str] = set()
             for row in trace_rows:
                 _validate_trace_audit(row, capacity, tasks)
                 audit_ids.add(str(row["decision_id"]))
-            if audit_ids != decision_ids or len(audit_ids) != len(trace_rows):
-                raise ValueError("trace audit decision IDs do not join one-to-one")
+            if audit_ids != admitted_decision_ids or len(audit_ids) != len(trace_rows):
+                raise ValueError("trace audit IDs do not join admitted decisions one-to-one")
         contract = _contract(summary, meta)
+        if not _HEX64.fullmatch(contract_id) or _canonical_sha256(contract) != contract_id.lower():
+            raise ValueError("comparison contract SHA-256 mismatch")
         _validate_contract(contract, summary)
         selection = meta.get("selection")
         if selection is not None:
@@ -392,6 +530,25 @@ def _validate_trace_audit(row: Mapping[str, Any], capacity: int, tasks: tuple[st
         raise ValueError("capacity_delta_sum must be zero")
     if row.get("capacity_conserved") is not True:
         raise ValueError("capacity_conserved must be true")
+    recomputed_delta = sum(int(trace[item]) - int(task[item]) for item in tasks)
+    if recomputed_delta != 0:
+        raise ValueError("recomputed same-state capacity delta is not zero")
+    for task_id in eligible:
+        task_score = float(row["task_only_scores"][task_id])
+        increment = float(row["trace_increments"][task_id])
+        total_score = float(row["trace_total_scores"][task_id])
+        if not math.isclose(task_score + increment, total_score, abs_tol=1e-12):
+            raise ValueError("trace total score is not task score plus increment")
+    expected_task_selected = _lexical_argmax(
+        row["task_only_scores"], eligible, "task_only_scores",
+    )
+    expected_trace_selected = _lexical_argmax(
+        row["trace_total_scores"], eligible, "trace_total_scores",
+    )
+    if row["task_state_selected_task_id"] != expected_task_selected:
+        raise ValueError("task-state selection is not lexical argmax")
+    if row["trace_state_selected_task_id"] != expected_trace_selected:
+        raise ValueError("trace-state selection is not lexical argmax")
     trace_selected = row["trace_state_selected_task_id"]
     task_selected = row["task_state_selected_task_id"]
     admission_count = 0 if admitted is None else 1

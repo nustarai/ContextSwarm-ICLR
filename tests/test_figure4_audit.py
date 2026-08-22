@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from scripts.audit_figure4 import POLICIES, SUMMARY_SCHEMA, audit_figure4
+from scripts.audit_figure4 import POLICIES, SUMMARY_SCHEMA, _canonical_sha256, audit_figure4
 
 
 TASKS = ["task-a", "task-b"]
@@ -37,7 +37,7 @@ def _summary(policy: str) -> dict[str, object]:
     return {
         "schema_version": SUMMARY_SCHEMA,
         "run_id": f"run-{policy}",
-        "comparison_contract_id": "c" * 64,
+        "comparison_contract_id": _canonical_sha256(CONTRACT),
         "comparison_contract": CONTRACT,
         "policy": policy,
         "paired_seed": 7,
@@ -48,6 +48,7 @@ def _summary(policy: str) -> dict[str, object]:
         "initial_allocation": {"task-a": 2, "task-b": 2},
         "accepted_score_history": [{"elapsed_seconds": 1, "score": 0}],
         "final_accepted_score": 0,
+        "max_score": 2,
         "time_to_k": {"1": None},
         "nauc": 0,
         "solver_usage": {"calls": 1, "input_tokens": 2, "output_tokens": 3},
@@ -95,8 +96,12 @@ def _make_fixture(root: Path, *, bad_policy: str | None = None) -> dict[str, Pat
         summary = _summary(policy)
         if bad_policy == policy:
             summary["comparison_contract"] = {**CONTRACT, "model": "different"}
+            summary["comparison_contract_id"] = _canonical_sha256(summary["comparison_contract"])
         _write(run / "figure4_run_summary.json", summary)
-        _write(run / "allocation_decisions.jsonl", {"decision_id": "d1", "policy": policy})
+        decision = {"decision_id": "d1", "policy": policy}
+        if policy == "trace_state":
+            decision["admitted_task_id"] = "task-a"
+        _write(run / "allocation_decisions.jsonl", decision)
         if policy == "trace_state":
             _write(run / "allocation_audit.jsonl", _audit_row())
     return paths
@@ -130,6 +135,36 @@ class Figure4AuditTests(unittest.TestCase):
             _write(paths["trace_state"] / "allocation_audit.jsonl", row)
             report = audit_figure4(paths)
             self.assertFalse(report["ok"])
+
+    def test_nonadmitted_trace_decision_needs_no_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _make_fixture(Path(directory))
+            summary = _summary("trace_state")
+            summary["allocation_metrics"]["decisions"] = 2
+            _write(paths["trace_state"] / "figure4_run_summary.json", summary)
+            (paths["trace_state"] / "allocation_decisions.jsonl").write_text(
+                json.dumps({"decision_id": "d1", "policy": "trace_state", "admitted_task_id": "task-a"}) + "\n"
+                + json.dumps({"decision_id": "d2", "policy": "trace_state", "disposition": "stale"}) + "\n",
+                encoding="utf-8",
+            )
+            report = audit_figure4(paths)
+            self.assertTrue(report["ok"], report)
+
+    def test_score_identity_and_argmax_are_recomputed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _make_fixture(Path(directory))
+            row = _audit_row()
+            row["trace_total_scores"]["task-b"] = 99
+            _write(paths["trace_state"] / "allocation_audit.jsonl", row)
+            self.assertFalse(audit_figure4(paths)["ok"])
+
+    def test_contract_hash_and_nauc_are_recomputed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _make_fixture(Path(directory))
+            summary = _summary("uniform_refill")
+            summary["comparison_contract_id"] = "f" * 64
+            _write(paths["uniform_refill"] / "figure4_run_summary.json", summary)
+            self.assertFalse(audit_figure4(paths)["ok"])
 
     def test_requires_exact_policy_set(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
