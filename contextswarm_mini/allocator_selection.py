@@ -37,6 +37,7 @@ RULE_SCHEMA = "contextswarm_allocator_selection_rule_v1"
 RULE_ID = "figure4_allocator_selection_v1"
 POLICIES = ("uniform_refill", "task_state", "trace_state", "llm_scheduler")
 REGISTRY_ORDER = POLICIES
+_POLICY_PARAMETER_IDENTITY_FIELDS = ("policy", "allocation_policy")
 DEFAULT_BOOTSTRAP_DRAWS = 10_000
 DEFAULT_BOOTSTRAP_SEED = 39039
 DEFAULT_TARGET_K = 6
@@ -44,6 +45,15 @@ MIN_VALIDATION_REPEATS = 8
 BOOTSTRAP_METHOD = "paired_block_percentile"
 BOOTSTRAP_CONFIDENCE = 0.95
 BOOTSTRAP_QUANTILE = "linear"
+# Comparisons in the frozen numeric guardrails use a tiny absolute tolerance
+# for serialization/rounding noise.  Keep this explicit and shared by the
+# per-repeat and aggregate checks.
+COMPARISON_EPSILON = 1e-12
+# JSON numbers are parsed as IEEE-754 doubles by many artifact consumers.
+# Refuse larger integer values so an integer field cannot silently change when
+# it crosses a serialization boundary (and to keep malformed artifacts from
+# forcing unbounded integer arithmetic).
+_MAX_EXACT_INTEGER = (1 << 53) - 1
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE_KEY = re.compile(
     r"(?:api[_-]?key|access[_-]?token|secret|password|credential|authorization|"
@@ -142,21 +152,20 @@ def _finite(value: Any, name: str, *, minimum: float | None = None, maximum: flo
 def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
     """Parse integer counts without lossy float conversion."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise AllocatorSelectionError(f"{name} must be numeric")
+        raise AllocatorSelectionError(f"{name} must be an integer")
     if isinstance(value, int):
-        if abs(value).bit_length() > 1024:
-            raise AllocatorSelectionError(f"{name} must be finite")
         number = value
     else:
         if not math.isfinite(value) or not value.is_integer():
             raise AllocatorSelectionError(f"{name} must be an integer")
-        if abs(value) > 2**53:
-            raise AllocatorSelectionError(
-                f"{name} exceeds exactly representable integer range"
-            )
+        # A float beyond this bound may already have lost integer precision.
+        if abs(value) > _MAX_EXACT_INTEGER:
+            raise AllocatorSelectionError(f"{name} exceeds exact integer range")
         number = int(value)
     if number < minimum:
         raise AllocatorSelectionError(f"{name} must be at least {minimum}")
+    if number > _MAX_EXACT_INTEGER:
+        raise AllocatorSelectionError(f"{name} exceeds exact integer range")
     return number
 
 
@@ -427,30 +436,24 @@ def _contract_summary(contract: Mapping[str, Any], repeat_id: str, paired_seed: 
 def _threshold(mapping: Mapping[str, Any], *names: str, default: Any = _MISSING) -> Any:
     found: list[tuple[str, Any]] = []
     for name in names:
-        if name not in mapping:
-            continue
-        value = mapping[name]
-        if isinstance(value, Mapping):
-            value = _get(value, "max", "threshold", default=_MISSING)
-        found.append((name, value))
+        if name in mapping:
+            value = mapping[name]
+            if isinstance(value, Mapping):
+                value = _get(value, "max", "threshold", default=_MISSING)
+                if value is _MISSING:
+                    raise AllocatorSelectionError(
+                        f"guardrail alias {name} must contain max or threshold"
+                    )
+            found.append((name, value))
     if found:
-        baseline_name, baseline = found[0]
-        for name, value in found[1:]:
-            if (
-                isinstance(baseline, (int, float))
-                and not isinstance(baseline, bool)
-                and isinstance(value, (int, float))
-                and not isinstance(value, bool)
-            ):
-                equivalent = value == baseline
-            else:
-                equivalent = canonical_json(value) == canonical_json(baseline)
-            if not equivalent:
-                raise AllocatorSelectionError(
-                    f"contradictory aliases for guardrail {baseline_name} and {name}",
-                    code="invalid_rule",
-                )
-        return baseline
+        baseline = canonical_json(found[0][1])
+        if any(canonical_json(value) != baseline for _, value in found[1:]):
+            raise AllocatorSelectionError(
+                "contradictory guardrail aliases for "
+                + ", ".join(name for name, _ in found),
+                code="invalid_rule",
+            )
+        return found[0][1]
     if default is not _MISSING:
         return default
     raise AllocatorSelectionError(f"guardrails missing one of {', '.join(names)}")
@@ -819,6 +822,33 @@ def _recompute_nauc(points: Sequence[tuple[float, float]], horizon: float, max_s
     return area / (horizon * max_score)
 
 
+def _policy_neutral_parameters(parameters: Mapping[str, Any], policy: str) -> dict[str, Any]:
+    """Return allocation parameters with only the arm identity removed.
+
+    The four Figure 4 arms are allowed to carry an explicit policy identity in
+    their parameter object, but every other parameter is part of the common
+    allocation contract.  Runtime summaries from older producers omit that
+    identity, so its presence is optional; when present, both compatibility
+    spellings must agree and must name the arm selected by the enclosing key.
+    """
+
+    normalized = json.loads(canonical_json(parameters))
+    identity = _get(
+        normalized,
+        *_POLICY_PARAMETER_IDENTITY_FIELDS,
+        default=_MISSING,
+    )
+    if identity is not _MISSING:
+        if not isinstance(identity, str) or identity != policy:
+            raise AllocatorSelectionError(
+                f"{policy}.allocation_parameters policy identity does not match arm",
+                code="config_mismatch",
+            )
+        for field in _POLICY_PARAMETER_IDENTITY_FIELDS:
+            normalized.pop(field, None)
+    return normalized
+
+
 def _normalize_arm(row: Mapping[str, Any], policy: str, *, row_horizon: float, task_count: int, require_history: bool) -> dict[str, Any]:
     arm = dict(_mapping(row, f"arms.{policy}"))
     if arm.get("policy", policy) != policy:
@@ -864,6 +894,7 @@ def _normalize_arm(row: Mapping[str, Any], policy: str, *, row_horizon: float, t
     config_hash = _sha(_get(arm, "allocation_config_sha256", "allocation_config_hash"), f"{policy}.allocation_config_sha256")
     if canonical_sha256(parameters) != config_hash:
         raise AllocatorSelectionError(f"{policy}.allocation_config_sha256 does not match allocation_parameters")
+    neutral_parameters = _policy_neutral_parameters(parameters, policy)
     cost = _extract_cost(arm, policy)
     return {
         "policy": policy,
@@ -874,6 +905,7 @@ def _normalize_arm(row: Mapping[str, Any], policy: str, *, row_horizon: float, t
         "time_to_k_seconds": times,
         "final_accepted_score": final_score,
         "allocation_parameters": parameters,
+        "allocation_parameters_neutral": neutral_parameters,
         "allocation_config_sha256": config_hash,
         "cost": cost,
         "raw": arm,
@@ -897,10 +929,37 @@ def _normalize_row(raw: Mapping[str, Any], *, require_history: bool) -> dict[str
         raise AllocatorSelectionError("comparison_contract_sha256 mismatch")
     contract_meta = _contract_summary(contract, repeat_id, seed)
     row_horizon = contract_meta["horizon_seconds"]
+    row_max_score_raw = row.get("max_score", _MISSING)
+    row_max_score = (
+        None
+        if row_max_score_raw is _MISSING
+        else _integer(row_max_score_raw, "paired_repeat.max_score", minimum=1)
+    )
     normalized_arms = {
         policy: _normalize_arm(arms_raw[policy], policy, row_horizon=row_horizon, task_count=len(contract_meta["ordered_task_ids"]), require_history=require_history)
         for policy in POLICIES
     }
+    arm_max_scores = {arm["max_score"] for arm in normalized_arms.values()}
+    if len(arm_max_scores) != 1:
+        raise AllocatorSelectionError(
+            "max_score must be identical across all paired arms",
+            code="contract_mismatch",
+        )
+    common_max_score = next(iter(arm_max_scores))
+    if row_max_score is not None and row_max_score != common_max_score:
+        raise AllocatorSelectionError(
+            "paired_repeat.max_score disagrees with arm max_score",
+            code="contract_mismatch",
+        )
+    neutral_parameter_values = {
+        policy: canonical_json(arm["allocation_parameters_neutral"])
+        for policy, arm in normalized_arms.items()
+    }
+    if len(set(neutral_parameter_values.values())) != 1:
+        raise AllocatorSelectionError(
+            "allocation parameters may differ across arms only by policy identity",
+            code="config_mismatch",
+        )
     # If the producer included registered contrasts, verify the two canonical
     # values instead of trusting a stale precomputed difference.
     contrasts = row.get("registered_contrasts", {})
@@ -929,6 +988,7 @@ def _normalize_row(raw: Mapping[str, Any], *, require_history: bool) -> dict[str
         "comparison_contract_sha256": contract_hash,
         "contract_meta": contract_meta,
         "contract_normalized": _without_pair_identity(contract),
+        "max_score": common_max_score,
         "arms": normalized_arms,
         "raw": row,
     }
@@ -936,6 +996,12 @@ def _normalize_row(raw: Mapping[str, Any], *, require_history: bool) -> dict[str
 
 def load_paired_repeats(source: str | Path | Iterable[Mapping[str, Any]], *, require_history: bool = True) -> list[dict[str, Any]]:
     """Load and validate paired-repeat rows from JSON, JSONL, or mappings."""
+
+    if require_history is not True:
+        raise AllocatorSelectionError(
+            "paired-repeat validation always requires accepted score history",
+            code="invalid_rule",
+        )
 
     source_name = "<memory>"
     if isinstance(source, (str, Path)):
@@ -978,13 +1044,24 @@ def load_paired_repeats(source: str | Path | Iterable[Mapping[str, Any]], *, req
     for row in rows[1:]:
         if canonical_json(row["contract_normalized"]) != baseline_contract:
             raise AllocatorSelectionError("comparison contract differs across paired repeats", code="contract_mismatch")
-    for policy in POLICIES:
-        baseline_hash = rows[0]["arms"][policy]["allocation_config_sha256"]
-        baseline_parameters = canonical_json(rows[0]["arms"][policy]["allocation_parameters"])
-        for row in rows[1:]:
-            arm = row["arms"][policy]
-            if arm["allocation_config_sha256"] != baseline_hash or canonical_json(arm["allocation_parameters"]) != baseline_parameters:
-                raise AllocatorSelectionError(f"allocation configuration drifts for {policy}", code="config_mismatch")
+        if row["max_score"] != rows[0]["max_score"]:
+            raise AllocatorSelectionError(
+                "max_score differs across paired repeats",
+                code="contract_mismatch",
+            )
+    baseline_neutral_parameters = canonical_json(
+        rows[0]["arms"][POLICIES[0]]["allocation_parameters_neutral"]
+    )
+    for row in rows:
+        for policy in POLICIES:
+            neutral_parameters = canonical_json(
+                row["arms"][policy]["allocation_parameters_neutral"]
+            )
+            if neutral_parameters != baseline_neutral_parameters:
+                raise AllocatorSelectionError(
+                    "policy-neutral allocation parameters drift across paired repeats",
+                    code="config_mismatch",
+                )
     return rows
 
 
@@ -1015,7 +1092,7 @@ def parse_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
     metric = dict(_mapping(rule.get("metric"), "rule.metric"))
     if metric.get("name") not in {"fixed_horizon_nauc", "nauc"} or metric.get("field", "nauc") != "nauc" or metric.get("aggregation") != "mean" or metric.get("direction") != "max":
         raise AllocatorSelectionError("rule metric must be mean fixed-horizon nAUC", code="invalid_rule")
-    if metric.get("require_history", True) is not True:
+    if metric.get("require_history") is not True:
         raise AllocatorSelectionError(
             "rule.metric.require_history must be true",
             code="invalid_rule",

@@ -25,6 +25,7 @@ from scripts.select_allocator import main as cli_main
 
 
 POLICIES = ("uniform_refill", "task_state", "trace_state", "llm_scheduler")
+VALIDATION_IDS = tuple(f"r{i}" for i in range(1, 9))
 
 
 def _contract(repeat_id: str, seed: int) -> dict[str, object]:
@@ -176,7 +177,31 @@ def _rule(*ids: str) -> dict[str, object]:
 
 
 def _validation_rows(**kwargs: object) -> list[dict[str, object]]:
-    return [_row(f"r{i}", 10 + i, **kwargs) for i in range(1, 9)]
+    return [_row(repeat_id, 10 + index, **kwargs) for index, repeat_id in enumerate(VALIDATION_IDS, 1)]
+
+
+def _validation_rule() -> dict[str, object]:
+    return _rule(*VALIDATION_IDS)
+
+
+def _set_row_max_score(row: dict[str, object], max_score: int) -> None:
+    """Rebuild every arm's score fields while preserving the rest of a row."""
+
+    for arm in row["arms"].values():
+        assert isinstance(arm, dict)
+        first = float(arm["accepted_score_history"][0]["elapsed_seconds"])
+        second = max(first + 1.0, 2.0)
+        third = max(second + 1.0, 3.0)
+        history = [
+            {"elapsed_seconds": first, "accepted_score": 1},
+            {"elapsed_seconds": second, "accepted_score": 2},
+            {"elapsed_seconds": third, "accepted_score": max_score},
+        ]
+        arm["max_score"] = max_score
+        arm["accepted_score_history"] = history
+        arm["time_to_k_seconds"] = {"1": first, "2": second, str(max_score): third}
+        arm["final_accepted_score"] = max_score
+        arm["nauc"] = _nauc(history, max_score=float(max_score))
 
 
 class AllocatorSelectionTests(unittest.TestCase):
@@ -185,6 +210,29 @@ class AllocatorSelectionTests(unittest.TestCase):
         self.assertEqual(rule["minimum_validation_repeats"], 8)
         self.assertEqual(rule["bootstrap"]["draws"], 10_000)
         self.assertTrue(rule["guardrails"]["require_per_block"])
+
+    def test_rule_rejects_history_bypass_and_contradictory_aliases(self) -> None:
+        rule = _validation_rule()
+        rule["metric"]["require_history"] = False
+        with self.assertRaises(AllocatorSelectionError):
+            load_rule(rule)
+        rule = _validation_rule()
+        rule["guardrails"]["fallback_rate_max"] = 0.10
+        rule["guardrails"]["fallback_fraction_max"] = 0.20
+        with self.assertRaises(AllocatorSelectionError):
+            load_rule(rule)
+
+    def test_digests_must_be_lowercase_and_integers_exact(self) -> None:
+        rows = _validation_rows()
+        rows[0]["comparison_contract"]["selector_config_sha256"] = "A" * 64
+        rows[0]["comparison_contract_sha256"] = canonical_sha256(rows[0]["comparison_contract"])
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(rows, _validation_rule())
+        rows = _validation_rows()
+        rows[0]["comparison_contract"]["total_capacity"] = 2**53
+        rows[0]["comparison_contract_sha256"] = canonical_sha256(rows[0]["comparison_contract"])
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(rows, _validation_rule())
 
     def test_selects_highest_eligible_nauc_and_emits_identity(self) -> None:
         rows = _validation_rows()
@@ -238,13 +286,15 @@ class AllocatorSelectionTests(unittest.TestCase):
         self.assertEqual(result["selected_policy"], "uniform_refill")
 
     def test_duplicate_repeat_and_contract_tampering_fail_closed(self) -> None:
-        rows = [_row("r1", 11), _row("r1", 12)]
-        with self.assertRaises(AllocatorSelectionError):
-            select_allocator(rows, _rule("r1", "r1"))
-        rows = [_row("r1", 11), _row("r2", 12)]
+        rows = _validation_rows()
+        rows[1] = _row("r1", 12)
+        with self.assertRaisesRegex(AllocatorSelectionError, "duplicate paired_repeat_id"):
+            select_allocator(rows, _validation_rule())
+        rows = _validation_rows()
         rows[1]["comparison_contract"]["model"] = "other-model"
-        with self.assertRaises(AllocatorSelectionError):
-            select_allocator(rows, _rule("r1", "r2"))
+        rows[1]["comparison_contract_sha256"] = canonical_sha256(rows[1]["comparison_contract"])
+        with self.assertRaisesRegex(AllocatorSelectionError, "comparison contract differs"):
+            select_allocator(rows, _validation_rule())
 
     def test_runner_selector_identity_object_aliases_are_reconciled(self) -> None:
         rows = _validation_rows()
@@ -270,38 +320,95 @@ class AllocatorSelectionTests(unittest.TestCase):
             select_allocator(rows, _rule(*ids))
 
     def test_exact_four_arms_and_config_hash_fail_closed(self) -> None:
-        row = _row("r1", 11)
-        del row["arms"]["uniform_refill"]
-        with self.assertRaises(AllocatorSelectionError):
-            select_allocator([row], _rule("r1"))
-        row = _row("r1", 11)
-        row["arms"]["task_state"]["allocation_parameters"]["normalization"]["window"] = 1
-        with self.assertRaises(AllocatorSelectionError):
-            select_allocator([row], _rule("r1"))
+        rows = _validation_rows()
+        del rows[0]["arms"]["uniform_refill"]
+        with self.assertRaisesRegex(AllocatorSelectionError, "exactly"):
+            select_allocator(rows, _validation_rule())
+        rows = _validation_rows()
+        rows[0]["arms"]["task_state"]["allocation_parameters"]["normalization"]["window"] = 1
+        with self.assertRaisesRegex(AllocatorSelectionError, "does not match allocation_parameters"):
+            select_allocator(rows, _validation_rule())
+
+    def test_all_arms_must_share_max_score(self) -> None:
+        rows = _validation_rows()
+        arm = rows[0]["arms"]["trace_state"]
+        arm["max_score"] = 3
+        arm["accepted_score_history"] = [
+            {"elapsed_seconds": 1.0, "accepted_score": 1},
+            {"elapsed_seconds": 2.0, "accepted_score": 2},
+            {"elapsed_seconds": 3.0, "accepted_score": 3},
+        ]
+        arm["time_to_k_seconds"] = {"1": 1.0, "2": 2.0, "3": 3.0}
+        arm["final_accepted_score"] = 3
+        arm["nauc"] = _nauc(arm["accepted_score_history"], max_score=3.0)
+        with self.assertRaisesRegex(AllocatorSelectionError, "identical across all paired arms"):
+            select_allocator(rows, _validation_rule())
+
+    def test_policy_neutral_parameters_must_match_across_arms(self) -> None:
+        rows = _validation_rows()
+        arm = rows[0]["arms"]["trace_state"]
+        arm["allocation_parameters"]["normalization"]["window"] = 601
+        arm["allocation_config_sha256"] = canonical_sha256(arm["allocation_parameters"])
+        with self.assertRaisesRegex(AllocatorSelectionError, "may differ across arms only"):
+            select_allocator(rows, _validation_rule())
+
+    def test_policy_identity_is_optional_for_legacy_runtime_parameters(self) -> None:
+        rows = _validation_rows()
+        for row in rows:
+            for arm in row["arms"].values():
+                arm["allocation_parameters"].pop("policy", None)
+                arm["allocation_config_sha256"] = canonical_sha256(arm["allocation_parameters"])
+        result = select_allocator(rows, _validation_rule())
+        self.assertEqual(result["selected_policy"], "trace_state")
+
+    def test_policy_parameter_identity_must_match_arm_key(self) -> None:
+        rows = _validation_rows()
+        arm = rows[0]["arms"]["trace_state"]
+        arm["allocation_parameters"]["policy"] = "task_state"
+        arm["allocation_config_sha256"] = canonical_sha256(arm["allocation_parameters"])
+        with self.assertRaisesRegex(AllocatorSelectionError, "identity does not match arm"):
+            select_allocator(rows, _validation_rule())
+
+    def test_max_score_must_not_drift_across_repeats(self) -> None:
+        rows = _validation_rows()
+        _set_row_max_score(rows[1], 3)
+        with self.assertRaisesRegex(AllocatorSelectionError, "max_score differs across paired repeats"):
+            select_allocator(rows, _validation_rule())
+
+    def test_policy_neutral_parameters_must_not_drift_across_repeats(self) -> None:
+        rows = _validation_rows()
+        for arm in rows[1]["arms"].values():
+            arm["allocation_parameters"]["normalization"]["window"] = 601
+            arm["allocation_config_sha256"] = canonical_sha256(arm["allocation_parameters"])
+        with self.assertRaisesRegex(AllocatorSelectionError, "drift across paired repeats"):
+            select_allocator(rows, _validation_rule())
 
     def test_missing_cost_or_history_fails_closed(self) -> None:
-        row = _row("r1", 11)
-        del row["arms"]["task_state"]["scheduler_cost"]
-        with self.assertRaises(AllocatorSelectionError):
-            select_allocator([row], _rule("r1"))
+        rows = _validation_rows()
+        del rows[0]["arms"]["task_state"]["scheduler_cost"]
+        with self.assertRaisesRegex(AllocatorSelectionError, "scheduler_cost"):
+            select_allocator(rows, _validation_rule())
+        rows = _validation_rows()
+        del rows[0]["arms"]["trace_state"]["accepted_score_history"]
+        with self.assertRaisesRegex(AllocatorSelectionError, "accepted_score_history"):
+            select_allocator(rows, _validation_rule())
 
     def test_rule_requires_explicit_split_and_thresholds(self) -> None:
-        row = _row("r1", 11)
-        rule = _rule(*[f"r{i}" for i in range(1, 9)])
+        rule = _validation_rule()
         del rule["guardrails"]["fallback_rate_max"]
         with self.assertRaises(AllocatorSelectionError):
-            select_allocator([row], rule)
-        rule = _rule(*[f"r{i}" for i in range(1, 9)])
+            load_rule(rule)
+        rule = _validation_rule()
         rule["bootstrap"]["draws"] = 9_999
         with self.assertRaises(AllocatorSelectionError):
             select_allocator(_validation_rows(), rule)
-        rule = _rule(*[f"r{i}" for i in range(1, 9)])
+        rule = _validation_rule()
         rule["guardrails"]["require_per_block"] = False
         with self.assertRaises(AllocatorSelectionError):
             select_allocator(_validation_rows(), rule)
         rule = _rule(*[f"missing{i}" for i in range(1, 9)])
         with self.assertRaises(AllocatorSelectionError):
-            select_allocator([row], rule)
+            select_allocator(_validation_rows(), rule)
 
     def test_rule_rejects_contradictory_guardrail_aliases(self) -> None:
         rule = _rule(*[f"r{i}" for i in range(1, 9)])
@@ -336,6 +443,10 @@ class AllocatorSelectionTests(unittest.TestCase):
         with self.assertRaises(AllocatorSelectionError):
             select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
         rows = _validation_rows()
+        rows[0]["arms"]["llm_scheduler"]["allocation_metrics"]["decisions"] = 3
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
+        rows = _validation_rows()
         rows[0]["arms"]["task_state"]["solver_usage"]["total_tokens"] = 10**10000
         with self.assertRaises(AllocatorSelectionError):
             select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
@@ -356,10 +467,10 @@ class AllocatorSelectionTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertNotEqual(cli_main(["--paired-repeats", str(paired), "--rule", str(rule_path), "--output", str(output)]), 0)
             self.assertFalse(output.exists())
-        row = _row("r1", 11)
-        del row["arms"]["trace_state"]["accepted_score_history"]
+        rows = _validation_rows()
+        del rows[0]["arms"]["trace_state"]["accepted_score_history"]
         with self.assertRaises(AllocatorSelectionError):
-            select_allocator([row], _rule("r1"))
+            select_allocator(rows, _validation_rule())
 
     def test_atomic_result_write(self) -> None:
         rows = _validation_rows()

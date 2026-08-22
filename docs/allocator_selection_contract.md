@@ -28,6 +28,14 @@ and does not invalidate its block.  Unreconciled candidate-independent
 infrastructure or contract failures invalidate the block; surviving arms are
 never paired ad hoc.
 
+The validator also enforces the registered comparison boundary instead of
+trusting arm labels.  All four arms, and every validation repeat, must share
+one `max_score`.  Canonical allocation parameters must be byte-for-byte equal
+after removing only an optional top-level `policy`/`allocation_policy` arm
+identity; when either identity is present it must name the enclosing arm.
+Every arm's full parameter object still has its own verified configuration
+hash.  Any other parameter or normalization drift invalidates the artifact.
+
 Eligible arms are ranked by the same deterministic order used for the Figure 3
 selector:
 
@@ -48,7 +56,11 @@ records observed values, thresholds, pass/fail, and the per-block details for:
 Missing, negative, non-finite, contradictory, or non-reconcilable values fail
 closed.  Deterministic arms must have exactly zero scheduler calls, tokens,
 latency, reservations, fallbacks, and occupied capacity.  LLM calls and
-fallbacks remain charged to the LLM arm.
+fallbacks remain charged to the LLM arm.  LLM scheduler calls, capacity
+reservations, and allocation decisions have identical cardinality.  Rule and
+artifact aliases may coexist only when their canonical values agree; digests
+must be lowercase SHA-256 and integer fields must remain exactly representable.
+Selection always reconstructs nAUC from complete accepted-score histories.
 
 The output contains the selected policy, exact allocation parameters and
 `allocation_config_sha256`, rule/config/source hashes, validation IDs and
