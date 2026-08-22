@@ -57,6 +57,22 @@ class _LifecycleServer:
                         {"ok": False, "error": "upstream unavailable"},
                         status_code=503,
                     )
+                elif owner.mode == "unconfirmed_429":
+                    self._send(
+                        {"error": "account_quota_exhausted"},
+                        status_code=429,
+                    )
+                elif owner.mode == "always_http_429" or (
+                    owner.mode == "http_429_then_proved" and owner.post_count < 3
+                ):
+                    self._send(
+                        {
+                            "error": "admission_capacity_exceeded",
+                            "message": "HTTP ingress capacity is exhausted",
+                            "retry_after_ms": 250,
+                        },
+                        status_code=429,
+                    )
                 elif owner.mode == "always_overloaded" or (
                     owner.mode == "overloaded_then_proved" and owner.post_count < 3
                 ):
@@ -78,6 +94,7 @@ class _LifecycleServer:
                         }
                     )
                 elif owner.mode in {
+                    "http_429_then_proved",
                     "overloaded_then_proved",
                     "terminal_overloaded_then_proved",
                 }:
@@ -628,7 +645,11 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertTrue(evaluator.remote_settlement_event.is_set())
 
     def test_definitive_admission_overload_is_retried(self) -> None:
-        for mode in ("overloaded_then_proved", "terminal_overloaded_then_proved"):
+        for mode in (
+            "http_429_then_proved",
+            "overloaded_then_proved",
+            "terminal_overloaded_then_proved",
+        ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 server = _LifecycleServer(mode)
@@ -645,7 +666,11 @@ class EvaluatorLifecycleTests(unittest.TestCase):
                 self.assertEqual(server.post_count, 3)
 
     def test_admission_overload_retry_is_bounded(self) -> None:
-        for mode in ("always_overloaded", "always_terminal_overloaded"):
+        for mode in (
+            "always_http_429",
+            "always_overloaded",
+            "always_terminal_overloaded",
+        ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 server = _LifecycleServer(mode)
@@ -713,6 +738,25 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertIs(verdict.response["remote_settlement_unconfirmed"], True)
         self.assertEqual(server.post_count, 1)
         self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+        self.assertTrue(evaluator.remote_settlement_event.is_set())
+
+    def test_unstructured_http_429_is_not_resubmitted_or_latched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("unconfirmed_429")
+            with server.running() as url:
+                evaluator = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    admission_retry_seconds=1.0,
+                )
+                verdict = evaluator.evaluate(_task(root), self._candidate(root))
+
+        self.assertEqual(verdict.status, "EVALUATOR_ERROR")
+        self.assertEqual(verdict.score, 0.0)
+        self.assertEqual(server.post_count, 1)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+        self.assertFalse(evaluator.remote_settlement_event.is_set())
 
     def test_huge_finite_lifecycle_deadline_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

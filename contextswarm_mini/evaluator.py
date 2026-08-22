@@ -158,6 +158,16 @@ def sanitize_worker_identifier(value: Any) -> str | None:
 class EvaluatorOverloadedError(EvaluatorError):
     """A definitive pre-admission rejection which is safe to retry."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        response: Mapping[str, Any] | None = None,
+        **details: Any,
+    ) -> None:
+        super().__init__(message, **details)
+        self.response = dict(response or {})
+
 
 class RemoteSettlementUnconfirmedError(EvaluatorError):
     """A submission may have created work whose identity was not returned."""
@@ -533,7 +543,7 @@ class LeanEvaluator:
                 exc.close()
                 confirmed_overload = (
                     is_job_submission
-                    and http_status == 503
+                    and http_status in {429, 503}
                     and isinstance(error_payload, Mapping)
                     and _confirmed_pre_admission_rejection(error_payload)
                 )
@@ -544,14 +554,14 @@ class LeanEvaluator:
                         http_status=http_status,
                         attempts=attempt,
                         retry_after_seconds=delay,
+                        response=error_payload,
                     ) from None
-                # A generic 503 is safe to replay for read-only health/poll
-                # requests, but not for job creation: without an idempotency
-                # key it may be a lost response after the first POST was
-                # admitted.  Only the explicit pre-admission receipt above may
-                # cause a submission retry.
-                retryable_capacity = http_status == 429 or (
-                    http_status == 503 and not is_job_submission
+                # Generic 429/503 responses are safe to replay for read-only
+                # health/poll requests, but not for job creation: without an
+                # idempotency key they may be lost responses after admission.
+                # Only the explicit pre-admission receipt above may retry POST.
+                retryable_capacity = (
+                    http_status in {429, 503} and not is_job_submission
                 )
                 if retryable_capacity:
                     delay = max(delay, backoff)
@@ -980,6 +990,7 @@ class LeanEvaluator:
                         **provenance,
                     )
                 admission_attempt += 1
+                admission_retry_delay = 0.0
                 submit_timeout = (
                     max(0.1, deadline_monotonic - time.monotonic())
                     if deadline_monotonic is not None
@@ -1000,8 +1011,10 @@ class LeanEvaluator:
                     if not _confirmed_pre_admission_rejection(submitted):
                         break
                     last_admission_rejection = submitted
-                except EvaluatorOverloadedError:
-                    pass
+                except EvaluatorOverloadedError as exc:
+                    if exc.response:
+                        last_admission_rejection = exc.response
+                    admission_retry_delay = float(exc.retry_after_seconds or 0.0)
                 if self.remote_unsettled_jobs > 0:
                     return self._remote_settlement_gate_verdict(
                         task,
@@ -1015,7 +1028,11 @@ class LeanEvaluator:
                         cancel_event,
                         min(
                             remaining_admission,
-                            self.poll_interval_seconds * min(4, admission_attempt),
+                            max(
+                                admission_retry_delay,
+                                self.poll_interval_seconds
+                                * min(4, admission_attempt),
+                            ),
                         ),
                     )
                     if cancelled:
@@ -1903,16 +1920,25 @@ def _confirmed_pre_admission_rejection(payload: Mapping[str, Any]) -> bool:
 
     if _retryable_admission_rejection(payload):
         return True
-    error_text = str(payload.get("error") or "").strip().lower()
+    if _submission_job_identifier(payload) is not None:
+        return False
+    error_code = str(payload.get("error") or "").strip().lower()
+    error_message = str(payload.get("message") or "").strip().lower()
+    error_text = f"{error_code} {error_message}".strip()
+    if error_code in {
+        "admission_capacity_exceeded",
+        "permit_unavailable",
+    }:
+        return True
     return (
         payload.get("ok") is False
-        and not (_nested_value(payload, "job_id") or _nested_value(payload, "id"))
         and (
             "overload" in error_text
             or (
                 "queue" in error_text
                 and any(word in error_text for word in ("full", "capacity"))
             )
+            or ("ingress" in error_text and "capacity" in error_text)
         )
     )
 
