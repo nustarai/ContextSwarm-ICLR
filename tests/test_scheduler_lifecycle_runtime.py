@@ -103,6 +103,10 @@ class SchedulerLifecycleRuntimeTests(unittest.TestCase):
         self.assertEqual(state["reservation_slots"], 0)
         self.assertEqual(state["occupied_slots"], 0)
         self.assertEqual(final["health"]["issues"], [])
+        self.assertEqual(
+            final["health"]["allocation_scheduler_summary_cost_calls"],
+            len(decisions),
+        )
 
     def test_prompt_rejection_is_costed_and_admits_bounded_fallback(self) -> None:
         base = load_config("configs/smoke.toml", ROOT)
@@ -197,3 +201,73 @@ class SchedulerLifecycleRuntimeTests(unittest.TestCase):
             self.assertEqual(first["output_tail"], "{malformed")
             self.assertTrue(first["invalid_output"])
 
+    def test_nested_scheduler_cost_cardinality_is_checked_at_health_closeout(self) -> None:
+        original_health = runner_module._run_health
+
+        def tamper_nested_cost(run_dir, *args, **kwargs):
+            path = run_dir / "allocation_summary.json"
+            summary = json.loads(path.read_text(encoding="utf-8"))
+            summary["scheduler_cost"]["calls"] = 999
+            path.write_text(
+                json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return original_health(run_dir, *args, **kwargs)
+
+        base = load_config("configs/smoke.toml", ROOT)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                runner_module,
+                "_run_health",
+                side_effect=tamper_nested_cost,
+            ):
+                run_dir = run_experiment(
+                    _llm_config(base),
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+            final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+            health = final["health"]
+            self.assertFalse(health["ok"])
+            self.assertEqual(health["allocation_scheduler_summary_cost_calls"], 999)
+            self.assertNotEqual(
+                health["allocation_scheduler_summary_cost_calls"],
+                health["allocation_scheduler_charged_decision_count"],
+            )
+            self.assertIn("allocation_scheduler_cost_cardinality_mismatch", health["issues"])
+            self.assertIn("allocation_scheduler_closeout_mismatch", health["issues"])
+
+    def test_charged_scheduler_decision_index_must_be_positive_integer(self) -> None:
+        original_choose = ReadOnlyLLMSchedulerPolicy.choose
+
+        def malformed_index(policy, snapshot):
+            decision = original_choose(policy, snapshot)
+            object.__setattr__(decision, "decision_index", 0)
+            return decision
+
+        base = load_config("configs/smoke.toml", ROOT)
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(ReadOnlyLLMSchedulerPolicy, "choose", malformed_index):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "runner worker/admission failure",
+                ):
+                    run_experiment(
+                        _llm_config(base),
+                        mock_agent=True,
+                        output_override=Path(temporary),
+                    )
+            run_dir = next(Path(temporary).iterdir())
+            final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+            self.assertEqual(final["status"], "ERROR")
+            events = _rows(run_dir / "events.jsonl")
+            worker_error = next(
+                row for row in events if row.get("event") == "elastic_worker_error"
+            )
+            self.assertIn(
+                "charged scheduler decision is missing a valid decision index",
+                worker_error["error"],
+            )
+            self.assertFalse(
+                any(row.get("event") == "allocation_scheduler_finished" for row in events)
+            )

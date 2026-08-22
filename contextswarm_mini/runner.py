@@ -3105,7 +3105,11 @@ def _run_elastic_cps(
         cost = getattr(decision, "scheduler_cost", None)
         if cost is None:
             return
-        index = int(decision.decision_index)
+        index = getattr(decision, "decision_index", None)
+        if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+            raise RuntimeError(
+                "charged scheduler decision is missing a valid decision index"
+            )
         with scheduler_results_lock:
             if index in scheduler_result_decisions:
                 raise RuntimeError("duplicate scheduler result decision index")
@@ -6016,6 +6020,7 @@ def _run_health(
     scheduler_fallbacks = 0
     scheduler_provider_errors = 0
     scheduler_summary_agent_calls: int | None = None
+    scheduler_summary_cost_calls: int | None = None
     scheduler_charged_decisions = 0
     scheduler_active_slots: int | None = None
     scheduler_reservation_slots: int | None = None
@@ -6058,7 +6063,14 @@ def _run_health(
             if isinstance(allocation_summary, Mapping):
                 raw_agent_calls = allocation_summary.get("agent_calls")
                 if raw_agent_calls is not None:
-                    scheduler_summary_agent_calls = int(raw_agent_calls)
+                    scheduler_summary_agent_calls = _artifact_nonnegative_int(
+                        raw_agent_calls
+                    )
+                raw_scheduler_cost = allocation_summary.get("scheduler_cost")
+                if isinstance(raw_scheduler_cost, Mapping):
+                    scheduler_summary_cost_calls = _artifact_nonnegative_int(
+                        raw_scheduler_cost.get("calls")
+                    )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             allocation_summary = None
         if config.allocation.policy == "agent":
@@ -6158,8 +6170,11 @@ def _run_health(
                 or llm_cost_errors
                 or llm_outcome_errors
                 or scheduler_summary_agent_calls != scheduler_charged_decisions
+                or scheduler_summary_cost_calls != scheduler_charged_decisions
             ):
                 issues.add("allocation_scheduler_closeout_mismatch")
+            if scheduler_summary_cost_calls != scheduler_charged_decisions:
+                issues.add("allocation_scheduler_cost_cardinality_mismatch")
         assignments, assignments_valid = _read_jsonl_objects(
             run_dir / "elastic_assignments.jsonl"
         )
@@ -6340,6 +6355,7 @@ def _run_health(
         "allocation_scheduler_provider_error_count": scheduler_provider_errors,
         "allocation_scheduler_charged_decision_count": scheduler_charged_decisions,
         "allocation_scheduler_summary_agent_calls": scheduler_summary_agent_calls,
+        "allocation_scheduler_summary_cost_calls": scheduler_summary_cost_calls,
         "judge_probe_count": len(probe_rows),
         "judge_probe_infrastructure_error_count": probe_infrastructure_errors,
         "assigned_count": assigned_count,
