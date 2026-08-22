@@ -2212,6 +2212,7 @@ def safe_worker_response(
         "is_valid_with_sorry",
         "retryable",
         "cache_reused",
+        "probe_cache_reused",
         "cancel_requested",
         "finalization_pending",
         "remote_settlement_unconfirmed",

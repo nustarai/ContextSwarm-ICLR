@@ -77,15 +77,23 @@ DIAGNOSTIC_TEXT_FIELDS = {
     "detail",
     "diagnostic",
     "error",
+    "error_code",
+    "error_kind",
+    "error_message",
     "error_tail",
+    "formal_status",
     "message",
     "output",
     "output_tail",
     "reason",
+    "settlement_error",
+    "status",
     "stderr",
     "stdout",
+    "terminal_reason",
     "traceback",
     "traceback_tail",
+    "verdict",
 }
 
 
@@ -246,6 +254,107 @@ def _oom_observed(*values: Any) -> bool:
     return False
 
 
+def _mapping_flag(value: Any, name: str) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if value.get(name) is True:
+        return True
+    return any(
+        _mapping_flag(item, name)
+        for item in value.values()
+        if isinstance(item, Mapping)
+    )
+
+
+def _cache_reuse_source(payload: Mapping[str, Any]) -> str:
+    raw_reused = payload.get("cache_reused")
+    if raw_reused not in (None, False, True):
+        return "inconsistent"
+    response = payload.get("response")
+    local = (
+        payload.get("probe_cache_reused") is True
+        or _mapping_flag(response, "probe_cache_reused")
+    )
+    remote = (
+        payload.get("remote_cache_reused") is True
+        or _mapping_flag(response, "cache_reused")
+    )
+    if raw_reused is True:
+        if remote:
+            return "remote"
+        if local:
+            return "local"
+        return "unknown"
+    if local or remote:
+        return "inconsistent"
+    return "none"
+
+
+def _cache_key(
+    payload: Mapping[str, Any],
+    *,
+    fallback_task_id: Any = None,
+) -> tuple[str, str, str, str] | None:
+    task_id = payload.get("task_id") or fallback_task_id
+    candidate = payload.get("candidate_sha256")
+    contract = payload.get("task_contract_sha256")
+    job_id = payload.get("judge_job_id")
+    if (
+        not isinstance(task_id, str)
+        or SHA256_RE.fullmatch(str(candidate or "")) is None
+        or SHA256_RE.fullmatch(str(contract or "")) is None
+        or not isinstance(job_id, str)
+        or not job_id.strip()
+    ):
+        return None
+    return task_id, str(candidate), str(contract), job_id
+
+
+def _check_disabled_cache_reuse(
+    judge_checks: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    final: Mapping[str, Any] | None,
+    audit: Audit,
+) -> None:
+    direct: set[tuple[str, str, str, str]] = set()
+    local_reused: set[tuple[str, str, str, str]] = set()
+    for row in judge_checks:
+        source = _cache_reuse_source(row)
+        key = _cache_key(row)
+        if row.get("accepted") is True and source == "none" and key is not None:
+            direct.add(key)
+        elif source == "local":
+            if key is None:
+                audit.add("judge_cache_reuse_invalid")
+            else:
+                local_reused.add(key)
+        elif source != "none":
+            audit.add("judge_cache_reuse_invalid")
+    if local_reused - direct:
+        audit.add("judge_cache_reuse_invalid")
+
+    values: list[tuple[Mapping[str, Any], Any]] = [
+        (row, row.get("task_id"))
+        for row in events
+        if row.get("event") == "evaluation_finished"
+    ]
+    if isinstance(final, Mapping):
+        verdicts = final.get("verdicts")
+        if isinstance(verdicts, Mapping):
+            values.extend(
+                (verdict, task_id)
+                for task_id, verdict in verdicts.items()
+                if isinstance(verdict, Mapping)
+            )
+    for value, fallback_task_id in values:
+        source = _cache_reuse_source(value)
+        if source == "none":
+            continue
+        key = _cache_key(value, fallback_task_id=fallback_task_id)
+        if source != "local" or key is None or key not in direct:
+            audit.add("judge_cache_reuse_invalid")
+
+
 def audit_canary(run_dir: Path) -> dict[str, Any]:
     audit = Audit()
     if not run_dir.is_dir():
@@ -353,6 +462,7 @@ def audit_canary(run_dir: Path) -> dict[str, Any]:
             audit.add("judge_broker_not_drained")
 
     accepted = [row for row in judge_checks if row.get("accepted") is True]
+    _check_disabled_cache_reuse(judge_checks, events, final, audit)
     audit.counts["judge_checks"] = len(judge_checks)
     audit.counts["accepted_judge_checks"] = len(accepted)
     audit.counts["solver_agents"] = len(agents)

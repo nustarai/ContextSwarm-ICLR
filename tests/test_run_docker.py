@@ -14,9 +14,10 @@ RUN_DOCKER = ROOT / "scripts" / "run_docker.sh"
 
 class RunDockerManifestTests(unittest.TestCase):
     def setUp(self) -> None:
+        (ROOT / "runs").mkdir(exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(
             prefix=".test-run-docker-",
-            dir=ROOT,
+            dir=ROOT / "runs",
         )
         self.temp = Path(self.temporary.name)
         self.bin_dir = self.temp / "bin"
@@ -70,14 +71,19 @@ class RunDockerManifestTests(unittest.TestCase):
 
     def _write_parent_manifest(self, *, image: str, memory_mb: int) -> None:
         self.parent_manifest.write_text(
-            'extends = ["../configs/smoke.toml"]\n\n'
+            'extends = ["../../configs/smoke.toml"]\n\n'
             "[docker]\n"
             f'image = "{image}"\n'
             f"memory_mb = {memory_mb}\n",
             encoding="utf-8",
         )
 
-    def _run(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        *,
+        config: Path | None = None,
+        **overrides: str,
+    ) -> subprocess.CompletedProcess[str]:
         if self.capture.exists():
             self.capture.unlink()
         if self.inspect_capture.exists():
@@ -99,7 +105,7 @@ class RunDockerManifestTests(unittest.TestCase):
                 "/bin/bash",
                 str(RUN_DOCKER),
                 "--config",
-                str(self.child_manifest.relative_to(ROOT)),
+                str((config or self.child_manifest).relative_to(ROOT)),
                 "--mock-agent",
             ],
             cwd=ROOT,
@@ -176,6 +182,21 @@ class RunDockerManifestTests(unittest.TestCase):
         result = self._run()
         self.assertEqual(result.returncode, 2)
         self.assertIn("invalid Docker image", result.stderr)
+        self.assertFalse(self.capture.exists())
+
+    def test_untracked_manifest_outside_runs_is_not_container_visible(self) -> None:
+        manifest = ROOT / ".untracked-launch-manifest.toml"
+        manifest.write_text(
+            'extends = ["configs/smoke.toml"]\n',
+            encoding="utf-8",
+        )
+        try:
+            result = self._run(config=manifest)
+        finally:
+            manifest.unlink(missing_ok=True)
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("tracked or located below runs", result.stderr)
         self.assertFalse(self.capture.exists())
 
 

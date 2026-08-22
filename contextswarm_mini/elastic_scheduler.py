@@ -309,7 +309,7 @@ class ElasticScheduler:
             state = self._tasks.get(normalized)
             if state is None:
                 raise KeyError(f"unknown task id: {normalized}")
-            if state.solved:
+            if state.solved or state.retired_reason is not None:
                 return None
             return self._admit_locked(state, admitted_at)
 

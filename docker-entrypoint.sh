@@ -37,6 +37,33 @@ if [[ "${MINI_SWARM_CODEX_INPUT_ENABLED:-0}" == "1" ]]; then
 fi
 export CODEX_HOME="${CODEX_RUNTIME_HOME}"
 
+if [[ -n "${CONTEXTSWARM_MANIFEST_SHA256:-}" ]]; then
+  python3 - "${CONTEXTSWARM_MANIFEST_PATH:-}" "${CONTEXTSWARM_MANIFEST_SHA256}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+from contextswarm_mini.launch_contract import (
+    LaunchContractError,
+    manifest_closure_sha256,
+)
+
+manifest = sys.argv[1]
+expected = sys.argv[2]
+if not manifest or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+    print("container manifest binding is invalid", file=sys.stderr)
+    raise SystemExit(2)
+try:
+    actual = manifest_closure_sha256(manifest, Path("/opt/contextswarm"))
+except (LaunchContractError, OSError, ValueError):
+    print("container manifest closure is unavailable", file=sys.stderr)
+    raise SystemExit(2)
+if actual != expected:
+    print("container manifest closure does not match the launcher", file=sys.stderr)
+    raise SystemExit(2)
+PY
+fi
+
 if [[ -x "${INPUT_BINARY}" ]]; then
   install -d -m 0700 "${RUNTIME_ROOT}/bin" "${RUNTIME_ROOT}/aisw"
   install -m 0755 "${INPUT_BINARY}" "${RUNTIME_ROOT}/bin/pi"

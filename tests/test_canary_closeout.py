@@ -191,10 +191,44 @@ class CanaryCloseoutTests(unittest.TestCase):
             _write_json(run / "final.json", final)
             exit_137 = audit_canary(run)
 
+            final["agents"][0]["returncode"] = 0
+            final["verdicts"]["task-1"]["response"] = {
+                "error_kind": "RESOURCE_LIMIT",
+                "response": {"error_message": "backend ran out of memory"},
+            }
+            _write_json(run / "final.json", final)
+            nested_diagnostic = audit_canary(run)
+
         self.assertNotIn("oom_observed", _codes(zero_count), zero_count)
         self.assertIn("oom_observed", _codes(positive_count), positive_count)
         self.assertIn("oom_observed", _codes(exit_137), exit_137)
         self.assertIn("solver_oom_or_exit_137", _codes(exit_137), exit_137)
+        self.assertIn("oom_observed", _codes(nested_diagnostic), nested_diagnostic)
+
+    def test_disabled_cache_allows_only_linked_local_probe_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run = _stage(Path(raw))
+            final = json.loads((run / "final.json").read_text(encoding="utf-8"))
+            verdict = final["verdicts"]["task-1"]
+            verdict.update(
+                {
+                    "task_id": "task-1",
+                    "candidate_sha256": CANDIDATE,
+                    "task_contract_sha256": CONTRACT,
+                    "judge_job_id": "job-1",
+                    "cache_reused": True,
+                    "response": {"probe_cache_reused": True},
+                }
+            )
+            _write_json(run / "final.json", final)
+            local = audit_canary(run)
+
+            verdict["response"] = {"cache_reused": True}
+            _write_json(run / "final.json", final)
+            remote = audit_canary(run)
+
+        self.assertNotIn("judge_cache_reuse_invalid", _codes(local), local)
+        self.assertIn("judge_cache_reuse_invalid", _codes(remote), remote)
 
     def test_requires_accepted_probe_with_complete_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

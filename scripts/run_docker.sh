@@ -71,23 +71,29 @@ if ! RESOLVED_RUNTIME_CONFIG="$(
 from pathlib import Path
 import sys
 
-from contextswarm_mini.config import ConfigError, load_config
+from contextswarm_mini.launch_contract import (
+    LaunchContractError,
+    resolve_launch_contract,
+)
 
 try:
-    config = load_config(Path(sys.argv[1]), Path(sys.argv[2]))
-except (ConfigError, OSError, ValueError) as exc:
+    contract = resolve_launch_contract(Path(sys.argv[1]), Path(sys.argv[2]))
+    config = contract.config
+except (LaunchContractError, OSError, ValueError) as exc:
     print(f"runtime manifest resolution failed: {exc}", file=sys.stderr)
     raise SystemExit(2)
 
 print(config.docker_image)
 print(config.docker_memory_mb)
 print("1" if config.lean_require_result_cache_disabled else "0")
+print(contract.container_manifest)
+print(contract.manifest_sha256)
 PY
 )"; then
   exit 2
 fi
 mapfile -t RESOLVED_RUNTIME_VALUES <<<"${RESOLVED_RUNTIME_CONFIG}"
-if [[ "${#RESOLVED_RUNTIME_VALUES[@]}" -ne 3 ]]; then
+if [[ "${#RESOLVED_RUNTIME_VALUES[@]}" -ne 5 ]]; then
   echo "runtime manifest resolution returned an invalid payload" >&2
   exit 2
 fi
@@ -95,6 +101,8 @@ fi
 IMAGE="${CONTEXTSWARM_MINI_IMAGE:-${RESOLVED_RUNTIME_VALUES[0]}}"
 MEMORY="${CONTEXTSWARM_MINI_MEMORY:-${RESOLVED_RUNTIME_VALUES[1]}m}"
 CACHE_DISABLED_REQUIRED="${RESOLVED_RUNTIME_VALUES[2]}"
+CONFIG="${RESOLVED_RUNTIME_VALUES[3]}"
+MANIFEST_SHA256="${RESOLVED_RUNTIME_VALUES[4]}"
 if [[ "${#IMAGE}" -gt 512 || ! "${IMAGE}" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$ ]]; then
   echo "invalid Docker image from manifest or CONTEXTSWARM_MINI_IMAGE" >&2
   exit 2
@@ -113,7 +121,7 @@ do
       ;;
   esac
 done
-if [[ "${RUN_UID}" == "0" || "${RUN_GID}" == "0" ]]; then
+if [[ "${RUN_UID}" =~ ^0+$ || "${RUN_GID}" =~ ^0+$ ]]; then
   echo "refusing to launch the experiment container as root; run as a regular host user" >&2
   exit 2
 fi
@@ -238,6 +246,8 @@ DOCKER_ARGS=(
   -e "MINI_SWARM_NUROUTER_VERSION=${NUROUTER_VERSION}"
   -e "CONTEXTSWARM_IMAGE_ID=${IMAGE_ID}"
   -e "CONTEXTSWARM_IMAGE_REVISION=${IMAGE_REVISION}"
+  -e "CONTEXTSWARM_MANIFEST_PATH=${CONFIG}"
+  -e "CONTEXTSWARM_MANIFEST_SHA256=${MANIFEST_SHA256}"
 )
 
 # Passing only the variable name keeps the private value out of docker's argv

@@ -105,6 +105,9 @@ cache-health capability 也只按变量名注入，只供 supervisor preflight �
 `run_docker.sh` 会从完整解析 `extends` 后的 `[docker]` 读取 `image` 和
 `memory_mb`。运维侧仍可用 `CONTEXTSWARM_MINI_IMAGE`、
 `CONTEXTSWARM_MINI_MEMORY` 覆盖，两者优先级高于 manifest。
+启动器拒绝有 tracked 修改的 worktree；manifest 继承链只能来自当前 commit 的
+tracked 文件，或来自容器唯一可写挂载 `runs/`。完整继承链的 SHA-256 会在容器
+entrypoint 再验一次，避免宿主解析的资源合同与容器实际加载的实验合同分叉。
 
 正式启动前可以只做 transport 检查（不会启动 Pi session）：
 

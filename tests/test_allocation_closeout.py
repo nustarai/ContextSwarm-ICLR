@@ -41,7 +41,8 @@ SOURCE_COMMIT = "c" * 40
 IMAGE_ID = "sha256:" + "d" * 64
 SOLVER_SYSTEM_PROMPT = (
     "You are not a general-purpose coding agent. Do not execute shell commands. "
-    "Use the judge_check tool and never create a local or raw-network fallback."
+    "Use the judge_check tool and never create a local or raw-network fallback. "
+    "Perform the mandatory early Judge checkpoint."
 )
 SCHEDULER_SYSTEM_PROMPT = (
     "You are a read-only allocation decision component. You have no tools and "
@@ -1148,6 +1149,89 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
         codes = _codes(json.loads(cached_result.stdout), "agent")
         self.assertIn("cache_reused_evaluation_probe_unlinked", codes)
         self.assertIn("cache_reused_final_probe_unlinked", codes)
+        self.assertIn("cache_reuse_source_unbound", codes)
+
+    def test_disabled_cache_distinguishes_local_probe_reuse_from_remote_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            agent_final = _final("agent")
+            verdict = agent_final["verdicts"][TASKS[0]]
+            verdict["cache_reused"] = True
+            verdict["response"] = {"probe_cache_reused": True}
+            _write_json(paths["agent"] / "final.json", agent_final)
+            agent_events = _events("agent")
+            evaluation = next(
+                row for row in agent_events if row.get("event") == "evaluation_finished"
+            )
+            evaluation["cache_reused"] = True
+            evaluation["response"] = {"probe_cache_reused": True}
+            _write_jsonl(paths["agent"] / "events.jsonl", agent_events)
+
+            local_result = _run_audit(paths)
+            self.assertEqual(
+                local_result.returncode,
+                0,
+                local_result.stdout + local_result.stderr,
+            )
+
+            verdict["response"] = {"cache_reused": True}
+            _write_json(paths["agent"] / "final.json", agent_final)
+            evaluation["response"] = {"cache_reused": True}
+            _write_jsonl(paths["agent"] / "events.jsonl", agent_events)
+            remote_result = _run_audit(paths)
+
+        self.assertEqual(remote_result.returncode, 1)
+        self.assertIn(
+            "remote_judge_cache_reuse_observed",
+            _codes(json.loads(remote_result.stdout), "agent"),
+        )
+
+    def test_local_probe_reuse_requires_a_direct_source_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            rows = [
+                json.loads(line)
+                for line in (paths["agent"] / "judge_checks.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            rows[0].update(
+                {
+                    "cache_reused": True,
+                    "probe_cache_reused": True,
+                    "remote_cache_reused": False,
+                }
+            )
+            _write_jsonl(paths["agent"] / "judge_checks.jsonl", rows)
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "local_cache_reuse_predecessor_missing",
+            _codes(json.loads(result.stdout), "agent"),
+        )
+
+    def test_local_probe_reuse_tolerates_concurrent_audit_write_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            direct = json.loads(
+                (paths["agent"] / "judge_checks.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            local = {
+                **direct,
+                "cache_reused": True,
+                "probe_cache_reused": True,
+                "remote_cache_reused": False,
+            }
+            _write_jsonl(
+                paths["agent"] / "judge_checks.jsonl",
+                [local, direct],
+            )
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_validation_evaluation_and_final_provenance_must_link(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -119,6 +119,26 @@ class ContainerContractTests(unittest.TestCase):
         )
         self.assertIn(f"<{image_id}>", arguments)
         self.assertNotIn("<contextswarm-iclr-mini:latest>", arguments)
+        self.assertTrue(
+            any(value.startswith("<CONTEXTSWARM_MANIFEST_SHA256=") for value in arguments)
+        )
+
+    def test_launch_rejects_zero_padded_root_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temporary:
+            temporary = Path(raw_temporary)
+            for field in ("CONTEXTSWARM_MINI_RUN_UID", "CONTEXTSWARM_MINI_RUN_GID"):
+                with self.subTest(field=field):
+                    env = self._launcher_environment(temporary)
+                    env[field] = "00"
+                    completed = self._run_launcher(
+                        temporary,
+                        "--config",
+                        "configs/smoke.toml",
+                        "--mock-agent",
+                        env=env,
+                    )
+                    self.assertEqual(completed.returncode, 2)
+                    self.assertIn("as root", completed.stderr)
 
     def test_real_launch_requires_judge_and_passes_only_variable_name(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temporary:

@@ -159,6 +159,27 @@ class _GlobalUnsettledEvaluator(_RecordingEvaluator):
         )
 
 
+class _NestedRemoteCacheEvaluator(_RecordingEvaluator):
+    def probe(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None,
+    ) -> Verdict:
+        self.calls.append((task, candidate, deadline_monotonic))
+        return Verdict(
+            task.slug,
+            "VERIFY_FAIL",
+            0.0,
+            0.0,
+            {"response": {"cache_reused": True}},
+            task_contract_sha256="a" * 64,
+            judge_job_id="remote-cache-job",
+            cache_reused=True,
+        )
+
+
 class _SnapshotEvaluator:
     def __init__(self, candidate: Path) -> None:
         self.candidate = candidate
@@ -579,6 +600,44 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertEqual(audit["failure_http_status"], 429)
             self.assertEqual(audit["failure_attempts"], 6)
             self.assertEqual(audit["failure_retry_after_seconds"], 12.5)
+
+    def test_audit_preserves_nested_remote_cache_reuse_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text(
+                "import Mathlib\ntheorem task : True := by trivial\n",
+                encoding="utf-8",
+            )
+            audit_path = root / "audit.jsonl"
+            broker = JudgeBroker(
+                _NestedRemoteCacheEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=audit_path,
+                min_probe_interval_seconds=0,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 2,
+                ) as env:
+                    result = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {}
+                    )
+            finally:
+                broker.close()
+            audit = json.loads(
+                audit_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+
+        self.assertTrue(result["cache_reused"])
+        self.assertTrue(audit["cache_reused"])
+        self.assertFalse(audit["probe_cache_reused"])
+        self.assertTrue(audit["remote_cache_reused"])
 
     def test_unexpected_broker_failure_is_stable_unaccepted_and_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

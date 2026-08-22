@@ -45,6 +45,7 @@ SOLVER_SYSTEM_PROMPT_MARKERS = {
     "Do not execute shell commands",
     "judge_check tool",
     "never create a local or raw-network fallback",
+    "mandatory early Judge checkpoint",
 }
 SCHEDULER_SYSTEM_PROMPT_MARKERS = {
     "read-only allocation decision component",
@@ -128,8 +129,66 @@ TRANSPORT_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 OOM_RE = re.compile(
-    r"(?:out of memory|oom(?:killed| kill)?|cannot allocate memory|memory limit exceeded)",
+    r"(?:\bout of memory\b|\boom(?:[-_\s]?kill(?:ed)?)?\b|"
+    r"\bcannot allocate memory\b|\bmemory limit exceeded\b)",
     re.IGNORECASE,
+)
+OOM_COUNT_FIELDS = {
+    "oom_or_exit_137_count",
+    "allocation_scheduler_oom_or_exit_137_count",
+}
+DIAGNOSTIC_TEXT_FIELDS = {
+    "detail",
+    "diagnostic",
+    "error",
+    "error_code",
+    "error_kind",
+    "error_message",
+    "error_tail",
+    "formal_status",
+    "message",
+    "output",
+    "output_tail",
+    "reason",
+    "settlement_error",
+    "status",
+    "stderr",
+    "terminal_reason",
+    "verdict",
+}
+RETRYABLE_RESOURCE_STATUSES = {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
+RETRYABLE_CLOSEOUT_INFRA_STATUSES = {
+    "EVALUATOR_ERROR",
+    "EVALUATOR_TIMEOUT",
+    "EXECUTION_TIMEOUT",
+    "INFRASTRUCTURE_ERROR",
+    "REJECTED_OVERLOADED",
+    "RESOURCE_LIMIT",
+}
+CLOSEOUT_LIFECYCLE_EVENTS = (
+    "horizon_closed",
+    "candidates_frozen",
+    "closeout_started",
+    "closeout_finished",
+)
+CLOSEOUT_DISPOSITION_FLAGS = (
+    "reused_authoritative_verdict",
+    "authoritative_proof_confirmed",
+    "closeout_infra_incomplete",
+    "authority_conflict",
+    "scoreboard_recorded",
+)
+CLOSEOUT_VERDICT_FIELDS = (
+    "task_id",
+    "status",
+    "score",
+    "elapsed_seconds",
+    "response",
+    "error",
+    "candidate_sha256",
+    "task_contract_sha256",
+    "judge_job_id",
+    "cache_reused",
 )
 LOCAL_LEAN_RE = re.compile(r"(?<![A-Za-z0-9_.-])(?:lean|lake|elan)(?![A-Za-z0-9_.-])", re.IGNORECASE)
 INSTALL_RE = re.compile(
@@ -384,6 +443,50 @@ def _walk_dicts(value: Any) -> Iterator[dict[str, Any]]:
     elif isinstance(value, list):
         for item in value:
             yield from _walk_dicts(item)
+
+
+def _mapping_has_oom_text(value: Mapping[str, Any]) -> bool:
+    """Inspect diagnostic values without treating field names as evidence."""
+
+    return any(
+        str(key).strip().lower() in DIAGNOSTIC_TEXT_FIELDS
+        and isinstance(item, str)
+        and OOM_RE.search(item) is not None
+        for key, item in value.items()
+    )
+
+
+def _oom_observed(value: Any) -> bool:
+    """Recognize explicit OOM evidence, including only positive count fields."""
+
+    for item in _walk_dicts(value):
+        if item.get("returncode") == 137:
+            return True
+        for field_name in OOM_COUNT_FIELDS:
+            count = item.get(field_name)
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                return True
+        if _mapping_has_oom_text(item):
+            return True
+    return False
+
+
+def _nested_response_value(payload: Mapping[str, Any], name: str) -> Any:
+    current: Any = payload
+    for _depth in range(4):
+        if not isinstance(current, Mapping):
+            return None
+        if name in current:
+            return current.get(name)
+        current = current.get("response")
+    return None
+
+
+def _retryable_resource_failure(payload: Mapping[str, Any]) -> bool:
+    return bool(
+        _normalize_status(payload.get("status")) in RETRYABLE_RESOURCE_STATUSES
+        and _nested_response_value(payload, "retryable") is True
+    )
 
 
 def _tool_records(value: Any) -> Iterator[tuple[str, str, Any, str]]:
@@ -812,7 +915,7 @@ def _check_scheduler_agent_closeout(
             )
         ) or row.get("mocked") is True:
             _add_issue(issues, "allocation_scheduler_result_failed")
-        if row.get("returncode") == 137 or OOM_RE.search(_serialized(row)):
+        if _oom_observed(row):
             _add_issue(issues, "allocation_scheduler_oom_or_exit_137")
         _check_agent_command(row, issues, fast_mode=False)
 
@@ -987,6 +1090,44 @@ def _provenance_key(
     )
 
 
+def _mapping_flag(value: Any, name: str) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if value.get(name) is True:
+        return True
+    return any(
+        _mapping_flag(item, name)
+        for item in value.values()
+        if isinstance(item, Mapping)
+    )
+
+
+def _cache_reuse_source(payload: Mapping[str, Any]) -> str:
+    """Classify reuse without conflating the local probe cache with Judge cache."""
+
+    raw_reused = payload.get("cache_reused")
+    if raw_reused not in (None, False, True):
+        return "inconsistent"
+    response = payload.get("response")
+    local = (
+        payload.get("probe_cache_reused") is True
+        or _mapping_flag(response, "probe_cache_reused")
+    )
+    remote = (
+        payload.get("remote_cache_reused") is True
+        or _mapping_flag(response, "cache_reused")
+    )
+    if raw_reused is True:
+        if remote:
+            return "remote"
+        if local:
+            return "local"
+        return "unknown"
+    if local or remote:
+        return "inconsistent"
+    return "none"
+
+
 def _check_communication_trace(
     rows: list[dict[str, Any]],
     issues: list[dict[str, str]],
@@ -1079,17 +1220,35 @@ def _check_judge_checks(
     task_ids: set[str],
     issues: list[dict[str, str]],
     warnings: list[dict[str, str]],
-) -> tuple[set[tuple[str, str, str, str]], int, int, int]:
+) -> tuple[
+    set[tuple[str, str, str, str]],
+    set[tuple[str, str, str, str]],
+    int,
+    int,
+    int,
+]:
     accepted_keys: set[tuple[str, str, str, str]] = set()
+    direct_accepted_keys: set[tuple[str, str, str, str]] = set()
+    local_reused_keys: set[tuple[str, str, str, str]] = set()
     hard_control_failures = 0
     soft_controls = 0
     normal_controls = 0
     if not rows:
         _add_issue(issues, "judge_checks_empty")
-        return accepted_keys, hard_control_failures, soft_controls, normal_controls
+        return (
+            accepted_keys,
+            direct_accepted_keys,
+            hard_control_failures,
+            soft_controls,
+            normal_controls,
+        )
     for row in rows:
         status = _normalize_status(row.get("status"))
-        if status in BAD_JUDGE_STATUSES or _judge_row_has_429(row):
+        if (
+            status in BAD_JUDGE_STATUSES
+            or _judge_row_has_429(row)
+            or _retryable_resource_failure(row)
+        ):
             _add_issue(issues, "judge_check_failure_status")
         control_class = _broker_control_class(row, status)
         if control_class == "hard":
@@ -1117,7 +1276,28 @@ def _check_judge_checks(
                 _add_issue(issues, "judge_check_provenance_incomplete")
             else:
                 accepted_keys.add(key)
-    return accepted_keys, hard_control_failures, soft_controls, normal_controls
+                reuse_source = _cache_reuse_source(row)
+                if reuse_source == "none":
+                    direct_accepted_keys.add(key)
+                elif reuse_source == "local":
+                    local_reused_keys.add(key)
+                elif reuse_source == "remote":
+                    _add_issue(issues, "remote_judge_cache_reuse_observed")
+                elif reuse_source == "unknown":
+                    _add_issue(issues, "cache_reuse_source_unbound")
+                else:
+                    _add_issue(issues, "cache_reuse_evidence_inconsistent")
+        elif _cache_reuse_source(row) != "none":
+            _add_issue(issues, "cache_reuse_evidence_inconsistent")
+    if local_reused_keys - direct_accepted_keys:
+        _add_issue(issues, "local_cache_reuse_predecessor_missing")
+    return (
+        accepted_keys,
+        direct_accepted_keys,
+        hard_control_failures,
+        soft_controls,
+        normal_controls,
+    )
 
 
 def _final_provenance_keys(
@@ -1144,6 +1324,15 @@ def _final_provenance_keys(
             keys.add(key)
             if raw_verdict.get("cache_reused") is True:
                 cache_reused_keys.add(key)
+                source = _cache_reuse_source(raw_verdict)
+                if source == "remote":
+                    _add_issue(issues, "remote_judge_cache_reuse_observed")
+                elif source == "unknown":
+                    _add_issue(issues, "cache_reuse_source_unbound")
+                elif source != "local":
+                    _add_issue(issues, "cache_reuse_evidence_inconsistent")
+            elif _cache_reuse_source(raw_verdict) != "none":
+                _add_issue(issues, "cache_reuse_evidence_inconsistent")
     return keys, cache_reused_keys
 
 
@@ -1169,6 +1358,15 @@ def _evaluation_provenance_keys(
             keys[key] += 1
             if row.get("cache_reused") is True:
                 cache_reused_keys.add(key)
+                source = _cache_reuse_source(row)
+                if source == "remote":
+                    _add_issue(issues, "remote_judge_cache_reuse_observed")
+                elif source == "unknown":
+                    _add_issue(issues, "cache_reuse_source_unbound")
+                elif source != "local":
+                    _add_issue(issues, "cache_reuse_evidence_inconsistent")
+            elif _cache_reuse_source(row) != "none":
+                _add_issue(issues, "cache_reuse_evidence_inconsistent")
     return keys, cache_reused_keys
 
 
@@ -1621,6 +1819,26 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
         health = final.get("health")
         if not isinstance(health, dict) or health.get("ok") is not True:
             _add_issue(audit.errors, "run_health_failed_or_missing")
+        elif _oom_observed(health):
+            solver_oom_count = health.get("oom_or_exit_137_count")
+            scheduler_oom_count = health.get(
+                "allocation_scheduler_oom_or_exit_137_count"
+            )
+            if (
+                isinstance(solver_oom_count, int)
+                and not isinstance(solver_oom_count, bool)
+                and solver_oom_count > 0
+            ):
+                _add_issue(audit.errors, "solver_oom_or_exit_137")
+            if (
+                isinstance(scheduler_oom_count, int)
+                and not isinstance(scheduler_oom_count, bool)
+                and scheduler_oom_count > 0
+            ):
+                _add_issue(
+                    audit.errors,
+                    "allocation_scheduler_oom_or_exit_137",
+                )
         for verdict in verdicts.values():
             if not isinstance(verdict, dict):
                 _add_issue(audit.errors, "final_verdicts_invalid")
@@ -1632,6 +1850,8 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
                 _serialized(verdict)
             ):
                 _add_issue(audit.errors, "evaluator_transport_error")
+            if _retryable_resource_failure(verdict):
+                _add_issue(audit.errors, "evaluator_infrastructure_error")
             if verdict_status in AUTHORITATIVE_VERDICT_STATUSES:
                 if not _valid_sha256(verdict.get("candidate_sha256")):
                     _add_issue(audit.errors, "final_candidate_hash_missing")
@@ -1653,10 +1873,12 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
             if agent.get("mocked"):
                 _add_issue(audit.errors, "mock_solver_present")
             returncode = agent.get("returncode")
-            tail_text = _serialized(
-                {"error_tail": agent.get("error_tail"), "output_tail": agent.get("output_tail")}
-            )
-            if returncode == 137 or OOM_RE.search(tail_text):
+            if returncode == 137 or _oom_observed(
+                {
+                    "error_tail": agent.get("error_tail"),
+                    "output_tail": agent.get("output_tail"),
+                }
+            ):
                 _add_issue(audit.errors, "solver_oom_or_exit_137")
             if returncode == -9 and not agent.get("cancelled") and not agent.get("timed_out"):
                 _add_issue(audit.errors, "solver_unexpected_sigkill")
@@ -1762,13 +1984,15 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
             or TRANSPORT_ERROR_RE.search(_serialized(event))
         ):
             _add_issue(audit.errors, "evaluator_transport_error")
+        if event_name == "evaluation_finished" and _retryable_resource_failure(event):
+            _add_issue(audit.errors, "evaluator_infrastructure_error")
         if (
             event_name == "evaluation_finished"
             and _normalize_status(event.get("status")) == "RUNNING"
         ):
             _add_issue(audit.errors, "running_state_present")
         if event_name == "agent_finished":
-            if event.get("returncode") == 137 or OOM_RE.search(_serialized(event)):
+            if _oom_observed(event):
                 _add_issue(audit.errors, "solver_oom_or_exit_137")
 
     audit.counts.update(_check_event_chain(events, final_agents, audit.errors))
@@ -1793,6 +2017,7 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
     )
     (
         accepted_judge_keys,
+        direct_accepted_judge_keys,
         hard_control_failures,
         soft_controls,
         normal_controls,
@@ -1811,7 +2036,7 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
         audit.errors,
     )
     _check_provenance_links(
-        accepted_judge=accepted_judge_keys,
+        accepted_judge=direct_accepted_judge_keys,
         validations=validation_keys,
         finals=final_keys,
         evaluations=evaluation_keys,

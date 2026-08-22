@@ -58,6 +58,7 @@ class ElasticSchedulerTests(unittest.TestCase):
         scheduler.finish(first, retire_reason="attempt_budget_exhausted")
 
         self.assertIsNone(scheduler.next_assignment())
+        self.assertIsNone(scheduler.next_assignment_for("a"))
         self.assertEqual(scheduler.active(), (second,))
         snapshot = scheduler.snapshot()["tasks"]["a"]
         self.assertFalse(snapshot["solved"])

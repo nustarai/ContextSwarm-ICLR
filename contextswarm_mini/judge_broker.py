@@ -1188,6 +1188,8 @@ class JudgeBroker:
         cache_reused: bool = False,
     ) -> None:
         failure_fields = _audit_failure_fields(result.get("response"))
+        response = result.get("response")
+        safe_response = response if isinstance(response, Mapping) else {}
         row = {
             "at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "event": "judge_check",
@@ -1204,6 +1206,12 @@ class JudgeBroker:
             "task_contract_sha256": _safe_hash(task_contract_sha256),
             "judge_job_id": _safe_identifier(judge_job_id),
             "cache_reused": bool(cache_reused),
+            "probe_cache_reused": _nested_response_bool(
+                safe_response, "probe_cache_reused"
+            ),
+            "remote_cache_reused": _nested_response_bool(
+                safe_response, "cache_reused"
+            ),
             "response_profile": LEAN_PROBE_RESPONSE_PROFILE,
             **failure_fields,
         }
@@ -1269,6 +1277,19 @@ def _has_unsettled_remote_cancellation(response: Mapping[str, Any]) -> bool:
         and cancellation.get("attempted") is True
         and cancellation.get("settled") is not True
     )
+
+
+def _nested_response_bool(response: Mapping[str, Any], name: str) -> bool:
+    """Read one boolean through the bounded Judge ``response`` envelope chain."""
+
+    current: Any = response
+    for _depth in range(4):
+        if not isinstance(current, Mapping):
+            return False
+        if current.get(name) is True:
+            return True
+        current = current.get("response")
+    return False
 
 
 def _has_unsettled_remote_work(
