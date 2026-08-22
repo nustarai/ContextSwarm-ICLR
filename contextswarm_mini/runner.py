@@ -1628,6 +1628,11 @@ def _core_snapshot_from_legacy(
         "task_state": dict(task_weights),
         "trace_state": dict(trace_weights),
         "normalization": dict(config.allocation.normalization),
+        # Prompt bounds are part of the manifest-owned allocation identity,
+        # even for non-LLM arms.  A changed bound must invalidate the same
+        # state/config hash rather than silently reusing an old decision.
+        "prompt_max_bytes": config.allocation.prompt_max_bytes,
+        "prompt_max_tokens": config.allocation.prompt_max_tokens,
     }
     allocation_config_sha256 = hashlib.sha256(
         json.dumps(
@@ -6337,6 +6342,8 @@ def _write_figure4_summary(
         "task_state": dict(config.allocation.task_state),
         "trace_state": dict(config.allocation.trace_state),
         "normalization": dict(config.allocation.normalization),
+        "prompt_max_bytes": config.allocation.prompt_max_bytes,
+        "prompt_max_tokens": config.allocation.prompt_max_tokens,
     }
     allocation_hash = canonical_json_sha256(parameters)
     summary = build_figure4_run_summary(

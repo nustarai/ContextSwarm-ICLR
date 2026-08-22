@@ -22,6 +22,13 @@ direct_messages = false
 # enabled selector identity while retaining the same task-local transfer rule.
 candidate_transfer = true
 
+# Shared hard bounds for the read-only scheduler wire prompt.  These values
+# are explicit in the common Figure 4 substrate so all four arms inherit the
+# same policy-independent contract.
+[allocation]
+prompt_max_bytes = 65536
+prompt_max_tokens = 65536
+
 [allocation.task_state]
 checker_quality = 1.0
 recent_progress = 1.0
