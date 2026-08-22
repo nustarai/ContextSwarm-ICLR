@@ -919,6 +919,65 @@ class MiniRuntimeTests(unittest.TestCase):
                 self.assertEqual(decisions[0]["disposition"], "not_admitted_stale")
                 self.assertFalse(decisions[0]["fallback"])
 
+    def test_llm_scheduler_stale_reserved_admission_releases_capacity(self) -> None:
+        original_admit_reserved = ElasticScheduler.admit_reserved
+        injected = False
+
+        def solve_before_reserved_admission(scheduler, reservation, task_id, *, now=None):
+            nonlocal injected
+            if not injected:
+                injected = True
+                scheduler.task_solved(task_id)
+            return original_admit_reserved(
+                scheduler,
+                reservation,
+                task_id,
+                now=now,
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = load_config("configs/smoke.toml", ROOT)
+            config = replace(
+                base,
+                allocation=replace(base.allocation, policy="llm_scheduler"),
+                max_tasks=1,
+                max_parallel=1,
+                initial_agents_per_task=1,
+                max_attempts_per_task=2,
+                time_limit_seconds=1,
+            )
+            with patch.object(
+                ElasticScheduler,
+                "admit_reserved",
+                solve_before_reserved_admission,
+            ):
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+
+            scheduler_state = json.loads(
+                (run_dir / "elastic_scheduler_state.json").read_text()
+            )
+            decisions = [
+                json.loads(line)
+                for line in (run_dir / "allocation_decisions.jsonl").read_text().splitlines()
+            ]
+            summary = json.loads((run_dir / "allocation_summary.json").read_text())
+            final = json.loads((run_dir / "final.json").read_text())
+
+            self.assertEqual(scheduler_state["reservation_slots"], 0)
+            self.assertEqual(len(decisions), 1)
+            self.assertEqual(decisions[0]["disposition"], "not_admitted_stale")
+            self.assertFalse(decisions[0]["fallback"])
+            self.assertEqual(summary["decision_count"], 1)
+            self.assertEqual(summary["fallback_count"], 0)
+            self.assertEqual(
+                final["health"]["allocation_scheduler_result_count"],
+                1,
+            )
+
     def test_agent_scheduler_failure_is_visible_and_degrades_run(self) -> None:
         original_mock_result = runner_module._mock_result
 

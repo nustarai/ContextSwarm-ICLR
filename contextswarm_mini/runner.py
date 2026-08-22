@@ -2675,6 +2675,11 @@ def _run_elastic_cps(
                         assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 if assignment is None and time.monotonic() < deadline:
                     if scheduler.horizon_reached:
+                        if scheduler_reservation is not None:
+                            scheduler.release_reservation(
+                                scheduler_reservation,
+                                reason="horizon_reached",
+                            )
                         record_decision(
                             decision,
                             snapshot,
@@ -2686,6 +2691,31 @@ def _run_elastic_cps(
                     if execution_snapshot is None:
                         execution_snapshot = build_snapshot(snapshot.decision_index)
                     if valid_agent_decision:
+                        record_decision(
+                            decision,
+                            snapshot,
+                            None,
+                            execution_snapshot=execution_snapshot,
+                            disposition="not_admitted_stale",
+                        )
+                        if (
+                            execution_snapshot.eligible_task_ids
+                            and scheduler.remaining_slots > 0
+                        ):
+                            continue
+                        return None
+                    if scheduler_reservation is not None:
+                        # An LLM choice is relative to the whole bounded state.
+                        # If its reserved admission loses the selected task,
+                        # do not run the generic fallback: that path invokes
+                        # the model again and admits through an unreserved
+                        # solver slot.  Release this call's reservation, log
+                        # the stale attempt, and retry from a fresh state with
+                        # a fresh reservation when capacity remains.
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="decision_became_stale",
+                        )
                         record_decision(
                             decision,
                             snapshot,
