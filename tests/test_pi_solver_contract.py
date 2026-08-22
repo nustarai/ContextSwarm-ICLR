@@ -359,6 +359,71 @@ process.stdout.write(JSON.stringify({ registered: registered.sort(), denied, all
         self.assertTrue(all(result["denied"].values()))
         self.assertTrue(all(result["allowed"].values()))
 
+    def test_solver_extension_write_guard_rejects_symlink_targets_and_parents(self) -> None:
+        node_binary = shutil.which("node")
+        if not node_binary:
+            self.skipTest("Node.js is unavailable")
+        harness = r"""
+import { pathToFileURL } from "node:url";
+const [extensionPath, workdir, symlinkFile, symlinkParent] = process.argv.slice(1);
+const listeners = new Map();
+const pi = {
+  on(name, callback) { listeners.set(name, callback); },
+  registerTool(_definition) {},
+};
+const extension = await import(pathToFileURL(extensionPath).href);
+extension.default(pi);
+const guard = listeners.get("tool_call");
+if (typeof guard !== "function") throw new Error("tool_call guard was not registered");
+async function denied(toolName, path) {
+  return (await guard({ toolName, input: { path, content: "x" } }, { cwd: workdir }))?.block === true;
+}
+const result = {
+  final_write: await denied("write", symlinkFile),
+  final_edit: await denied("edit", symlinkFile),
+  parent_write: await denied("write", symlinkParent),
+  parent_edit: await denied("edit", symlinkParent),
+};
+process.stdout.write(JSON.stringify(result));
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "workdir"
+            workdir.mkdir()
+            outside_file = root / "outside.txt"
+            outside_file.write_text("private\n", encoding="utf-8")
+            symlink_file = workdir / "result.lean"
+            symlink_file.symlink_to(outside_file)
+            tasks = workdir / "tasks"
+            tasks.mkdir()
+            outside_task = root / "outside-task"
+            outside_task.mkdir()
+            (outside_task / "result.lean").write_text("private\n", encoding="utf-8")
+            symlink_task = tasks / "link"
+            symlink_task.symlink_to(outside_task, target_is_directory=True)
+            env = dict(os.environ)
+            env["CONTEXTSWARM_WORKDIR"] = str(workdir)
+            completed = subprocess.run(
+                [
+                    node_binary,
+                    "--input-type=module",
+                    "-e",
+                    harness,
+                    str(ROOT / "contextswarm_mini" / "pi_solver_tools.mjs"),
+                    str(workdir),
+                    str(symlink_file),
+                    str(symlink_task / "result.lean"),
+                ],
+                cwd=workdir,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(all(json.loads(completed.stdout).values()))
+
     def test_solver_broker_client_uses_runner_deadline_not_fixed_310_seconds(self) -> None:
         source = (ROOT / "contextswarm_mini" / "pi_solver_tools.mjs").read_text(
             encoding="utf-8"

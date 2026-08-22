@@ -137,6 +137,31 @@ function isWritableCandidate(rel) {
   return rel === "result.lean" || /^tasks\/[^/]+\/result\.lean$/.test(rel);
 }
 
+// Unlike read/search paths, the final candidate may not exist yet (the write
+// tool is allowed to create result.lean).  Resolve the path lexically, but
+// inspect every existing component with lstat before allowing a write/edit.
+// Otherwise a pre-existing result.lean symlink (or a symlinked task directory)
+// could make an apparently in-workspace write modify an arbitrary host file.
+function writableRelative(rawPath, cwd) {
+  if (typeof rawPath !== "string" || !rawPath.trim()) return null;
+  const lexical = isAbsolute(rawPath) ? resolve(rawPath) : resolve(cwd, rawPath);
+  const rel = relativeInside(lexical, cwd);
+  if (!rel || !isWritableCandidate(rel)) return null;
+  const parts = rel.split("/");
+  let current = cwd;
+  for (let index = 0; index < parts.length; index += 1) {
+    current = resolve(current, parts[index]);
+    try {
+      if (lstatSync(current).isSymbolicLink()) return null;
+    } catch {
+      // A missing final result.lean is valid, but a missing parent directory
+      // must not be accepted because the tool could recreate it elsewhere.
+      if (index !== parts.length - 1) return null;
+    }
+  }
+  return rel;
+}
+
 function isSafeSearchDirectory(rel) {
   return (
     rel === "baseline" ||
@@ -259,10 +284,8 @@ function installPathGuard(pi) {
       } catch {
         return { block: true, reason: "assigned workspace is unavailable" };
       }
-      const raw = typeof input.path === "string" ? input.path : "";
-      const lexical = raw ? (isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw)) : "";
-      const rel = lexical ? relativeInside(lexical, cwd) : null;
-      if (!rel || !isWritableCandidate(rel)) {
+      const rel = writableRelative(input.path, cwd);
+      if (!rel) {
         return { block: true, reason: "write/edit is restricted to assigned result.lean" };
       }
       return;
