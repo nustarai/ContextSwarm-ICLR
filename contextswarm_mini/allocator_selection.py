@@ -40,10 +40,10 @@ REGISTRY_ORDER = POLICIES
 DEFAULT_BOOTSTRAP_DRAWS = 10_000
 DEFAULT_BOOTSTRAP_SEED = 39039
 DEFAULT_TARGET_K = 6
-# Comparisons in the frozen numeric guardrails use a tiny absolute tolerance
-# for serialization/rounding noise.  Keep this explicit and shared by the
-# per-repeat and aggregate checks.
-COMPARISON_EPSILON = 1e-12
+MIN_VALIDATION_REPEATS = 8
+BOOTSTRAP_METHOD = "paired_block_percentile"
+BOOTSTRAP_CONFIDENCE = 0.95
+BOOTSTRAP_QUANTILE = "linear"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE_KEY = re.compile(
     r"(?:api[_-]?key|access[_-]?token|secret|password|credential|authorization|"
@@ -126,7 +126,10 @@ def _text(value: Any, name: str, *, allow_empty: bool = False) -> str:
 def _finite(value: Any, name: str, *, minimum: float | None = None, maximum: float | None = None) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise AllocatorSelectionError(f"{name} must be numeric")
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise AllocatorSelectionError(f"{name} must be finite") from exc
     if not math.isfinite(number):
         raise AllocatorSelectionError(f"{name} must be finite")
     if minimum is not None and number < minimum:
@@ -192,6 +195,8 @@ def _pair_identity(value: Any, name: str) -> str:
     text = str(value).strip()
     if not text:
         raise AllocatorSelectionError(f"{name} must not be empty")
+    if text.startswith("-") and text[1:].isdigit():
+        raise AllocatorSelectionError(f"{name} must be a string or non-negative integer")
     return text
 
 
@@ -388,6 +393,11 @@ class GuardrailConfig:
         require_per_block = values.get("require_per_block", True)
         if not isinstance(require_per_block, bool):
             raise AllocatorSelectionError("guardrails.require_per_block must be boolean")
+        if require_per_block is not True:
+            raise AllocatorSelectionError(
+                "guardrails.require_per_block must be true (fail-closed rule)",
+                code="invalid_rule",
+            )
         return cls(occupied_number, token_number, fallback_number, factor_number, slots_number, require_per_block)
 
     def as_dict(self) -> dict[str, Any]:
@@ -425,14 +435,14 @@ def development_rule(*, validation_repeat_ids: Sequence[str] | None = None) -> d
             "require_history": True,
         },
         "validation_split": {"kind": "paired_repeat_ids", "paired_repeat_ids": ids},
-        "minimum_validation_repeats": 1,
+        "minimum_validation_repeats": MIN_VALIDATION_REPEATS,
         "target_k": DEFAULT_TARGET_K,
         "bootstrap": {
-            "method": "paired_block_percentile",
+            "method": BOOTSTRAP_METHOD,
             "draws": DEFAULT_BOOTSTRAP_DRAWS,
             "seed": DEFAULT_BOOTSTRAP_SEED,
-            "confidence": 0.95,
-            "quantile": "linear",
+            "confidence": BOOTSTRAP_CONFIDENCE,
+            "quantile": BOOTSTRAP_QUANTILE,
         },
         "tie_break": ["mean_nauc_desc", "bootstrap_lcb95_desc", "median_time_to_k_asc", "registry_order"],
         "guardrails": GuardrailConfig().as_dict(),
@@ -442,6 +452,7 @@ def development_rule(*, validation_repeat_ids: Sequence[str] | None = None) -> d
 
 @dataclass(frozen=True)
 class _Cost:
+    solver_calls: int
     solver_tokens: int
     scheduler_tokens: int
     solver_slot_seconds: float
@@ -460,6 +471,7 @@ class _Cost:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "solver_calls": self.solver_calls,
             "solver_tokens": self.solver_tokens,
             "scheduler_tokens": self.scheduler_tokens,
             "solver_slot_seconds": self.solver_slot_seconds,
@@ -475,22 +487,39 @@ class _Cost:
 
 
 def _cost_number(mapping: Mapping[str, Any], names: Sequence[str], name: str, *, default: Any = _MISSING) -> float:
-    value = _get(mapping, *names, default=default)
-    if value is _MISSING:
-        raise AllocatorSelectionError(f"missing {name}")
+    values = [mapping[key] for key in names if key in mapping]
+    if not values:
+        if default is _MISSING:
+            raise AllocatorSelectionError(f"missing {name}")
+        value = default
+    else:
+        parsed = [_finite(value, name, minimum=0.0) for value in values]
+        if any(value != parsed[0] for value in parsed[1:]):
+            raise AllocatorSelectionError(f"contradictory aliases for {name}")
+        return parsed[0]
     return _finite(value, name, minimum=0.0)
 
 
 def _cost_int(mapping: Mapping[str, Any], names: Sequence[str], name: str, *, default: Any = _MISSING) -> int:
-    value = _get(mapping, *names, default=default)
-    if value is _MISSING:
-        raise AllocatorSelectionError(f"missing {name}")
+    values = [mapping[key] for key in names if key in mapping]
+    if not values:
+        if default is _MISSING:
+            raise AllocatorSelectionError(f"missing {name}")
+        value = default
+    else:
+        parsed = [_integer(value, name, minimum=0) for value in values]
+        if any(value != parsed[0] for value in parsed[1:]):
+            raise AllocatorSelectionError(f"contradictory aliases for {name}")
+        return parsed[0]
     return _integer(value, name, minimum=0)
 
 
 def _extract_cost(arm: Mapping[str, Any], policy: str) -> _Cost:
     solver = _mapping(_get(arm, "solver_usage", "solver_cost"), f"{policy}.solver_usage")
     scheduler = _mapping(_get(arm, "scheduler_cost", "llm_scheduler_cost"), f"{policy}.scheduler_cost")
+    solver_calls = _cost_int(
+        solver, ("calls", "solver_calls"), f"{policy}.solver_usage.calls", default=_MISSING
+    )
     solver_tokens = _cost_int(
         solver,
         ("total_tokens", "tokens", "model_tokens", "solver_tokens"),
@@ -499,8 +528,8 @@ def _extract_cost(arm: Mapping[str, Any], policy: str) -> _Cost:
     )
     solver_input = _cost_int(solver, ("input_tokens", "prompt_tokens"), f"{policy}.solver_usage.input_tokens", default=_MISSING)
     solver_output = _cost_int(solver, ("output_tokens", "completion_tokens"), f"{policy}.solver_usage.output_tokens", default=_MISSING)
-    if solver_tokens < solver_input + solver_output:
-        raise AllocatorSelectionError(f"{policy}.solver_usage.total_tokens is below input+output")
+    if solver_tokens != solver_input + solver_output:
+        raise AllocatorSelectionError(f"{policy}.solver_usage.total_tokens must equal input+output")
     solver_slots = _cost_number(
         solver,
         ("slot_seconds", "occupied_slot_seconds", "solver_slot_seconds", "compute_slot_seconds", "solver_agent_seconds"),
@@ -515,8 +544,8 @@ def _extract_cost(arm: Mapping[str, Any], policy: str) -> _Cost:
         f"{policy}.scheduler_cost.total_tokens",
         default=_MISSING,
     )
-    if scheduler_tokens < scheduler_input + scheduler_output:
-        raise AllocatorSelectionError(f"{policy}.scheduler_cost.total_tokens is below input+output")
+    if scheduler_tokens != scheduler_input + scheduler_output:
+        raise AllocatorSelectionError(f"{policy}.scheduler_cost.total_tokens must equal input+output")
     scheduler_slots = _cost_number(
         scheduler,
         ("occupied_capacity_slot_seconds", "reserved_slot_seconds", "occupied_slot_seconds", "slot_seconds"),
@@ -527,9 +556,29 @@ def _extract_cost(arm: Mapping[str, Any], policy: str) -> _Cost:
     latency = _cost_number(scheduler, ("latency_seconds", "scheduler_latency_seconds"), f"{policy}.scheduler_cost.latency_seconds", default=_MISSING)
     reservations = _cost_int(scheduler, ("capacity_reservations", "reservation_slots", "reservations"), f"{policy}.scheduler_cost.capacity_reservations", default=_MISSING)
     invalid = _cost_int(scheduler, ("invalid_outputs", "invalid_decisions"), f"{policy}.scheduler_cost.invalid_outputs", default=_MISSING)
+    scheduler_fallback = _cost_int(
+        scheduler, ("fallback_count", "fallbacks", "fallback_decisions"),
+        f"{policy}.scheduler_cost.fallback_count", default=_MISSING,
+    )
+    scheduler_horizon = _cost_int(
+        scheduler, ("horizon_truncations", "horizon_truncation_count"),
+        f"{policy}.scheduler_cost.horizon_truncations", default=0,
+    )
     metrics = _mapping(_get(arm, "allocation_metrics", "allocation"), f"{policy}.allocation_metrics")
     decisions = _cost_int(metrics, ("decisions", "decision_count", "allocation_decisions"), f"{policy}.allocation_metrics.decisions", default=_MISSING)
     fallback = _cost_int(metrics, ("fallbacks", "fallback_decisions", "fallback_count"), f"{policy}.allocation_metrics.fallbacks", default=_MISSING)
+    metrics_invalid = _cost_int(
+        metrics, ("invalid_outputs", "invalid_output_count"),
+        f"{policy}.allocation_metrics.invalid_outputs", default=0,
+    )
+    metrics_horizon = _cost_int(
+        metrics, ("horizon_truncations", "horizon_truncation_count"),
+        f"{policy}.allocation_metrics.horizon_truncations", default=0,
+    )
+    admitted = _cost_int(
+        metrics, ("admitted_decisions", "admitted_count"),
+        f"{policy}.allocation_metrics.admitted_decisions", default=decisions,
+    )
     reported_rate = _get(metrics, "fallback_rate", default=_MISSING)
     if reported_rate is not _MISSING:
         rate = _finite(reported_rate, f"{policy}.allocation_metrics.fallback_rate", minimum=0.0, maximum=1.0)
@@ -537,12 +586,29 @@ def _extract_cost(arm: Mapping[str, Any], policy: str) -> _Cost:
             raise AllocatorSelectionError(f"{policy}.allocation_metrics.fallback_rate is inconsistent")
     if fallback > decisions:
         raise AllocatorSelectionError(f"{policy}.allocation_metrics.fallbacks exceeds decisions")
-    max_slots_raw = _get(
-        scheduler,
-        "max_occupied_slots",
-        "max_occupied_capacity",
-        default=_get(arm, "max_occupied_slots", default=None),
-    )
+    if admitted > decisions:
+        raise AllocatorSelectionError(f"{policy}.allocation_metrics.admitted_decisions exceeds decisions")
+    if scheduler_fallback != fallback:
+        raise AllocatorSelectionError(f"{policy} scheduler and allocation fallback counts disagree")
+    if invalid != metrics_invalid:
+        raise AllocatorSelectionError(f"{policy} scheduler and allocation invalid-output counts disagree")
+    if scheduler_horizon != metrics_horizon:
+        raise AllocatorSelectionError(f"{policy} scheduler and allocation horizon-truncation counts disagree")
+    max_candidates = []
+    for source, names in (
+        (solver, ("max_occupied_slots", "max_occupied_capacity")),
+        (scheduler, ("max_occupied_slots", "max_occupied_capacity")),
+        (arm, ("max_occupied_slots", "max_occupied_capacity")),
+    ):
+        for alias in names:
+            if alias in source:
+                max_candidates.append(_integer(source[alias], f"{policy}.max_occupied_slots", minimum=0))
+                break
+    if not max_candidates:
+        raise AllocatorSelectionError(f"{policy}.max_occupied_slots is required")
+    if len(set(max_candidates)) != 1:
+        raise AllocatorSelectionError(f"{policy}.max_occupied_slots is contradictory")
+    max_slots_raw = max_candidates[0]
     max_slots = None if max_slots_raw is None else _integer(max_slots_raw, f"{policy}.max_occupied_slots", minimum=0)
     if invalid > calls:
         raise AllocatorSelectionError(f"{policy}.scheduler_cost.invalid_outputs exceeds calls")
@@ -550,6 +616,7 @@ def _extract_cost(arm: Mapping[str, Any], policy: str) -> _Cost:
         raise AllocatorSelectionError(f"{policy}.allocation_metrics.fallbacks exceeds scheduler calls")
     cost = _Cost(
         solver_tokens=solver_tokens,
+        solver_calls=solver_calls,
         scheduler_tokens=scheduler_tokens,
         solver_slot_seconds=solver_slots,
         scheduler_slot_seconds=scheduler_slots,
@@ -562,10 +629,15 @@ def _extract_cost(arm: Mapping[str, Any], policy: str) -> _Cost:
         max_occupied_slots=max_slots,
     )
     if policy != "llm_scheduler":
-        if any(value != 0 for value in (scheduler_tokens, scheduler_slots, calls, reservations, invalid, fallback)) or latency != 0.0:
+        if any(value != 0 for value in (scheduler_tokens, scheduler_slots, calls, reservations, invalid, fallback, scheduler_fallback, scheduler_horizon)) or latency != 0.0:
             raise AllocatorSelectionError(f"deterministic arm {policy} has non-zero scheduler cost")
-    elif calls == 0 and (scheduler_tokens or scheduler_slots or fallback or invalid):
-        raise AllocatorSelectionError("llm_scheduler has cost/fallbacks but zero calls")
+    else:
+        if reservations != calls:
+            raise AllocatorSelectionError("llm_scheduler capacity reservations must equal calls")
+        if calls != decisions:
+            raise AllocatorSelectionError("llm_scheduler calls must equal allocation decisions")
+    if calls == 0 and latency != 0.0:
+        raise AllocatorSelectionError(f"{policy} has latency but zero scheduler calls")
     return cost
 
 
@@ -816,6 +888,11 @@ def parse_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
     if _text(rule.get("rule_id"), "rule_id") != RULE_ID:
         raise AllocatorSelectionError("unexpected allocator selection rule ID", code="invalid_rule")
     phase = _text(rule.get("phase", "development_validation"), "rule.phase")
+    if phase != "development_validation":
+        raise AllocatorSelectionError(
+            "rule.phase must be development_validation",
+            code="invalid_rule",
+        )
     if phase.lower() in {"posthoc", "post_hoc", "outcome_tuned"}:
         raise AllocatorSelectionError("post-hoc selection is forbidden", code="invalid_rule")
     if rule.get("posthoc_tuning", False) is not False:
@@ -835,19 +912,32 @@ def parse_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
     ids = tuple(_pair_identity(item, "validation_split.paired_repeat_id") for item in split.get("paired_repeat_ids", ()))
     if not ids or len(set(ids)) != len(ids):
         raise AllocatorSelectionError("validation split must contain unique paired repeat IDs", code="invalid_rule")
-    minimum = _integer(rule.get("minimum_validation_repeats", 1), "minimum_validation_repeats", minimum=1)
+    minimum = _integer(rule.get("minimum_validation_repeats", MIN_VALIDATION_REPEATS), "minimum_validation_repeats", minimum=MIN_VALIDATION_REPEATS)
+    if minimum < MIN_VALIDATION_REPEATS:
+        raise AllocatorSelectionError(
+            f"minimum_validation_repeats must be at least {MIN_VALIDATION_REPEATS}",
+            code="invalid_rule",
+        )
     if len(ids) < minimum:
         raise AllocatorSelectionError("validation split is smaller than minimum_validation_repeats", code="invalid_rule")
     target_k = _integer(rule.get("target_k", DEFAULT_TARGET_K), "target_k", minimum=1)
     bootstrap = dict(_mapping(rule.get("bootstrap"), "rule.bootstrap"))
-    if bootstrap.get("method") != "paired_block_percentile":
+    if bootstrap.get("method") != BOOTSTRAP_METHOD:
         raise AllocatorSelectionError("unsupported bootstrap method", code="invalid_rule")
-    draws = _integer(bootstrap.get("draws", DEFAULT_BOOTSTRAP_DRAWS), "bootstrap.draws", minimum=1)
+    draws = _integer(bootstrap.get("draws", DEFAULT_BOOTSTRAP_DRAWS), "bootstrap.draws", minimum=DEFAULT_BOOTSTRAP_DRAWS)
+    if draws != DEFAULT_BOOTSTRAP_DRAWS:
+        raise AllocatorSelectionError(
+            f"bootstrap.draws must be exactly {DEFAULT_BOOTSTRAP_DRAWS}",
+            code="invalid_rule",
+        )
     seed = _integer(bootstrap.get("seed", DEFAULT_BOOTSTRAP_SEED), "bootstrap.seed", minimum=0)
-    confidence = _finite(bootstrap.get("confidence", 0.95), "bootstrap.confidence", minimum=0.0, maximum=1.0)
-    if not 0.0 < confidence < 1.0:
-        raise AllocatorSelectionError("bootstrap.confidence must be between zero and one", code="invalid_rule")
-    if bootstrap.get("quantile", "linear") != "linear":
+    confidence = _finite(bootstrap.get("confidence", BOOTSTRAP_CONFIDENCE), "bootstrap.confidence", minimum=0.0, maximum=1.0)
+    if confidence != BOOTSTRAP_CONFIDENCE:
+        raise AllocatorSelectionError(
+            f"bootstrap.confidence must be exactly {BOOTSTRAP_CONFIDENCE}",
+            code="invalid_rule",
+        )
+    if bootstrap.get("quantile", BOOTSTRAP_QUANTILE) != BOOTSTRAP_QUANTILE:
         raise AllocatorSelectionError("bootstrap.quantile must be linear", code="invalid_rule")
     tie_break = list(rule.get("tie_break", ("mean_nauc_desc", "bootstrap_lcb95_desc", "median_time_to_k_asc", "registry_order")))
     expected_tie = ["mean_nauc_desc", "bootstrap_lcb95_desc", "median_time_to_k_asc", "registry_order"]
@@ -881,11 +971,11 @@ def parse_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
         "minimum_validation_repeats": minimum,
         "target_k": target_k,
         "bootstrap": {
-            "method": "paired_block_percentile",
+            "method": BOOTSTRAP_METHOD,
             "draws": draws,
             "seed": seed,
             "confidence": confidence,
-            "quantile": "linear",
+            "quantile": BOOTSTRAP_QUANTILE,
         },
         "tie_break": expected_tie,
         "guardrails": guardrails.as_dict(),
@@ -969,40 +1059,42 @@ def _guardrail_check(policy: str, rows: Sequence[dict[str, Any]], config: Guardr
         total_decisions += cost.decisions
         checks: dict[str, dict[str, Any]] = {}
         occupied_fraction = cost.scheduler_slot_seconds / budget
-        checks["scheduler_occupied_capacity_fraction"] = {"observed": occupied_fraction, "threshold": config.scheduler_occupied_capacity_fraction_max, "pass": occupied_fraction <= config.scheduler_occupied_capacity_fraction_max + COMPARISON_EPSILON}
+        checks["scheduler_occupied_capacity_fraction"] = {"observed": occupied_fraction, "threshold": config.scheduler_occupied_capacity_fraction_max, "pass": occupied_fraction <= config.scheduler_occupied_capacity_fraction_max}
         token_fraction = cost.scheduler_tokens / cost.total_tokens if cost.total_tokens else (0.0 if cost.scheduler_tokens == 0 else math.inf)
-        checks["scheduler_token_fraction"] = {"observed": token_fraction, "threshold": config.scheduler_token_fraction_max, "pass": math.isfinite(token_fraction) and token_fraction <= config.scheduler_token_fraction_max + COMPARISON_EPSILON}
+        checks["scheduler_token_fraction"] = {"observed": token_fraction, "threshold": config.scheduler_token_fraction_max, "pass": math.isfinite(token_fraction) and token_fraction <= config.scheduler_token_fraction_max}
         fallback_fraction = cost.fallback_count / cost.decisions if cost.decisions else None
-        checks["fallback_rate"] = {"observed": fallback_fraction, "threshold": config.fallback_rate_max, "pass": fallback_fraction is not None and fallback_fraction <= config.fallback_rate_max + COMPARISON_EPSILON}
+        checks["fallback_rate"] = {"observed": fallback_fraction, "threshold": config.fallback_rate_max, "pass": fallback_fraction is not None and fallback_fraction <= config.fallback_rate_max}
         slot_factor = (cost.solver_slot_seconds + cost.scheduler_slot_seconds) / budget
-        checks["total_slot_seconds_factor"] = {"observed": slot_factor, "threshold": config.total_slot_seconds_factor_max, "pass": slot_factor <= config.total_slot_seconds_factor_max + COMPARISON_EPSILON}
-        if config.max_occupied_slots is not None:
-            observed_slots = cost.max_occupied_slots
-            checks["max_occupied_slots"] = {"observed": observed_slots, "threshold": config.max_occupied_slots, "pass": observed_slots is not None and observed_slots <= config.max_occupied_slots}
-        else:
-            checks["max_occupied_slots"] = {"observed": cost.max_occupied_slots, "threshold": None, "pass": True}
+        checks["total_slot_seconds_factor"] = {"observed": slot_factor, "threshold": config.total_slot_seconds_factor_max, "pass": slot_factor <= config.total_slot_seconds_factor_max}
+        observed_slots = cost.max_occupied_slots
+        max_threshold = capacity if config.max_occupied_slots is None else min(capacity, config.max_occupied_slots)
+        checks["max_occupied_slots"] = {"observed": observed_slots, "threshold": max_threshold, "pass": observed_slots is not None and observed_slots <= max_threshold}
         block_pass = all(bool(item["pass"]) for item in checks.values())
         if policy != "llm_scheduler":
             block_pass = block_pass and all(value == 0 for value in (cost.scheduler_tokens, cost.scheduler_slot_seconds, cost.scheduler_calls, cost.scheduler_reservations, cost.invalid_outputs, cost.fallback_count, cost.scheduler_latency_seconds))
         elif cost.scheduler_calls == 0 and cost.decisions > 0:
             block_pass = False
-        per_repeat.append({"paired_repeat_id": row["paired_repeat_id"], "paired_seed": row["paired_seed"], "checks": checks, "pass": block_pass, "cost": cost.as_dict()})
+        per_repeat.append({"paired_repeat_id": row["paired_repeat_id"], "paired_seed": row["paired_seed"], "capacity": capacity, "checks": checks, "pass": block_pass, "cost": cost.as_dict()})
         all_pass = all_pass and (block_pass if config.require_per_block else True)
     aggregate_budget = total_budget
     aggregate_checks: dict[str, dict[str, Any]] = {}
     occupied_fraction = total_scheduler_slots / aggregate_budget
-    aggregate_checks["scheduler_occupied_capacity_fraction"] = {"observed": occupied_fraction, "threshold": config.scheduler_occupied_capacity_fraction_max, "pass": occupied_fraction <= config.scheduler_occupied_capacity_fraction_max + COMPARISON_EPSILON}
+    aggregate_checks["scheduler_occupied_capacity_fraction"] = {"observed": occupied_fraction, "threshold": config.scheduler_occupied_capacity_fraction_max, "pass": occupied_fraction <= config.scheduler_occupied_capacity_fraction_max}
     token_fraction = total_scheduler_tokens / total_tokens if total_tokens else (0.0 if total_scheduler_tokens == 0 else math.inf)
-    aggregate_checks["scheduler_token_fraction"] = {"observed": token_fraction, "threshold": config.scheduler_token_fraction_max, "pass": math.isfinite(token_fraction) and token_fraction <= config.scheduler_token_fraction_max + COMPARISON_EPSILON}
+    aggregate_checks["scheduler_token_fraction"] = {"observed": token_fraction, "threshold": config.scheduler_token_fraction_max, "pass": math.isfinite(token_fraction) and token_fraction <= config.scheduler_token_fraction_max}
     fallback_fraction = total_fallbacks / total_decisions if total_decisions else None
-    aggregate_checks["fallback_rate"] = {"observed": fallback_fraction, "threshold": config.fallback_rate_max, "pass": fallback_fraction is not None and fallback_fraction <= config.fallback_rate_max + COMPARISON_EPSILON}
+    aggregate_checks["fallback_rate"] = {"observed": fallback_fraction, "threshold": config.fallback_rate_max, "pass": fallback_fraction is not None and fallback_fraction <= config.fallback_rate_max}
     slot_factor = (total_solver_slots + total_scheduler_slots) / aggregate_budget
-    aggregate_checks["total_slot_seconds_factor"] = {"observed": slot_factor, "threshold": config.total_slot_seconds_factor_max, "pass": slot_factor <= config.total_slot_seconds_factor_max + COMPARISON_EPSILON}
-    if config.max_occupied_slots is not None:
-        observed = max((item["cost"]["max_occupied_slots"] for item in per_repeat if item["cost"]["max_occupied_slots"] is not None), default=None)
-        aggregate_checks["max_occupied_slots"] = {"observed": observed, "threshold": config.max_occupied_slots, "pass": observed is not None and observed <= config.max_occupied_slots}
-    else:
-        aggregate_checks["max_occupied_slots"] = {"observed": None, "threshold": None, "pass": True}
+    aggregate_checks["total_slot_seconds_factor"] = {"observed": slot_factor, "threshold": config.total_slot_seconds_factor_max, "pass": slot_factor <= config.total_slot_seconds_factor_max}
+    observed_values = [
+        (row["cost"]["max_occupied_slots"], row["capacity"])
+        for row in per_repeat
+        if row["cost"]["max_occupied_slots"] is not None
+    ]
+    observed = max((value for value, _ in observed_values), default=None)
+    capacity_limit = min((capacity for _, capacity in observed_values), default=0)
+    aggregate_threshold = capacity_limit if config.max_occupied_slots is None else min(capacity_limit, config.max_occupied_slots)
+    aggregate_checks["max_occupied_slots"] = {"observed": observed, "threshold": aggregate_threshold, "pass": observed is not None and observed <= aggregate_threshold}
     aggregate_pass = all(bool(item["pass"]) for item in aggregate_checks.values())
     if policy != "llm_scheduler":
         aggregate_pass = aggregate_pass and all(value == 0 for value in (total_scheduler_tokens, total_scheduler_slots, sum(item["cost"]["scheduler_calls"] for item in per_repeat), sum(item["cost"]["scheduler_reservations"] for item in per_repeat), sum(item["cost"]["invalid_outputs"] for item in per_repeat), total_fallbacks, sum(item["cost"]["scheduler_latency_seconds"] for item in per_repeat)))
@@ -1058,7 +1150,7 @@ def select_allocator(source: str | Path | Iterable[Mapping[str, Any]], rule: Map
         median_time = float(median(times)) if times else float("inf")
         mean_nauc = math.fsum(arm["nauc"] for arm in arm_rows) / len(arm_rows)
         lcb = intervals[policy]["lower"]
-        rank_tuple = (-round(mean_nauc, 12), -round(lcb, 12), round(median_time, 12) if math.isfinite(median_time) else None, index)
+        rank_tuple = (-mean_nauc, -lcb, median_time if math.isfinite(median_time) else None, index)
         arm_results[policy] = {
             "policy": policy,
             "repeat_count": len(arm_rows),

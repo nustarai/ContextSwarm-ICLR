@@ -8,8 +8,10 @@ not change a runner, re-run an arm, or replace the independent Figure 4 audit.
 ## Frozen decision order
 
 Before official repeats, the experiment owner must publish one rule artifact
-with a rule ID, validation repeat IDs, target `k`, bootstrap algorithm/seed,
-tie-break, and numeric cost thresholds.  The development helper emits
+with a rule ID, at least eight validation repeat IDs, target `k`, bootstrap
+algorithm/seed, tie-break, and numeric cost thresholds.  The frozen interval
+uses exactly 10,000 paired-block percentile draws, 95% confidence, and linear
+quantiles.  The development helper emits
 `figure4_allocator_selection_v1` with explicit proposal values; those values
 are development defaults, not silently registered formal settings.
 
@@ -71,4 +73,6 @@ python3 scripts/select_allocator.py \
 ```
 
 The command uses atomic publication and exits non-zero without a partial output
-when either input is malformed or no valid rule can be applied.
+when either input is malformed.  When every arm fails a cost gate, it publishes
+the auditable `status: "no_selection"` artifact and exits non-zero so downstream
+Ours cannot continue accidentally.

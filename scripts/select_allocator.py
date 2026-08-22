@@ -44,6 +44,12 @@ def main(argv: list[str] | None = None) -> int:
         if result.get("schema_version") != SELECTION_SCHEMA:
             raise AllocatorSelectionError("selector produced an invalid result schema")
         write_selection_result(args.output, result)
+        if result.get("status") != "selected":
+            print(
+                "allocator-selection: no_selection: no arm passed numeric guardrails",
+                file=sys.stderr,
+            )
+            return 3
     except AllocatorSelectionError as exc:
         # Keep diagnostics bounded and free of artifact values.  The exception
         # itself is authored by the pure validator and contains no secrets.

@@ -16,6 +16,7 @@ from contextswarm_mini.allocator_selection import (
     SELECTION_SCHEMA,
     canonical_sha256,
     development_rule,
+    load_rule,
     select_allocator,
     write_selection_result,
 )
@@ -32,10 +33,7 @@ def _contract(repeat_id: str, seed: int) -> dict[str, object]:
         "paired_repeat_id": repeat_id,
         "paired_seed": seed,
         "selector_identity": "nustigmergy-v1",
-        # Selector identity is a canonical SHA-256 digest in the paired
-        # comparison contract.  Keep the fixture deterministic while using
-        # valid lowercase hexadecimal rather than a placeholder character.
-        "selector_config_sha256": "a" * 64,
+        "selector_config_sha256": "b" * 64,
         "selector_visibility": "project_shared",
         "model": "paper-model",
         "inference_settings": {"thinking": "max", "temperature": 0},
@@ -77,17 +75,21 @@ def _arm(policy: str, *, first: float, second: float | None = None, llm_cost: bo
         "capacity_reservations": 0,
         "occupied_capacity_slot_seconds": 0.0,
         "invalid_outputs": 0,
+        "fallback_count": 0,
+        "horizon_truncations": 0,
     }
     if llm_cost:
         scheduler = {
-            "calls": 2,
+            "calls": 4,
             "input_tokens": 20,
             "output_tokens": 10,
             "total_tokens": 30,
             "latency_seconds": 1.0,
-            "capacity_reservations": 2,
+            "capacity_reservations": 4,
             "occupied_capacity_slot_seconds": 8.0,
             "invalid_outputs": 0,
+            "fallback_count": 0,
+            "horizon_truncations": 0,
         }
     if bad_cost:
         scheduler["occupied_capacity_slot_seconds"] = 0.0
@@ -100,13 +102,22 @@ def _arm(policy: str, *, first: float, second: float | None = None, llm_cost: bo
         "time_to_k_seconds": {"1": first, "2": second},
         "nauc": 0.0,  # filled after constructing the row
         "solver_usage": {
+            "calls": 4,
             "input_tokens": solver_tokens // 2,
             "output_tokens": solver_tokens // 2,
             "total_tokens": solver_tokens,
             "slot_seconds": solver_slots,
+            "max_occupied_slots": 4,
         },
         "scheduler_cost": scheduler,
-        "allocation_metrics": {"decisions": 4, "fallbacks": 0, "fallback_rate": 0.0},
+        "allocation_metrics": {
+            "decisions": 4,
+            "admitted_decisions": 4,
+            "fallbacks": 0,
+            "fallback_rate": 0.0,
+            "invalid_outputs": 0,
+            "horizon_truncations": 0,
+        },
         "allocation_parameters": params,
         "allocation_config_sha256": canonical_sha256(params),
     }
@@ -155,27 +166,37 @@ def _row(repeat_id: str, seed: int, *, llm_bad: bool = False, trace_first: float
     }
 
 
-def _rule(*ids: str, draws: int = 200) -> dict[str, object]:
+def _rule(*ids: str) -> dict[str, object]:
     rule = development_rule(validation_repeat_ids=ids)
     rule["minimum_validation_repeats"] = len(ids)
     rule["target_k"] = 1
-    rule["bootstrap"]["draws"] = draws
+    rule["bootstrap"]["draws"] = 10_000
     return rule
 
 
+def _validation_rows(**kwargs: object) -> list[dict[str, object]]:
+    return [_row(f"r{i}", 10 + i, **kwargs) for i in range(1, 9)]
+
+
 class AllocatorSelectionTests(unittest.TestCase):
+    def test_checked_in_development_rule_is_frozen_and_parseable(self) -> None:
+        rule = load_rule(Path(__file__).resolve().parents[1] / "configs" / "allocator_selection_rule_dev.json")
+        self.assertEqual(rule["minimum_validation_repeats"], 8)
+        self.assertEqual(rule["bootstrap"]["draws"], 10_000)
+        self.assertTrue(rule["guardrails"]["require_per_block"])
+
     def test_selects_highest_eligible_nauc_and_emits_identity(self) -> None:
-        rows = [_row("r1", 11), _row("r2", 12)]
-        result = select_allocator(rows, _rule("r1", "r2"))
+        rows = _validation_rows()
+        result = select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
         self.assertEqual(result["schema_version"], SELECTION_SCHEMA)
         self.assertEqual(result["status"], "selected")
         self.assertEqual(result["selected_policy"], "trace_state")
-        self.assertEqual(result["validation_repeat_ids"], ["r1", "r2"])
+        self.assertEqual(result["validation_repeat_ids"], [f"r{i}" for i in range(1, 9)])
         self.assertEqual(result["arms"]["trace_state"]["allocation_config_sha256"], rows[0]["arms"]["trace_state"]["allocation_config_sha256"])
         self.assertEqual(result["paired_contrasts"]["trace_state_minus_task_state"]["bootstrap_ci95"]["lower"] > 0, True)
 
     def test_cost_guardrail_filters_llm_before_metric_ranking(self) -> None:
-        rows = [_row("r1", 11, llm_bad=True), _row("r2", 12, llm_bad=True)]
+        rows = _validation_rows(llm_bad=True)
         # Make LLM's metric highest while keeping its malformed total-token
         # accounting; the arm must be ineligible rather than selected.
         for row in rows:
@@ -183,20 +204,21 @@ class AllocatorSelectionTests(unittest.TestCase):
             arm["accepted_score_history"] = _history(0.1, 0.2)
             arm["time_to_k_seconds"] = {"1": 0.1, "2": 0.2}
             arm["nauc"] = _nauc(arm["accepted_score_history"])
-        result = select_allocator(rows, _rule("r1", "r2"))
+        result = select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
         self.assertFalse(result["arms"]["llm_scheduler"]["eligible"])
         self.assertNotEqual(result["selected_policy"], "llm_scheduler")
 
     def test_permutation_of_rows_is_deterministic(self) -> None:
-        rows = [_row("r1", 11), _row("r2", 12)]
+        rows = _validation_rows()
         shuffled = copy.deepcopy(rows)
         random.Random(4).shuffle(shuffled)
-        result_a = select_allocator(rows, _rule("r1", "r2"))
-        result_b = select_allocator(shuffled, _rule("r1", "r2"))
+        ids = [f"r{i}" for i in range(1, 9)]
+        result_a = select_allocator(rows, _rule(*ids))
+        result_b = select_allocator(shuffled, _rule(*ids))
         self.assertEqual(result_a, result_b)
 
     def test_exact_tie_uses_registry_order(self) -> None:
-        rows = [_row("r1", 11, trace_first=1.0), _row("r2", 12, trace_first=1.0)]
+        rows = _validation_rows(trace_first=1.0)
         # Give Uniform and Task identical trajectories and config identities;
         # both pass, so the fixed registry order decides the tie.
         for row in rows:
@@ -211,7 +233,7 @@ class AllocatorSelectionTests(unittest.TestCase):
             arm["time_to_k_seconds"] = {"1": 1.0, "2": 2.0}
             arm["final_accepted_score"] = 2
             arm["nauc"] = _nauc(arm["accepted_score_history"])
-        result = select_allocator(rows, _rule("r1", "r2"))
+        result = select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
         self.assertEqual(result["selected_policy"], "uniform_refill")
 
     def test_duplicate_repeat_and_contract_tampering_fail_closed(self) -> None:
@@ -241,21 +263,39 @@ class AllocatorSelectionTests(unittest.TestCase):
 
     def test_rule_requires_explicit_split_and_thresholds(self) -> None:
         row = _row("r1", 11)
-        rule = _rule("r1")
+        rule = _rule(*[f"r{i}" for i in range(1, 9)])
         del rule["guardrails"]["fallback_rate_max"]
         with self.assertRaises(AllocatorSelectionError):
             select_allocator([row], rule)
-        rule = _rule("missing")
+        rule = _rule(*[f"r{i}" for i in range(1, 9)])
+        rule["bootstrap"]["draws"] = 9_999
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(_validation_rows(), rule)
+        rule = _rule(*[f"r{i}" for i in range(1, 9)])
+        rule["guardrails"]["require_per_block"] = False
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(_validation_rows(), rule)
+        rule = _rule(*[f"missing{i}" for i in range(1, 9)])
         with self.assertRaises(AllocatorSelectionError):
             select_allocator([row], rule)
+
+    def test_cost_cardinality_and_huge_values_fail_closed(self) -> None:
+        rows = _validation_rows()
+        rows[0]["arms"]["llm_scheduler"]["scheduler_cost"]["capacity_reservations"] = 3
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
+        rows = _validation_rows()
+        rows[0]["arms"]["task_state"]["solver_usage"]["total_tokens"] = 10**10000
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
 
     def test_cli_writes_result_and_leaves_no_partial_file_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             paired = root / "figure4_paired_repeats.jsonl"
-            paired.write_text(json.dumps(_row("r1", 11), sort_keys=True) + "\n")
+            paired.write_text("\n".join(json.dumps(_row(f"r{i}", 10 + i), sort_keys=True) for i in range(1, 9)) + "\n")
             rule_path = root / "rule.json"
-            rule_path.write_text(json.dumps(_rule("r1"), sort_keys=True))
+            rule_path.write_text(json.dumps(_rule(*[f"r{i}" for i in range(1, 9)]), sort_keys=True))
             output = root / "allocator_selection.json"
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(cli_main(["--paired-repeats", str(paired), "--rule", str(rule_path), "--output", str(output)]), 0)
@@ -271,8 +311,8 @@ class AllocatorSelectionTests(unittest.TestCase):
             select_allocator([row], _rule("r1"))
 
     def test_atomic_result_write(self) -> None:
-        rows = [_row("r1", 11)]
-        result = select_allocator(rows, _rule("r1"))
+        rows = _validation_rows()
+        result = select_allocator(rows, _rule(*[f"r{i}" for i in range(1, 9)]))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "allocator_selection.json"
             write_selection_result(path, result)
