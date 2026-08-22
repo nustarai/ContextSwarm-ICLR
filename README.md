@@ -323,6 +323,9 @@ snapshot，再由 preflight 和 Broker 共同使用这一份 snapshot。SHA/sche
 configured/index/endpoint revision 任一缺失或不一致都会 fail closed。最终候选仍
 按 Mono/Parallel/CPS 原有策略在 horizon 后冻结；helper 反馈不会改变 freeze source，
 正式分数只来自 broker revoke+drain 之后、对冻结字节发起的独立 fresh closeout。
+当 cache-health 使用独立 endpoint 时，preflight 还要求它和实际执行 Judge
+公布同一个稳定 deployment identity；没有 identity 或 identity 不匹配会拒绝运行，
+避免把旁路 backend 的 cache 状态当成执行 backend 的证据。
 
 ## Lean evaluator contract
 

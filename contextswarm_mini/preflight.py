@@ -108,6 +108,7 @@ def run_preflight(
             judge_mode=config.lean_judge_mode,
         )
         health = evaluator.health()
+        execution_identity = _deployment_identity(health)
         report["lean"] = _safe_health(health, config.lean_env_id)
         _validate_lean_health(report["lean"])
         # The strict kernel/index contract is enabled for paper-facing
@@ -191,9 +192,23 @@ def run_preflight(
                 raise PreflightError(
                     "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL must be set when disabled Judge result cache is required"
                 )
+            # A separately configured cache-health URL may point at a
+            # different Judge deployment.  Requiring a stable identity match
+            # prevents a healthy cache-disabled sidecar from being mistaken
+            # for the backend that actually receives proof submissions.
+            identity_required = not _same_endpoint(
+                config.lean_server_url,
+                cache_health_url,
+            )
+            if identity_required and execution_identity is None:
+                raise PreflightError(
+                    "Lean health lacks a stable execution deployment identity"
+                )
             cache_evidence = _result_cache_health(
                 cache_health_url,
                 config.lean_env_id,
+                expected_identity=execution_identity,
+                require_identity=identity_required,
             )
             report["lean"]["result_cache"] = cache_evidence
             if cache_evidence.get("enabled") is not False:
@@ -339,7 +354,13 @@ def _runtime_policy(base_url: str, token: str) -> dict[str, Any]:
     }
 
 
-def _result_cache_health(raw_url: str, requested_env: str) -> dict[str, Any]:
+def _result_cache_health(
+    raw_url: str,
+    requested_env: str,
+    *,
+    expected_identity: tuple[str, str] | None = None,
+    require_identity: bool = False,
+) -> dict[str, Any]:
     """Read cache state only from a ready backend serving ``requested_env``."""
 
     try:
@@ -399,11 +420,25 @@ def _result_cache_health(raw_url: str, requested_env: str) -> dict[str, Any]:
         raise PreflightError(
             "Judge cache-health backend does not advertise the requested environment"
         )
+    observed_identity = _deployment_identity(payload)
+    if require_identity and observed_identity is None:
+        raise PreflightError(
+            "Judge cache-health response lacks a stable deployment identity"
+        )
+    if expected_identity is not None and observed_identity != expected_identity:
+        raise PreflightError(
+            "Judge cache-health deployment identity does not match the execution Judge"
+        )
     result: dict[str, Any] = {
         "enabled": cache["enabled"],
         "backend_ready": True,
         "requested_env_accepted": True,
     }
+    if observed_identity is not None:
+        result["deployment_identity"] = {
+            "kind": observed_identity[0],
+            "value": observed_identity[1],
+        }
     backend = cache.get("backend")
     if isinstance(backend, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", backend):
         result["backend"] = backend
@@ -416,6 +451,66 @@ def _result_cache_health(raw_url: str, requested_env: str) -> dict[str, Any]:
     ):
         result["api_version"] = api_version
     return result
+
+
+_DEPLOYMENT_ID_KEYS = (
+    "deployment_id",
+    "execution_pool_id",
+    "router_id",
+    "service_instance_id",
+    "instance_id",
+)
+_DEPLOYMENT_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,160}")
+
+
+def _deployment_identity(payload: Any) -> tuple[str, str] | None:
+    """Extract one stable, non-secret Judge deployment identity."""
+
+    if not isinstance(payload, dict):
+        return None
+    candidates: list[dict[str, Any]] = [payload]
+    nested = payload.get("response")
+    if isinstance(nested, dict):
+        candidates.append(nested)
+    service = payload.get("service")
+    if isinstance(service, dict):
+        candidates.append(service)
+    for candidate in candidates:
+        for key in _DEPLOYMENT_ID_KEYS:
+            value = candidate.get(key)
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip()
+            if _DEPLOYMENT_ID_RE.fullmatch(normalized):
+                return key, normalized
+    return None
+
+
+def _same_endpoint(left: str, right: str) -> bool:
+    """Compare endpoint scopes without recording or exposing credentials."""
+
+    try:
+        left_parts = urlsplit(str(left or "").strip())
+        right_parts = urlsplit(str(right or "").strip())
+    except ValueError:
+        return False
+    if not left_parts.scheme or not left_parts.netloc or not right_parts.scheme or not right_parts.netloc:
+        return False
+    left_path = left_parts.path.rstrip("/")
+    right_path = right_parts.path.rstrip("/")
+    if left_path.endswith("/healthz"):
+        left_path = left_path[: -len("/healthz")].rstrip("/")
+    if right_path.endswith("/healthz"):
+        right_path = right_path[: -len("/healthz")].rstrip("/")
+    return (
+        left_parts.scheme.lower(),
+        left_parts.netloc.lower(),
+        left_path,
+    ) == (
+        right_parts.scheme.lower(),
+        right_parts.netloc.lower(),
+        right_path,
+    )
 
 
 def _version(binary: Path) -> str:
@@ -462,6 +557,12 @@ def _safe_health(payload: dict[str, Any], requested_env: str) -> dict[str, Any]:
         "lean_environment",
     }
     result = {key: payload[key] for key in allowed if key in payload}
+    identity = _deployment_identity(payload)
+    if identity is not None:
+        result["deployment_identity"] = {
+            "kind": identity[0],
+            "value": identity[1],
+        }
     accepted = payload.get("accepted_lean_env_ids")
     if isinstance(accepted, list):
         safe_accepted = [value for value in accepted if isinstance(value, str)]
