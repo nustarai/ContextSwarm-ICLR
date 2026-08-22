@@ -36,7 +36,15 @@ Prove that 3034 ≤ a₂₀₂₃.
 
         ## Work Mode
 
-        - Treat this as an offline proof-construction task.
+        - Follow the mandatory execution and verification contract in the worker prompt.
+        - Treat this as offline proof construction. The sole checking exception is
+          `judge_check`, the experiment-provided controlled external Judge interface.
+        - Never execute local Lean/lake/elan, install or download Lean/Mathlib/toolchains,
+          run a local verifier or proof search, perform resource-heavy computation, or
+          start background or parallel processes. Never call raw Judge HTTP endpoints.
+        - If `judge_check` is unavailable or overloaded, retry/wait only through that tool
+          within budget, or leave the best `result.lean`; do not create a local fallback.
+        - The assigned scope includes this task directory and any shared CPS context,
+          shared candidate, or helper tool explicitly named by the runner's worker prompt.
+          Do not browse any other home, system, runtime, worker, or session artifacts.
         - Edit `result.lean` only within the allowed proof surface described above.
-        - Use static Lean reasoning and edit only the allowed proof surface.
-        - Do not search outside the current task directory for Lean/Mathlib internals, including home, system, runtime source, aggregate output, or other worker/session artifact directories. Do not use network requests, external documentation sites, or online Lean/Mathlib search; proof context is limited to the current task directory and evaluator/verifier feedback.

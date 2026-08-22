@@ -316,7 +316,7 @@ class CPSStore:
             stats = result[task_id]
             stats["piece_count"] += 1
             kind = str(item.get("kind") or "")
-            if kind == "validation_result":
+            if kind == "validation_result" and _is_authoritative_validation_piece(item):
                 stats["validation_piece_count"] += 1
             elif kind in {"proof_strategy", "strategy", "handoff", "lemma", "blocker"}:
                 stats["strategy_piece_count"] += 1
@@ -379,6 +379,22 @@ def render_digest(digest: Mapping[str, Any], *, max_chars: int = 6_000) -> str:
     return text if len(text) <= max_chars else text[:max_chars] + "\n[context truncated]"
 
 
+def _is_authoritative_validation_piece(item: Mapping[str, Any]) -> bool:
+    if str(item.get("author") or "") != "runner":
+        return False
+    try:
+        payload = json.loads(str(item.get("body") or ""))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    return all(
+        isinstance(payload.get(key), str)
+        and re.fullmatch(r"[0-9a-f]{64}", str(payload[key]).lower()) is not None
+        for key in ("candidate_sha256", "task_contract_sha256")
+    )
+
+
 @dataclass
 class CommunicationPolicy:
     """Policy facade used by the runner; methods are no-ops for baseline mode."""
@@ -403,11 +419,27 @@ class CommunicationPolicy:
             )
         )
 
-    def publish(self, task_id: str, actor_id: str, *, title: str, body: str, kind: str = "handoff") -> None:
+    def publish(
+        self,
+        task_id: str,
+        actor_id: str,
+        *,
+        title: str,
+        body: str,
+        kind: str = "handoff",
+        tags: Iterable[str] = (),
+    ) -> None:
         if not self.enabled:
             return
         assert self.store is not None
-        self.store.create_piece(task_id=task_id, author=actor_id, kind=kind, title=title, body=body)
+        self.store.create_piece(
+            task_id=task_id,
+            author=actor_id,
+            kind=kind,
+            title=title,
+            body=body,
+            tags=tags,
+        )
 
     def send(self, task_id: str, actor_id: str, body: str, recipient: str | None = None) -> None:
         if not self.enabled or self.name == "blackboard":

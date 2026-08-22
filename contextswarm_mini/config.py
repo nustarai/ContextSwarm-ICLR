@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import copy
 import math
+import os
 from pathlib import Path
 import tomllib
 from typing import Any, Mapping
-from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
@@ -177,6 +177,7 @@ class ExperimentConfig:
     lean_max_concurrent_evaluations: int
     lean_verification_profile: str
     lean_judge_mode: str
+    lean_require_result_cache_disabled: bool
     docker_image: str
     docker_memory_mb: int
     docker_internet: str
@@ -237,12 +238,13 @@ class ExperimentConfig:
             "aisw_coordinator_configured": bool(self.aisw_coordinator_url),
             "aisw_account_configured": bool(self.aisw_account),
             "aisw_group_configured": bool(self.aisw_group),
-            "lean_server_url": _redact_endpoint(self.lean_server_url),
+            "lean_server_configured": bool(self.lean_server_url),
             "lean_env_id": self.lean_env_id,
             "lean_timeout_seconds": self.lean_timeout_seconds,
             "lean_max_concurrent_evaluations": self.lean_max_concurrent_evaluations,
             "lean_verification_profile": self.lean_verification_profile,
             "lean_judge_mode": self.lean_judge_mode,
+            "lean_require_result_cache_disabled": self.lean_require_result_cache_disabled,
             "docker_image": self.docker_image,
             "docker_memory_mb": self.docker_memory_mb,
             "docker_internet": self.docker_internet,
@@ -413,7 +415,13 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         2,
     )
 
-    lean_url = _text(lean.get("server_url"), "http://127.0.0.1:18000")
+    # The raw endpoint is an operator secret/capability.  It must enter only
+    # through the supervisor environment, never through a tracked manifest.
+    if _text(lean.get("server_url")):
+        raise ConfigError(
+            "lean.server_url is not allowed in manifests; set CONTEXTSWARM_JUDGE_URL at runtime"
+        )
+    lean_url = _text(os.environ.get("CONTEXTSWARM_JUDGE_URL"))
     lean_env = _text(lean.get("env_id"), "formal_matholympiadbench")
     lean_timeout = _positive_int(lean.get("timeout_seconds"), "lean.timeout_seconds", 300)
     lean_max_evaluations = _positive_int(
@@ -423,6 +431,9 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     )
     profile = _text(lean.get("verification_profile"), "formal_proof")
     judge_mode = _text(lean.get("judge_mode"), "fast")
+    require_result_cache_disabled = bool(
+        lean.get("require_result_cache_disabled", False)
+    )
 
     cfg = ExperimentConfig(
         manifest_path=manifest_path,
@@ -469,6 +480,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         lean_max_concurrent_evaluations=lean_max_evaluations,
         lean_verification_profile=profile,
         lean_judge_mode=judge_mode,
+        lean_require_result_cache_disabled=require_result_cache_disabled,
         docker_image=_text(docker.get("image"), "contextswarm-iclr-mini:latest"),
         docker_memory_mb=_positive_int(docker.get("memory_mb"), "docker.memory_mb", 16384),
         docker_internet=_text(docker.get("internet"), "online"),
@@ -477,17 +489,3 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     if cfg.uses_cps and cfg.episodes_per_task < 1:
         raise ConfigError("CPS requires at least one episode per task")
     return cfg
-
-
-def _redact_endpoint(raw: str) -> str:
-    value = str(raw or "").strip()
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return "<configured>" if value else ""
-    if parsed.scheme and parsed.hostname:
-        host = parsed.hostname
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
-        return f"{parsed.scheme}://{host}"
-    return "<configured>" if value else ""

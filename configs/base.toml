@@ -1,4 +1,5 @@
-# Shared paper-facing contract.  Do not put API keys or AISW tokens here.
+# Shared paper-facing contract. Do not put endpoints, API keys, or AISW tokens
+# here. Real runs receive the Judge base URL through CONTEXTSWARM_JUDGE_URL.
 
 [experiment]
 name = "mobench-cps"
@@ -79,12 +80,12 @@ lease_wait_seconds = 7200
 lease_retry_interval_seconds = 2
 
 [lean]
-server_url = "http://127.0.0.1:18000"
 env_id = "formal_matholympiadbench"
 timeout_seconds = 300
 max_concurrent_evaluations = 1
 verification_profile = "formal_proof"
 judge_mode = "fast"
+require_result_cache_disabled = false
 
 [docker]
 image = "contextswarm-iclr-mini:latest"

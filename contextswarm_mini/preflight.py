@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+from http.client import HTTPException
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tomllib
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .config import ExperimentConfig
-from .evaluator import LeanEvaluator
+from .evaluator import EvaluatorError, LeanEvaluator, sanitize_worker_text
 from .pi_agent import PiAgent
 
 
@@ -23,15 +26,21 @@ class PreflightError(RuntimeError):
 
 def run_preflight(config: ExperimentConfig, output_dir: Path) -> dict[str, Any]:
     """Check binary/config/Lean reachability without exposing credentials."""
+    if not config.lean_server_url:
+        raise PreflightError(
+            "CONTEXTSWARM_JUDGE_URL must be set for a real preflight"
+        )
     report: dict[str, Any] = {"schema_version": 1, "status": "ok", "aisw": {}, "lean": {}}
     agent = PiAgent(config)
     binary = Path(agent.binary())
     if not binary.is_file() or not os.access(binary, os.X_OK):
-        raise PreflightError(f"NuRouter/AISW Pi executable is not available: {binary}")
+        raise PreflightError("NuRouter/AISW Pi executable is not available")
     report["aisw"] = {
         "enabled": bool(config.aisw_enabled),
         "binary_sha256": _sha256(binary),
-        "nurouter_version": os.environ.get("MINI_SWARM_NUROUTER_VERSION", "unknown"),
+        "nurouter_version": sanitize_worker_text(
+            os.environ.get("MINI_SWARM_NUROUTER_VERSION", "unknown"), 200
+        ),
         "pi_binary_version": _version(binary),
     }
 
@@ -60,8 +69,31 @@ def run_preflight(config: ExperimentConfig, output_dir: Path) -> dict[str, Any]:
             )
         if report["lean"].get("workspace_ready") is False:
             raise PreflightError("Lean router workspace is not ready")
-    except Exception as exc:
-        raise PreflightError(f"Lean evaluator transport is unavailable: {exc}") from exc
+        if config.lean_require_result_cache_disabled:
+            cache_health_url = os.environ.get(
+                "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", ""
+            ).strip()
+            if not cache_health_url:
+                raise PreflightError(
+                    "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL must be set when disabled Judge result cache is required"
+                )
+            cache_evidence = _result_cache_health(
+                cache_health_url,
+                config.lean_env_id,
+            )
+            report["lean"]["result_cache"] = cache_evidence
+            if cache_evidence.get("enabled") is not False:
+                raise PreflightError("Judge result cache is not verifiably disabled")
+    except PreflightError:
+        raise
+    except EvaluatorError as exc:
+        raise PreflightError(
+            f"Lean evaluator transport is unavailable ({exc.category})"
+        ) from None
+    except Exception:
+        raise PreflightError(
+            "Lean evaluator transport is unavailable (unexpected_error)"
+        ) from None
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "transport_preflight.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -76,8 +108,8 @@ def _read_node_config(config: ExperimentConfig, raw: str) -> dict[str, Any]:
         path = config.resolve_runtime_path(raw)
     try:
         payload = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise PreflightError(f"AISW node config cannot be read: {path}") from exc
+    except (OSError, tomllib.TOMLDecodeError):
+        raise PreflightError("AISW node config cannot be read") from None
     if not isinstance(payload, dict):
         raise PreflightError("AISW node config must be a TOML table")
     return payload
@@ -91,13 +123,100 @@ def _runtime_policy(base_url: str, token: str) -> dict[str, Any]:
     try:
         with urlopen(Request(url, headers=headers, method="GET"), timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise PreflightError("NuRouter runtime-policy request failed") from exc
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        HTTPException,
+        TypeError,
+        ValueError,
+    ):
+        raise PreflightError("NuRouter runtime-policy request failed") from None
     allowed = payload.get("allowCodexFastMode") if isinstance(payload, dict) else None
     return {
         "status": "ok" if allowed is True else "blocked",
         "allow_codex_fast_mode": allowed if isinstance(allowed, bool) else None,
     }
+
+
+def _result_cache_health(raw_url: str, requested_env: str) -> dict[str, Any]:
+    """Read cache state only from a ready backend serving ``requested_env``."""
+
+    try:
+        parsed = urlsplit(raw_url.strip())
+    except ValueError:
+        raise PreflightError("Judge cache-health endpoint is invalid") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise PreflightError("Judge cache-health endpoint is invalid")
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/healthz"):
+        path = f"{path}/healthz" if path else "/healthz"
+    url = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    try:
+        with urlopen(
+            Request(url, headers={"Accept": "application/json"}, method="GET"),
+            timeout=10,
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        HTTPError,
+        URLError,
+        TimeoutError,
+        OSError,
+        HTTPException,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ):
+        raise PreflightError("Judge cache-health request failed") from None
+    cache = payload.get("result_cache") if isinstance(payload, dict) else None
+    if not isinstance(cache, dict) or not isinstance(cache.get("enabled"), bool):
+        raise PreflightError("Judge cache-health response lacks result_cache.enabled")
+    if payload.get("ok") is not True or payload.get("workspace_ready") is not True:
+        raise PreflightError("Judge cache-health backend is not ready")
+    for readiness_field in (
+        "safeverify_ready",
+        "formal_strict_safeverify_ready",
+    ):
+        if readiness_field in payload and payload.get(readiness_field) is not True:
+            raise PreflightError("Judge cache-health backend is not ready")
+    advertised_envs: set[str] = set()
+    for env_field in ("accepted_lean_env_ids", "supported_lean_env_ids"):
+        raw_envs = payload.get(env_field)
+        if isinstance(raw_envs, list):
+            advertised_envs.update(
+                value for value in raw_envs if isinstance(value, str)
+            )
+    if requested_env not in advertised_envs:
+        raise PreflightError(
+            "Judge cache-health backend does not advertise the requested environment"
+        )
+    result: dict[str, Any] = {
+        "enabled": cache["enabled"],
+        "backend_ready": True,
+        "requested_env_accepted": True,
+    }
+    backend = cache.get("backend")
+    if isinstance(backend, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", backend):
+        result["backend"] = backend
+    service = payload.get("service")
+    if isinstance(service, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", service):
+        result["service"] = service
+    api_version = payload.get("api_version")
+    if isinstance(api_version, str) and re.fullmatch(
+        r"[A-Za-z0-9_.-]{1,64}", api_version
+    ):
+        result["api_version"] = api_version
+    return result
 
 
 def _version(binary: Path) -> str:
@@ -112,7 +231,7 @@ def _version(binary: Path) -> str:
     except (OSError, subprocess.SubprocessError):
         return "unavailable"
     line = (result.stdout or result.stderr or "").splitlines()
-    return line[0][:200] if line else "unavailable"
+    return sanitize_worker_text(line[0], 200) if line else "unavailable"
 
 
 def _sha256(path: Path) -> str:

@@ -11,3 +11,6 @@ output_root = "runs/1h_allocation"
 piece_limit_per_task = 3
 piece_body_chars = 1200
 agent_timeout_seconds = 120
+
+[lean]
+require_result_cache_disabled = true

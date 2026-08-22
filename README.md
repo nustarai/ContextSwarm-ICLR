@@ -54,6 +54,9 @@ CONTEXTSWARM_MINI_PI_VERSION=0.84.2 scripts/build_image.sh
 
 镜像同时固定 Codex compatibility binary（当前默认 `0.148.0`，可用
 `CONTEXTSWARM_MINI_CODEX_VERSION` 覆盖）。
+正式构建只接受 clean worktree，并使用 `git archive HEAD` 作为 Docker context；
+镜像 label 绑定完整 source commit。启动器会校验实际 image ID 与 revision label，
+并把两者写入 run provenance，因此三个 allocation arm 可以做精确版本联结。
 
 默认 manifest 使用标准 provider routing（`fast_mode = false`），这样可以
 兼容没有 runtime-policy endpoint 的 NuRouter release；确认 coordinator 的
@@ -64,7 +67,13 @@ manifest 中打开 fast mode。
 
 1. 可在 Linux 容器执行的 NuRouter/AISW release ELF（优先使用 `nurouter`）；
 2. NuRouter node/coordinator 配置（默认读取 `~/.nurouter/node.toml`）；
-3. 可访问的 MathOlympiadBench Lean router（默认 `http://127.0.0.1:18000`）。
+3. 可访问的 MathOlympiadBench Lean Judge，并在宿主环境中设置
+   `CONTEXTSWARM_JUDGE_URL`。Judge 地址不会写入 tracked manifest。
+
+正式 allocation 和 canary manifest 还要求 supervisor 注入
+`CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL`。它必须指向同一 Judge backend 的
+`/healthz`（也可以给 backend base URL），用于 fail-closed 地确认本次 Lean 环境
+就绪且 result cache 已禁用。
 
 如果使用同机的 `ContextSwarmJudge`，需要启动完整 formal stack（不要只启动
 Lean-Eval slice），例如：
@@ -74,14 +83,22 @@ cd /path/to/ContextSwarmJudge
 ./scripts/start_formal_lean_stack.sh up
 ```
 
-然后确认 `18000/healthz` 的 `accepted_lean_env_ids` 包含
-`formal_matholympiadbench`。
+然后通过 Judge 的 health endpoint 确认 `accepted_lean_env_ids` 包含
+`formal_matholympiadbench`。真实 run 和 preflight 在该变量未设置时会直接拒绝
+启动；离线 `--mock-agent` smoke 不需要它。
 
 默认运行 CPS：
 
 ```bash
+# 先在本地 shell 或 secret manager 中设置并 export CONTEXTSWARM_JUDGE_URL。
 scripts/run_docker.sh --config configs/cps.toml
 ```
+
+启动脚本只把环境变量名（`-e CONTEXTSWARM_JUDGE_URL`）交给 Docker，避免私有值
+出现在进程参数、命令日志或 run summary。runner 会把它转换成每个 solver session
+独立的 loopback capability；Solver 看不到 raw Judge endpoint。
+cache-health capability 也只按变量名注入，只供 supervisor preflight 使用；其私有值
+不会交给 Solver，也不会写入 tracked manifest、preflight 证据或运行摘要。
 
 正式启动前可以只做 transport 检查（不会启动 Pi session）：
 
@@ -177,13 +194,18 @@ python3 scripts/compare_runs.py \
   runs/1h_allocation/agent/<run-id>
 ```
 
-用于短 canary 的 180 秒 manifest 已保留在 `configs/3min_*.toml`：
+正式实验前先运行单题、单 agent、单次尝试的 180 秒 controlled-Judge canary，
+并让 fail-closed 审计确认至少发生一次真实 `judge_check`：
 
 ```bash
-scripts/run_docker.sh --config configs/3min_mono.toml
-scripts/run_docker.sh --config configs/3min_parallel.toml
-scripts/run_docker.sh --config configs/3min_cps.toml
+scripts/run_docker.sh --config configs/canary.toml
+python3 scripts/audit_canary_closeout.py runs/canary/<run-id>
 ```
+
+审计同时检查真实镜像 provenance、受控 Solver command/tool allowlist、Judge probe
+provenance、broker drain、health、429/OOM/worker error，并报告是否观察到远端 job
+DELETE；自然完成且没有取消 job 的 canary 不强制伪造 DELETE。完整的 3 分钟
+Mono/Parallel/CPS 调试 manifests 仍保留在 `configs/3min_*.toml`。
 
 3 分钟 horizon 到达后，runner 会停止 Pi session，并跳过已经迟到的 Lean
 提交/长轮询；这保证 container closeout 不会被 evaluator queue 无限拖延。
@@ -200,7 +222,14 @@ CONTEXTSWARM_CODEX_HOME=$HOME/.codex \
 scripts/run_docker.sh --config configs/cps.toml
 ```
 
-脚本通过 `--network host` 让容器访问宿主机上的 AISW coordinator 和 Lean router；AISW binary 与 node config 只读挂载，不会被复制进仓库或镜像。若环境不允许 host network，请把 manifest 中的服务地址改成容器可达地址。
+脚本通过 `--network host` 让容器访问 AISW coordinator 和环境变量注入的 Judge；
+AISW binary、node config 和可选 Codex home 都只读挂载，随后所需私有 metadata
+会复制到容器的临时 `/run`。容器使用宿主 UID/GID、只读根文件系统、受限 PID、
+`no-new-privileges` 和独立 tmpfs，因此新 run artifacts 不再由 root 创建。若服务不在
+宿主网络上，应把 `CONTEXTSWARM_JUDGE_URL` 设置为容器实际可达的地址，而不是修改
+tracked manifest。实验代码、Prompt、manifest 与 benchmark 均使用构建时写入镜像的
+冻结副本；运行时只挂载宿主 `runs/` 输出目录，避免一小时实验中途受到 worktree
+修改影响。
 
 `run_docker.sh` 会同时发现相邻的 `.nurouter-pi-launcher.json`（或旧
 `.aisw-pi-launcher.json`），并在容器内重写 `real_pi`/`real_codex` 到镜像内
@@ -214,15 +243,10 @@ scripts/run_docker.sh --config configs/cps_fast.toml preflight
 
 ## CPS 接口
 
-CPS worker 在工作目录中获得 `./context_piece`：
-
-```bash
-./context_piece search --query inequality
-./context_piece create --kind proof_strategy --title 'route' --body '...'
-./context_piece message send --to worker-imo2024_p1-e2 --body '...'
-./context_piece message inbox
-./context_piece actor list
-```
+CPS worker 没有 shell 或本地 `context_piece` CLI。它只能通过 runner 注入的受控
+tools 使用 CPS：`cps_search`、`cps_publish`、`cps_inbox`、`cps_send`、`cps_ack`
+和 `cps_actors`。这些调用都经过 session-bound loopback broker；agent 不能直接读取
+SQLite、跨 workspace 浏览，或自行发起网络请求。
 
 `communication = none` 的 Mono/Parallel workspace 不会创建共享数据库或 helper，避免 baseline 意外获得通信能力。CPS 的实现集中在 `contextswarm_mini/cps.py`，后续可以只替换 policy、ranking 或 digest，而不改 NuRouter/Pi transport。
 

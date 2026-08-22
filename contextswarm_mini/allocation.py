@@ -18,6 +18,18 @@ from typing import Any, Callable, Iterable, Mapping
 from .models import AgentResult
 
 
+_PROVED_STATUS_ALIASES = frozenset({"PROVED", "AC", "PASS", "PASSED"})
+
+
+def normalize_verdict_status(status: Any) -> str:
+    """Return one canonical status for policy features and best comparisons."""
+
+    normalized = str(status or "UNKNOWN").strip().upper() or "UNKNOWN"
+    if normalized in _PROVED_STATUS_ALIASES:
+        return "PROVED"
+    return normalized
+
+
 @dataclass(frozen=True)
 class EvidencePiece:
     """A bounded, read-only CPS item exposed to an allocation policy."""
@@ -62,6 +74,38 @@ class TaskProgress:
     strategy_piece_count: int
     duplicate_piece_count: int
     recent_pieces: tuple[EvidencePiece, ...] = ()
+
+    def causal_fingerprint(self) -> tuple[Any, ...]:
+        """State whose change can invalidate a decision about this task.
+
+        Wall-clock ages are deliberately excluded: merely spending model time
+        must not make an otherwise unchanged choice stale.  Other tasks are
+        absent because each decision is revalidated only against its selected
+        task.
+        """
+
+        pieces = tuple(
+            (piece.piece_id, piece.kind, piece.title, piece.body, piece.author)
+            for piece in self.recent_pieces
+        )
+        return (
+            self.task_id,
+            self.eligible,
+            self.solved,
+            self.active_agents,
+            self.attempts,
+            self.completed_attempts,
+            normalize_verdict_status(self.best_status),
+            float(self.best_score),
+            normalize_verdict_status(self.last_verdict_status),
+            self.last_feedback,
+            self.consecutive_failures,
+            self.piece_count,
+            self.validation_piece_count,
+            self.strategy_piece_count,
+            self.duplicate_piece_count,
+            pieces,
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -108,6 +152,12 @@ class TaskProgressSnapshot:
             for piece in task.recent_pieces
         )
 
+    def task_causal_fingerprint(self, task_id: str) -> tuple[Any, ...] | None:
+        for task in self.tasks:
+            if task.task_id == task_id:
+                return task.causal_fingerprint()
+        return None
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema_version": "contextswarm_task_progress_v1",
@@ -137,6 +187,12 @@ class AllocationDecision:
     features: dict[str, dict[str, float]] = field(default_factory=dict)
     agent_returncode: int | None = None
     agent_timed_out: bool = False
+    agent_cancelled: bool = False
+    agent_result_valid: bool | None = None
+    agent_id: str = ""
+    agent_task_id: str = ""
+    agent_episode: int | None = None
+    agent_run_horizon_reached: bool = False
 
     def __post_init__(self) -> None:
         if not self.requested_task_id:
@@ -161,6 +217,12 @@ class AllocationDecision:
             },
             "agent_returncode": self.agent_returncode,
             "agent_timed_out": self.agent_timed_out,
+            "agent_cancelled": self.agent_cancelled,
+            "agent_result_valid": self.agent_result_valid,
+            "agent_id": self.agent_id,
+            "agent_task_id": self.agent_task_id,
+            "agent_episode": self.agent_episode,
+            "agent_run_horizon_reached": self.agent_run_horizon_reached,
         }
         if snapshot is not None:
             row["snapshot"] = snapshot.as_dict()
@@ -250,11 +312,9 @@ class FormulaAllocationPolicy:
         active_balance = 1.0 / (1.0 + max(0, task.active_agents))
         status_quality = {
             "PROVED": p["proved_quality"],
-            "AC": p["proved_quality"],
-            "PASSED": p["proved_quality"],
             "COMPILES_WITH_SORRY": p["compiles_with_sorry_quality"],
             "VERIFY_FAIL": p["verify_fail_quality"],
-        }.get(task.best_status, p["other_status_quality"])
+        }.get(normalize_verdict_status(task.best_status), p["other_status_quality"])
         progress_window = max(1.0, p["progress_window_seconds"])
         recent_progress = math.exp(-max(0.0, task.seconds_since_progress) / progress_window)
         evidence_scale = max(1.0, p["evidence_saturation"])
@@ -414,6 +474,26 @@ SNAPSHOT:
     def choose(self, snapshot: TaskProgressSnapshot) -> AllocationDecision:
         started = time.monotonic()
         result = self._invoke(snapshot, self.prompt(snapshot), snapshot.decision_index)
+        if result.run_horizon_reached:
+            decision = AllocationDecision(
+                decision_index=snapshot.decision_index,
+                policy=self.name,
+                selected_task_id="",
+                requested_task_id="",
+                reason="scheduler agent was truncated by the overall run horizon",
+                latency_seconds=time.monotonic() - started,
+                agent_returncode=result.returncode,
+                agent_timed_out=result.timed_out,
+                agent_cancelled=result.cancelled,
+                agent_result_valid=None,
+                agent_id=result.agent_id,
+                agent_task_id=result.task_id,
+                agent_episode=result.episode,
+                agent_run_horizon_reached=True,
+            )
+            with self._lock:
+                self._decisions.append(decision)
+            return decision
         parsed, error = self._parse(result, snapshot)
         latency = time.monotonic() - started
         if parsed is None:
@@ -430,6 +510,11 @@ SNAPSHOT:
                 fallback_reason=error,
                 agent_returncode=result.returncode,
                 agent_timed_out=result.timed_out,
+                agent_cancelled=result.cancelled,
+                agent_result_valid=False,
+                agent_id=result.agent_id,
+                agent_task_id=result.task_id,
+                agent_episode=result.episode,
             )
         else:
             decision = AllocationDecision(
@@ -441,6 +526,11 @@ SNAPSHOT:
                 latency_seconds=latency,
                 agent_returncode=result.returncode,
                 agent_timed_out=result.timed_out,
+                agent_cancelled=result.cancelled,
+                agent_result_valid=True,
+                agent_id=result.agent_id,
+                agent_task_id=result.task_id,
+                agent_episode=result.episode,
             )
         with self._lock:
             self._decisions.append(decision)
@@ -470,6 +560,20 @@ SNAPSHOT:
         result = _decision_summary(self.name, decisions)
         result["agent_calls"] = len(decisions)
         result["agent_timeouts"] = sum(decision.agent_timed_out for decision in decisions)
+        result["agent_policy_timeouts"] = sum(
+            decision.agent_timed_out and not decision.agent_run_horizon_reached
+            for decision in decisions
+        )
+        result["agent_horizon_truncations"] = sum(
+            decision.agent_run_horizon_reached for decision in decisions
+        )
+        result["agent_cancellations"] = sum(decision.agent_cancelled for decision in decisions)
+        result["agent_invalid_outputs"] = sum(
+            decision.agent_result_valid is False for decision in decisions
+        )
+        result["agent_nonzero_returns"] = sum(
+            decision.agent_returncode not in {None, 0} for decision in decisions
+        )
         return result
 
 
@@ -500,4 +604,5 @@ __all__ = [
     "TaskProgress",
     "TaskProgressSnapshot",
     "UniformAllocationPolicy",
+    "normalize_verdict_status",
 ]
