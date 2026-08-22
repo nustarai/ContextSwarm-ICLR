@@ -1325,6 +1325,45 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(json.loads(rows[0])["status"], "TASK_CANCELLED")
 
+    def test_drain_deadline_boundary_accepts_already_quiet_broker(self) -> None:
+        """Do not fail closeout when the last handler exits at the deadline."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            evaluator = _RecordingEvaluator()
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=Path(temporary) / "audit.jsonl",
+                min_probe_interval_seconds=0,
+            )
+
+            samples = iter(
+                [
+                    {
+                        "active_handlers": 1,
+                        "fifo_depth": 0,
+                        "remote_unsettled_jobs": 0,
+                    },
+                    {
+                        "active_handlers": 0,
+                        "fifo_depth": 0,
+                        "remote_unsettled_jobs": 0,
+                    },
+                ]
+            )
+            with patch.object(broker, "drain_state", side_effect=lambda: next(samples)):
+                state = broker._wait_for_drain(time.monotonic() - 1.0)
+
+            self.assertEqual(
+                state,
+                {
+                    "drained": True,
+                    "active_handlers": 0,
+                    "fifo_depth": 0,
+                    "remote_unsettled_jobs": 0,
+                },
+            )
+
     def test_close_cancels_active_evaluator_then_waits_for_handler_audit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

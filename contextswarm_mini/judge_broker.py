@@ -495,7 +495,25 @@ class JudgeBroker:
                 }
             remaining = deadline_monotonic - time.monotonic()
             if remaining <= 0:
-                return {"drained": False, **state}
+                # A handler can finish on the same tick that the deadline is
+                # reached.  The state sampled above is then stale, and
+                # returning an unconditional failure turns an already quiet
+                # broker into a spurious closeout error.  Re-sample once at
+                # the boundary and accept the close if every accounting
+                # domain is actually empty.
+                final_state = self.drain_state()
+                pending_watchers = _nonnegative_count(
+                    getattr(self.evaluator, "pending_settlement_watchers", 0)
+                )
+                drained = (
+                    final_state["active_handlers"] == 0
+                    and final_state["fifo_depth"] == 0
+                    and pending_watchers == 0
+                    and final_state["remote_unsettled_jobs"] == 0
+                )
+                if pending_watchers:
+                    final_state["pending_settlement_watchers"] = pending_watchers
+                return {"drained": drained, **final_state}
             with self._handler_condition:
                 self._handler_condition.wait(timeout=min(remaining, 0.05))
 
