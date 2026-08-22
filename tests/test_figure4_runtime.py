@@ -6,11 +6,16 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
-from contextswarm_mini.allocation_core import ReadOnlyLLMSchedulerPolicy
+from contextswarm_mini.allocation_core import (
+    LLMSchedulerResponse,
+    ReadOnlyLLMSchedulerPolicy,
+)
 from contextswarm_mini.allocation_audit import AllocationAuditRecord
+from contextswarm_mini.allocator_selection import _extract_cost
 from contextswarm_mini.config import load_config
 from contextswarm_mini.elastic_scheduler import ElasticScheduler
 from contextswarm_mini.runner import run_experiment
@@ -39,6 +44,23 @@ def _config(policy: str, *, attempts: int = 3):
 
 
 class Figure4RuntimeTests(unittest.TestCase):
+    def assert_scheduler_summary_is_selectable(
+        self,
+        run_dir: Path,
+    ) -> dict[str, object]:
+        summary = json.loads(
+            (run_dir / "figure4_run_summary.json").read_text(encoding="utf-8")
+        )
+        scheduler = summary["scheduler_cost"]
+        metrics = summary["allocation_metrics"]
+        self.assertEqual(scheduler["fallback_count"], metrics["fallbacks"])
+        self.assertEqual(scheduler["invalid_outputs"], metrics["invalid_outputs"])
+        self.assertEqual(
+            scheduler["horizon_truncations"], metrics["horizon_truncations"]
+        )
+        _extract_cost(summary, "llm_scheduler")
+        return summary
+
     def test_four_policies_run_and_trace_audits_exact_admissions(self) -> None:
         initial_orders: list[list[str]] = []
         with tempfile.TemporaryDirectory() as temporary:
@@ -261,6 +283,130 @@ class Figure4RuntimeTests(unittest.TestCase):
             summary["scheduler_cost"]["reserved_slot_seconds"],
             summary["scheduler_reserved_slot_seconds"],
         )
+        figure4 = self.assert_scheduler_summary_is_selectable(run_dir)
+        self.assertEqual(figure4["scheduler_cost"]["fallback_count"], 1)
+        self.assertEqual(figure4["scheduler_cost"]["invalid_outputs"], 0)
+        self.assertEqual(figure4["scheduler_cost"]["horizon_truncations"], 0)
+
+    def test_llm_malformed_output_summary_is_selectable(self) -> None:
+        original_choose = ReadOnlyLLMSchedulerPolicy.choose
+        malformed_sent = False
+
+        def malformed_once(policy, snapshot):
+            nonlocal malformed_sent
+            if not malformed_sent:
+                malformed_sent = True
+                original_invoke = policy._invoke
+                policy._invoke = lambda *_args: LLMSchedulerResponse(
+                    output="not scheduler JSON",
+                    latency_seconds=0.01,
+                    occupied_slot_seconds=0.01,
+                )
+                try:
+                    return original_choose(policy, snapshot)
+                finally:
+                    policy._invoke = original_invoke
+            return original_choose(policy, snapshot)
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.object(
+            ReadOnlyLLMSchedulerPolicy,
+            "choose",
+            malformed_once,
+        ):
+            run_dir = run_experiment(
+                _config("llm_scheduler", attempts=2),
+                mock_agent=True,
+                output_override=Path(temporary.name),
+            )
+
+        summary = self.assert_scheduler_summary_is_selectable(run_dir)
+        self.assertEqual(summary["scheduler_cost"]["fallback_count"], 1)
+        self.assertEqual(summary["scheduler_cost"]["invalid_outputs"], 1)
+        self.assertEqual(summary["scheduler_cost"]["horizon_truncations"], 0)
+
+    def test_llm_horizon_truncation_summary_is_selectable(self) -> None:
+        original_mock_result = runner_module._mock_result
+
+        def horizon_scheduler_result(agent_id: str, task_id: str, episode: int):
+            result = original_mock_result(agent_id, task_id, episode)
+            if task_id == "__allocation__":
+                result.returncode = 124
+                result.timed_out = True
+                result.run_horizon_reached = True
+                result.error_tail = "overall run horizon elapsed"
+            return result
+
+        base = _config("llm_scheduler", attempts=2)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            time_limit_seconds=0.1,
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.object(
+            runner_module,
+            "_mock_result",
+            horizon_scheduler_result,
+        ):
+            run_dir = run_experiment(
+                config,
+                mock_agent=True,
+                output_override=Path(temporary.name),
+            )
+
+        decisions = _rows(run_dir / "allocation_decisions.jsonl")
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["disposition"], "not_admitted_horizon")
+        self.assertFalse(decisions[0]["fallback"])
+        summary = self.assert_scheduler_summary_is_selectable(run_dir)
+        self.assertEqual(summary["scheduler_cost"]["fallback_count"], 0)
+        self.assertEqual(summary["scheduler_cost"]["invalid_outputs"], 0)
+        self.assertEqual(summary["scheduler_cost"]["horizon_truncations"], 1)
+
+    def test_llm_admission_deadline_summary_is_selectable(self) -> None:
+        """A valid decision can cross the horizon after its provider returns."""
+
+        original_choose = ReadOnlyLLMSchedulerPolicy.choose
+        delayed = False
+
+        def cross_deadline_once(policy, snapshot):
+            nonlocal delayed
+            decision = original_choose(policy, snapshot)
+            if not delayed:
+                delayed = True
+                time.sleep(0.08)
+            return decision
+
+        base = _config("llm_scheduler", attempts=2)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            time_limit_seconds=0.05,
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        with patch.object(
+            ReadOnlyLLMSchedulerPolicy,
+            "choose",
+            cross_deadline_once,
+        ):
+            run_dir = run_experiment(
+                config,
+                mock_agent=True,
+                output_override=Path(temporary.name),
+            )
+
+        decisions = _rows(run_dir / "allocation_decisions.jsonl")
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["disposition"], "not_admitted_horizon")
+        self.assertFalse(decisions[0]["fallback"])
+        summary = self.assert_scheduler_summary_is_selectable(run_dir)
+        self.assertEqual(summary["scheduler_cost"]["horizon_truncations"], 1)
 
     def test_llm_global_state_change_is_stale_and_not_admitted(self) -> None:
         original_choose = ReadOnlyLLMSchedulerPolicy.choose
