@@ -65,6 +65,31 @@ class ElasticSchedulerTests(unittest.TestCase):
         self.assertTrue(snapshot["retired"])
         self.assertEqual(snapshot["retired_reason"], "attempt_budget_exhausted")
 
+    def test_retired_task_does_not_leave_a_phantom_initial_quota(self) -> None:
+        scheduler = ElasticScheduler(
+            ["a", "b"],
+            max_parallel=2,
+            initial_agents={"a": 2, "b": 1},
+            horizon=20,
+        )
+        first = scheduler.next_assignment()
+        second = scheduler.next_assignment()
+        assert first is not None and second is not None
+        self.assertEqual((first.task_id, second.task_id), ("a", "b"))
+        self.assertTrue(scheduler.has_pending_initial)
+
+        scheduler.finish(first, retire_reason="attempt_budget_exhausted")
+
+        self.assertFalse(scheduler.has_pending_initial)
+        replacement = scheduler.next_assignment()
+        self.assertIsNotNone(replacement)
+        assert replacement is not None
+        self.assertEqual(replacement.task_id, "b")
+        self.assertEqual(
+            scheduler.snapshot()["tasks"]["b"]["initial_admitted"],
+            1,
+        )
+
     def test_horizon_blocks_new_leases_but_allows_closeout(self) -> None:
         current = [10.0]
         scheduler = ElasticScheduler(["a"], max_parallel=1, initial_agents=1, horizon=5, clock=lambda: current[0])

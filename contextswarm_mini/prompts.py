@@ -11,6 +11,13 @@ SOLVER_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
 - Use only `judge_check`, the experiment-provided controlled Judge interface, for
   Lean checking. `CONTEXTSWARM_JUDGE_URL` is reserved for that tool: do not read,
   print, modify, or use it to contact the Judge yourself.
+- A mandatory early Judge checkpoint is required for every assigned task. After
+  reading the theorem and current `result.lean`, immediately submit the current
+  candidate through `judge_check` before any optional coordination, recipient
+  discovery, or extended proof search.
+  Do not wait for a polished proof: `COMPILES_WITH_SORRY` or `VERIFY_FAIL` is useful
+  remote feedback. Afterward, keep checks serial and submit again only after a
+  material edit.
 - Never invoke local `lean`, `lake`, `elan`, a local verifier, proof-search service,
   or any other local proof checker. Do not install or download Lean, Mathlib,
   toolchains, packages, caches, compilers, or solver infrastructure.

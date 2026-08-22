@@ -13,6 +13,7 @@ from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -116,6 +117,9 @@ HOST_PORT_RE = re.compile(r"^[A-Za-z0-9_.-]+:\d+(?:/|$)")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+MANIFEST_PATH_RE = re.compile(
+    r"^configs/allocation_1h_cps48_(uniform|formula|agent)\.toml$"
+)
 BROKER_CLOSEOUT_SCHEMA = "contextswarm_judge_broker_closeout_v1"
 SECRET_VALUE_RE = re.compile(
     r"(?:\bbearer\s+[A-Za-z0-9._~+/=-]{8,}|"
@@ -678,6 +682,28 @@ def _check_runtime_provenance(
             issues,
             "runtime_image_id_invalid",
             field_name="run_meta.runtime_provenance.image_id",
+        )
+    manifest_path = provenance.get("manifest_path")
+    manifest_match = (
+        MANIFEST_PATH_RE.fullmatch(manifest_path)
+        if isinstance(manifest_path, str)
+        else None
+    )
+    allocation = meta.get("allocation")
+    expected_policy = (
+        allocation.get("policy") if isinstance(allocation, Mapping) else None
+    )
+    if manifest_match is None or manifest_match.group(1) != expected_policy:
+        _add_issue(
+            issues,
+            "runtime_manifest_path_invalid",
+            field_name="run_meta.runtime_provenance.manifest_path",
+        )
+    if not _valid_sha256(provenance.get("manifest_sha256")):
+        _add_issue(
+            issues,
+            "runtime_manifest_sha256_invalid",
+            field_name="run_meta.runtime_provenance.manifest_sha256",
         )
 
 
@@ -1370,6 +1396,537 @@ def _evaluation_provenance_keys(
     return keys, cache_reused_keys
 
 
+@dataclass
+class _CloseoutEvidence:
+    direct_keys: set[tuple[str, str, str, str]] = field(default_factory=set)
+    positive_direct_keys: Counter[tuple[str, str, str, str]] = field(
+        default_factory=Counter
+    )
+    cache_reused_keys: set[tuple[str, str, str, str]] = field(default_factory=set)
+    prior_authority_keys: set[tuple[str, str, str, str]] = field(default_factory=set)
+
+
+def _verdict_projection(payload: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    if any(field_name not in payload for field_name in CLOSEOUT_VERDICT_FIELDS):
+        return None
+    score = payload.get("score")
+    elapsed = payload.get("elapsed_seconds")
+    response = payload.get("response")
+    error = payload.get("error")
+    cache_reused = payload.get("cache_reused")
+    task_id = payload.get("task_id")
+    status = _normalize_status(payload.get("status"))
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or not status
+        or isinstance(score, bool)
+        or not isinstance(score, (int, float))
+        or isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not isinstance(response, Mapping)
+        or (error is not None and not isinstance(error, str))
+        or not isinstance(cache_reused, bool)
+    ):
+        return None
+    candidate_hash = payload.get("candidate_sha256")
+    contract_hash = payload.get("task_contract_sha256")
+    judge_job_id = payload.get("judge_job_id")
+    if candidate_hash is not None and not isinstance(candidate_hash, str):
+        return None
+    if contract_hash is not None and not isinstance(contract_hash, str):
+        return None
+    if judge_job_id is not None and not isinstance(judge_job_id, str):
+        return None
+    return (
+        task_id,
+        status,
+        float(score),
+        float(elapsed),
+        deepcopy(dict(response)),
+        error,
+        candidate_hash.lower() if isinstance(candidate_hash, str) else None,
+        contract_hash.lower() if isinstance(contract_hash, str) else None,
+        judge_job_id,
+        cache_reused,
+    )
+
+
+def _hash_file(path: Path) -> str | None:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _closeout_index_rows(
+    run_dir: Path,
+    root_index: Mapping[str, Any] | None,
+    nested_index: Mapping[str, Any] | None,
+    task_ids: set[str],
+    issues: list[dict[str, str]],
+) -> dict[str, dict[str, Any]]:
+    if root_index is None or nested_index is None or root_index != nested_index:
+        _add_issue(issues, "closeout_candidate_index_invalid")
+        return {}
+    rows = root_index.get("candidates")
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        _add_issue(issues, "closeout_candidate_index_invalid")
+        return {}
+    indexed: dict[str, dict[str, Any]] = {}
+    run_root = run_dir.resolve()
+    snapshot_root = (run_root / "closeout_candidates").resolve()
+    invalid = len(rows) != len(task_ids)
+    for row in rows:
+        task_id = row.get("task_id")
+        candidate_hash = row.get("candidate_sha256")
+        source = row.get("source")
+        snapshot = row.get("snapshot")
+        if (
+            not isinstance(task_id, str)
+            or not task_id
+            or task_id in indexed
+            or not _valid_sha256(candidate_hash)
+            or not isinstance(source, str)
+            or not source
+            or not isinstance(snapshot, str)
+            or not snapshot
+        ):
+            invalid = True
+            continue
+        source_path = Path(source)
+        snapshot_path = Path(snapshot)
+        if source_path.is_absolute() or snapshot_path.is_absolute():
+            invalid = True
+            continue
+        try:
+            resolved_source = (run_root / source_path).resolve()
+            resolved_source.relative_to(run_root)
+            resolved_snapshot = (run_root / snapshot_path).resolve()
+            resolved_snapshot.relative_to(snapshot_root)
+        except (OSError, ValueError):
+            invalid = True
+            continue
+        if _hash_file(resolved_snapshot) != str(candidate_hash).lower():
+            invalid = True
+            continue
+        indexed[task_id] = row
+    if invalid or set(indexed) != task_ids:
+        _add_issue(issues, "closeout_candidate_index_invalid")
+    return indexed
+
+
+def _single_rows_by_task(
+    rows: Iterable[Mapping[str, Any]],
+    event_name: str,
+    issues: list[dict[str, str]],
+    issue_code: str,
+) -> dict[str, Mapping[str, Any]]:
+    indexed: dict[str, Mapping[str, Any]] = {}
+    invalid = False
+    for row in rows:
+        if row.get("event") != event_name:
+            continue
+        task_id = row.get("task_id")
+        if not isinstance(task_id, str) or not task_id or task_id in indexed:
+            invalid = True
+            continue
+        indexed[task_id] = row
+    if invalid:
+        _add_issue(issues, issue_code)
+    return indexed
+
+
+def _same_optional_hash(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is right
+    return bool(
+        isinstance(left, str)
+        and isinstance(right, str)
+        and left.lower() == right.lower()
+    )
+
+
+def _response_mapping(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    response = payload.get("response")
+    return response if isinstance(response, Mapping) else {}
+
+
+def _check_closeout_lifecycle(
+    *,
+    run_dir: Path,
+    meta: Mapping[str, Any] | None,
+    events: list[dict[str, Any]],
+    scoreboard: list[dict[str, Any]],
+    verdicts: Mapping[str, Any],
+    reported_final_score: Any,
+    task_ids: set[str],
+    root_index: Mapping[str, Any] | None,
+    nested_index: Mapping[str, Any] | None,
+    accepted_judge: set[tuple[str, str, str, str]],
+    issues: list[dict[str, str]],
+) -> _CloseoutEvidence:
+    evidence = _CloseoutEvidence()
+    positions: dict[str, int] = {}
+    for event_name in (
+        "run_started",
+        "horizon_started",
+        *CLOSEOUT_LIFECYCLE_EVENTS,
+        "judge_broker_closed",
+        "run_finished",
+    ):
+        found = [index for index, row in enumerate(events) if row.get("event") == event_name]
+        if len(found) != 1:
+            _add_issue(issues, "closeout_lifecycle_incomplete")
+        else:
+            positions[event_name] = found[0]
+    ordered_names = (
+        "run_started",
+        "horizon_started",
+        "horizon_closed",
+        "candidates_frozen",
+        "closeout_started",
+        "closeout_finished",
+        "judge_broker_closed",
+        "run_finished",
+    )
+    if all(name in positions for name in ordered_names) and [
+        positions[name] for name in ordered_names
+    ] != sorted(positions[name] for name in ordered_names):
+        _add_issue(issues, "closeout_lifecycle_incomplete")
+
+    indexed_candidates = _closeout_index_rows(
+        run_dir,
+        root_index,
+        nested_index,
+        task_ids,
+        issues,
+    )
+    frozen_rows = [row for row in events if row.get("event") == "candidates_frozen"]
+    started_rows = [row for row in events if row.get("event") == "closeout_started"]
+    finished_rows = [row for row in events if row.get("event") == "closeout_finished"]
+    if len(frozen_rows) == len(started_rows) == len(finished_rows) == 1:
+        frozen = frozen_rows[0]
+        started = started_rows[0]
+        expected_count = len(task_ids)
+        frozen_projection = Counter()
+        frozen_candidates = frozen.get("candidates")
+        if isinstance(frozen_candidates, list):
+            for item in frozen_candidates:
+                if isinstance(item, Mapping):
+                    frozen_projection[
+                        (item.get("task_id"), str(item.get("candidate_sha256") or "").lower())
+                    ] += 1
+        index_projection = Counter(
+            (task_id, str(row.get("candidate_sha256") or "").lower())
+            for task_id, row in indexed_candidates.items()
+        )
+        if (
+            frozen.get("candidate_count") != expected_count
+            or started.get("candidate_count") != expected_count
+            or frozen_projection != index_projection
+            or not isinstance(meta, Mapping)
+            or started.get("max_concurrent_evaluations")
+            != meta.get("lean_max_concurrent_evaluations")
+            or started.get("execution_timeout_seconds")
+            != meta.get("lean_timeout_seconds")
+        ):
+            _add_issue(issues, "closeout_lifecycle_incomplete")
+
+    closeout_rows = _single_rows_by_task(
+        events,
+        "closeout_evaluation_finished",
+        issues,
+        "closeout_evaluation_chain_mismatch",
+    )
+    if set(closeout_rows) != task_ids or len(closeout_rows) != len(task_ids):
+        _add_issue(issues, "closeout_evaluation_chain_mismatch")
+    if "closeout_started" in positions and "closeout_finished" in positions:
+        if any(
+            not (
+                positions["closeout_started"] < index < positions["closeout_finished"]
+            )
+            for index, row in enumerate(events)
+            if row.get("event") == "closeout_evaluation_finished"
+            or str(row.get("event") or "").startswith("closeout_authority_")
+            or row.get("event") == "closeout_infra_incomplete"
+        ):
+            _add_issue(issues, "closeout_lifecycle_incomplete")
+
+    closeout_scoreboard = [
+        row
+        for row in scoreboard
+        if row.get("source") == "closeout"
+        or row.get("agent_id") == "closeout"
+    ]
+    scoreboard_by_task: dict[str, list[Mapping[str, Any]]] = {}
+    for row in closeout_scoreboard:
+        task_id = row.get("task_id")
+        if isinstance(task_id, str):
+            scoreboard_by_task.setdefault(task_id, []).append(row)
+
+    dispositions: dict[str, str] = {}
+    for task_id in task_ids:
+        row = closeout_rows.get(task_id)
+        final = verdicts.get(task_id)
+        index_row = indexed_candidates.get(task_id)
+        if not isinstance(row, Mapping) or not isinstance(final, Mapping):
+            continue
+        row_projection = _verdict_projection(row)
+        final_projection = _verdict_projection(final)
+        if (
+            row_projection is None
+            or final_projection is None
+            or row_projection != final_projection
+            or row.get("agent_id") != "closeout"
+            or row.get("episode") != 0
+        ):
+            _add_issue(issues, "closeout_evaluation_chain_mismatch")
+        if isinstance(index_row, Mapping) and not _same_optional_hash(
+            row.get("candidate_sha256"), index_row.get("candidate_sha256")
+        ):
+            _add_issue(issues, "closeout_evaluation_chain_mismatch")
+
+        raw_flags = tuple(row.get(name) for name in CLOSEOUT_DISPOSITION_FLAGS)
+        if not all(isinstance(value, bool) for value in raw_flags):
+            _add_issue(issues, "closeout_disposition_invalid")
+            continue
+        flags = tuple(bool(value) for value in raw_flags)
+        status = _normalize_status(row.get("status"))
+        observed_status = _normalize_status(row.get("observed_status"))
+        if flags == (False, False, False, False, True):
+            disposition = "evaluated"
+            valid = observed_status == status
+        elif flags == (False, True, False, False, False):
+            disposition = "confirmed"
+            valid = status == "PROVED" and observed_status == "PROVED"
+        elif flags == (True, False, True, False, False):
+            disposition = "retryable_reused"
+            valid = (
+                status == "PROVED"
+                and observed_status in RETRYABLE_CLOSEOUT_INFRA_STATUSES
+            )
+        elif flags == (False, False, False, True, True):
+            disposition = "conflict"
+            score = row.get("score")
+            valid = bool(
+                status == "AUTHORITY_CONFLICT"
+                and isinstance(score, (int, float))
+                and not isinstance(score, bool)
+                and float(score) == 0.0
+            )
+        elif flags == (False, False, False, False, False):
+            disposition = "remote"
+            valid = status == observed_status == "REMOTE_SETTLEMENT_UNCONFIRMED"
+        else:
+            disposition = "invalid"
+            valid = False
+        if not valid:
+            _add_issue(issues, "closeout_disposition_invalid")
+        dispositions[task_id] = disposition
+
+        matching_scoreboard = scoreboard_by_task.get(task_id, [])
+        if row.get("scoreboard_recorded") is True:
+            if (
+                len(matching_scoreboard) != 1
+                or matching_scoreboard[0].get("source") != "closeout"
+                or matching_scoreboard[0].get("agent_id") != "closeout"
+                or matching_scoreboard[0].get("episode") != 0
+                or _verdict_projection(matching_scoreboard[0]) != row_projection
+            ):
+                _add_issue(issues, "closeout_scoreboard_chain_mismatch")
+        elif matching_scoreboard:
+            _add_issue(issues, "closeout_scoreboard_chain_mismatch")
+
+        key = _provenance_key(row, fallback_task_id=task_id)
+        if status in AUTHORITATIVE_VERDICT_STATUSES and key is None:
+            _add_issue(issues, "closeout_provenance_incomplete")
+        if disposition == "evaluated" and key is not None:
+            evidence.direct_keys.add(key)
+            if _has_positive_score(row):
+                evidence.positive_direct_keys[key] += 1
+        elif disposition in {"confirmed", "retryable_reused"} and key is not None:
+            evidence.prior_authority_keys.add(key)
+        if row.get("cache_reused") is True and key is not None:
+            evidence.cache_reused_keys.add(key)
+            source = _cache_reuse_source(row)
+            if source == "remote":
+                _add_issue(issues, "remote_judge_cache_reuse_observed")
+            elif source == "unknown":
+                _add_issue(issues, "cache_reuse_source_unbound")
+            elif source != "local":
+                _add_issue(issues, "cache_reuse_evidence_inconsistent")
+
+    infra_rows = _single_rows_by_task(
+        events,
+        "closeout_infra_incomplete",
+        issues,
+        "closeout_authority_chain_mismatch",
+    )
+    confirmed_rows = _single_rows_by_task(
+        events,
+        "closeout_authority_confirmed",
+        issues,
+        "closeout_authority_chain_mismatch",
+    )
+    conflict_rows = _single_rows_by_task(
+        events,
+        "closeout_authority_conflict",
+        issues,
+        "closeout_authority_chain_mismatch",
+    )
+    expected_infra = {task for task, value in dispositions.items() if value == "retryable_reused"}
+    expected_confirmed = {task for task, value in dispositions.items() if value == "confirmed"}
+    expected_conflict = {task for task, value in dispositions.items() if value == "conflict"}
+    if set(infra_rows) != expected_infra or set(confirmed_rows) != expected_confirmed or set(conflict_rows) != expected_conflict:
+        _add_issue(issues, "closeout_authority_chain_mismatch")
+
+    for task_id in expected_infra:
+        row = closeout_rows[task_id]
+        special = infra_rows.get(task_id, {})
+        raw_detail = _response_mapping(row).get("closeout_infra_incomplete")
+        detail = raw_detail if isinstance(raw_detail, Mapping) else {}
+        if (
+            not isinstance(raw_detail, Mapping)
+            or special.get("observed_retryable") is not True
+            or _normalize_status(special.get("observed_status"))
+            != _normalize_status(row.get("observed_status"))
+            or _normalize_status(special.get("final_status"))
+            != _normalize_status(row.get("status"))
+            or special.get("final_score") != row.get("score")
+            or special.get("observed_error_kind") != detail.get("error_kind")
+            or special.get("observed_terminal_reason")
+            != detail.get("terminal_reason")
+            or not _same_optional_hash(special.get("candidate_sha256"), row.get("candidate_sha256"))
+            or not _same_optional_hash(special.get("task_contract_sha256"), row.get("task_contract_sha256"))
+            or detail.get("retryable") is not True
+            or _normalize_status(detail.get("observed_status"))
+            != _normalize_status(row.get("observed_status"))
+        ):
+            _add_issue(issues, "closeout_authority_chain_mismatch")
+
+    for task_id in expected_confirmed:
+        row = closeout_rows[task_id]
+        special = confirmed_rows.get(task_id, {})
+        detail = _response_mapping(row).get("closeout_authority_confirmed")
+        if (
+            special.get("prior_judge_job_id") != row.get("judge_job_id")
+            or not isinstance(special.get("observed_judge_job_id"), str)
+            or not special.get("observed_judge_job_id")
+            or _normalize_status(special.get("observed_status"))
+            != _normalize_status(row.get("observed_status"))
+            or not _same_optional_hash(special.get("candidate_sha256"), row.get("candidate_sha256"))
+            or not _same_optional_hash(special.get("task_contract_sha256"), row.get("task_contract_sha256"))
+            or not isinstance(detail, Mapping)
+            or detail.get("candidate_sha256_match") is not True
+            or detail.get("task_contract_sha256_match") is not True
+            or _normalize_status(detail.get("observed_status")) != "PROVED"
+        ):
+            _add_issue(issues, "closeout_authority_chain_mismatch")
+
+    for task_id in expected_conflict:
+        row = closeout_rows[task_id]
+        special = conflict_rows.get(task_id, {})
+        detail = _response_mapping(row)
+        if (
+            _normalize_status(special.get("prior_status")) != "PROVED"
+            or _normalize_status(special.get("observed_status"))
+            != _normalize_status(row.get("observed_status"))
+            or _normalize_status(special.get("final_status")) != "AUTHORITY_CONFLICT"
+            or not isinstance(special.get("observed_retryable"), bool)
+            or row.get("judge_job_id") is not None
+            or _normalize_status(detail.get("prior_status")) != "PROVED"
+            or _normalize_status(detail.get("observed_status"))
+            != _normalize_status(special.get("observed_status"))
+            or detail.get("observed_error_kind")
+            != special.get("observed_error_kind")
+            or detail.get("observed_retryable")
+            != special.get("observed_retryable")
+            or not _same_optional_hash(special.get("candidate_sha256"), row.get("candidate_sha256"))
+            or not _same_optional_hash(special.get("task_contract_sha256"), row.get("task_contract_sha256"))
+        ):
+            _add_issue(issues, "closeout_authority_chain_mismatch")
+
+    mismatch_rows = _single_rows_by_task(
+        events,
+        "closeout_authority_mismatch",
+        issues,
+        "closeout_authority_chain_mismatch",
+    )
+    for task_id, special in mismatch_rows.items():
+        index_row = indexed_candidates.get(task_id, {})
+        if (
+            dispositions.get(task_id) not in {"evaluated", "remote"}
+            or isinstance(special.get("authoritative_proof_count"), bool)
+            or not isinstance(special.get("authoritative_proof_count"), int)
+            or special.get("authoritative_proof_count", 0) < 1
+            or not all(
+                isinstance(special.get(field_name), bool)
+                for field_name in (
+                    "candidate_sha256_available",
+                    "task_contract_sha256_available",
+                    "candidate_sha256_match",
+                    "task_contract_sha256_match",
+                )
+            )
+            or not _same_optional_hash(
+                special.get("candidate_sha256"),
+                index_row.get("candidate_sha256"),
+            )
+        ):
+            _add_issue(issues, "closeout_authority_chain_mismatch")
+
+    if len(finished_rows) == 1:
+        finished = finished_rows[0]
+        expected_counts = {
+            "reused_authoritative_verdicts": sum(value == "retryable_reused" for value in dispositions.values()),
+            "authoritative_proofs_confirmed": sum(value == "confirmed" for value in dispositions.values()),
+            "closeout_infra_incomplete": sum(value == "retryable_reused" for value in dispositions.values()),
+            "authority_conflicts": sum(value == "conflict" for value in dispositions.values()),
+            "remote_settlement_unconfirmed": sum(value == "remote" for value in dispositions.values()),
+        }
+        counts_valid = all(
+            isinstance(finished.get(name), int)
+            and not isinstance(finished.get(name), bool)
+            and finished.get(name) >= 0
+            and finished.get(name) == expected
+            for name, expected in expected_counts.items()
+        )
+        expected_score = sum(
+            float(row.get("score", 0.0))
+            for row in closeout_rows.values()
+            if isinstance(row.get("score"), (int, float))
+            and not isinstance(row.get("score"), bool)
+        )
+        if (
+            not counts_valid
+            or finished.get("score") != expected_score
+            or reported_final_score != expected_score
+            or len(
+                run_finished := [
+                    row for row in events if row.get("event") == "run_finished"
+                ]
+            )
+            != 1
+            or run_finished[0].get("score") != expected_score
+            or sum(expected_counts[name] for name in (
+                "authoritative_proofs_confirmed",
+                "closeout_infra_incomplete",
+                "authority_conflicts",
+                "remote_settlement_unconfirmed",
+            )) > len(task_ids)
+        ):
+            _add_issue(issues, "closeout_summary_mismatch")
+
+    if evidence.cache_reused_keys - accepted_judge:
+        _add_issue(issues, "cache_reused_closeout_probe_unlinked")
+    return evidence
+
+
 def _has_positive_score(payload: Mapping[str, Any]) -> bool:
     score = _provenance_value(payload, "score")
     return (
@@ -1459,6 +2016,7 @@ def _check_positive_exact_once(
     events: list[dict[str, Any]],
     scoreboard: list[dict[str, Any]],
     communication_trace: list[dict[str, Any]],
+    closeout_direct: Counter[tuple[str, str, str, str]],
     issues: list[dict[str, str]],
 ) -> dict[str, int]:
     finals = _positive_final_keys(verdicts, issues)
@@ -1493,18 +2051,35 @@ def _check_positive_exact_once(
                 early_evaluations[key] += 1
     credits = _proof_credit_keys(events, issues)
 
+    solver_finals = finals.copy()
+    for key, count in closeout_direct.items():
+        if solver_finals[key] < count:
+            _add_issue(issues, "positive_closeout_final_provenance_mismatch")
+        solver_finals[key] = max(0, solver_finals[key] - count)
+        if solver_finals[key] == 0:
+            del solver_finals[key]
+
     for actual, code in (
         (evaluations, "positive_final_evaluation_provenance_mismatch"),
-        (scored, "positive_scoreboard_provenance_mismatch"),
         (validations, "positive_validation_provenance_mismatch"),
         (promotions, "positive_promotion_provenance_mismatch"),
     ):
-        if actual != finals:
+        if actual != solver_finals:
             _add_issue(issues, code)
+    if scored != finals:
+        _add_issue(issues, "positive_scoreboard_provenance_mismatch")
     if credits != early_evaluations:
         _add_issue(issues, "positive_proof_credit_provenance_mismatch")
 
-    for counter in (finals, evaluations, scored, validations, promotions, credits):
+    credited_evaluations = evaluations + closeout_direct
+    for counter in (
+        finals,
+        credited_evaluations,
+        scored,
+        validations,
+        promotions,
+        credits,
+    ):
         by_task: Counter[str] = Counter()
         for key, count in counter.items():
             by_task[key[0]] += count
@@ -1513,7 +2088,7 @@ def _check_positive_exact_once(
             break
     return {
         "positive_final_verdicts": sum(finals.values()),
-        "positive_evaluations": sum(evaluations.values()),
+        "positive_evaluations": sum(credited_evaluations.values()),
         "positive_scoreboard_rows": sum(scored.values()),
         "positive_validations": sum(validations.values()),
         "positive_promotions": sum(promotions.values()),
@@ -1529,13 +2104,16 @@ def _check_provenance_links(
     evaluations: Counter[tuple[str, str, str, str]],
     cache_reused_finals: set[tuple[str, str, str, str]],
     cache_reused_evaluations: set[tuple[str, str, str, str]],
+    closeout_direct: set[tuple[str, str, str, str]],
+    closeout_prior_authorities: set[tuple[str, str, str, str]],
     issues: list[dict[str, str]],
 ) -> None:
     if validations != evaluations:
         _add_issue(issues, "validation_evaluation_provenance_mismatch")
-    if finals - set(validations):
+    required_solver_links = (finals - closeout_direct) | closeout_prior_authorities
+    if required_solver_links - set(validations):
         _add_issue(issues, "final_validation_provenance_unlinked")
-    if finals - set(evaluations):
+    if required_solver_links - set(evaluations):
         _add_issue(issues, "final_evaluation_provenance_unlinked")
     if cache_reused_evaluations - accepted_judge:
         _add_issue(issues, "cache_reused_evaluation_probe_unlinked")
@@ -1550,6 +2128,15 @@ def _normalize_meta(meta: Mapping[str, Any]) -> dict[str, Any]:
     allocation = normalized.get("allocation")
     if isinstance(allocation, dict):
         allocation.pop("policy", None)
+    # Each arm is launched from its own tracked policy manifest.  The binding
+    # is validated per arm above, but the path and closure digest are expected
+    # to differ across uniform/formula/agent and are therefore not fairness
+    # fields.  The source commit and immutable image ID remain cross-arm
+    # invariants.
+    runtime_provenance = normalized.get("runtime_provenance")
+    if isinstance(runtime_provenance, dict):
+        runtime_provenance.pop("manifest_path", None)
+        runtime_provenance.pop("manifest_sha256", None)
     return normalized
 
 
@@ -1666,6 +2253,18 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
         missing_code="judge_broker_closeout_missing",
         invalid_code="judge_broker_closeout_invalid_json",
     )
+    closeout_candidate_index = _load_json(
+        run_dir / "closeout_candidates.json",
+        audit.errors,
+        missing_code="closeout_candidate_index_missing",
+        invalid_code="closeout_candidate_index_invalid_json",
+    )
+    nested_closeout_candidate_index = _load_json(
+        run_dir / "closeout_candidates" / "index.json",
+        audit.errors,
+        missing_code="closeout_candidate_index_missing",
+        invalid_code="closeout_candidate_index_invalid_json",
+    )
     allocation_decisions = _load_jsonl(
         run_dir / "allocation_decisions.jsonl",
         audit.errors,
@@ -1723,6 +2322,18 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
             broker_closeout,
             audit.errors,
             ("judge_broker_closeout",),
+        )
+    if closeout_candidate_index is not None:
+        _scan_sensitive_value(
+            closeout_candidate_index,
+            audit.errors,
+            ("closeout_candidates",),
+        )
+    if nested_closeout_candidate_index is not None:
+        _scan_sensitive_value(
+            nested_closeout_candidate_index,
+            audit.errors,
+            ("closeout_candidates_index",),
         )
     for index, event in enumerate(events):
         _scan_sensitive_value(event, audit.errors, ("events", str(index)))
@@ -2035,6 +2646,19 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
         events,
         audit.errors,
     )
+    closeout_evidence = _check_closeout_lifecycle(
+        run_dir=run_dir,
+        meta=meta,
+        events=events,
+        scoreboard=scoreboard,
+        verdicts=verdicts,
+        reported_final_score=final.get("score") if isinstance(final, Mapping) else None,
+        task_ids=task_ids,
+        root_index=closeout_candidate_index,
+        nested_index=nested_closeout_candidate_index,
+        accepted_judge=direct_accepted_judge_keys,
+        issues=audit.errors,
+    )
     _check_provenance_links(
         accepted_judge=direct_accepted_judge_keys,
         validations=validation_keys,
@@ -2042,6 +2666,8 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
         evaluations=evaluation_keys,
         cache_reused_finals=cache_reused_final_keys,
         cache_reused_evaluations=cache_reused_evaluation_keys,
+        closeout_direct=closeout_evidence.direct_keys,
+        closeout_prior_authorities=closeout_evidence.prior_authority_keys,
         issues=audit.errors,
     )
     audit.counts.update(
@@ -2050,6 +2676,7 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
             events=events,
             scoreboard=scoreboard,
             communication_trace=communication_trace,
+            closeout_direct=closeout_evidence.positive_direct_keys,
             issues=audit.errors,
         )
     )
@@ -2060,6 +2687,9 @@ def _audit_arm(label: str, run_dir: Path) -> ArmAudit:
     audit.counts["validation_provenance_keys"] = len(validation_keys)
     audit.counts["evaluation_provenance_keys"] = len(evaluation_keys)
     audit.counts["final_provenance_keys"] = len(final_keys)
+    audit.counts["closeout_direct_provenance_keys"] = len(
+        closeout_evidence.direct_keys
+    )
     audit.counts["judge_control_failures"] = hard_control_failures
     audit.counts["judge_soft_controls"] = soft_controls
     audit.counts["judge_normal_controls"] = normal_controls

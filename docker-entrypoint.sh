@@ -37,29 +37,33 @@ if [[ "${MINI_SWARM_CODEX_INPUT_ENABLED:-0}" == "1" ]]; then
 fi
 export CODEX_HOME="${CODEX_RUNTIME_HOME}"
 
-if [[ -n "${CONTEXTSWARM_MANIFEST_SHA256:-}" ]]; then
-  python3 - "${CONTEXTSWARM_MANIFEST_PATH:-}" "${CONTEXTSWARM_MANIFEST_SHA256}" <<'PY'
+MANIFEST_BINDING_REQUIRED="${CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED:-0}"
+MANIFEST_PATH="${CONTEXTSWARM_MANIFEST_PATH:-}"
+MANIFEST_SHA256="${CONTEXTSWARM_MANIFEST_SHA256:-}"
+if [[ "${MANIFEST_BINDING_REQUIRED}" != "0" && "${MANIFEST_BINDING_REQUIRED}" != "1" ]]; then
+  echo "container manifest binding requirement is invalid" >&2
+  exit 2
+fi
+if [[ "${MANIFEST_BINDING_REQUIRED}" == "1" || -n "${MANIFEST_PATH}" || -n "${MANIFEST_SHA256}" ]]; then
+  if [[ -z "${MANIFEST_PATH}" || -z "${MANIFEST_SHA256}" ]]; then
+    echo "container manifest binding is incomplete" >&2
+    exit 2
+  fi
+  python3 - "${MANIFEST_PATH}" "${MANIFEST_SHA256}" <<'PY'
 from pathlib import Path
-import re
 import sys
 
 from contextswarm_mini.launch_contract import (
     LaunchContractError,
-    manifest_closure_sha256,
+    verify_manifest_binding,
 )
 
 manifest = sys.argv[1]
 expected = sys.argv[2]
-if not manifest or re.fullmatch(r"[0-9a-f]{64}", expected) is None:
-    print("container manifest binding is invalid", file=sys.stderr)
-    raise SystemExit(2)
 try:
-    actual = manifest_closure_sha256(manifest, Path("/opt/contextswarm"))
+    verify_manifest_binding(manifest, Path("/opt/contextswarm"), expected)
 except (LaunchContractError, OSError, ValueError):
-    print("container manifest closure is unavailable", file=sys.stderr)
-    raise SystemExit(2)
-if actual != expected:
-    print("container manifest closure does not match the launcher", file=sys.stderr)
+    print("container manifest binding verification failed", file=sys.stderr)
     raise SystemExit(2)
 PY
 fi

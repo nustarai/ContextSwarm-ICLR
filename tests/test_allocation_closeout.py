@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -35,7 +36,8 @@ TOOLS = (
     "read,edit,write,grep,find,ls,judge_check,cps_search,cps_publish,"
     "cps_inbox,cps_send,cps_ack,cps_actors"
 )
-CANDIDATE_HASH = "a" * 64
+CANDIDATE_SOURCE = b"fixture closeout candidate\n"
+CANDIDATE_HASH = hashlib.sha256(CANDIDATE_SOURCE).hexdigest()
 TASK_CONTRACT_HASH = "b" * 64
 SOURCE_COMMIT = "c" * 40
 IMAGE_ID = "sha256:" + "d" * 64
@@ -169,6 +171,12 @@ def _meta(arm: str) -> dict[str, object]:
         "runtime_provenance": {
             "source_commit": SOURCE_COMMIT,
             "image_id": IMAGE_ID,
+            "manifest_path": f"configs/allocation_1h_cps48_{arm}.toml",
+            "manifest_sha256": {
+                "uniform": "d" * 64,
+                "formula": "e" * 64,
+                "agent": "f" * 64,
+            }[arm],
         },
         "allocation": {
             "policy": arm,
@@ -191,15 +199,11 @@ def _final(arm: str) -> dict[str, object]:
             "elapsed_seconds": 1.0,
             "response": {},
             "error": None,
+            "candidate_sha256": CANDIDATE_HASH,
+            "task_contract_sha256": TASK_CONTRACT_HASH,
+            "judge_job_id": "job-1" if index == 0 else f"closeout-job-{index}",
+            "cache_reused": False,
         }
-        if index == 0:
-            verdict.update(
-                {
-                    "candidate_sha256": CANDIDATE_HASH,
-                    "task_contract_sha256": TASK_CONTRACT_HASH,
-                    "judge_job_id": "job-1",
-                }
-            )
         verdicts[task] = verdict
     return {
         "schema_version": "contextswarm_mini_run_v1",
@@ -246,6 +250,9 @@ def _final(arm: str) -> dict[str, object]:
 
 
 def _events(arm: str) -> list[dict[str, object]]:
+    final = _final(arm)
+    verdicts = final["verdicts"]
+    assert isinstance(verdicts, dict)
     rows: list[dict[str, object]] = [
         {
             "at": "2026-08-22T00:00:00+00:00",
@@ -264,6 +271,12 @@ def _events(arm: str) -> list[dict[str, object]]:
             "allocation": {"policy": arm, "agent_timeout_seconds": 120},
             "lean_env_id": "formal_matholympiadbench",
             "lean_max_concurrent_evaluations": 8,
+        },
+        {
+            "at": "2026-08-22T00:00:00.500000+00:00",
+            "event": "horizon_started",
+            "horizon_seconds": 3600,
+            "horizon_started_at": ARM_TIMES[arm][1],
         },
         {
             "at": "2026-08-22T00:00:01+00:00",
@@ -298,18 +311,144 @@ def _events(arm: str) -> list[dict[str, object]]:
             "judge_job_id": "job-1",
         },
         {
-            "at": "2026-08-22T01:00:00+00:00",
-            "event": "run_finished",
-            "status": "COMPLETED",
-            "score": 0.0,
+            "at": "2026-08-22T00:50:00+00:00",
+            "event": "horizon_closed",
+            "reason": "solver_completed",
+        },
+        {
+            "at": "2026-08-22T00:50:01+00:00",
+            "event": "candidates_frozen",
+            "candidate_count": len(TASKS),
+            "candidates": [
+                {"task_id": task, "candidate_sha256": CANDIDATE_HASH}
+                for task in TASKS
+            ],
+        },
+        {
+            "at": "2026-08-22T00:50:02+00:00",
+            "event": "closeout_started",
+            "candidate_count": len(TASKS),
+            "max_concurrent_evaluations": 8,
+            "execution_timeout_seconds": 300,
         },
     ]
+    for index, task in enumerate(TASKS):
+        verdict = verdicts[task]
+        assert isinstance(verdict, dict)
+        rows.append(
+            {
+                "at": f"2026-08-22T00:51:{index:02d}+00:00",
+                "event": "closeout_evaluation_finished",
+                **json.loads(json.dumps(verdict)),
+                "agent_id": "closeout",
+                "episode": 0,
+                "observed_status": verdict["status"],
+                "reused_authoritative_verdict": False,
+                "authoritative_proof_confirmed": False,
+                "closeout_infra_incomplete": False,
+                "authority_conflict": False,
+                "scoreboard_recorded": True,
+            }
+        )
+    rows.extend(
+        [
+            {
+                "at": "2026-08-22T00:59:55+00:00",
+                "event": "closeout_finished",
+                "score": 0.0,
+                "reused_authoritative_verdicts": 0,
+                "authoritative_proofs_confirmed": 0,
+                "closeout_infra_incomplete": 0,
+                "authority_conflicts": 0,
+                "remote_settlement_unconfirmed": 0,
+            },
+            {
+                "at": "2026-08-22T00:59:59+00:00",
+                "event": "judge_broker_closed",
+                "schema_version": "contextswarm_judge_broker_closeout_v1",
+                "drained": True,
+                "active_handlers": 0,
+                "fifo_depth": 0,
+                "remote_unsettled_jobs": 0,
+            },
+            {
+                "at": "2026-08-22T01:00:00+00:00",
+                "event": "run_finished",
+                "status": "COMPLETED",
+                "score": 0.0,
+            },
+        ]
+    )
     if arm == "agent":
-        rows[-1:-1] = [
+        horizon_index = next(
+            index for index, row in enumerate(rows) if row.get("event") == "horizon_closed"
+        )
+        rows[horizon_index:horizon_index] = [
             {"event": "allocation_scheduler_finished", **_scheduler_agent(index)}
             for index in (1, 2)
         ]
     return rows
+
+
+def _closeout_scoreboard_rows(events: list[dict[str, object]]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for event in events:
+        if (
+            event.get("event") != "closeout_evaluation_finished"
+            or event.get("scoreboard_recorded") is not True
+        ):
+            continue
+        verdict = {field: event.get(field) for field in (
+            "task_id",
+            "status",
+            "score",
+            "elapsed_seconds",
+            "response",
+            "error",
+            "candidate_sha256",
+            "task_contract_sha256",
+            "judge_job_id",
+            "cache_reused",
+        )}
+        rows.append(
+            {
+                "at": event.get("at"),
+                "horizon_elapsed_seconds": 3600.0,
+                "source": "closeout",
+                "agent_id": "closeout",
+                "episode": 0,
+                **verdict,
+            }
+        )
+    return rows
+
+
+def _sync_closeout_task(
+    events: list[dict[str, object]],
+    verdict: dict[str, object],
+) -> dict[str, object]:
+    task_id = verdict["task_id"]
+    row = next(
+        item
+        for item in events
+        if item.get("event") == "closeout_evaluation_finished"
+        and item.get("task_id") == task_id
+    )
+    for field_name in (
+        "task_id",
+        "status",
+        "score",
+        "elapsed_seconds",
+        "response",
+        "error",
+        "candidate_sha256",
+        "task_contract_sha256",
+        "judge_job_id",
+        "cache_reused",
+    ):
+        row[field_name] = json.loads(json.dumps(verdict.get(field_name)))
+    row["observed_status"] = verdict["status"]
+    return row
 
 
 def _stage_arm(root: Path, arm: str) -> Path:
@@ -326,7 +465,8 @@ def _stage_arm(root: Path, arm: str) -> Path:
             **({"agent_calls": 2} if arm == "agent" else {}),
         },
     )
-    _write_jsonl(run / "events.jsonl", _events(arm))
+    events = _events(arm)
+    _write_jsonl(run / "events.jsonl", events)
     _write_json(
         run / "elastic_scheduler_state.json",
         {
@@ -349,6 +489,22 @@ def _stage_arm(root: Path, arm: str) -> Path:
             "remote_unsettled_jobs": 0,
         },
     )
+    candidate_rows = []
+    for task in TASKS:
+        snapshot = run / "closeout_candidates" / task / "result.lean"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_bytes(CANDIDATE_SOURCE)
+        candidate_rows.append(
+            {
+                "task_id": task,
+                "source": f"workers/{task}/best/result.lean",
+                "snapshot": f"closeout_candidates/{task}/result.lean",
+                "candidate_sha256": CANDIDATE_HASH,
+            }
+        )
+    candidate_index = {"candidates": candidate_rows}
+    _write_json(run / "closeout_candidates.json", candidate_index)
+    _write_json(run / "closeout_candidates" / "index.json", candidate_index)
     _write_json(
         run / "transport_preflight.json",
         {
@@ -454,6 +610,10 @@ def _stage_arm(root: Path, arm: str) -> Path:
             }
         ],
     )
+    _write_jsonl(
+        run / "scoreboard_history.jsonl",
+        _closeout_scoreboard_rows(events),
+    )
     (run / "cps.sqlite3").touch()
     session = run / "sessions" / "solver.jsonl"
     _write_jsonl(
@@ -519,6 +679,13 @@ def _stage_positive_uniform(run: Path) -> None:
     final_verdict = final["verdicts"][TASKS[0]]
     final_verdict["status"] = "PROVED"
     final_verdict["score"] = 1.0
+    final_verdict["response"] = {
+        "closeout_authority_confirmed": {
+            "observed_status": "PROVED",
+            "candidate_sha256_match": True,
+            "task_contract_sha256_match": True,
+        }
+    }
     final["score"] = 1.0
     _write_json(run / "final.json", final)
 
@@ -544,6 +711,33 @@ def _stage_positive_uniform(run: Path) -> None:
         }
     )
     agent_finished = next(row for row in events if row.get("event") == "agent_finished")
+    closeout = _sync_closeout_task(events, final_verdict)
+    closeout.update(
+        {
+            "authoritative_proof_confirmed": True,
+            "scoreboard_recorded": False,
+        }
+    )
+    closeout_index = events.index(closeout)
+    events.insert(
+        closeout_index,
+        {
+            "at": "2026-08-22T00:50:59+00:00",
+            "event": "closeout_authority_confirmed",
+            "task_id": TASKS[0],
+            "candidate_sha256": CANDIDATE_HASH,
+            "task_contract_sha256": TASK_CONTRACT_HASH,
+            "prior_judge_job_id": "job-1",
+            "observed_judge_job_id": "closeout-confirmation-job",
+            "observed_status": "PROVED",
+        },
+    )
+    closeout_finished = next(
+        row for row in events if row.get("event") == "closeout_finished"
+    )
+    closeout_finished["score"] = 1.0
+    closeout_finished["authoritative_proofs_confirmed"] = 1
+    next(row for row in events if row.get("event") == "run_finished")["score"] = 1.0
     events.remove(evaluation)
     events.remove(agent_finished)
     admission_index = next(
@@ -595,12 +789,10 @@ def _stage_positive_uniform(run: Path) -> None:
                 "agent_id": "solver-1",
                 "task_id": TASKS[0],
                 "episode": 1,
-                "status": "PROVED",
-                "score": 1.0,
-                "candidate_sha256": CANDIDATE_HASH,
-                "task_contract_sha256": TASK_CONTRACT_HASH,
-                "judge_job_id": "job-1",
-            }
+                **json.loads(json.dumps(final_verdict)),
+                "response": {},
+            },
+            *_closeout_scoreboard_rows(events),
         ],
     )
 
@@ -792,6 +984,224 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
         report = json.loads(result.stdout)
         self.assertIn("solver_oom_or_exit_137", _codes(report, "uniform"))
         self.assertIn("evaluator_transport_error", _codes(report, "formula"))
+
+    def test_oom_detection_ignores_zero_count_fields_and_benign_room_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            uniform_final = _final("uniform")
+            uniform_final["health"].update(
+                {
+                    "oom_or_exit_137_count": 0,
+                    "allocation_scheduler_oom_or_exit_137_count": 0,
+                }
+            )
+            uniform_final["agents"][0]["output_tail"] = (
+                "There is room for another proof attempt."
+            )
+            _write_json(paths["uniform"] / "final.json", uniform_final)
+            uniform_events = _events("uniform")
+            agent_finished = next(
+                row for row in uniform_events if row.get("event") == "agent_finished"
+            )
+            agent_finished["diagnostic"] = "scheduler has room for more progress"
+            _write_jsonl(paths["uniform"] / "events.jsonl", uniform_events)
+
+            agent_final = _final("agent")
+            agent_final["allocation_scheduler_agents"][0]["output_tail"] = (
+                "There is room to prioritize a different task."
+            )
+            _write_json(paths["agent"] / "final.json", agent_final)
+            benign = _run_audit(paths)
+
+            uniform_final["health"]["oom_or_exit_137_count"] = 1
+            _write_json(paths["uniform"] / "final.json", uniform_final)
+            positive = _run_audit(paths)
+
+        self.assertEqual(benign.returncode, 0, benign.stdout + benign.stderr)
+        self.assertEqual(positive.returncode, 1)
+        self.assertIn(
+            "solver_oom_or_exit_137",
+            _codes(json.loads(positive.stdout), "uniform"),
+        )
+
+    def test_retryable_resource_judge_receipts_are_infrastructure_failures(self) -> None:
+        for status in ("RESOURCE_LIMIT", "EXECUTION_TIMEOUT"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                paths = self._clean_runs(Path(temporary))
+                rows = [
+                    json.loads(line)
+                    for line in (paths["uniform"] / "judge_checks.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                rows[0]["status"] = status
+                rows[0]["response"] = {"retryable": True}
+                _write_jsonl(paths["uniform"] / "judge_checks.jsonl", rows)
+                retryable = _run_audit(paths)
+
+                rows[0]["response"] = {"retryable": False}
+                _write_jsonl(paths["uniform"] / "judge_checks.jsonl", rows)
+                terminal = _run_audit(paths)
+
+            self.assertEqual(retryable.returncode, 1)
+            self.assertIn(
+                "judge_check_failure_status",
+                _codes(json.loads(retryable.stdout), "uniform"),
+            )
+            self.assertEqual(terminal.returncode, 0, terminal.stdout + terminal.stderr)
+
+    def test_fresh_closeout_proof_needs_no_solver_feedback_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            run = paths["uniform"]
+            final = _final("uniform")
+            verdict = final["verdicts"][TASKS[1]]
+            verdict.update(
+                {
+                    "status": "PROVED",
+                    "score": 1.0,
+                    "response": {"recorded_phase": "closeout"},
+                    "judge_job_id": "fresh-closeout-job",
+                }
+            )
+            final["score"] = 1.0
+            _write_json(run / "final.json", final)
+            events = _events("uniform")
+            _sync_closeout_task(events, verdict)
+            next(
+                row for row in events if row.get("event") == "closeout_finished"
+            )["score"] = 1.0
+            next(row for row in events if row.get("event") == "run_finished")[
+                "score"
+            ] = 1.0
+            _write_jsonl(run / "events.jsonl", events)
+            _write_jsonl(
+                run / "scoreboard_history.jsonl",
+                _closeout_scoreboard_rows(events),
+            )
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_retryable_closeout_reuses_exact_prior_authority(self) -> None:
+        for observed_status in ("RESOURCE_LIMIT", "EXECUTION_TIMEOUT"):
+            with (
+                self.subTest(observed_status=observed_status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                paths = self._clean_runs(Path(temporary))
+                run = paths["uniform"]
+                _stage_positive_uniform(run)
+                final = json.loads((run / "final.json").read_text(encoding="utf-8"))
+                verdict = final["verdicts"][TASKS[0]]
+                verdict["response"] = {
+                    "closeout_infra_incomplete": {
+                        "observed_status": observed_status,
+                        "error_kind": "resource_limit",
+                        "terminal_reason": "execution_timeout",
+                        "retryable": True,
+                    }
+                }
+                _write_json(run / "final.json", final)
+                events = [
+                    json.loads(line)
+                    for line in (run / "events.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                events = [
+                    row
+                    for row in events
+                    if row.get("event") != "closeout_authority_confirmed"
+                ]
+                closeout = _sync_closeout_task(events, verdict)
+                closeout.update(
+                    {
+                        "observed_status": observed_status,
+                        "reused_authoritative_verdict": True,
+                        "authoritative_proof_confirmed": False,
+                        "closeout_infra_incomplete": True,
+                        "scoreboard_recorded": False,
+                    }
+                )
+                events.insert(
+                    events.index(closeout),
+                    {
+                        "event": "closeout_infra_incomplete",
+                        "task_id": TASKS[0],
+                        "candidate_sha256": CANDIDATE_HASH,
+                        "task_contract_sha256": TASK_CONTRACT_HASH,
+                        "observed_status": observed_status,
+                        "observed_error_kind": "resource_limit",
+                        "observed_terminal_reason": "execution_timeout",
+                        "observed_retryable": True,
+                        "final_status": "PROVED",
+                        "final_score": 1.0,
+                    },
+                )
+                finished = next(
+                    row for row in events if row.get("event") == "closeout_finished"
+                )
+                finished["authoritative_proofs_confirmed"] = 0
+                finished["reused_authoritative_verdicts"] = 1
+                finished["closeout_infra_incomplete"] = 1
+                _write_jsonl(run / "events.jsonl", events)
+                _write_jsonl(
+                    run / "scoreboard_history.jsonl",
+                    [
+                        row
+                        for row in json.loads(
+                            json.dumps(
+                                [
+                                    {
+                                        "at": "2026-08-22T00:05:00+00:00",
+                                        "horizon_elapsed_seconds": 240.0,
+                                        "source": "judge_check",
+                                        "agent_id": "solver-1",
+                                        "task_id": TASKS[0],
+                                        "episode": 1,
+                                        **verdict,
+                                        "response": {},
+                                    },
+                                    *_closeout_scoreboard_rows(events),
+                                ]
+                            )
+                        )
+                    ],
+                )
+                result = _run_audit(paths)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_closeout_lifecycle_final_and_aggregate_drift_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            uniform_events = [
+                row
+                for row in _events("uniform")
+                if row.get("event") != "closeout_started"
+            ]
+            _write_jsonl(paths["uniform"] / "events.jsonl", uniform_events)
+
+            formula_final = _final("formula")
+            formula_final["verdicts"][TASKS[0]]["response"] = {"drift": True}
+            _write_json(paths["formula"] / "final.json", formula_final)
+
+            agent_events = _events("agent")
+            next(
+                row for row in agent_events if row.get("event") == "closeout_finished"
+            )["authority_conflicts"] = 1
+            _write_jsonl(paths["agent"] / "events.jsonl", agent_events)
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 1)
+        report = json.loads(result.stdout)
+        self.assertIn("closeout_lifecycle_incomplete", _codes(report, "uniform"))
+        self.assertIn(
+            "closeout_evaluation_chain_mismatch",
+            _codes(report, "formula"),
+        )
+        self.assertIn("closeout_summary_mismatch", _codes(report, "agent"))
 
     def test_shell_capability_and_forbidden_session_actions_fail(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1165,7 +1575,12 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
             )
             evaluation["cache_reused"] = True
             evaluation["response"] = {"probe_cache_reused": True}
+            _sync_closeout_task(agent_events, verdict)
             _write_jsonl(paths["agent"] / "events.jsonl", agent_events)
+            _write_jsonl(
+                paths["agent"] / "scoreboard_history.jsonl",
+                _closeout_scoreboard_rows(agent_events),
+            )
 
             local_result = _run_audit(paths)
             self.assertEqual(
@@ -1177,7 +1592,12 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
             verdict["response"] = {"cache_reused": True}
             _write_json(paths["agent"] / "final.json", agent_final)
             evaluation["response"] = {"cache_reused": True}
+            _sync_closeout_task(agent_events, verdict)
             _write_jsonl(paths["agent"] / "events.jsonl", agent_events)
+            _write_jsonl(
+                paths["agent"] / "scoreboard_history.jsonl",
+                _closeout_scoreboard_rows(agent_events),
+            )
             remote_result = _run_audit(paths)
 
         self.assertEqual(remote_result.returncode, 1)
@@ -1257,7 +1677,7 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
         report = json.loads(result.stdout)
         agent_codes = _codes(report, "agent")
         self.assertIn("validation_evaluation_provenance_mismatch", agent_codes)
-        self.assertIn("final_validation_provenance_unlinked", agent_codes)
+        self.assertNotIn("final_validation_provenance_unlinked", agent_codes)
         self.assertIn("judge_check_judge_job_missing", _codes(report, "formula"))
         self.assertIn("judge_check_provenance_incomplete", _codes(report, "formula"))
 
@@ -1325,7 +1745,7 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
         report = json.loads(result.stdout)
         fields = _error_fields(report, "agent")
         self.assertIn("final.agents.0.output_tail", fields)
-        self.assertIn("events.3.error", fields)
+        self.assertIn("events.4.error", fields)
         self.assertIn("judge_checks.0.diagnostic", fields)
         self.assertIn("communication_trace.0.payload.diagnostic", fields)
         self.assertTrue(any(field.startswith("session.0.0") for field in fields))
@@ -1533,11 +1953,16 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
                 row for row in events if row.get("event") == "evaluation_finished"
             )
             evaluation["status"] = " aC "
+            _sync_closeout_task(events, final["verdicts"][TASKS[0]])
             run_finished = next(
                 row for row in events if row.get("event") == "run_finished"
             )
             run_finished["status"] = " CoMpLeTeD "
             _write_jsonl(paths["agent"] / "events.jsonl", events)
+            _write_jsonl(
+                paths["agent"] / "scoreboard_history.jsonl",
+                _closeout_scoreboard_rows(events),
+            )
 
             judge_rows = [
                 json.loads(line)

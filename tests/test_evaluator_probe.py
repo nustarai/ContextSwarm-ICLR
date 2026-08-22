@@ -12,12 +12,21 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
+from contextswarm_mini.config import load_config
 from contextswarm_mini.evaluator import (
     EvaluatorError,
     LeanEvaluator,
     safe_worker_response,
 )
 from contextswarm_mini.models import Task
+from contextswarm_mini.runner import (
+    _FrozenCandidate,
+    RunLogger,
+    _run_closeout,
+)
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _task(root: Path) -> Task:
@@ -59,6 +68,20 @@ class _CountingEvaluator(LeanEvaluator):
                 "truncated": False,
             }
         return result
+
+
+class _CountingProofEvaluator(_CountingEvaluator):
+    def _request(  # type: ignore[no-untyped-def]
+        self, method, path, payload=None, *, timeout_seconds=None, cancel_event=None
+    ):
+        del method, path, timeout_seconds, cancel_event
+        self.payloads.append(dict(payload or {}))
+        return {
+            "job_id": f"counting-proof-job-{len(self.payloads)}",
+            "status": "succeeded",
+            "formal_status": "PROVED",
+            "is_valid_no_sorry": True,
+        }
 
 
 class _OneFailureEvaluator(_CountingEvaluator):
@@ -223,6 +246,60 @@ class EvaluatorProbeTests(unittest.TestCase):
             candidate.write_text(source + "\n-- changed\n", encoding="utf-8")
             evaluator.evaluate(_task(root), candidate)
             self.assertEqual(len(evaluator.payloads), 2)
+
+    def test_runner_closeout_forces_fresh_remote_receipt_after_broker_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = _task(root)
+            source = "import Mathlib\ntheorem task : True := by trivial\n"
+            candidate = root / "closeout_candidates" / task.slug / "result.lean"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_text(source, encoding="utf-8")
+            evaluator = _CountingProofEvaluator()
+
+            prior = evaluator.probe_source(task, source)
+            config = load_config(ROOT / "configs" / "smoke.toml", ROOT)
+            verdicts = _run_closeout(
+                config,
+                [task],
+                {
+                    task.slug: _FrozenCandidate(
+                        task.slug,
+                        candidate,
+                        prior.candidate_sha256,
+                    )
+                },
+                RunLogger(root),
+                evaluator,
+                threading.BoundedSemaphore(1),
+                reusable_verdicts=[prior],
+            )
+
+            events = [
+                json.loads(line)
+                for line in (root / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(len(evaluator.payloads), 2)
+        self.assertEqual(
+            evaluator.payloads[0]["response_profile"],
+            "lean_probe_v1",
+        )
+        self.assertNotIn("response_profile", evaluator.payloads[1])
+        self.assertEqual(prior.judge_job_id, "counting-proof-job-1")
+        self.assertEqual(verdicts[task.slug].judge_job_id, prior.judge_job_id)
+        confirmation = next(
+            row for row in events if row["event"] == "closeout_authority_confirmed"
+        )
+        self.assertEqual(confirmation["prior_judge_job_id"], prior.judge_job_id)
+        self.assertEqual(
+            confirmation["observed_judge_job_id"],
+            "counting-proof-job-2",
+        )
+        self.assertNotEqual(
+            confirmation["observed_judge_job_id"],
+            confirmation["prior_judge_job_id"],
+        )
 
     def test_evaluation_budget_is_clamped_to_exact_run_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -23,19 +23,28 @@ class LaunchContract:
     manifest_sha256: str
 
 
-def resolve_launch_contract(raw: str | Path, repo_root: Path) -> LaunchContract:
-    """Resolve one clean, container-visible manifest closure.
+def resolve_launch_contract(
+    raw: str | Path,
+    repo_root: Path,
+    *,
+    formal: bool = False,
+) -> LaunchContract:
+    """Resolve one container-visible manifest closure.
 
     Tracked manifests are supplied by the commit-bound image. Operator-local
-    manifests are allowed only below ``runs/``, the sole source-tree mount in
-    the hardened container. Every inherited manifest must follow the same
-    rule, and the complete closure is hashed for an entrypoint recheck.
+    manifests are allowed only below ``runs/`` for mock/development commands,
+    because that is the sole source-tree mount in the hardened container.
+    Formal runs and preflights require a clean worktree and a fully tracked
+    closure, so the read-only image removes the post-check mutation window.
+    Every inherited manifest follows the same rule, and the complete closure
+    is hashed for an entrypoint recheck.
     """
 
     root = repo_root.resolve()
-    _require_clean_tracked_tree(root)
+    if formal:
+        _require_clean_tracked_tree(root)
     try:
-        config = load_config(raw, root)
+        config = load_config(_rooted_manifest_arg(raw, root), root)
         sources = manifest_sources(config.manifest_path)
     except (ConfigError, OSError, ValueError) as exc:
         raise LaunchContractError(str(exc)) from exc
@@ -52,9 +61,14 @@ def resolve_launch_contract(raw: str | Path, repo_root: Path) -> LaunchContract:
         if not relative.parts:
             raise LaunchContractError("manifest path is invalid")
         relative_text = relative.as_posix()
-        if relative.parts[0] != "runs" and relative_text not in tracked:
+        is_tracked = relative_text in tracked
+        if relative.parts[0] != "runs" and not is_tracked:
             raise LaunchContractError(
                 "manifest sources must be tracked or located below runs/"
+            )
+        if formal and not is_tracked:
+            raise LaunchContractError(
+                "formal manifest sources must be tracked by the launcher commit"
             )
         relative_sources.append((relative, source))
 
@@ -86,6 +100,38 @@ def manifest_closure_sha256(raw: str | Path, repo_root: Path) -> str:
             ) from exc
         relative_sources.append((relative, source))
     return _manifest_digest(relative_sources)
+
+
+def verify_manifest_binding(
+    raw: str | Path,
+    repo_root: Path,
+    expected_sha256: str,
+) -> str:
+    """Fail unless a container-visible closure matches its launcher digest."""
+
+    expected = str(expected_sha256).strip()
+    if len(expected) != 64 or any(
+        character not in "0123456789abcdef" for character in expected
+    ):
+        raise LaunchContractError("manifest binding digest is invalid")
+    actual = manifest_closure_sha256(raw, repo_root)
+    if actual != expected:
+        raise LaunchContractError("manifest closure does not match the launcher")
+    return actual
+
+
+def _rooted_manifest_arg(raw: str | Path, root: Path) -> Path:
+    """Resolve relative launcher input without consulting the caller's cwd."""
+
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    options = (
+        root / candidate,
+        root / "configs" / candidate,
+        root / "configs" / f"{candidate}.toml",
+    )
+    return next((option for option in options if option.is_file()), options[0])
 
 
 def manifest_sources(raw: str | Path) -> tuple[Path, ...]:

@@ -701,6 +701,48 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
     ) -> Verdict:
+        """Evaluate a candidate, reusing an exact in-process probe when present."""
+
+        return self._evaluate_candidate(
+            task,
+            candidate_path,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+            reuse_probe_cache=True,
+        )
+
+    def evaluate_fresh(
+        self,
+        task: Task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: Any | None = None,
+    ) -> Verdict:
+        """Evaluate through a fresh Judge submission, bypassing probe cache.
+
+        Frozen closeout candidates use this path so their observed receipt has
+        independent remote lineage.  Ordinary in-horizon evaluation retains
+        the exact-candidate probe-cache behavior exposed by :meth:`evaluate`.
+        """
+
+        return self._evaluate_candidate(
+            task,
+            candidate_path,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+            reuse_probe_cache=False,
+        )
+
+    def _evaluate_candidate(
+        self,
+        task: Task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic: float | None,
+        cancel_event: Any | None,
+        reuse_probe_cache: bool,
+    ) -> Verdict:
         started = time.monotonic()
         code = _read_candidate(candidate_path)
         if self.remote_unsettled_jobs > 0:
@@ -724,7 +766,7 @@ class LeanEvaluator:
                 cancellation=None,
             )
         cache_key = self._probe_cache_key(task, code) if code is not None else None
-        if cache_key is not None:
+        if reuse_probe_cache and cache_key is not None:
             cached = self._cached_verdict(cache_key)
             if cached is not None:
                 return cached

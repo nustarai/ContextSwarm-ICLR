@@ -224,6 +224,7 @@ export default function registerContextSwarmSolverTools(pi) {
       "Submit the runner-bound result.lean to the controlled external Lean Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.",
     promptSnippet: "Check the current result.lean through the controlled external Judge",
     promptGuidelines: [
+      "Complete the mandatory early Judge checkpoint immediately after initial inspection.",
       "Use judge_check one candidate at a time; never attempt local Lean or raw Judge access.",
       "A retryable busy result is not permission to use a local fallback.",
     ],

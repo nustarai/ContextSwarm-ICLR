@@ -61,6 +61,7 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertIn("Do not execute shell commands", system_prompt)
         self.assertIn("All dynamic Lean verification must use", system_prompt)
         self.assertIn("judge_check", system_prompt)
+        self.assertIn("mandatory early Judge checkpoint", system_prompt)
         self.assertEqual(
             {
                 "judge_check",
@@ -107,6 +108,9 @@ class PiSolverContractTests(unittest.TestCase):
                 "CONTEXTSWARM_JUDGE_URL": "http://raw-judge.invalid",
                 "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL": "https://cache-health.invalid",
                 "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "1",
+                "CONTEXTSWARM_MANIFEST_PATH": "configs/stale.toml",
+                "CONTEXTSWARM_MANIFEST_SHA256": "f" * 64,
+                "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED": "1",
             },
             clear=False,
         ):
@@ -132,6 +136,9 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertNotIn("CONTEXTSWARM_JUDGE_URL", raw_env)
         self.assertNotIn("CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", raw_env)
         self.assertNotIn("CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS", raw_env)
+        self.assertNotIn("CONTEXTSWARM_MANIFEST_PATH", raw_env)
+        self.assertNotIn("CONTEXTSWARM_MANIFEST_SHA256", raw_env)
+        self.assertNotIn("CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED", raw_env)
         self.assertNotIn("LEAN_AUTH_TOKEN", broker_env)
         self.assertNotIn("CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", broker_env)
         self.assertEqual(
@@ -355,6 +362,7 @@ process.stdout.write(JSON.stringify({ registered: registered.sort(), denied, all
         source = (ROOT / "contextswarm_mini" / "pi_solver_tools.mjs").read_text(
             encoding="utf-8"
         )
+        self.assertIn("mandatory early Judge checkpoint", source)
         self.assertIn("CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS", source)
         self.assertNotIn("310_000", source)
 

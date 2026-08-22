@@ -22,6 +22,7 @@ from contextswarm_mini.cps import CPSStore, make_policy
 from contextswarm_mini.elastic_scheduler import ElasticScheduler
 from contextswarm_mini.evaluator import LeanEvaluator, MockEvaluator, _is_proved, normalize_base_url
 from contextswarm_mini.judge_broker import JudgeBroker, JudgeBrokerDrainError
+from contextswarm_mini.launch_contract import manifest_closure_sha256
 from contextswarm_mini.runner import (
     _atomic_promote_candidate,
     _enforce_verdict_provenance,
@@ -45,11 +46,19 @@ from contextswarm_mini.preflight import PreflightError
 
 
 ROOT = Path(__file__).resolve().parents[1]
-_FORMAL_PROVENANCE_ENV = {
-    "CONTEXTSWARM_IMAGE_REVISION": "1" * 40,
-    "CONTEXTSWARM_SOURCE_COMMIT": "1" * 40,
-    "CONTEXTSWARM_IMAGE_ID": "sha256:" + "3" * 64,
-}
+
+
+def _formal_provenance_env(manifest_path: str) -> dict[str, str]:
+    return {
+        "CONTEXTSWARM_IMAGE_REVISION": "1" * 40,
+        "CONTEXTSWARM_SOURCE_COMMIT": "1" * 40,
+        "CONTEXTSWARM_IMAGE_ID": "sha256:" + "3" * 64,
+        "CONTEXTSWARM_MANIFEST_PATH": manifest_path,
+        "CONTEXTSWARM_MANIFEST_SHA256": manifest_closure_sha256(
+            manifest_path,
+            ROOT,
+        ),
+    }
 
 
 def _write_fake_pi(root: Path, source: str) -> Path:
@@ -423,6 +432,64 @@ class MiniRuntimeTests(unittest.TestCase):
                 run_experiment(config, output_override=output_root)
             self.assertEqual(list(output_root.iterdir()), [])
 
+            missing_manifest = {
+                "CONTEXTSWARM_IMAGE_REVISION": "1" * 40,
+                "CONTEXTSWARM_SOURCE_COMMIT": "1" * 40,
+                "CONTEXTSWARM_IMAGE_ID": "sha256:" + "3" * 64,
+                "CONTEXTSWARM_MANIFEST_PATH": "",
+                "CONTEXTSWARM_MANIFEST_SHA256": "",
+            }
+            with patch.dict(os.environ, missing_manifest), self.assertRaisesRegex(
+                ConfigError, "manifest binding"
+            ):
+                run_experiment(config, output_override=output_root)
+            self.assertEqual(list(output_root.iterdir()), [])
+
+    def test_runtime_provenance_is_bound_to_loaded_manifest_closure(self) -> None:
+        config = load_config("configs/parallel.toml", ROOT)
+        valid = _formal_provenance_env("configs/parallel.toml")
+        with patch.dict(os.environ, valid):
+            self.assertEqual(
+                runner_module._runtime_provenance(config, mock_agent=False),
+                {
+                    "source_commit": valid["CONTEXTSWARM_IMAGE_REVISION"],
+                    "image_id": valid["CONTEXTSWARM_IMAGE_ID"],
+                    "manifest_path": valid["CONTEXTSWARM_MANIFEST_PATH"],
+                    "manifest_sha256": valid["CONTEXTSWARM_MANIFEST_SHA256"],
+                },
+            )
+
+        invalid_bindings = (
+            {
+                **valid,
+                "CONTEXTSWARM_MANIFEST_PATH": "configs/smoke.toml",
+                "CONTEXTSWARM_MANIFEST_SHA256": manifest_closure_sha256(
+                    "configs/smoke.toml",
+                    ROOT,
+                ),
+            },
+            {**valid, "CONTEXTSWARM_MANIFEST_SHA256": "0" * 64},
+        )
+        for invalid in invalid_bindings:
+            with self.subTest(
+                manifest=invalid["CONTEXTSWARM_MANIFEST_PATH"],
+                digest=invalid["CONTEXTSWARM_MANIFEST_SHA256"],
+            ), patch.dict(os.environ, invalid), self.assertRaisesRegex(
+                ConfigError,
+                "manifest binding",
+            ):
+                runner_module._runtime_provenance(config, mock_agent=False)
+
+        with patch.dict(os.environ, invalid_bindings[0]):
+            self.assertEqual(
+                runner_module._runtime_provenance(config, mock_agent=True),
+                {
+                    "source_commit": "test-only-mock-source",
+                    "image_id": "test-only-mock-image",
+                    "test_only": True,
+                },
+            )
+
     def test_broker_drain_timeout_is_fatal_before_health_and_final(self) -> None:
         original_close = JudgeBroker.close
 
@@ -507,7 +574,10 @@ class MiniRuntimeTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as temporary:
             output_root = Path(temporary)
-            with patch.dict(os.environ, _FORMAL_PROVENANCE_ENV), self.assertRaises(
+            with patch.dict(
+                os.environ,
+                _formal_provenance_env("configs/smoke.toml"),
+            ), self.assertRaises(
                 PreflightError
             ) as raised:
                 run_experiment(config, output_override=output_root)
@@ -1125,7 +1195,8 @@ class MiniRuntimeTests(unittest.TestCase):
                 max_tasks=1,
                 time_limit_seconds=0.3,
             )
-            with patch.dict(os.environ, _FORMAL_PROVENANCE_ENV), patch.object(
+            formal_env = _formal_provenance_env("configs/parallel.toml")
+            with patch.dict(os.environ, formal_env), patch.object(
                 runner_module, "run_preflight", delayed_preflight
             ), patch.object(runner_module, "_run_task_workers", capture_workers):
                 run_dir = run_experiment(
@@ -1141,10 +1212,10 @@ class MiniRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 meta["runtime_provenance"],
                 {
-                    "source_commit": _FORMAL_PROVENANCE_ENV[
-                        "CONTEXTSWARM_IMAGE_REVISION"
-                    ],
-                    "image_id": _FORMAL_PROVENANCE_ENV["CONTEXTSWARM_IMAGE_ID"],
+                    "source_commit": formal_env["CONTEXTSWARM_IMAGE_REVISION"],
+                    "image_id": formal_env["CONTEXTSWARM_IMAGE_ID"],
+                    "manifest_path": formal_env["CONTEXTSWARM_MANIFEST_PATH"],
+                    "manifest_sha256": formal_env["CONTEXTSWARM_MANIFEST_SHA256"],
                 },
             )
 
@@ -1363,7 +1434,10 @@ class MiniRuntimeTests(unittest.TestCase):
                         episodes_per_task=1,
                         time_limit_seconds=2,
                     )
-                    with patch.dict(os.environ, _FORMAL_PROVENANCE_ENV), patch.object(
+                    with patch.dict(
+                        os.environ,
+                        _formal_provenance_env(manifest),
+                    ), patch.object(
                         runner_module, "run_preflight", return_value=None
                     ), patch.object(runner_module, "LeanEvaluator", return_value=evaluator):
                         run_dir = run_experiment(
@@ -1485,7 +1559,10 @@ class MiniRuntimeTests(unittest.TestCase):
                 lean_max_concurrent_evaluations=2,
                 time_limit_seconds=4,
             )
-            with patch.dict(os.environ, _FORMAL_PROVENANCE_ENV), patch.object(
+            with patch.dict(
+                os.environ,
+                _formal_provenance_env("configs/smoke.toml"),
+            ), patch.object(
                 runner_module, "run_preflight", return_value=None
             ), patch.object(runner_module, "LeanEvaluator", return_value=evaluator):
                 run_dir = run_experiment(
@@ -1615,7 +1692,10 @@ class MiniRuntimeTests(unittest.TestCase):
                 lean_max_concurrent_evaluations=1,
                 time_limit_seconds=5,
             )
-            with patch.dict(os.environ, _FORMAL_PROVENANCE_ENV), patch.object(
+            with patch.dict(
+                os.environ,
+                _formal_provenance_env("configs/smoke.toml"),
+            ), patch.object(
                 runner_module, "run_preflight", return_value=None
             ), patch.object(
                 runner_module, "LeanEvaluator", return_value=evaluator
@@ -1750,7 +1830,12 @@ class MiniRuntimeTests(unittest.TestCase):
                     return original_scoreboard(logger, verdict, **kwargs)
 
                 with ExitStack() as stack:
-                    stack.enter_context(patch.dict(os.environ, _FORMAL_PROVENANCE_ENV))
+                    stack.enter_context(
+                        patch.dict(
+                            os.environ,
+                            _formal_provenance_env("configs/smoke.toml"),
+                        )
+                    )
                     stack.enter_context(
                         patch.object(runner_module, "run_preflight", return_value=None)
                     )
@@ -1862,6 +1947,18 @@ class MiniRuntimeTests(unittest.TestCase):
             "CONTEXTSWARM_BEST_CANDIDATE_FILE": "/tmp/stale-result.lean",
             "CONTEXTSWARM_TASK_ROOT": "/tmp/stale-task",
             "CONTEXTSWARM_CPS_FUTURE_CAPABILITY": "stale",
+            "CONTEXTSWARM_JUDGE_URL": "http://raw-judge.invalid",
+            "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL": "http://cache.invalid",
+            "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "1",
+            "CONTEXTSWARM_LEAN_SERVER_URL": "http://stale-route.invalid",
+            "CONTEXTSWARM_LEAN_ENV_ID": "stale_env",
+            "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE": "stale_profile",
+            "CONTEXTSWARM_LEAN_JUDGE_MODE": "stale_mode",
+            "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS": "321",
+            "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS": "6543",
+            "CONTEXTSWARM_MANIFEST_PATH": "configs/stale.toml",
+            "CONTEXTSWARM_MANIFEST_SHA256": "f" * 64,
+            "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED": "1",
         }
         with patch.dict(os.environ, stale, clear=False):
             for manifest in ("configs/mono.toml", "configs/parallel.toml"):
@@ -1883,6 +1980,57 @@ class MiniRuntimeTests(unittest.TestCase):
                     workdir=ROOT,
                     extra_env={"CONTEXTSWARM_CPS_DB": "/run/current.sqlite3"},
                 )
+
+    def test_agent_environment_exposes_only_controlled_loopback_broker(self) -> None:
+        config = load_config("configs/cps.toml", ROOT)
+        stale = {
+            "LEAN_AUTH_TOKEN": "private-token",
+            "CONTEXTSWARM_JUDGE_URL": "http://raw-judge.invalid",
+            "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL": "http://cache.invalid",
+            "CONTEXTSWARM_LEAN_SERVER_URL": "http://stale-route.invalid",
+            "CONTEXTSWARM_LEAN_ENV_ID": "stale_env",
+            "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE": "stale_profile",
+            "CONTEXTSWARM_LEAN_JUDGE_MODE": "stale_mode",
+            "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS": "321",
+            "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS": "6543",
+            "CONTEXTSWARM_MANIFEST_PATH": "configs/stale.toml",
+            "CONTEXTSWARM_MANIFEST_SHA256": "f" * 64,
+            "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED": "1",
+        }
+        token = "a" * 43
+        with patch.dict(os.environ, stale, clear=False):
+            env = PiAgent(config).environment(
+                task_id="task",
+                actor_id="actor",
+                workdir=ROOT,
+                extra_env={
+                    "CONTEXTSWARM_JUDGE_URL": f"http://127.0.0.1:29999/{token}",
+                    "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "2000000000000",
+                },
+            )
+        self.assertEqual(
+            env["CONTEXTSWARM_JUDGE_URL"],
+            f"http://127.0.0.1:29999/{token}",
+        )
+        self.assertEqual(
+            env["CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"],
+            "2000000000000",
+        )
+        self.assertNotIn("LEAN_AUTH_TOKEN", env)
+        self.assertNotIn("CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", env)
+        self.assertFalse(any(key.startswith("CONTEXTSWARM_LEAN_") for key in env))
+        self.assertFalse(any(key.startswith("CONTEXTSWARM_MANIFEST_") for key in env))
+        self.assertNotIn("CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED", env)
+
+        with self.assertRaisesRegex(ValueError, "unsupported solver environment"):
+            PiAgent(config).environment(
+                task_id="task",
+                actor_id="actor",
+                workdir=ROOT,
+                extra_env={
+                    "CONTEXTSWARM_LEAN_SERVER_URL": "http://127.0.0.1:29998",
+                },
+            )
 
     def test_verdict_helpers(self) -> None:
         self.assertEqual(normalize_base_url("http://judge/api/lean/jobs"), "http://judge")

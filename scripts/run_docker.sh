@@ -65,9 +65,13 @@ if [[ -f "${ROOT_DIR}/${CONFIG}" ]]; then
 else
   CONFIG_PATH="${CONFIG}"
 fi
+FORMAL_LAUNCH=0
+if (( MOCK == 0 )) && [[ "${COMMAND}" == "run" || "${COMMAND}" == "preflight" ]]; then
+  FORMAL_LAUNCH=1
+fi
 if ! RESOLVED_RUNTIME_CONFIG="$(
   PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
-    python3 - "${CONFIG_PATH}" "${ROOT_DIR}" <<'PY'
+    python3 - "${CONFIG_PATH}" "${ROOT_DIR}" "${FORMAL_LAUNCH}" <<'PY'
 from pathlib import Path
 import sys
 
@@ -77,7 +81,11 @@ from contextswarm_mini.launch_contract import (
 )
 
 try:
-    contract = resolve_launch_contract(Path(sys.argv[1]), Path(sys.argv[2]))
+    contract = resolve_launch_contract(
+        Path(sys.argv[1]),
+        Path(sys.argv[2]),
+        formal=sys.argv[3] == "1",
+    )
     config = contract.config
 except (LaunchContractError, OSError, ValueError) as exc:
     print(f"runtime manifest resolution failed: {exc}", file=sys.stderr)
@@ -130,10 +138,7 @@ if (( PIDS_LIMIT < 1 )); then
   exit 2
 fi
 
-NEEDS_JUDGE=0
-if (( MOCK == 0 )) && [[ "${COMMAND}" == "run" || "${COMMAND}" == "preflight" ]]; then
-  NEEDS_JUDGE=1
-fi
+NEEDS_JUDGE="${FORMAL_LAUNCH}"
 if (( NEEDS_JUDGE == 1 )) && [[ -z "${CONTEXTSWARM_JUDGE_URL:-}" ]]; then
   echo "CONTEXTSWARM_JUDGE_URL must be set for a real run or preflight" >&2
   exit 2
@@ -246,6 +251,7 @@ DOCKER_ARGS=(
   -e "MINI_SWARM_NUROUTER_VERSION=${NUROUTER_VERSION}"
   -e "CONTEXTSWARM_IMAGE_ID=${IMAGE_ID}"
   -e "CONTEXTSWARM_IMAGE_REVISION=${IMAGE_REVISION}"
+  -e "CONTEXTSWARM_LAUNCH_CONTRACT_REQUIRED=1"
   -e "CONTEXTSWARM_MANIFEST_PATH=${CONFIG}"
   -e "CONTEXTSWARM_MANIFEST_SHA256=${MANIFEST_SHA256}"
 )
