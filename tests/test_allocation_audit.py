@@ -70,6 +70,12 @@ class AuditTests(unittest.TestCase):
                 row[field] = value
                 with self.assertRaises(ValueError):
                     AllocationAuditRecord.create(**row)
+        for field in ("state_id", "decision_id", "allocation_config_sha256"):
+            with self.subTest(missing=field):
+                row = dict(base)
+                row.pop(field)
+                with self.assertRaises(ValueError):
+                    AllocationAuditRecord.create(**row)
 
     def test_audit_ids_reject_control_or_surrounding_whitespace(self):
         base = _record().as_dict()

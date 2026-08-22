@@ -151,10 +151,10 @@ class AllocationAuditRecord:
         # Validate identity fields before any derived vectors are built.  In
         # particular, never use ``str(value)`` here: ``None`` and integers are
         # malformed artifact values, not alternate spellings of an ID.
-        state_id = _audit_text(kwargs.pop("state_id"), "state_id")
-        decision_id = _audit_text(kwargs.pop("decision_id"), "decision_id")
+        state_id = _audit_text(kwargs.pop("state_id", None), "state_id")
+        decision_id = _audit_text(kwargs.pop("decision_id", None), "decision_id")
         config_hash = _audit_text(
-            kwargs.pop("allocation_config_sha256"),
+            kwargs.pop("allocation_config_sha256", None),
             "allocation_config_sha256",
         )
         if _SHA256.fullmatch(state_id) is None or _SHA256.fullmatch(config_hash) is None:
