@@ -31,6 +31,7 @@ from typing import Any, Iterable, Iterator, Mapping, Protocol, Sequence
 from .allocation_projection import (
     TraceAllocationProjectionAdapter,
     TraceAllocationProjectionBatch,
+    TraceProjectionRecord,
     TraceProjectionLimits,
     TraceProjectionRecordBatch,
     build_synthetic_trace_projection,
@@ -74,6 +75,132 @@ class _ProjectionSource(Protocol):
 
 
 @dataclass(frozen=True)
+class TraceProjectionSnapshotPage:
+    """One page of a pinned, full-current trace projection.
+
+    ``trace_watermark`` identifies the causal snapshot, while ``next_cursor``
+    is only a pagination cursor *inside that snapshot*.  They are deliberately
+    separate: a cursor must never be persisted as the allocator's state
+    identity, and a source head must not be used to skip records which have not
+    yet been materialized.
+    """
+
+    records: tuple[Any, ...]
+    trace_watermark: str
+    next_cursor: str = ""
+    complete: bool = True
+    source_watermark: int | None = None
+
+    def __post_init__(self) -> None:
+        watermark = str(self.trace_watermark or "").strip()
+        if not watermark or len(watermark) > 512:
+            raise ValueError("trace_watermark must be non-empty and bounded")
+        object.__setattr__(self, "trace_watermark", watermark)
+        cursor = str(self.next_cursor or "").strip()
+        if len(cursor) > 512:
+            raise ValueError("next_cursor must be at most 512 characters")
+        object.__setattr__(self, "next_cursor", cursor)
+        if not isinstance(self.complete, bool):
+            raise ValueError("complete must be a boolean")
+        if self.complete and cursor:
+            raise ValueError("a complete projection page must not have next_cursor")
+        if not self.complete and not cursor:
+            raise ValueError("an incomplete projection page requires next_cursor")
+        if self.source_watermark is not None:
+            if (
+                isinstance(self.source_watermark, bool)
+                or not isinstance(self.source_watermark, int)
+                or self.source_watermark < 0
+            ):
+                raise ValueError("source_watermark must be a non-negative integer")
+        object.__setattr__(self, "records", tuple(self.records))
+
+
+class TraceProjectionSnapshotSource(Protocol):
+    """Source protocol for a complete, causally pinned projection.
+
+    The first call uses ``as_of_watermark=None`` and an empty cursor.  Every
+    subsequent call must echo the returned ``trace_watermark`` and use the
+    returned cursor.  A source may paginate, but it must keep the watermark
+    fixed until ``complete=True``.
+    """
+
+    def read_allocation_projection_snapshot(
+        self,
+        task_ids: Sequence[str],
+        *,
+        as_of_watermark: str | None,
+        cursor: str,
+        limit: int,
+    ) -> TraceProjectionSnapshotPage: ...
+
+
+def _snapshot_identity(
+    task_ids: Sequence[str],
+    source_watermark: str,
+    records: Sequence[Any],
+    ordinary_outcome_ids: Iterable[str],
+) -> str:
+    """Hash only the bounded projection contract, never raw source metadata."""
+
+    normalized: list[dict[str, Any]] = []
+    for record in records:
+        if isinstance(record, Mapping):
+            normalized.append(
+                {
+                    key: record.get(key)
+                    for key in (
+                        "sequence",
+                        "record_id",
+                        "task_id",
+                        "kind",
+                        "lineage_id",
+                        "evidence_id",
+                        "worker_id",
+                        "source",
+                        "source_outcome_id",
+                        "exposure_id",
+                        "effective",
+                        "terminal",
+                    )
+                    if key in record
+                }
+            )
+        else:
+            normalized.append(
+                {
+                    key: getattr(record, key)
+                    for key in (
+                        "sequence",
+                        "record_id",
+                        "task_id",
+                        "kind",
+                        "lineage_id",
+                        "evidence_id",
+                        "worker_id",
+                        "source",
+                        "source_outcome_id",
+                        "exposure_id",
+                        "effective",
+                        "terminal",
+                    )
+                    if hasattr(record, key)
+                }
+            )
+    return _canonical_sha(
+        {
+            "schema": "contextswarm_trace_projection_snapshot_v1",
+            "task_ids": list(task_ids),
+            "source_watermark": str(source_watermark),
+            "ordinary_outcome_ids": sorted(
+                {str(value).strip() for value in ordinary_outcome_ids if str(value).strip()}
+            ),
+            "records": normalized,
+        }
+    )
+
+
+@dataclass(frozen=True)
 class AllocationTraceView:
     """One bounded, immutable trace view for a core allocation snapshot."""
 
@@ -88,6 +215,7 @@ class AllocationTraceView:
         if not self.watermark or len(self.watermark) > 512:
             raise ValueError("trace watermark must be non-empty and bounded")
         if self.source not in {
+            "selection_store_snapshot",
             "selection_store_protocol",
             "selection_store_sqlite_v1",
             "synthetic",
@@ -343,6 +471,158 @@ class SelectionStoreTraceSource:
         return tuple(records), watermark
 
 
+class SelectionRuntimeTraceSource:
+    """Explicit adapter from an Issue #38 ``SelectionRuntime`` to trace state.
+
+    ``SelectionRuntime.search`` and ``SelectionStore.effective_feedback`` are
+    selector APIs, not allocation projections.  This adapter intentionally
+    unwraps only the runtime's attribution store and frozen feedback mapping,
+    then delegates to the bounded full-materialization reader above.  It does
+    not call the selector, inspect CPS pieces, or expose raw search results.
+
+    SelectionStore v1 cannot replay historical snapshots.  A requested
+    ``as_of_watermark`` is therefore accepted only when it still matches the
+    freshly materialized content hash; otherwise the adapter fails closed.
+    """
+
+    def __init__(self, runtime: Any, *, max_records: int = 4096) -> None:
+        selection_store = getattr(runtime, "selection_store", None)
+        if selection_store is None:
+            raise TypeError("selection runtime has no selection_store")
+        values = getattr(runtime, "feedback_values", None)
+        if not isinstance(values, Mapping):
+            # A runtime with no configured polarity must not silently infer
+            # positive/negative meaning from selector feedback-kind labels.
+            values = None
+        self._source = SelectionStoreTraceSource(
+            selection_store,
+            feedback_values=values,
+            max_records=max_records,
+        )
+
+    def read_allocation_projection_snapshot(
+        self,
+        task_ids: Sequence[str],
+        *,
+        as_of_watermark: str | None,
+        cursor: str,
+        limit: int,
+    ) -> TraceProjectionSnapshotPage:
+        if cursor:
+            raise ValueError("SelectionStore v1 projection is not cursor-paged")
+        if limit <= 0:
+            raise ValueError("projection limit must be positive")
+        records, watermark = self._source.read_complete_records(task_ids)
+        if len(records) > limit:
+            raise OverflowError("selection projection exceeds the requested bound")
+        if as_of_watermark is not None and str(as_of_watermark) != watermark:
+            raise ValueError("requested selection projection snapshot is no longer available")
+        return TraceProjectionSnapshotPage(
+            records=records,
+            trace_watermark=watermark,
+            complete=True,
+        )
+
+
+def _record_evidence_id(record: Any) -> str:
+    if isinstance(record, Mapping):
+        return str(
+            record.get("evidence_id")
+            or record.get("piece_id")
+            or record.get("context_piece_id")
+            or ""
+        ).strip()
+    return str(getattr(record, "evidence_id", "") or "").strip()
+
+
+def _record_task_id(record: Any) -> str:
+    if isinstance(record, Mapping):
+        return str(record.get("task_id") or "").strip()
+    return str(getattr(record, "task_id", "") or "").strip()
+
+
+def _trace_references(
+    task_ids: Sequence[str], records: Sequence[Any]
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    by_task: dict[str, set[str]] = {task_id: set() for task_id in task_ids}
+    for record in records:
+        task_id = _record_task_id(record)
+        evidence_id = _record_evidence_id(record)
+        if task_id in by_task and evidence_id:
+            by_task[task_id].add(evidence_id[:512])
+    return tuple(
+        (task_id, tuple(sorted(by_task[task_id])[:100]))
+        for task_id in task_ids
+    )
+
+
+def _legacy_batch_is_complete(batch: TraceProjectionRecordBatch) -> bool:
+    """Validate the old integer-watermark protocol before consuming it.
+
+    The legacy API has no ``complete`` bit or pinned snapshot identity.  The
+    only safe compatibility case is a one-shot page whose explicit sequences
+    end exactly at the reported watermark.  A source head larger than the
+    returned page is otherwise indistinguishable from a silently truncated
+    read, so it must fail closed.
+    """
+
+    if not isinstance(batch, TraceProjectionRecordBatch):
+        return False
+    sequences: list[int] = []
+    identities: set[tuple[str, ...]] = set()
+    for item in batch.records:
+        if isinstance(item, TraceProjectionRecord):
+            sequence = item.sequence
+            identity = item.canonical_identity
+        elif isinstance(item, Mapping):
+            if not any(key in item for key in ("sequence", "seq", "watermark")):
+                return False
+            try:
+                sequence = int(item.get("sequence", item.get("seq", item.get("watermark", 0))))
+            except (TypeError, ValueError, OverflowError):
+                return False
+            identity = ("mapping", str(item.get("record_id", item.get("event_id", ""))), str(sequence))
+        else:
+            return False
+        if sequence <= 0 or sequence in sequences or identity in identities:
+            return False
+        sequences.append(sequence)
+        identities.add(identity)
+    return int(batch.watermark) == max(sequences, default=0)
+
+
+def _project_complete_records(
+    adapter: TraceAllocationProjectionAdapter,
+    task_ids: Sequence[str],
+    records: Sequence[Any],
+    *,
+    ordinary_outcome_ids: Iterable[str],
+    source_watermark: int | None = None,
+) -> TraceAllocationProjectionBatch:
+    """Use the explicit full-state adapter when available.
+
+    The fallback keeps this bridge source-compatible with the first projection
+    implementation; once the stricter ``project_full_records`` API is present,
+    pinned snapshots never pass through incremental ``after_watermark`` logic.
+    """
+
+    full_project = getattr(adapter, "project_full_records", None)
+    if callable(full_project):
+        return full_project(
+            task_ids,
+            records,
+            ordinary_outcome_ids=ordinary_outcome_ids,
+            source_watermark=source_watermark,
+        )
+    return adapter.project_records(
+        task_ids,
+        records,
+        after_watermark=0,
+        source_watermark=source_watermark,
+        ordinary_outcome_ids=ordinary_outcome_ids,
+    )
+
+
 class TraceProjectionBridge:
     """Resolve one complete allocation trace view, with explicit fail-closed zero."""
 
@@ -377,8 +657,12 @@ class TraceProjectionBridge:
         *,
         store: Any | None = None,
         feedback_values: Mapping[str, Any] | None = None,
+        ordinary_outcome_ids: Iterable[str] = (),
     ) -> AllocationTraceView:
         ordered = _ordered_task_ids(task_ids, maximum=self.limits.max_tasks)
+        ordinary_ids = tuple(
+            sorted({str(value).strip() for value in ordinary_outcome_ids if str(value).strip()})
+        )
         if self.synthetic_features is not None:
             selected = {task_id: self.synthetic_features.get(task_id, {}) for task_id in ordered}
             batch = build_synthetic_trace_projection(selected)
@@ -390,19 +674,93 @@ class TraceProjectionBridge:
             )
         if store is None:
             return self.zero(ordered)
+        snapshot_protocol = getattr(store, "read_allocation_projection_snapshot", None)
+        if callable(snapshot_protocol):
+            try:
+                records: list[Any] = []
+                cursor = ""
+                as_of: str | None = None
+                seen_cursors: set[str] = set()
+                # A page can contain at most max_records records.  One extra
+                # empty page is enough to detect a non-terminating source while
+                # keeping the bridge's work bounded.
+                max_pages = self.limits.max_records + 1
+                for _page_index in range(max_pages):
+                    page = snapshot_protocol(
+                        ordered,
+                        as_of_watermark=as_of,
+                        cursor=cursor,
+                        limit=self.limits.max_records,
+                    )
+                    if not isinstance(page, TraceProjectionSnapshotPage):
+                        raise TypeError("snapshot source returned an invalid page")
+                    if as_of is None:
+                        as_of = page.trace_watermark
+                    elif page.trace_watermark != as_of:
+                        raise ValueError("trace watermark changed during pagination")
+                    records.extend(page.records)
+                    if len(records) > self.limits.max_records:
+                        raise OverflowError("snapshot projection exceeds its record bound")
+                    if page.complete:
+                        if page.next_cursor:
+                            raise ValueError("complete snapshot returned a cursor")
+                        assert as_of is not None
+                        batch = _project_complete_records(
+                            self.adapter,
+                            ordered,
+                            records,
+                            ordinary_outcome_ids=ordinary_ids,
+                            source_watermark=None,
+                        )
+                        if batch.truncated:
+                            raise OverflowError("snapshot projection is incomplete")
+                        return AllocationTraceView(
+                            batch=batch,
+                            watermark="snapshot:" + _snapshot_identity(
+                                ordered, as_of, records, ordinary_ids
+                            ),
+                            source="selection_store_snapshot",
+                            complete=True,
+                            trace_references=_trace_references(ordered, records),
+                        )
+                    next_cursor = page.next_cursor
+                    if not next_cursor or next_cursor in seen_cursors:
+                        raise ValueError("snapshot cursor did not advance")
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+                raise OverflowError("snapshot pagination exceeded its page bound")
+            except Exception as exc:
+                return self.zero(ordered, reason=_bounded_reason(exc))
         protocol = getattr(store, "read_allocation_projection_records", None)
         if callable(protocol):
             try:
                 # A complete state is requested from origin.  Truncation is not
                 # silently interpreted as zero or as the current trace state.
-                batch = self.adapter.project(store, ordered, after_watermark=0)
+                raw_batch = store.read_allocation_projection_records(
+                    ordered, after_watermark=0, limit=self.limits.max_records
+                )
+                if not _legacy_batch_is_complete(raw_batch):
+                    raise ValueError("legacy projection source lacks a complete pinned snapshot")
+                batch = _project_complete_records(
+                    self.adapter,
+                    ordered,
+                    raw_batch.records,
+                    ordinary_outcome_ids=ordinary_ids,
+                    source_watermark=raw_batch.watermark,
+                )
                 if batch.truncated:
                     raise OverflowError("store-native projection is incomplete")
                 return AllocationTraceView(
                     batch=batch,
-                    watermark=f"protocol:{batch.watermark}",
+                    watermark="legacy:" + _snapshot_identity(
+                        ordered,
+                        str(raw_batch.watermark),
+                        raw_batch.records,
+                        ordinary_ids,
+                    ),
                     source="selection_store_protocol",
                     complete=True,
+                    trace_references=_trace_references(ordered, raw_batch.records),
                 )
             except Exception as exc:
                 return self.zero(ordered, reason=_bounded_reason(exc))
@@ -413,10 +771,11 @@ class TraceProjectionBridge:
                 max_records=self.limits.max_records,
             )
             records, watermark = source.read_complete_records(ordered)
-            batch = self.adapter.project_records(
+            batch = _project_complete_records(
+                self.adapter,
                 ordered,
                 records,
-                after_watermark=0,
+                ordinary_outcome_ids=ordinary_ids,
                 source_watermark=len(records),
             )
             if batch.truncated:
@@ -467,7 +826,10 @@ def feedback_values_from_config(config: Any) -> Mapping[str, Any] | None:
 
 __all__ = [
     "AllocationTraceView",
+    "SelectionRuntimeTraceSource",
     "SelectionStoreTraceSource",
+    "TraceProjectionSnapshotPage",
+    "TraceProjectionSnapshotSource",
     "TraceProjectionBridge",
     "feedback_values_from_config",
     "policy_reads_trace",

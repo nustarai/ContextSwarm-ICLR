@@ -13,6 +13,8 @@ from contextswarm_mini.allocation_projection import (
 )
 from contextswarm_mini.allocation_trace_bridge import (
     SelectionStoreTraceSource,
+    SelectionRuntimeTraceSource,
+    TraceProjectionSnapshotPage,
     TraceProjectionBridge,
     feedback_values_from_config,
     policy_reads_trace,
@@ -163,7 +165,7 @@ def _selection_db(path: Path, *, private_marker: str) -> _Store:
 
 
 class _ProtocolStore:
-    def __init__(self, rows, *, watermark: int = 7):
+    def __init__(self, rows, *, watermark: int = 1):
         self.rows = tuple(rows)
         self.watermark = watermark
         self.calls = []
@@ -173,6 +175,21 @@ class _ProtocolStore:
     ) -> TraceProjectionRecordBatch:
         self.calls.append((tuple(task_ids), after_watermark, limit))
         return TraceProjectionRecordBatch(self.rows, self.watermark)
+
+
+class _SnapshotStore:
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.calls = []
+
+    def read_allocation_projection_snapshot(
+        self, task_ids, *, as_of_watermark, cursor, limit
+    ):
+        self.calls.append((tuple(task_ids), as_of_watermark, cursor, limit))
+        if not self.pages:
+            raise AssertionError("unexpected snapshot page")
+        page = self.pages.pop(0)
+        return page
 
 
 class AllocationTraceBridgeTests(unittest.TestCase):
@@ -282,6 +299,133 @@ class AllocationTraceBridgeTests(unittest.TestCase):
         ).read(["task-a"], store=incomplete)
         self.assertEqual(zero.source, "zero")
         self.assertTrue(zero.for_task("task-a").is_zero)
+
+    def test_pinned_snapshot_pages_are_materialized_before_projection(self) -> None:
+        source = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(
+                        {
+                            "sequence": 1,
+                            "record_id": "frontier-1",
+                            "task_id": "task-a",
+                            "kind": "frontier",
+                            "lineage_id": "l1",
+                            "evidence_id": "piece-1",
+                        },
+                    ),
+                    trace_watermark="W",
+                    next_cursor="c1",
+                    complete=False,
+                ),
+                TraceProjectionSnapshotPage(
+                    records=(
+                        {
+                            "sequence": 2,
+                            "record_id": "frontier-2",
+                            "task_id": "task-a",
+                            "kind": "frontier",
+                            "lineage_id": "l2",
+                            "evidence_id": "piece-2",
+                        },
+                    ),
+                    trace_watermark="W",
+                    complete=True,
+                ),
+            ]
+        )
+        view = TraceProjectionBridge(
+            limits=TraceProjectionLimits(max_records=2)
+        ).read(["task-a"], store=source)
+        self.assertEqual(view.source, "selection_store_snapshot")
+        self.assertEqual(view.for_task("task-a").frontier_count, 2)
+        self.assertEqual(view.watermark.startswith("snapshot:"), True)
+        self.assertEqual(
+            source.calls,
+            [
+                (("task-a",), None, "", 2),
+                (("task-a",), "W", "c1", 2),
+            ],
+        )
+
+    def test_snapshot_watermark_drift_cursor_replay_and_source_head_fail_closed(self) -> None:
+        drift = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(), trace_watermark="W1", next_cursor="c1", complete=False
+                ),
+                TraceProjectionSnapshotPage(
+                    records=(), trace_watermark="W2", complete=True
+                ),
+            ]
+        )
+        replay = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(), trace_watermark="W", next_cursor="c1", complete=False
+                ),
+                TraceProjectionSnapshotPage(
+                    records=(), trace_watermark="W", next_cursor="c1", complete=False
+                ),
+            ]
+        )
+        for source in (drift, replay):
+            view = TraceProjectionBridge().read(["task-a"], store=source)
+            self.assertEqual(view.source, "zero")
+            self.assertTrue(view.for_task("task-a").is_zero)
+
+        # Legacy integer watermark 9 with only sequence 1 is an unsafe source
+        # head fast-forward and must not become an apparently complete view.
+        unsafe_legacy = _ProtocolStore(
+            [
+                {
+                    "sequence": 1,
+                    "record_id": "frontier-1",
+                    "task_id": "task-a",
+                    "kind": "frontier",
+                    "lineage_id": "l1",
+                }
+            ],
+            watermark=9,
+        )
+        view = TraceProjectionBridge().read(["task-a"], store=unsafe_legacy)
+        self.assertEqual(view.source, "zero")
+
+    def test_selection_runtime_adapter_is_explicit_and_rejects_cursor_replay(self) -> None:
+        class Runtime:
+            selection_store = object()
+            feedback_values = FEEDBACK_VALUES
+
+        # Bypass SQLite setup to test the adapter's protocol boundary without
+        # invoking selector search or CPS state.
+        runtime_source = SelectionRuntimeTraceSource.__new__(SelectionRuntimeTraceSource)
+        runtime_source._source = type(
+            "CompleteSource",
+            (),
+            {
+                "read_complete_records": lambda self, task_ids: (
+                    (
+                        {
+                            "sequence": 1,
+                            "record_id": "e1",
+                            "task_id": "a",
+                            "kind": "frontier",
+                            "lineage_id": "l1",
+                        },
+                    ),
+                    "W",
+                )
+            },
+        )()
+        page = runtime_source.read_allocation_projection_snapshot(
+            ["a"], as_of_watermark=None, cursor="", limit=4
+        )
+        self.assertTrue(page.complete)
+        self.assertEqual(page.trace_watermark, "W")
+        with self.assertRaises(ValueError):
+            runtime_source.read_allocation_projection_snapshot(
+                ["a"], as_of_watermark="W", cursor="c1", limit=4
+            )
 
     def test_zero_and_synthetic_fallbacks_are_deterministic(self) -> None:
         bridge = TraceProjectionBridge()
