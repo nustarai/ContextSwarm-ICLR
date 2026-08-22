@@ -106,6 +106,16 @@ class _LifecycleServer:
                             "correct": True,
                         }
                     )
+                elif owner.mode == "cache_reused":
+                    self._send(
+                        {
+                            "job_id": "job-cache-hit",
+                            "status": "succeeded",
+                            "formal_status": "PROVED",
+                            "correct": True,
+                            "cache_reused": True,
+                        }
+                    )
                 elif (
                     owner.mode == "queued_rejected_then_proved"
                     and owner.post_count >= 2
@@ -244,6 +254,23 @@ class _LifecycleServer:
                             "execution_ms": 600,
                         }
                     )
+                elif owner.mode == "terminal_without_receipt_job_id":
+                    self._send(
+                        {
+                            "status": "succeeded",
+                            "formal_status": "PROVED",
+                            "correct": True,
+                        }
+                    )
+                elif owner.mode == "terminal_with_wrong_receipt_job_id":
+                    self._send(
+                        {
+                            "job_id": "job-other",
+                            "status": "succeeded",
+                            "formal_status": "PROVED",
+                            "correct": True,
+                        }
+                    )
                 elif owner.mode == "queued_then_proved" and elapsed >= 0.6:
                     self._send(
                         {
@@ -362,6 +389,21 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(verdict.status, "RESOURCE_LIMIT")
         self.assertEqual(verdict.response["error_kind"], "memory_limit_exceeded")
         self.assertEqual(verdict.response["queue_wait_ms"], 4)
+
+    def test_remote_cache_reuse_receipt_propagates_to_verdict(self) -> None:
+        for method in ("evaluate", "probe"):
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                server = _LifecycleServer("cache_reused")
+                with server.running() as url:
+                    evaluator = LeanEvaluator(url, lean_env_id="test")
+                    verdict = getattr(evaluator, method)(
+                        _task(root), self._candidate(root)
+                    )
+
+                self.assertEqual(verdict.status, "PROVED")
+                self.assertTrue(verdict.response["cache_reused"])
+                self.assertTrue(verdict.cache_reused)
 
     def test_horizon_abandonment_cancels_job_and_returns_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -802,6 +844,44 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(verdict.response["queue_wait_ms"], 600)
         self.assertEqual(verdict.response["execution_ms"], 600)
         self.assertEqual(server.post_payloads[0]["max_retries"], 1)
+
+    def test_submit_job_id_binds_terminal_receipt_that_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("terminal_without_receipt_job_id")
+            with server.running() as url:
+                verdict = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    poll_interval_seconds=0.01,
+                ).evaluate(_task(root), self._candidate(root))
+
+        self.assertEqual(verdict.status, "PROVED")
+        self.assertEqual(verdict.judge_job_id, "job-1")
+        self.assertEqual(verdict.response["job_id"], "job-1")
+        self.assertIsNotNone(verdict.candidate_sha256)
+        self.assertIsNotNone(verdict.task_contract_sha256)
+
+    def test_terminal_poll_with_wrong_job_id_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("terminal_with_wrong_receipt_job_id")
+            with server.running() as url:
+                evaluator = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    timeout_seconds=1,
+                    max_lifecycle_seconds=1,
+                    poll_interval_seconds=0.01,
+                    settlement_grace_seconds=0.05,
+                    cancel_grace_seconds=0.1,
+                )
+                verdict = evaluator.evaluate(_task(root), self._candidate(root))
+
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
+        self.assertEqual(verdict.score, 0.0)
+        self.assertEqual(server.deletes, 1)
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
 
     def test_unsettled_cancel_never_persists_running(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

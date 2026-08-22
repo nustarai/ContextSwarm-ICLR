@@ -254,7 +254,6 @@ def _read_candidate(path: Path) -> str | None:
     except (OSError, UnicodeError):
         return None
 
-
 def candidate_sha256(code: str) -> str:
     """Hash the exact UTF-8 source submitted to the Judge."""
 
@@ -320,7 +319,6 @@ def _wait_for_cancel(
             time.sleep(delay)
         return False
     return bool(cancel_event.wait(delay))
-
 
 class LeanEvaluator:
     is_mock_evaluator = False
@@ -730,7 +728,7 @@ class LeanEvaluator:
             cached = self._cached_verdict(cache_key)
             if cached is not None:
                 return cached
-        return self._evaluate(
+        verdict = self._evaluate(
             task,
             candidate_path,
             deadline_monotonic=deadline_monotonic,
@@ -740,6 +738,11 @@ class LeanEvaluator:
             candidate_code=code,
             cancel_event=combined_cancel_event,
         )
+        verdict.cache_reused = bool(
+            verdict.cache_reused
+            or _nested_value(verdict.response, "cache_reused") is True
+        )
+        return verdict
 
     def probe(
         self,
@@ -810,6 +813,10 @@ class LeanEvaluator:
             response_profile=LEAN_PROBE_RESPONSE_PROFILE,
             candidate_code=code,
             cancel_event=combined_cancel_event,
+        )
+        verdict.cache_reused = bool(
+            verdict.cache_reused
+            or _nested_value(verdict.response, "cache_reused") is True
         )
         if cache_key is not None and verdict.status not in _NON_CACHEABLE_PROBE_STATUSES:
             with self._probe_cache_lock:
@@ -1147,6 +1154,31 @@ class LeanEvaluator:
                         last_poll_error = str(exc)
                         if time.monotonic() >= settlement_deadline:
                             break
+                        _wait_for_cancel(
+                            cancel_event,
+                            min(
+                                self.poll_interval_seconds,
+                                max(0.0, settlement_deadline - time.monotonic()),
+                            ),
+                        )
+                        continue
+                    # A successful GET on the job-specific capability binds an
+                    # otherwise id-less receipt to the submitted job.  An
+                    # explicit contradictory id is never rewritten or scored;
+                    # keep polling and, if necessary, reconcile the original
+                    # job through the normal fail-closed cancellation path.
+                    expected_job_id = sanitize_worker_identifier(job_id)
+                    receipt_job_id = _submission_job_identifier(response)
+                    if receipt_job_id is None and expected_job_id is not None:
+                        response = dict(response)
+                        response["job_id"] = expected_job_id
+                    elif receipt_job_id != expected_job_id:
+                        last_poll_error = "Judge poll receipt job id mismatch"
+                        response = {
+                            "job_id": expected_job_id,
+                            "status": "RUNNING",
+                            "reason": "poll_job_id_mismatch",
+                        }
                         _wait_for_cancel(
                             cancel_event,
                             min(
@@ -2179,6 +2211,7 @@ def safe_worker_response(
         "is_valid_no_sorry",
         "is_valid_with_sorry",
         "retryable",
+        "cache_reused",
         "cancel_requested",
         "finalization_pending",
         "remote_settlement_unconfirmed",

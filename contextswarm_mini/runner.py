@@ -259,6 +259,205 @@ class _FrozenCandidate:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class _CloseoutDecision:
+    verdict: Verdict
+    observed: Verdict
+    prior_authority: Verdict | None
+    disposition: str
+    authority_mismatch: Mapping[str, Any] | None = None
+
+
+_AUTHORITATIVE_PROVED_STATUSES = {"PROVED", "AC", "PASS", "PASSED"}
+_RETRYABLE_CLOSEOUT_INFRA_STATUSES = {
+    "EVALUATOR_ERROR",
+    "EVALUATOR_TIMEOUT",
+    "EXECUTION_TIMEOUT",
+    "INFRASTRUCTURE_ERROR",
+    "REJECTED_OVERLOADED",
+    "RESOURCE_LIMIT",
+}
+
+
+def _normalized_sha256(value: Any) -> str | None:
+    digest = str(value or "").strip().lower()
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        return None
+    return digest
+
+
+def _normalized_verdict_status(verdict: Verdict) -> str:
+    return str(verdict.status or "").strip().upper()
+
+
+def _response_value(response: Mapping[str, Any], key: str) -> Any:
+    value = response.get(key)
+    if value is not None:
+        return value
+    nested = response.get("response")
+    if isinstance(nested, Mapping):
+        return _response_value(nested, key)
+    return None
+
+
+def _is_authoritative_proved(verdict: Verdict) -> bool:
+    return bool(
+        _normalized_verdict_status(verdict) in _AUTHORITATIVE_PROVED_STATUSES
+        and float(verdict.score) >= 1.0
+        and _normalized_sha256(verdict.candidate_sha256) is not None
+        and _normalized_sha256(verdict.task_contract_sha256) is not None
+        and str(verdict.judge_job_id or "").strip()
+    )
+
+
+def _prior_authoritative_proof(
+    evaluator: Any,
+    task: Task,
+    candidate: _FrozenCandidate,
+    verdicts: Iterable[Verdict],
+) -> tuple[Verdict | None, Mapping[str, Any] | None]:
+    """Join a prior Judge proof to the frozen candidate and exact task contract."""
+
+    candidate_sha = _normalized_sha256(candidate.sha256)
+    try:
+        expected_contract = _normalized_sha256(
+            _expected_task_contract(evaluator, task)
+        )
+    except Exception:
+        expected_contract = None
+    authorities = [
+        verdict
+        for verdict in verdicts
+        if verdict.task_id == task.slug and _is_authoritative_proved(verdict)
+    ]
+    for verdict in authorities:
+        if (
+            candidate_sha is not None
+            and expected_contract is not None
+            and _normalized_sha256(verdict.candidate_sha256) == candidate_sha
+            and _normalized_sha256(verdict.task_contract_sha256) == expected_contract
+        ):
+            return verdict, None
+    if not authorities:
+        return None, None
+    return None, {
+        "authoritative_proof_count": len(authorities),
+        "candidate_sha256_available": candidate_sha is not None,
+        "task_contract_sha256_available": expected_contract is not None,
+        "candidate_sha256_match": any(
+            _normalized_sha256(verdict.candidate_sha256) == candidate_sha
+            for verdict in authorities
+        ) if candidate_sha is not None else False,
+        "task_contract_sha256_match": any(
+            _normalized_sha256(verdict.task_contract_sha256) == expected_contract
+            for verdict in authorities
+        ) if expected_contract is not None else False,
+    }
+
+
+def _authoritative_proof_matches(
+    verdict: Verdict,
+    *,
+    candidate_sha256: str,
+    task_contract_sha256: str,
+) -> bool:
+    return bool(
+        _is_authoritative_proved(verdict)
+        and _normalized_sha256(verdict.candidate_sha256) == candidate_sha256
+        and _normalized_sha256(verdict.task_contract_sha256) == task_contract_sha256
+    )
+
+
+def _retryable_closeout_infrastructure_failure(verdict: Verdict) -> bool:
+    return bool(
+        _normalized_verdict_status(verdict) in _RETRYABLE_CLOSEOUT_INFRA_STATUSES
+        and _response_value(verdict.response, "retryable") is True
+    )
+
+
+def _reuse_authority_after_infrastructure_failure(
+    prior: Verdict,
+    observed: Verdict,
+) -> Verdict:
+    response = dict(prior.response)
+    response["closeout_infra_incomplete"] = {
+        "observed_status": _normalized_verdict_status(observed),
+        "error_kind": _response_value(observed.response, "error_kind"),
+        "terminal_reason": _response_value(observed.response, "terminal_reason"),
+        "retryable": True,
+    }
+    return Verdict(
+        task_id=prior.task_id,
+        status="PROVED",
+        score=1.0,
+        elapsed_seconds=prior.elapsed_seconds,
+        response=response,
+        error=prior.error,
+        candidate_sha256=prior.candidate_sha256,
+        task_contract_sha256=prior.task_contract_sha256,
+        judge_job_id=prior.judge_job_id,
+        cache_reused=prior.cache_reused,
+    )
+
+
+def _preserve_authority_after_confirmation(
+    prior: Verdict,
+    observed: Verdict,
+) -> Verdict:
+    """Keep the original exact-once receipt while recording revalidation."""
+
+    response = dict(prior.response)
+    response["closeout_authority_confirmed"] = {
+        "observed_status": _normalized_verdict_status(observed),
+        "candidate_sha256_match": (
+            _normalized_sha256(observed.candidate_sha256)
+            == _normalized_sha256(prior.candidate_sha256)
+        ),
+        "task_contract_sha256_match": (
+            _normalized_sha256(observed.task_contract_sha256)
+            == _normalized_sha256(prior.task_contract_sha256)
+        ),
+    }
+    return Verdict(
+        task_id=prior.task_id,
+        status="PROVED",
+        score=1.0,
+        elapsed_seconds=prior.elapsed_seconds,
+        response=response,
+        error=prior.error,
+        candidate_sha256=prior.candidate_sha256,
+        task_contract_sha256=prior.task_contract_sha256,
+        judge_job_id=prior.judge_job_id,
+        cache_reused=prior.cache_reused,
+    )
+
+
+def _authority_conflict_verdict(
+    task: Task,
+    prior: Verdict,
+    observed: Verdict,
+) -> Verdict:
+    return Verdict(
+        task_id=task.slug,
+        status="AUTHORITY_CONFLICT",
+        score=0.0,
+        elapsed_seconds=observed.elapsed_seconds,
+        response={
+            "reason": "nonretryable_closeout_authority_contradiction",
+            "prior_status": _normalized_verdict_status(prior),
+            "observed_status": _normalized_verdict_status(observed),
+            "observed_error_kind": _response_value(observed.response, "error_kind"),
+            "observed_retryable": _response_value(observed.response, "retryable") is True,
+        },
+        error=(
+            "The same candidate and task contract received a non-retryable "
+            "closeout verdict after an authoritative Judge proof"
+        ),
+        candidate_sha256=prior.candidate_sha256,
+        task_contract_sha256=prior.task_contract_sha256,
+    )
+
+
 def _verdict_priority(verdict: Verdict | None) -> tuple[int, float]:
     if verdict is None:
         return (-1, -1.0)
@@ -306,6 +505,17 @@ _NONTERMINAL_VERDICT_STATUSES = frozenset(
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _SOURCE_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _IMAGE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def _is_infrastructure_verdict(verdict: Verdict) -> bool:
+    status = normalize_verdict_status(verdict.status)
+    return bool(
+        status in _INFRASTRUCTURE_VERDICT_STATUSES
+        or (
+            status in {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
+            and _response_value(verdict.response, "retryable") is True
+        )
+    )
 
 
 def _runtime_provenance(*, mock_agent: bool) -> dict[str, str | bool]:
@@ -2906,38 +3116,6 @@ def _freeze_closeout_candidates(
     return frozen
 
 
-def _reusable_closeout_verdict(
-    evaluator: Any,
-    task: Task,
-    candidate: _FrozenCandidate,
-    verdicts: Iterable[Verdict],
-) -> Verdict | None:
-    """Reuse an exact authoritative proof without creating a duplicate score."""
-
-    if candidate.sha256 is None:
-        return None
-    expected_contract = _expected_task_contract(evaluator, task)
-    allow_mock = _allows_mock_provenance(evaluator)
-    best: Verdict | None = None
-    for verdict in verdicts:
-        if verdict.task_id != task.slug:
-            continue
-        if (
-            normalize_verdict_status(verdict.status) != "PROVED"
-            or float(verdict.score) < 1.0
-            or str(verdict.candidate_sha256 or "").lower() != candidate.sha256
-            or str(verdict.task_contract_sha256 or "").lower() != expected_contract
-            or not (
-                verdict.judge_job_id
-                or (allow_mock and verdict.response.get("mock") is True)
-            )
-        ):
-            continue
-        if _verdict_priority(verdict) > _verdict_priority(best):
-            best = verdict
-    return best
-
-
 def _evaluate_closeout_candidate(
     evaluator: Any,
     task: Task,
@@ -3007,7 +3185,7 @@ def _run_closeout(
 ) -> dict[str, Verdict]:
     """Score frozen candidates under one bounded, feedback-free contract."""
 
-    prior = tuple(reusable_verdicts)
+    prior_verdicts = tuple(reusable_verdicts)
     logger.event(
         "closeout_started",
         candidate_count=len(tasks),
@@ -3015,41 +3193,158 @@ def _run_closeout(
         execution_timeout_seconds=config.lean_timeout_seconds,
     )
     verdicts: dict[str, Verdict] = {}
-    reused: dict[str, bool] = {}
+    disposition_counts: dict[str, int] = {}
 
-    def evaluate(task: Task) -> tuple[Verdict, bool]:
+    def evaluate(task: Task) -> _CloseoutDecision:
+        candidate = frozen[task.slug]
+        prior, mismatch = _prior_authoritative_proof(
+            evaluator,
+            task,
+            candidate,
+            prior_verdicts,
+        )
         try:
-            candidate = frozen[task.slug]
-            reusable = _reusable_closeout_verdict(
+            observed = _evaluate_closeout_candidate(
                 evaluator,
                 task,
                 candidate,
-                prior,
+                gate,
             )
-            if reusable is not None:
-                return reusable, True
-            return _evaluate_closeout_candidate(evaluator, task, candidate, gate), False
         except Exception as exc:
-            return (
-                Verdict(
-                    task.slug,
-                    "EVALUATOR_ERROR",
-                    0.0,
-                    0.0,
-                    error=sanitize_worker_text(exc),
-                ),
-                False,
+            try:
+                contract_sha256 = _expected_task_contract(evaluator, task)
+            except Exception:
+                contract_sha256 = None
+            observed = Verdict(
+                task.slug,
+                "EVALUATOR_ERROR",
+                0.0,
+                0.0,
+                {
+                    "error_kind": "closeout_evaluator_exception",
+                    "retryable": False,
+                },
+                error=sanitize_worker_text(exc),
+                candidate_sha256=candidate.sha256,
+                task_contract_sha256=contract_sha256,
             )
+        if _verdict_has_unsettled_remote_work(observed):
+            return _CloseoutDecision(
+                observed,
+                observed,
+                prior,
+                "remote_settlement_unconfirmed",
+                mismatch,
+            )
+        if prior is None:
+            return _CloseoutDecision(
+                observed,
+                observed,
+                None,
+                "evaluated",
+                mismatch,
+            )
+
+        candidate_sha = _normalized_sha256(candidate.sha256)
+        contract_sha = _normalized_sha256(prior.task_contract_sha256)
+        assert candidate_sha is not None and contract_sha is not None
+        if _authoritative_proof_matches(
+            observed,
+            candidate_sha256=candidate_sha,
+            task_contract_sha256=contract_sha,
+        ):
+            return _CloseoutDecision(
+                _preserve_authority_after_confirmation(prior, observed),
+                observed,
+                prior,
+                "authority_confirmed",
+            )
+        if _retryable_closeout_infrastructure_failure(observed):
+            return _CloseoutDecision(
+                _reuse_authority_after_infrastructure_failure(prior, observed),
+                observed,
+                prior,
+                "retryable_infra_reused",
+            )
+        return _CloseoutDecision(
+            _authority_conflict_verdict(task, prior, observed),
+            observed,
+            prior,
+            "authority_conflict",
+        )
 
     worker_count = max(1, min(config.lean_max_concurrent_evaluations, len(tasks)))
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="closeout") as executor:
         futures = {executor.submit(evaluate, task): task for task in tasks}
         for future in as_completed(futures):
             task = futures[future]
-            verdict, was_reused = future.result()
+            decision = future.result()
+            verdict = decision.verdict
             verdicts[task.slug] = verdict
-            reused[task.slug] = was_reused
-            if not was_reused:
+            disposition_counts[decision.disposition] = (
+                disposition_counts.get(decision.disposition, 0) + 1
+            )
+            if decision.authority_mismatch is not None:
+                logger.event(
+                    "closeout_authority_mismatch",
+                    task_id=task.slug,
+                    candidate_sha256=frozen[task.slug].sha256,
+                    **decision.authority_mismatch,
+                )
+            if decision.disposition == "retryable_infra_reused":
+                logger.event(
+                    "closeout_infra_incomplete",
+                    task_id=task.slug,
+                    candidate_sha256=verdict.candidate_sha256,
+                    task_contract_sha256=verdict.task_contract_sha256,
+                    observed_status=_normalized_verdict_status(decision.observed),
+                    observed_error_kind=_response_value(
+                        decision.observed.response,
+                        "error_kind",
+                    ),
+                    observed_terminal_reason=_response_value(
+                        decision.observed.response,
+                        "terminal_reason",
+                    ),
+                    observed_retryable=True,
+                    final_status=verdict.status,
+                    final_score=verdict.score,
+                )
+            elif decision.disposition == "authority_confirmed":
+                logger.event(
+                    "closeout_authority_confirmed",
+                    task_id=task.slug,
+                    candidate_sha256=verdict.candidate_sha256,
+                    task_contract_sha256=verdict.task_contract_sha256,
+                    prior_judge_job_id=verdict.judge_job_id,
+                    observed_judge_job_id=decision.observed.judge_job_id,
+                    observed_status=_normalized_verdict_status(decision.observed),
+                )
+            elif decision.disposition == "authority_conflict":
+                logger.event(
+                    "closeout_authority_conflict",
+                    task_id=task.slug,
+                    candidate_sha256=verdict.candidate_sha256,
+                    task_contract_sha256=verdict.task_contract_sha256,
+                    prior_status=_normalized_verdict_status(
+                        decision.prior_authority
+                    ) if decision.prior_authority is not None else None,
+                    observed_status=_normalized_verdict_status(decision.observed),
+                    observed_error_kind=_response_value(
+                        decision.observed.response,
+                        "error_kind",
+                    ),
+                    observed_retryable=(
+                        _response_value(decision.observed.response, "retryable")
+                        is True
+                    ),
+                    final_status=verdict.status,
+                )
+            scoreboard_recorded = decision.disposition in {
+                "evaluated",
+                "authority_conflict",
+            }
+            if scoreboard_recorded:
                 logger.scoreboard(
                     verdict,
                     episode=0,
@@ -3061,14 +3356,42 @@ def _run_closeout(
                 **verdict.as_dict(),
                 agent_id="closeout",
                 episode=0,
-                reused_authoritative_verdict=was_reused,
-                scoreboard_recorded=not was_reused,
+                observed_status=_normalized_verdict_status(decision.observed),
+                reused_authoritative_verdict=(
+                    decision.disposition == "retryable_infra_reused"
+                ),
+                authoritative_proof_confirmed=(
+                    decision.disposition == "authority_confirmed"
+                ),
+                closeout_infra_incomplete=(
+                    decision.disposition == "retryable_infra_reused"
+                ),
+                authority_conflict=(
+                    decision.disposition == "authority_conflict"
+                ),
+                scoreboard_recorded=scoreboard_recorded,
             )
     ordered = {task.slug: verdicts[task.slug] for task in tasks}
     logger.event(
         "closeout_finished",
         score=sum(verdict.score for verdict in ordered.values()),
-        reused_authoritative_verdicts=sum(reused.values()),
+        reused_authoritative_verdicts=disposition_counts.get(
+            "retryable_infra_reused",
+            0,
+        ),
+        authoritative_proofs_confirmed=disposition_counts.get(
+            "authority_confirmed",
+            0,
+        ),
+        closeout_infra_incomplete=disposition_counts.get(
+            "retryable_infra_reused",
+            0,
+        ),
+        authority_conflicts=disposition_counts.get("authority_conflict", 0),
+        remote_settlement_unconfirmed=disposition_counts.get(
+            "remote_settlement_unconfirmed",
+            0,
+        ),
     )
     return ordered
 
@@ -3146,7 +3469,7 @@ def _run_health(
     for verdict in attempts:
         status = normalize_verdict_status(verdict.status)
         status_counts[status] = status_counts.get(status, 0) + 1
-        if status in _INFRASTRUCTURE_VERDICT_STATUSES:
+        if _is_infrastructure_verdict(verdict):
             issues.add("evaluator_infrastructure_error")
         if status in _NONTERMINAL_VERDICT_STATUSES:
             issues.add("nonterminal_verdict")
@@ -3155,6 +3478,7 @@ def _run_health(
     if len(verdicts) != expected_task_count:
         issues.add("final_task_bundle_incomplete")
     incomplete_closeout_statuses = {
+        "AUTHORITY_CONFLICT",
         "CANCELLED",
         "EVALUATOR_ERROR",
         "EVALUATOR_TIMEOUT",
@@ -3166,9 +3490,19 @@ def _run_health(
     }
     for verdict in verdicts.values():
         status = normalize_verdict_status(verdict.status)
-        if status in incomplete_closeout_statuses or status in _NONTERMINAL_VERDICT_STATUSES:
+        retryable_terminal_limit = bool(
+            status in {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
+            and _response_value(verdict.response, "retryable") is True
+        )
+        if (
+            status in incomplete_closeout_statuses
+            or status in _NONTERMINAL_VERDICT_STATUSES
+            or retryable_terminal_limit
+        ):
             issues.add("closeout_incomplete")
-        if status in _INFRASTRUCTURE_VERDICT_STATUSES:
+        if status == "AUTHORITY_CONFLICT":
+            issues.add("closeout_authority_conflict")
+        if _is_infrastructure_verdict(verdict):
             issues.add("evaluator_infrastructure_error")
         if status == "PROVENANCE_INVALID":
             issues.add("verdict_provenance_invalid")

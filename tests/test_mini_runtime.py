@@ -69,12 +69,13 @@ def _fake_pi_config(root: Path, fake: Path, *, timeout: int = 5):
 
 
 class _ImmediateProofEvaluator:
-    """Return a candidate-bound proof, then mutate the worker-owned file."""
+    """Return a broker proof and independently confirm its frozen closeout."""
 
     def __init__(self, output_root: Path) -> None:
         self.output_root = output_root
         self.probe_calls = 0
         self.evaluate_calls = 0
+        self.closeout_receipts: list[tuple[Path, str, str]] = []
         self.lock = threading.Lock()
         self.probe_barrier: threading.Barrier | None = None
 
@@ -111,10 +112,33 @@ class _ImmediateProofEvaluator:
             judge_job_id=f"judge-job-{call_index}",
         )
 
-    def evaluate(self, *_args, **_kwargs) -> Verdict:
+    def evaluate(
+        self,
+        task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> Verdict:
+        if deadline_monotonic is not None:
+            raise AssertionError("solver evaluation must reuse the broker proof")
+        if "closeout_candidates" not in candidate_path.parts:
+            raise AssertionError("closeout must evaluate the frozen candidate")
+        digest = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
         with self.lock:
             self.evaluate_calls += 1
-        raise AssertionError("final evaluation must reuse the broker proof")
+            call_index = self.evaluate_calls
+            job_id = f"closeout-confirmation-{call_index}"
+            self.closeout_receipts.append((candidate_path, digest, job_id))
+        return Verdict(
+            task.slug,
+            "PROVED",
+            1.0,
+            0.02,
+            {"formal_status": "PROVED"},
+            candidate_sha256=digest,
+            task_contract_sha256="a" * 64,
+            judge_job_id=job_id,
+        )
 
 
 class _ProbeAndFinalProofEvaluator:
@@ -123,6 +147,9 @@ class _ProbeAndFinalProofEvaluator:
     def __init__(self) -> None:
         self.probe_calls = 0
         self.evaluate_calls = 0
+        self.solver_evaluate_calls = 0
+        self.closeout_evaluate_calls = 0
+        self.closeout_receipts: list[tuple[Path, str, str]] = []
         self.final_started = threading.Event()
         self.allow_final_return = threading.Event()
         self.final_evaluated = threading.Event()
@@ -158,10 +185,28 @@ class _ProbeAndFinalProofEvaluator:
         *,
         deadline_monotonic: float | None = None,
     ) -> Verdict:
-        del deadline_monotonic
         digest = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+        if deadline_monotonic is None:
+            if "closeout_candidates" not in candidate_path.parts:
+                raise AssertionError("closeout must evaluate the frozen candidate")
+            with self.lock:
+                self.evaluate_calls += 1
+                self.closeout_evaluate_calls += 1
+                job_id = f"closeout-confirmation-{self.closeout_evaluate_calls}"
+                self.closeout_receipts.append((candidate_path, digest, job_id))
+            return Verdict(
+                task.slug,
+                "PROVED",
+                1.0,
+                0.02,
+                {"formal_status": "PROVED"},
+                candidate_sha256=digest,
+                task_contract_sha256="b" * 64,
+                judge_job_id=job_id,
+            )
         with self.lock:
             self.evaluate_calls += 1
+            self.solver_evaluate_calls += 1
         self.final_started.set()
         if not self.allow_final_return.wait(timeout=3):
             raise AssertionError("early callback did not enter the shared commit barrier")
@@ -1342,7 +1387,8 @@ class MiniRuntimeTests(unittest.TestCase):
                     self.assertEqual(positive[0]["source"], "judge_check")
                     self.assertIsInstance(positive[0]["horizon_elapsed_seconds"], float)
                     self.assertEqual(evaluator.probe_calls, 1)
-                    self.assertEqual(evaluator.evaluate_calls, 0)
+                    self.assertEqual(evaluator.evaluate_calls, 1)
+                    self.assertEqual(len(evaluator.closeout_receipts), 1)
                     credited_index = next(
                         index for index, row in enumerate(events) if row["event"] == "judge_proof_credited"
                     )
@@ -1362,6 +1408,38 @@ class MiniRuntimeTests(unittest.TestCase):
                         hashlib.sha256(frozen.read_bytes()).hexdigest(),
                         positive[0]["candidate_sha256"],
                     )
+                    closeout_path, closeout_sha256, closeout_job_id = (
+                        evaluator.closeout_receipts[0]
+                    )
+                    self.assertEqual(
+                        closeout_path.resolve(),
+                        (
+                            run_dir
+                            / "closeout_candidates"
+                            / task_id
+                            / "result.lean"
+                        ).resolve(),
+                    )
+                    self.assertEqual(closeout_sha256, positive[0]["candidate_sha256"])
+                    final_verdict = final["verdicts"][task_id]
+                    self.assertEqual(
+                        final_verdict["judge_job_id"],
+                        positive[0]["judge_job_id"],
+                    )
+                    confirmation = next(
+                        row
+                        for row in events
+                        if row["event"] == "closeout_authority_confirmed"
+                    )
+                    self.assertEqual(
+                        confirmation["prior_judge_job_id"],
+                        positive[0]["judge_job_id"],
+                    )
+                    self.assertEqual(
+                        confirmation["observed_judge_job_id"],
+                        closeout_job_id,
+                    )
+                    self.assertNotEqual(closeout_job_id, final_verdict["judge_job_id"])
 
     def test_cps_concurrent_proofs_credit_once_cancel_peers_and_promote_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1442,7 +1520,8 @@ class MiniRuntimeTests(unittest.TestCase):
                 if item["kind"] == "validation_result"
             ]
             self.assertEqual(evaluator.probe_calls, 2)
-            self.assertEqual(evaluator.evaluate_calls, 0)
+            self.assertEqual(evaluator.evaluate_calls, 1)
+            self.assertEqual(len(evaluator.closeout_receipts), 1)
             self.assertEqual(len(assignments), 2)
             self.assertEqual(len(positive), 1)
             self.assertEqual(len(promotions), 1)
@@ -1464,6 +1543,23 @@ class MiniRuntimeTests(unittest.TestCase):
             )
             final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
             self.assertEqual(final["score"], 1.0)
+            task_id = positive[0]["task_id"]
+            final_verdict = final["verdicts"][task_id]
+            self.assertEqual(final_verdict["judge_job_id"], positive[0]["judge_job_id"])
+            closeout_path, closeout_sha256, closeout_job_id = evaluator.closeout_receipts[0]
+            self.assertEqual(
+                closeout_path.resolve(),
+                (run_dir / "closeout_candidates" / task_id / "result.lean").resolve(),
+            )
+            self.assertEqual(closeout_sha256, positive[0]["candidate_sha256"])
+            confirmation = next(
+                row for row in events if row["event"] == "closeout_authority_confirmed"
+            )
+            self.assertEqual(
+                confirmation["prior_judge_job_id"],
+                positive[0]["judge_job_id"],
+            )
+            self.assertEqual(confirmation["observed_judge_job_id"], closeout_job_id)
             self.assertEqual(sum(agent["cancelled"] for agent in final["agents"]), 2)
 
     def test_cps_early_callback_and_peer_final_share_exactly_once_commit_barrier(self) -> None:
@@ -1563,7 +1659,10 @@ class MiniRuntimeTests(unittest.TestCase):
             ]
 
             self.assertEqual(evaluator.probe_calls, 1)
-            self.assertEqual(evaluator.evaluate_calls, 1)
+            self.assertEqual(evaluator.evaluate_calls, 2)
+            self.assertEqual(evaluator.solver_evaluate_calls, 1)
+            self.assertEqual(evaluator.closeout_evaluate_calls, 1)
+            self.assertEqual(len(evaluator.closeout_receipts), 1)
             self.assertEqual(len(positive), 1)
             self.assertEqual(positive[0]["source"], "judge_check")
             self.assertEqual(len(superseded), 1)
@@ -1576,6 +1675,22 @@ class MiniRuntimeTests(unittest.TestCase):
             final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
             self.assertEqual(final["score"], 1.0)
             self.assertTrue(final["health"]["ok"], final["health"])
+            final_verdict = final["verdicts"][task_id]
+            self.assertEqual(final_verdict["judge_job_id"], positive[0]["judge_job_id"])
+            closeout_path, closeout_sha256, closeout_job_id = evaluator.closeout_receipts[0]
+            self.assertEqual(
+                closeout_path.resolve(),
+                (run_dir / "closeout_candidates" / task_id / "result.lean").resolve(),
+            )
+            self.assertEqual(closeout_sha256, positive[0]["candidate_sha256"])
+            confirmation = next(
+                row for row in events if row["event"] == "closeout_authority_confirmed"
+            )
+            self.assertEqual(
+                confirmation["prior_judge_job_id"],
+                positive[0]["judge_job_id"],
+            )
+            self.assertEqual(confirmation["observed_judge_job_id"], closeout_job_id)
 
     def test_cps_callback_failures_are_global_fatal_without_partial_credit(self) -> None:
         fake_source = (
