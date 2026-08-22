@@ -1115,6 +1115,33 @@ def _provenance_key(
     )
 
 
+def _local_rejection_key(
+    payload: Mapping[str, Any],
+    *,
+    fallback_task_id: Any = None,
+) -> tuple[str, str, str, str] | None:
+    """Identify a supervisor-local rejection without inventing Judge authority."""
+
+    task_id = _provenance_value(payload, "task_id") or fallback_task_id
+    candidate_hash = _provenance_value(payload, "candidate_sha256")
+    contract_hash = _provenance_value(payload, "task_contract_sha256")
+    status = _normalize_status(_provenance_value(payload, "status"))
+    if (
+        not isinstance(task_id, str)
+        or not task_id
+        or not _valid_sha256(candidate_hash)
+        or not _valid_sha256(contract_hash)
+        or status != "LOCAL_REJECTED"
+    ):
+        return None
+    return (
+        task_id,
+        str(candidate_hash).lower(),
+        str(contract_hash).lower(),
+        status,
+    )
+
+
 def _mapping_flag(value: Any, name: str) -> bool:
     if not isinstance(value, Mapping):
         return False
@@ -1255,6 +1282,8 @@ def _check_judge_checks(
     accepted_keys: set[tuple[str, str, str, str]] = set()
     direct_accepted_keys: set[tuple[str, str, str, str]] = set()
     local_reused_keys: set[tuple[str, str, str, str]] = set()
+    direct_local_rejection_keys: set[tuple[str, str, str, str]] = set()
+    reused_local_rejection_keys: set[tuple[str, str, str, str]] = set()
     hard_control_failures = 0
     soft_controls = 0
     normal_controls = 0
@@ -1293,6 +1322,27 @@ def _check_judge_checks(
         if row.get("accepted") is True and control_class == "none":
             if not _valid_sha256(row.get("task_contract_sha256")):
                 _add_issue(issues, "judge_check_task_contract_hash_missing")
+            reuse_source = _cache_reuse_source(row)
+            if status == "LOCAL_REJECTED":
+                if row.get("judge_job_id") is not None:
+                    _add_issue(issues, "local_rejected_judge_job_present")
+                local_rejection_key = _local_rejection_key(row)
+                if local_rejection_key is None:
+                    _add_issue(
+                        issues,
+                        "judge_check_local_rejection_provenance_incomplete",
+                    )
+                elif reuse_source == "none":
+                    direct_local_rejection_keys.add(local_rejection_key)
+                elif reuse_source == "local":
+                    reused_local_rejection_keys.add(local_rejection_key)
+                elif reuse_source == "remote":
+                    _add_issue(issues, "remote_judge_cache_reuse_observed")
+                elif reuse_source == "unknown":
+                    _add_issue(issues, "cache_reuse_source_unbound")
+                else:
+                    _add_issue(issues, "cache_reuse_evidence_inconsistent")
+                continue
             job_id = row.get("judge_job_id")
             if not isinstance(job_id, str) or not job_id.strip():
                 _add_issue(issues, "judge_check_judge_job_missing")
@@ -1301,7 +1351,6 @@ def _check_judge_checks(
                 _add_issue(issues, "judge_check_provenance_incomplete")
             else:
                 accepted_keys.add(key)
-                reuse_source = _cache_reuse_source(row)
                 if reuse_source == "none":
                     direct_accepted_keys.add(key)
                 elif reuse_source == "local":
@@ -1315,6 +1364,8 @@ def _check_judge_checks(
         elif _cache_reuse_source(row) != "none":
             _add_issue(issues, "cache_reuse_evidence_inconsistent")
     if local_reused_keys - direct_accepted_keys:
+        _add_issue(issues, "local_cache_reuse_predecessor_missing")
+    if reused_local_rejection_keys - direct_local_rejection_keys:
         _add_issue(issues, "local_cache_reuse_predecessor_missing")
     return (
         accepted_keys,

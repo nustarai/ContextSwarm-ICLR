@@ -1652,6 +1652,116 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_local_rejected_direct_and_process_local_reuse_need_no_judge_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            direct = {
+                "event": "judge_check",
+                "actor_id": "solver-1",
+                "task_id": TASKS[0],
+                "accepted": True,
+                "status": "LOCAL_REJECTED",
+                "candidate_sha256": CANDIDATE_HASH,
+                "task_contract_sha256": TASK_CONTRACT_HASH,
+                "judge_job_id": None,
+                "cache_reused": False,
+                "probe_cache_reused": False,
+                "remote_cache_reused": False,
+            }
+            reused = {
+                **direct,
+                "cache_reused": True,
+                "probe_cache_reused": True,
+            }
+            _write_jsonl(
+                paths["agent"] / "judge_checks.jsonl",
+                [reused, direct],
+            )
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(
+            report["arms"]["agent"]["counts"]["accepted_judge_provenance_keys"],
+            0,
+        )
+
+    def test_local_rejected_process_local_reuse_requires_direct_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            _write_jsonl(
+                paths["agent"] / "judge_checks.jsonl",
+                [
+                    {
+                        "event": "judge_check",
+                        "actor_id": "solver-1",
+                        "task_id": TASKS[0],
+                        "accepted": True,
+                        "status": "LOCAL_REJECTED",
+                        "candidate_sha256": CANDIDATE_HASH,
+                        "task_contract_sha256": TASK_CONTRACT_HASH,
+                        "judge_job_id": None,
+                        "cache_reused": True,
+                        "probe_cache_reused": True,
+                        "remote_cache_reused": False,
+                    }
+                ],
+            )
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 1)
+        codes = _codes(json.loads(result.stdout), "agent")
+        self.assertIn("local_cache_reuse_predecessor_missing", codes)
+        self.assertNotIn("judge_check_judge_job_missing", codes)
+        self.assertNotIn("judge_check_provenance_incomplete", codes)
+
+    def test_local_rejected_remote_cache_marker_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            _write_jsonl(
+                paths["agent"] / "judge_checks.jsonl",
+                [
+                    {
+                        "event": "judge_check",
+                        "actor_id": "solver-1",
+                        "task_id": TASKS[0],
+                        "accepted": True,
+                        "status": "LOCAL_REJECTED",
+                        "candidate_sha256": CANDIDATE_HASH,
+                        "task_contract_sha256": TASK_CONTRACT_HASH,
+                        "judge_job_id": None,
+                        "cache_reused": True,
+                        "probe_cache_reused": False,
+                        "remote_cache_reused": True,
+                    }
+                ],
+            )
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "remote_judge_cache_reuse_observed",
+            _codes(json.loads(result.stdout), "agent"),
+        )
+
+    def test_nonlocal_accepted_judge_check_still_requires_job_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            rows = [
+                json.loads(line)
+                for line in (paths["agent"] / "judge_checks.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            rows[0].pop("judge_job_id")
+            _write_jsonl(paths["agent"] / "judge_checks.jsonl", rows)
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 1)
+        codes = _codes(json.loads(result.stdout), "agent")
+        self.assertIn("judge_check_judge_job_missing", codes)
+        self.assertIn("judge_check_provenance_incomplete", codes)
+
     def test_validation_evaluation_and_final_provenance_must_link(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = self._clean_runs(Path(temporary))
