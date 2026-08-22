@@ -1862,6 +1862,15 @@ class MiniRuntimeTests(unittest.TestCase):
             "CONTEXTSWARM_BEST_CANDIDATE_FILE": "/tmp/stale-result.lean",
             "CONTEXTSWARM_TASK_ROOT": "/tmp/stale-task",
             "CONTEXTSWARM_CPS_FUTURE_CAPABILITY": "stale",
+            "CONTEXTSWARM_JUDGE_URL": "http://raw-judge.invalid",
+            "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL": "http://cache.invalid",
+            "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "1",
+            "CONTEXTSWARM_LEAN_SERVER_URL": "http://stale-route.invalid",
+            "CONTEXTSWARM_LEAN_ENV_ID": "stale_env",
+            "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE": "stale_profile",
+            "CONTEXTSWARM_LEAN_JUDGE_MODE": "stale_mode",
+            "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS": "321",
+            "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS": "6543",
         }
         with patch.dict(os.environ, stale, clear=False):
             for manifest in ("configs/mono.toml", "configs/parallel.toml"):
@@ -1883,6 +1892,52 @@ class MiniRuntimeTests(unittest.TestCase):
                     workdir=ROOT,
                     extra_env={"CONTEXTSWARM_CPS_DB": "/run/current.sqlite3"},
                 )
+
+    def test_agent_environment_exposes_only_controlled_loopback_broker(self) -> None:
+        config = load_config("configs/cps.toml", ROOT)
+        stale = {
+            "LEAN_AUTH_TOKEN": "private-token",
+            "CONTEXTSWARM_JUDGE_URL": "http://raw-judge.invalid",
+            "CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL": "http://cache.invalid",
+            "CONTEXTSWARM_LEAN_SERVER_URL": "http://stale-route.invalid",
+            "CONTEXTSWARM_LEAN_ENV_ID": "stale_env",
+            "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE": "stale_profile",
+            "CONTEXTSWARM_LEAN_JUDGE_MODE": "stale_mode",
+            "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS": "321",
+            "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS": "6543",
+        }
+        token = "a" * 43
+        with patch.dict(os.environ, stale, clear=False):
+            env = PiAgent(config).environment(
+                task_id="task",
+                actor_id="actor",
+                workdir=ROOT,
+                extra_env={
+                    "CONTEXTSWARM_JUDGE_URL": f"http://127.0.0.1:29999/{token}",
+                    "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": "2000000000000",
+                },
+            )
+        self.assertEqual(
+            env["CONTEXTSWARM_JUDGE_URL"],
+            f"http://127.0.0.1:29999/{token}",
+        )
+        self.assertEqual(
+            env["CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"],
+            "2000000000000",
+        )
+        self.assertNotIn("LEAN_AUTH_TOKEN", env)
+        self.assertNotIn("CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", env)
+        self.assertFalse(any(key.startswith("CONTEXTSWARM_LEAN_") for key in env))
+
+        with self.assertRaisesRegex(ValueError, "unsupported solver environment"):
+            PiAgent(config).environment(
+                task_id="task",
+                actor_id="actor",
+                workdir=ROOT,
+                extra_env={
+                    "CONTEXTSWARM_LEAN_SERVER_URL": "http://127.0.0.1:18000",
+                },
+            )
 
     def test_verdict_helpers(self) -> None:
         self.assertEqual(normalize_base_url("http://judge/api/lean/jobs"), "http://judge")

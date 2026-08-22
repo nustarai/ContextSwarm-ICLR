@@ -197,10 +197,14 @@ class PiAgent:
         env = dict(os.environ)
         # The supervisor alone owns raw Judge credentials and endpoints.  A
         # session-scoped broker capability may be injected below via extra_env.
-        env.pop("LEAN_AUTH_TOKEN", None)
-        env.pop("CONTEXTSWARM_JUDGE_URL", None)
-        env.pop("CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL", None)
-        env.pop("CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS", None)
+        for key in tuple(env):
+            if (
+                key == "LEAN_AUTH_TOKEN"
+                or key.startswith("CONTEXTSWARM_JUDGE_")
+                or key.startswith("CONTEXTSWARM_LEAN_")
+                or key == "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS"
+            ):
+                env.pop(key, None)
         # A notebook/operator shell may still carry variables from a previous
         # CPS run.  Baselines inherit the ordinary process environment, but
         # never an implicit communication surface; CPS call sites explicitly
