@@ -454,13 +454,10 @@ def _prompt_token_count(prompt: str) -> int:
     """Deterministic tokenizer-independent upper bound for prompt tokens."""
 
     # Provider tokenizers differ and are not available in the pure policy core.
-    # A four-byte UTF-8 chunk is a conservative *budget estimate* for ordinary
-    # JSON text.  The byte limit remains the hard transport bound; this second
-    # guard prevents a caller from selecting an unbounded provider context.
-    # A provider tokenizer is intentionally unavailable in this pure module.
-    # One token per UTF-8 byte is a conservative provider-independent budget
-    # ceiling (and makes the optional token guard fail closed rather than
-    # undercounting punctuation-heavy prompts).
+    # Count one token per UTF-8 byte as a conservative provider-independent
+    # ceiling.  This deliberately over-counts ordinary text, but makes the
+    # optional token guard fail closed rather than undercounting punctuation- or
+    # non-ASCII-heavy prompts.  The byte limit remains the hard transport bound.
     return len(prompt.encode("utf-8"))
 
 
@@ -1195,8 +1192,6 @@ class ReadOnlyLLMSchedulerPolicy:
             raise TypeError("trace_weights must be TraceScoreWeights")
         self._invoke = invoke
         self._fallback = fallback_policy or TaskStateAllocationPolicy()
-        if not isinstance(trace_weights, TraceScoreWeights):
-            raise TypeError("trace_weights must be TraceScoreWeights")
         # The LLM arm's deterministic fallback is task-state selection, but
         # its auditable task/trace score view must remain the same manifest-
         # selected projection as Trace-State.  Keep that scorer immutable and
