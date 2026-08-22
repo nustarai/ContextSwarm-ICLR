@@ -322,6 +322,14 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(payload["decision_id"], "decision-é")
         self.assertEqual(payload["tasks"][0]["task_id"], "任务-é")
 
+    def test_llm_prompt_accepts_registered_paired_decision_identifier(self) -> None:
+        snap = snapshot(
+            task("task-a", active=0),
+            decision_id="paired-007/decision-000042",
+        )
+        prompt = ReadOnlyLLMSchedulerPolicy.prompt(snap)
+        self.assertIn("paired-007/decision-000042", prompt)
+
     def test_llm_prompt_byte_overflow_is_charged_fallback_without_invocation(self) -> None:
         snap = snapshot(task("a", checker_quality=0.9), task("b"))
         calls: list[tuple[object, str]] = []

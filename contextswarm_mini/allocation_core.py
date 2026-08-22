@@ -89,7 +89,12 @@ def _thaw_json(value: Any) -> Any:
     return value
 
 
-def _scheduler_identifier_is_safe(value: str, *, allow_empty: bool = True) -> bool:
+def _scheduler_identifier_is_safe(
+    value: str,
+    *,
+    allow_empty: bool = True,
+    allow_paired_decision: bool = False,
+) -> bool:
     """Return whether an opaque ID can be shown to the read-only scheduler.
 
     Task and trace IDs are needed verbatim in the scheduler response, so they
@@ -105,8 +110,11 @@ def _scheduler_identifier_is_safe(value: str, *, allow_empty: bool = True) -> bo
     # Canonical paired decision IDs may contain one slash (for example
     # ``paired-007/decision-000042``).  Permit only that registered shape;
     # absolute/relative paths and arbitrary path-like IDs fail closed.
-    if "/" in value and not re.fullmatch(
-        r"paired-[A-Za-z0-9_.-]+/decision-[A-Za-z0-9_.-]+", value
+    if "/" in value and not (
+        allow_paired_decision
+        and re.fullmatch(
+            r"paired-[A-Za-z0-9_.-]+/decision-[A-Za-z0-9_.-]+", value
+        )
     ):
         return False
     if "://" in value or value.startswith(("file:", "path:", "./", "../")):
@@ -187,8 +195,18 @@ def _scheduler_state_dict(snapshot: "AllocationStateSnapshot") -> dict[str, Any]
     fail closed because the scheduler must return the original ID verbatim.
     """
 
-    def safe_id(value: str, field_name: str, *, allow_empty: bool = False) -> str:
-        if not _scheduler_identifier_is_safe(value, allow_empty=allow_empty):
+    def safe_id(
+        value: str,
+        field_name: str,
+        *,
+        allow_empty: bool = False,
+        allow_paired_decision: bool = False,
+    ) -> str:
+        if not _scheduler_identifier_is_safe(
+            value,
+            allow_empty=allow_empty,
+            allow_paired_decision=allow_paired_decision,
+        ):
             raise ValueError(f"scheduler snapshot contains an unsafe {field_name}")
         return value
 
@@ -200,7 +218,12 @@ def _scheduler_state_dict(snapshot: "AllocationStateSnapshot") -> dict[str, Any]
         safe_id(task.task_id, "task identifier", allow_empty=False)
         for value in task.trace_reference_ids:
             safe_id(value, "trace reference", allow_empty=False)
-    safe_id(snapshot.decision_id, "decision identifier", allow_empty=False)
+    safe_id(
+        snapshot.decision_id,
+        "decision identifier",
+        allow_empty=False,
+        allow_paired_decision=True,
+    )
 
     # Opaque watermarks and outcome IDs are useful for audit identity but are
     # never echoed by the scheduler.  Keep their shape while removing path,
