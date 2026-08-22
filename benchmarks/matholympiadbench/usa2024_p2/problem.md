@@ -14,6 +14,16 @@ the intersection of the sets in T is a multiple of the number of
 sets in T. What is the least possible number of elements that are in
 at least 50 sets?
 
+## Formalization Revision
+
+This task is a documented repaired fork of the original MOBench row. ContextSwarm
+commit `5ce40d200affbb9e9d432da1a49d565a1c5ab7b0` restored all three load-bearing
+parts of the official statement: exactly 100 sets, intersection cardinality a
+multiple of the number of selected sets, and the fixed threshold 50. Compfiles
+later made the same semantic repair in commit
+`a70ebe163bdeed2eea3e6d5f7c9d89ab2af6d953`. Pre-correction results are not
+comparable.
+
         ## Task Surface
 
         - Baseline file: `baseline/usa2024_p2.lean`.

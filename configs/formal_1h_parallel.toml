@@ -1,0 +1,12 @@
+extends = ["formal_1h_bridge.toml"]
+
+[experiment]
+name = "mobench-formal-1h-parallel"
+mode = "parallel"
+communication = "none"
+max_parallel = 12
+episodes_per_task = 1
+max_attempts_per_task = 1
+
+[docker]
+memory_mb = 16384

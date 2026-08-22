@@ -1,6 +1,6 @@
 # ContextSwarm ICLR Mini
 
-这是一个与上游 `ContextSwarm` 隔离的、只保留 MathOlympiadBench latest12 的研究运行时。当前目录的代码不会修改 sibling 上游仓库。
+这是一个与上游 `ContextSwarm` 隔离的研究运行时，并冻结了论文使用的六套公开题目包：USACO、ICPC、PutnamBench、MathOlympiadBench（imobench）、Clever 和 Verina。当前默认运行入口仍绑定 MathOlympiadBench latest12；其余五套用于题目定义、来源与完整性审计，不会暗中改变 Mono/Parallel/CPS 的 task/model/time/evaluator contract。当前目录的代码不会修改 sibling 上游仓库。
 
 运行形态固定为同一套 Docker + NuRouter/AISW + Pi backend：
 
@@ -195,6 +195,23 @@ configs/scale_1h_cps96.toml
 其中 Parallel 保持每题一个 baseline agent；CPS24/48/96 分别从每题 2/4/8
 个 agent 起步，总槽位分别为 24/48/96。
 
+隔离的新 Judge 上运行完整七组正式 sweep 时，使用 commit-bound 的 bridge
+manifests：
+
+```text
+configs/formal_1h_mono.toml
+configs/formal_1h_parallel.toml
+configs/formal_1h_cps12.toml
+configs/formal_1h_cps24.toml
+configs/formal_1h_cps48.toml
+configs/formal_1h_cps96.toml
+configs/formal_1h_cps192.toml
+```
+
+它们统一固定 12 道题、同一模型/时限/四路 evaluator，并要求 Judge result cache
+关闭。CPS12/24/48/96/192 分别从每题 1/2/4/8/16 个 solver 起步，完成后的空闲
+slot 由 `allocation.policy = "uniform"` 继续分配给尚未证明的已有题目。
+
 一小时 CPS48 allocation 对照使用下面三个 manifest；它们都是 12 题、每题初始
 4 个 solver、总 48 slots，除 `allocation.policy` 与输出目录/名称外合同相同：
 
@@ -358,4 +375,8 @@ verdict 计入分数。
 
 ## 数据来源
 
-`benchmarks/matholympiadbench/` 只迁移 latest12 的 `problem.md`、`metadata.json` 和 `baseline/*.lean`。题目源 revision 记录在各任务 metadata 中；原仓库的生产 evaluator 和其它 benchmark 没有被复制。这里的 Lean evaluator 是精简的 HTTP adapter，不会绕过 judge 或改变 theorem contract。
+`benchmarks/catalog.json` 将六套题目统一固定到上游 `ContextSwarm` 的同一 revision；每套目录都包含 `manifest.json`、`problem_ids.json` 和上游 `benchmark_integrity.json`。Formal 题库迁移公开 `problem.md`、`metadata.json` 与 `baseline/*.lean`，ICPC 迁移公开题目入口与 C++ baseline，USACO 只迁移公开 metadata projection 和 resident test contract，不包含隐藏测试。
+
+这次完整性修订使用新 task id 隔离语义变化：MathOlympiadBench 的 `imo2023_p2_v2` 取代 `imo2023_p2`，Clever 的四个修订题也使用 `_v2` id；旧结果不得与新 contract 合并。各题库的详细来源、修复分类和 hash 见对应 `PROVENANCE.md`（若有）与 `benchmark_integrity.json`。
+
+原仓库的生产 evaluator、隐藏测试、oracle、解答和 Judge-side package 均未复制。默认 Math 运行时继续使用本仓库的精简 HTTP adapter，不会绕过 Judge 或改变 theorem contract。题库布局与维护同步命令见 `benchmarks/README.md`。

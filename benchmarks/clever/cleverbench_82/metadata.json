@@ -1,0 +1,29 @@
+{
+  "dataset": "clever",
+  "problem_id": "cleverbench_82",
+  "slug": "cleverbench_82",
+  "subset": "clever",
+  "namespace": "cleverbench_82",
+  "theorem_name": "implementation_postcond_satisfied",
+  "theorem_names": [
+    "implementation_postcond_satisfied"
+  ],
+  "imports": [
+    "Mathlib",
+    "Std",
+    "Tacs"
+  ],
+  "source_kind": "clever_project_multi_assignment",
+  "source_benchmark": "Goedel-Code-Prover/benchmark/clever_bench.json",
+  "source_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+  "source_json_sha256": "f9c40ba9c1cff83452f0abdd9a23b023b808b7a74f5fe8f0df414e4cf972eb42",
+  "source_index": 82,
+  "baseline_sha256": "9994d428d18ce003eee7ef6ff060b25c558c4eddd322111979e21686b9bc2964",
+  "benchmark_revision": "clever-hard12-integrity-v2",
+  "semantics_revision": 1,
+  "upstream_repository": "https://github.com/trishullab/clever",
+  "upstream_problem_path": "src/lean4/human_eval/problem_83.lean",
+  "upstream_reference_commit": "830a9a9f3fcd6afa68379fb9d9b58d5083754147",
+  "derivation_status": "intermediate_snapshot_no_identified_semantic_drift",
+  "contract_scope": "checked Lean precondition/postcondition for the included implementation"
+}

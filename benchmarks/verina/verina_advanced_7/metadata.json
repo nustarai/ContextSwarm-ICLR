@@ -1,0 +1,18 @@
+{
+  "problem_id": "verina/verina_advanced_7.lean",
+  "slug": "verina_advanced_7",
+  "subset": "advanced",
+  "namespace": "verina_advanced_7",
+  "theorem_name": "binaryToDecimal_spec_satisfied",
+  "source_benchmark": "Goedel-Code-Prover/benchmark/verina_bench.json",
+  "source_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+  "source_json_sha256": "2db247946216c8f1cd3421136686273511f59e2284876712743d41ba82df19b0",
+  "baseline_sha256": "1b91d793556cd06925ca76684e289512588841959d076f5c251c1141b404e323",
+  "benchmark_revision": "verina-functional-hard12-integrity-v2",
+  "semantics_revision": 1,
+  "upstream_repository": "https://github.com/sunblaze-ucb/verina",
+  "upstream_problem_path": "datasets/verina/verina_advanced_7/task.lean",
+  "upstream_reference_commit": "66b3ce5014edafb20cb26b87c681e7f31847249f",
+  "derivation_status": "upstream_functional_projection",
+  "contract_scope": "checked Lean functional precondition/postcondition for the included implementation"
+}

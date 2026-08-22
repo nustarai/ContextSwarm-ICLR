@@ -545,6 +545,7 @@ def _safe_health(payload: dict[str, Any], requested_env: str) -> dict[str, Any]:
         "api_version",
         "service",
         "active_workers",
+        "ready_workers",
         "available_service_units",
         "backend_queue_depth",
         "busy_workers",
@@ -563,6 +564,29 @@ def _safe_health(payload: dict[str, Any], requested_env: str) -> dict[str, Any]:
             "kind": identity[0],
             "value": identity[1],
         }
+    # The formal Judge exposes group-admission capacity at the top level for
+    # observability.  When that optional protocol is disabled, its deliberate
+    # ``admission_disabled``/zero-capacity projection must not be mistaken for
+    # the direct /api/lean/jobs worker pool used by this runner.
+    group_admission = payload.get("group_admission")
+    group_disabled = (
+        isinstance(group_admission, dict)
+        and group_admission.get("enabled") is False
+        and group_admission.get("status") == "disabled"
+        and payload.get("capacity_error_kind") == "admission_disabled"
+    )
+    if group_disabled:
+        result["group_admission_enabled"] = False
+        for key in (
+            "available_service_units",
+            "backend_queue_depth",
+            "capacity_state",
+        ):
+            result.pop(key, None)
+    elif isinstance(group_admission, dict) and isinstance(
+        group_admission.get("enabled"), bool
+    ):
+        result["group_admission_enabled"] = bool(group_admission["enabled"])
     accepted = payload.get("accepted_lean_env_ids")
     if isinstance(accepted, list):
         safe_accepted = [value for value in accepted if isinstance(value, str)]
@@ -600,6 +624,16 @@ def _validate_lean_health(health: dict[str, Any]) -> None:
         raise PreflightError(
             "Lean router does not explicitly accept the requested environment"
         )
+    if health.get("group_admission_enabled") is False:
+        direct_ready = health.get("ready_workers", health.get("active_workers"))
+        if (
+            isinstance(direct_ready, bool)
+            or not isinstance(direct_ready, (int, float))
+            or not math.isfinite(float(direct_ready))
+            or direct_ready <= 0
+        ):
+            raise PreflightError("Direct Lean Judge has no ready workers")
+        return
     if "available_service_units" in health:
         available = health.get("available_service_units")
         if (

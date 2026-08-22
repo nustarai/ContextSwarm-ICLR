@@ -1,0 +1,32 @@
+{
+  "dataset": "clever",
+  "problem_id": "cleverbench_89_v2",
+  "slug": "cleverbench_89_v2",
+  "subset": "clever",
+  "namespace": "cleverbench_89_v2",
+  "theorem_name": "implementation_postcond_satisfied",
+  "theorem_names": [
+    "implementation_postcond_satisfied"
+  ],
+  "imports": [
+    "Mathlib",
+    "Std",
+    "Tacs"
+  ],
+  "source_kind": "clever_project_multi_assignment",
+  "source_benchmark": "Goedel-Code-Prover/benchmark/clever_bench.json",
+  "source_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+  "source_json_sha256": "f9c40ba9c1cff83452f0abdd9a23b023b808b7a74f5fe8f0df414e4cf972eb42",
+  "source_index": 89,
+  "baseline_sha256": "4c9a837d5f8e1734d90bc879d8e85d38f4ab9850022a8eb4e96844714155fa23",
+  "benchmark_revision": "clever-hard12-integrity-v2",
+  "semantics_revision": 2,
+  "supersedes_problem_id": "cleverbench_89",
+  "result_compatibility": "incompatible_with_cleverbench_89_results",
+  "upstream_repository": "https://github.com/trishullab/clever",
+  "upstream_problem_path": "src/lean4/human_eval/problem_90.lean",
+  "upstream_reference_commit": "830a9a9f3fcd6afa68379fb9d9b58d5083754147",
+  "upstream_introduction_commit": "c79cfb45a744ae43d4488e3bd1418bc683108967",
+  "derivation_status": "under_specification_repaired",
+  "contract_scope": "the returned second-smallest value must occur in the input list"
+}

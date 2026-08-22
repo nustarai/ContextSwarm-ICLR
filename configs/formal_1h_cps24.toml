@@ -1,0 +1,18 @@
+extends = ["formal_1h_bridge.toml"]
+
+[experiment]
+name = "mobench-formal-1h-cps24"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 24
+initial_agents_per_task = 2
+max_attempts_per_task = 0
+cancel_on_proved = true
+assignment_policy = "least_active"
+episodes_per_task = 2
+
+[allocation]
+policy = "uniform"
+
+[docker]
+memory_mb = 16384

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,19 +16,24 @@ from contextswarm_mini.prompts import render_problem_work_mode
 
 
 BENCHMARK_ROOT = ROOT / "benchmarks" / "matholympiadbench"
-MARKER = "        ## Work Mode\n\n"
-NEXT_SECTION = "\n        ## "
+WORK_MODE_HEADING = re.compile(r"(?m)^(?P<indent>[ ]*)## Work Mode[ ]*\n\n")
 
 
 def synchronized_text(source: str) -> str:
     """Replace one Work Mode section while preserving any later sections."""
 
-    before, marker, after = source.partition(MARKER)
-    if not marker:
+    marker = WORK_MODE_HEADING.search(source)
+    if marker is None:
         raise ValueError("missing canonical Work Mode marker")
-    next_section = after.find(NEXT_SECTION)
-    suffix = after[next_section:] if next_section >= 0 else "\n"
-    return before + MARKER + render_problem_work_mode() + suffix
+    indent = marker.group("indent")
+    after = source[marker.end() :]
+    next_heading = re.search(rf"(?m)^{re.escape(indent)}## [^#]", after)
+    suffix = f"\n\n{after[next_heading.start():]}" if next_heading else "\n"
+    return (
+        source[: marker.end()]
+        + render_problem_work_mode(indent=indent)
+        + suffix
+    )
 
 
 def main() -> int:

@@ -1,0 +1,22 @@
+{
+  "aliases": [
+    "icpc"
+  ],
+  "benchmark_revision": "icpc-wf-2025-statement-faithful-derived-v1",
+  "candidate_filename": "result.cpp",
+  "contextswarm_source": {
+    "path": "definitions/coding/icpc_wf_2025/all",
+    "repository": "https://github.com/shiyegao/ContextSwarm",
+    "revision": "cfed6e508193a0eeebdc56e1e8846f70a0ecc635"
+  },
+  "dataset": "icpc_wf_2025",
+  "integrity_manifest": "benchmark_integrity.json",
+  "language": "cpp",
+  "problem_ids": "problem_ids.json",
+  "provenance": "PROVENANCE.md",
+  "runnable_with_contextswarm_mini": false,
+  "schema_version": "contextswarm_mini_benchmark_bundle_v1",
+  "subset": "all",
+  "task_count": 12,
+  "verification_profile": "coding_icpc_contest"
+}
