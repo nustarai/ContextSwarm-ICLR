@@ -600,13 +600,11 @@ _MANIFEST_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+\.toml")
 
 def _is_infrastructure_verdict(verdict: Verdict) -> bool:
     status = normalize_verdict_status(verdict.status)
-    return bool(
-        status in _INFRASTRUCTURE_VERDICT_STATUSES
-        or (
-            status in {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
-            and _response_value(verdict.response, "retryable") is True
-        )
-    )
+    # Candidate-bound terminal Judge statuses are ordinary zero-progress
+    # attempts even when a provider supplies a retryable hint.  Only statuses
+    # in the explicit infrastructure set (which carry candidate-independent
+    # evidence) may degrade the arm.
+    return status in _INFRASTRUCTURE_VERDICT_STATUSES
 
 
 def _runtime_provenance(
@@ -4422,14 +4420,9 @@ def _run_health(
     }
     for verdict in verdicts.values():
         status = normalize_verdict_status(verdict.status)
-        retryable_terminal_limit = bool(
-            status in {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
-            and _response_value(verdict.response, "retryable") is True
-        )
         if (
             status in incomplete_closeout_statuses
             or status in _NONTERMINAL_VERDICT_STATUSES
-            or retryable_terminal_limit
         ):
             issues.add("closeout_incomplete")
         if status == "AUTHORITY_CONFLICT":
@@ -4916,6 +4909,8 @@ def _write_figure4_summary(
     contract = {
         "dataset": config.dataset_name,
         "ordered_task_ids": task_order,
+        "selection": selector_identity,
+        "figure4_phase": getattr(config, "figure4_phase", ""),
         "paired_repeat_id": repeat,
         "paired_seed": config.seed,
         "selector_identity": selector_identity,
