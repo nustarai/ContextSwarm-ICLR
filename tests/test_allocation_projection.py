@@ -378,6 +378,19 @@ class TraceAllocationProjectionTests(unittest.TestCase):
         result = TraceAllocationProjectionAdapter().project(source, ["a"])
         self.assertEqual(result.for_task("a").frontier_count, 1)
 
+    def test_default_feedback_rate_preserves_exposure_denominator(self) -> None:
+        projection = TraceAllocationProjectionAdapter().project_full_records(
+            ["a"],
+            [
+                _row(1, "worker_exposure", record_id="x1", evidence_id="t1", worker_id="w", exposure_id="x1"),
+                _row(2, "worker_exposure", record_id="x2", evidence_id="t2", worker_id="w", exposure_id="x2"),
+                _row(3, "feedback_positive", record_id="f1", evidence_id="t1", worker_id="w", exposure_id="x1", effective=True, terminal=True),
+            ],
+            source_watermark=3,
+        ).for_task("a")
+        self.assertEqual(projection.feedback_exposure_count, 2)
+        self.assertEqual(projection.positive_feedback, 0.5)
+
     def test_full_state_requires_declared_trace_or_lineage_identity(self) -> None:
         projection = TraceAllocationProjectionAdapter().project_full_records(
             ["a"],

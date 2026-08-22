@@ -201,7 +201,9 @@ class TraceProjectionLimits:
     lineage_stagnation_weight: float = 1.0
     recency_window_seconds: float = 600.0
     stagnation_window_seconds: float = 600.0
-    feedback_kappa: float = 1.0
+    # Zero preserves the historical exposure-rate calculation.  Formal
+    # experiments set any additive smoothing explicitly from the manifest.
+    feedback_kappa: float = 0.0
     feedback_trust_default: float = 1.0
     feedback_values: Mapping[str, float] | None = None
     require_feedback_mapping: bool = False
@@ -226,10 +228,13 @@ class TraceProjectionLimits:
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        for name in ("recency_window_seconds", "stagnation_window_seconds", "feedback_kappa"):
+        for name in ("recency_window_seconds", "stagnation_window_seconds"):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+        kappa = float(self.feedback_kappa)
+        if not math.isfinite(kappa) or kappa < 0:
+            raise ValueError("feedback_kappa must be finite and non-negative")
         value = float(self.feedback_trust_default)
         if not math.isfinite(value) or value < 0:
             raise ValueError("feedback_trust_default must be finite and non-negative")
@@ -1143,8 +1148,8 @@ class TraceAllocationProjectionAdapter:
             if winner.source_outcome_id:
                 acc.source_outcome_ids.add(winner.source_outcome_id)
         denominator = self.limits.feedback_kappa + exposure_count
-        positive = _unit(positive_weight / denominator)
-        negative = _unit(negative_weight / denominator)
+        positive = _unit(positive_weight / denominator) if denominator else 0.0
+        negative = _unit(negative_weight / denominator) if denominator else 0.0
 
         denominator_entities = sum(recency(entity) for entity in all_entities)
         if denominator_entities <= 0:
