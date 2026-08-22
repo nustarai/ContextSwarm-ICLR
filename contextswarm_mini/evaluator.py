@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -57,6 +58,36 @@ def normalize_base_url(raw: str) -> str:
         if value.endswith(suffix):
             value = value[: -len(suffix)]
     return value.rstrip("/")
+
+
+def candidate_sha256(code: str) -> str:
+    """Hash the exact UTF-8 source submitted to the Judge."""
+
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def task_contract_sha256(
+    task: Task,
+    *,
+    lean_env_id: str,
+    verification_profile: str,
+    judge_mode: str,
+) -> str:
+    """Hash the immutable inputs which give a formal verdict its meaning."""
+
+    digest = hashlib.sha256()
+    for value in (
+        task.slug,
+        task.problem_id,
+        task.theorem_name,
+        task.baseline_code,
+        lean_env_id,
+        verification_profile,
+        judge_mode,
+    ):
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 class LeanEvaluator:
@@ -177,6 +208,16 @@ class LeanEvaluator:
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/healthz")
 
+    def expected_task_contract_sha256(self, task: Task) -> str:
+        """Return the contract identity used for this task's Judge request."""
+
+        return task_contract_sha256(
+            task,
+            lean_env_id=self.lean_env_id,
+            verification_profile=self.verification_profile,
+            judge_mode=self.judge_mode,
+        )
+
     def evaluate(
         self,
         task: Task,
@@ -185,19 +226,42 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
     ) -> Verdict:
         started = time.monotonic()
-        return self._evaluate(
+        contract_sha256 = self.expected_task_contract_sha256(task)
+        try:
+            code = candidate_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            return Verdict(
+                task_id=task.slug,
+                status="EVALUATOR_ERROR",
+                score=0.0,
+                elapsed_seconds=time.monotonic() - started,
+                error=str(exc),
+                task_contract_sha256=contract_sha256,
+            )
+        verdict = self._evaluate(
             task,
             candidate_path,
+            candidate_code=code,
             deadline_monotonic=deadline_monotonic,
             started=started,
             terminal_overload_retries=self.terminal_overload_retries,
         )
+        verdict.candidate_sha256 = candidate_sha256(code)
+        verdict.task_contract_sha256 = contract_sha256
+        raw_job_id = _nested_value(verdict.response, "job_id")
+        if raw_job_id is None:
+            raw_job_id = _nested_value(verdict.response, "id")
+        if isinstance(raw_job_id, (str, int)) and str(raw_job_id).strip():
+            verdict.judge_job_id = str(raw_job_id).strip()
+        verdict.cache_reused = _nested_value(verdict.response, "cache_reused") is True
+        return verdict
 
     def _evaluate(
         self,
         task: Task,
         candidate_path: Path,
         *,
+        candidate_code: str,
         deadline_monotonic: float | None,
         started: float,
         terminal_overload_retries: int,
@@ -211,7 +275,7 @@ class LeanEvaluator:
         response: dict[str, Any] = {}
         last_poll_error: str | None = None
         try:
-            code = candidate_path.read_text(encoding="utf-8")
+            code = candidate_code
             target = task.baseline_code
             local_error = _local_contract_error(task, code, target)
             if local_error:
@@ -374,10 +438,15 @@ class LeanEvaluator:
                 response, cancel_error = self._cancel_and_reconcile(job_id, response)
                 if cancel_error:
                     last_poll_error = cancel_error
+            if job_id:
+                # Poll and cancellation receipts are allowed to omit the id;
+                # preserve the identity from the authoritative submit receipt.
+                response.setdefault("job_id", job_id)
             if _retryable_admission_rejection(response):
                 retried = self._retry_terminal_overload(
                     task,
                     candidate_path,
+                    candidate_code=candidate_code,
                     deadline_monotonic=deadline_monotonic,
                     started=started,
                     terminal_overload_retries=terminal_overload_retries,
@@ -464,12 +533,16 @@ class LeanEvaluator:
                 response=_safe_response(response),
             )
         except (OSError, EvaluatorError, UnicodeError) as exc:
+            if job_id:
+                response.setdefault("job_id", job_id)
             if job_id and not _terminal(response):
                 response, cancel_error = self._cancel_and_reconcile(job_id, response)
+                response.setdefault("job_id", job_id)
                 if _retryable_admission_rejection(response):
                     retried = self._retry_terminal_overload(
                         task,
                         candidate_path,
+                        candidate_code=candidate_code,
                         deadline_monotonic=deadline_monotonic,
                         started=started,
                         terminal_overload_retries=terminal_overload_retries,
@@ -510,6 +583,7 @@ class LeanEvaluator:
         task: Task,
         candidate_path: Path,
         *,
+        candidate_code: str,
         deadline_monotonic: float | None,
         started: float,
         terminal_overload_retries: int,
@@ -526,6 +600,7 @@ class LeanEvaluator:
         verdict = self._evaluate(
             task,
             candidate_path,
+            candidate_code=candidate_code,
             deadline_monotonic=deadline_monotonic,
             started=started,
             terminal_overload_retries=terminal_overload_retries - 1,
@@ -584,6 +659,14 @@ class MockEvaluator:
     def health(self) -> dict[str, Any]:
         return {"ok": True, "mock": True}
 
+    def expected_task_contract_sha256(self, task: Task) -> str:
+        return task_contract_sha256(
+            task,
+            lean_env_id="mock",
+            verification_profile="mock",
+            judge_mode="mock",
+        )
+
     def evaluate(
         self,
         task: Task,
@@ -602,6 +685,8 @@ class MockEvaluator:
             1.0 if proved else 0.0,
             0.0,
             {"mock": True},
+            candidate_sha256=candidate_sha256(code),
+            task_contract_sha256=self.expected_task_contract_sha256(task),
         )
 
 
@@ -862,6 +947,7 @@ def _safe_response(payload: Mapping[str, Any]) -> dict[str, Any]:
         "error_kind",
         "terminal_reason",
         "retryable",
+        "cache_reused",
         "cancel_requested",
         "queue_wait_ms",
         "execution_ms",

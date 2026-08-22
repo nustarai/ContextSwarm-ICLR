@@ -236,6 +236,14 @@ class _LifecycleServer:
                             "execution_ms": 600,
                         }
                     )
+                elif owner.mode == "terminal_without_receipt_job_id":
+                    self._send(
+                        {
+                            "status": "succeeded",
+                            "formal_status": "PROVED",
+                            "correct": True,
+                        }
+                    )
                 elif owner.mode == "queued_then_proved" and elapsed >= 0.6:
                     self._send(
                         {
@@ -554,6 +562,23 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(verdict.response["queue_wait_ms"], 600)
         self.assertEqual(verdict.response["execution_ms"], 600)
         self.assertEqual(server.post_payloads[0]["max_retries"], 1)
+
+    def test_submit_job_id_binds_terminal_receipt_that_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            server = _LifecycleServer("terminal_without_receipt_job_id")
+            with server.running() as url:
+                verdict = LeanEvaluator(
+                    url,
+                    lean_env_id="test",
+                    poll_interval_seconds=0.01,
+                ).evaluate(_task(root), self._candidate(root))
+
+        self.assertEqual(verdict.status, "PROVED")
+        self.assertEqual(verdict.judge_job_id, "job-1")
+        self.assertEqual(verdict.response["job_id"], "job-1")
+        self.assertIsNotNone(verdict.candidate_sha256)
+        self.assertIsNotNone(verdict.task_contract_sha256)
 
     def test_unsettled_cancel_never_persists_running(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
