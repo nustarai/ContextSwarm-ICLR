@@ -1,0 +1,406 @@
+{
+  "1587_bronze_make_all_distinct": {
+    "problem_id": "1587_bronze_make_all_distinct",
+    "cp_id": 1587,
+    "problem_level": "bronze",
+    "name": "Make All Distinct",
+    "description_no_samples": "You have an integer array $a_1\\dots a_N$ with elements initially in the range\n$[1,N]$\n($1\\le N\\le 2\\cdot 10^5$), as well as a nonzero integer $K$\n($-N \\le K\\le N, K\\neq 0$).\n\nYou may perform the following operation as many times as you'd like (possibly\nzero): select an index $i$ and set $a_i=a_i+K$.\n\nFind the minimum number of operations to make all array elements distinct.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe input consists of $T$ ($1\\le T\\le 10$) independent tests. Each test is\ndescribed as follows:\n\nThe first line contains $N$ and $K$.\n\nThe second line contains $a_1\\dots a_N$.\n\nIt is guaranteed that the sum of $N$ over all tests does not exceed\n$10^6$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test, output a single line containing the minimum number of operations.\n\nNote: The large size of integers involved in this problem may require the use\nof 64-bit integer data types (e.g., a \"long long\" in C/C++).\n",
+    "samples": [
+      {
+        "input": "4\n4 1\n4 1 4 1\n4 -3\n4 1 4 1\n4 4\n4 1 4 1\n3 -1\n1 1 2\n",
+        "output": "2\n4\n2\n1\n"
+      }
+    ],
+    "num_samples": 1,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1587",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 13,
+    "benchmark_contract_id": "usaco/season26contest3results/1587_bronze_make_all_distinct@824dafabd1ec515d",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1587",
+      "test_data_url": "https://usaco.org/current/data/prob1_bronze_season26contest3.zip",
+      "statement_text_sha256": "767bd5cfd754dfd4df6afc2788686186bf2080b507a932da4e9849225df5f826",
+      "test_data_zip_sha256": "0b4251fcc96ef88d7ec83f1c71c84c0bfbf7247fb07645b24474037968e0e0cb",
+      "test_corpus_sha256": "c9ba6dc539f01eef46f45928b3c59c2655979310607c6f27a06c157583977ca0",
+      "content_contract_sha256": "824dafabd1ec515d9364a46a7a4d2786085d684b85748b3fa85a503c496dbc08"
+    },
+    "num_tests": 0
+  },
+  "1588_bronze_strange_function": {
+    "problem_id": "1588_bronze_strange_function",
+    "cp_id": 1588,
+    "problem_level": "bronze",
+    "name": "Strange Function",
+    "description_no_samples": "For all positive integers $x$, the function $f(x)$ is defined as follows:\n\nIf $x$ has any digits that aren't $0$ or $1$, for each digit of $x$, set it to\n$1$ if it is odd or $0$ otherwise, and return $x$.\n\nOtherwise, return $x-1$.\n\nGiven a value of $x$ ($1 \\leq x < 10^{2\\cdot 10^5}$), find how many times $f$\nneeds to be applied to $x$ until $x$ reaches $0$. As this number might be very\nlarge, output its remainder when divided by $10^9+7$.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe first line contains $T$ ($1\\le T\\le 10^5$), the number of independent tests.\n\nThe next $T$ lines each contain a positive integer $x$ consisting solely of the\ndigits 0-9, with no leading zeros.\n\nIt is guaranteed that the total number of digits in all input integers does not\nexceed $10^6$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test case, output the remainder of the number of times when divided by\n$10^9+7$ on a separate line.\n",
+    "samples": [
+      {
+        "input": "2\n24680\n210\n",
+        "output": "1\n4\n"
+      },
+      {
+        "input": "1\n1234567890123456789012345678901234567890\n",
+        "output": "511620083\n"
+      }
+    ],
+    "num_samples": 2,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1588",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 12,
+    "benchmark_contract_id": "usaco/season26contest3results/1588_bronze_strange_function@ee43cddd0cad1f35",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1588",
+      "test_data_url": "https://usaco.org/current/data/prob2_bronze_season26contest3.zip",
+      "statement_text_sha256": "857d3e561a17a727046b01f870f5f97cf0741af5422a2c5a574596885cd52603",
+      "test_data_zip_sha256": "5bc1202dd4b8405b89dde61da28b709c318fb2a26c3e14a52c4364d16910bfb5",
+      "test_corpus_sha256": "846f0abde39c6af6613292810f61b804d0cab76f0339d2540f0ff7c8287904cb",
+      "content_contract_sha256": "ee43cddd0cad1f3585931ba366d62377f8bde0974cfd163f7c3bd67d50cf1edc"
+    },
+    "num_tests": 0
+  },
+  "1589_bronze_swap_to_win": {
+    "problem_id": "1589_bronze_swap_to_win",
+    "cp_id": 1589,
+    "problem_level": "bronze",
+    "name": "Swap to Win",
+    "description_no_samples": "Farmer John has a favorite string $t$ with $M$ characters. He also has $N$\nstrings $s_1, s_2, \\ldots, s_N$ each with $M$ characters\n($1 \\leq N, M \\leq 1000$).\n\nFJ can perform the following two types of operations:\n\nFJ chooses any string $s_x$ and two indices $p$ and $q$. Then, he swaps the\n$p$'th and $q$'th character of $s_x$ ($1\\le x\\le N, 1\\le p,q\\le M$).\n\nFJ chooses two strings $s_x$ and $s_y$ and an index $k$. Then, he swaps the\n$k$'th characters of $s_x$ and $s_y$ ($1\\le x,y\\le N, 1\\le k\\le M$).\n\nHis goal is to make $s_1$ equal to $t$. Find any series of operations that\nfulfills his goal. Because FJ is in a hurry, he only has time to perform a total\nof $2M$ operations. The inputs guarantee that it is possible to fulfill FJ's\ngoal.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe first line contains $T$ ($1\\le T\\le 10$), the number of independent tests.\nEach test is specified in the following format:\n\nThe first line contains $N$ and $M$.\n\nThe second line contains $t$.\n\nThen, $N$ lines follow, the $i$'th of which contains $s_i$.\n\nThe inputs will guarantee that it is possible to fulfill FJ's goal. All strings\ncontain lowercase English letters (a-z).\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nThe output for each test should be as follows:\n\nOn the first line, output an integer $K$, the number of operations you will\nperform. $K$ must be a non-negative integer less than or equal to $2M$.\n\nThen, output $K$ lines, denoting the operations you will perform in sequential\norder. Each line should be one of the following:\n\n$\\texttt{1 x p q}$\n\n$\\texttt{2 x y k}$\n",
+    "samples": [
+      {
+        "input": "3\n3 6\nbanana\nnabana\nbanana\nnnbaaa\n5 3\nabc\ndef\nbca\nghi\njkl\nmno\n3 5\nabcde\nabcde\nabcde\nzzzzz\n",
+        "output": "3\n2 1 2 1\n1 1 3 5\n2 1 2 5\n5\n1 2 1 3\n2 1 2 1\n1 2 2 3\n2 1 2 2\n2 1 2 3\n0\n"
+      }
+    ],
+    "num_samples": 1,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1589",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 12,
+    "benchmark_contract_id": "usaco/season26contest3results/1589_bronze_swap_to_win@f4f702a42320e5cc",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1589",
+      "test_data_url": "https://usaco.org/current/data/prob3_bronze_season26contest3.zip",
+      "statement_text_sha256": "da7462edc760bee398b2b4157d576e7411f766b6adb8043a15cf5a4a60a3d8ac",
+      "test_data_zip_sha256": "9559aa0f7facf77395a193e4f0045cc7229a73bb87d143428db8ca91331c664b",
+      "test_corpus_sha256": "a9ac44c42c74c7e6a8f019aac7fddb280222f09446b6b71e3d7576e22f4ec7bc",
+      "content_contract_sha256": "f4f702a42320e5ccc5344a242345d08d21f3642917064a096b007585958c87f1"
+    },
+    "num_tests": 0
+  },
+  "1590_silver_clash": {
+    "problem_id": "1590_silver_clash",
+    "cp_id": 1590,
+    "problem_level": "silver",
+    "name": "Clash!",
+    "description_no_samples": "Farmer John is playing a famous and strategic card game with his dear cow\nBessie. FJ has $N$ ($2\\le N\\le 2\\cdot 10^5$) cards, conveniently numbered from\n$1$ to $N$. The $i$'th card costs $a_i$ ($1 \\leq a_i \\leq 10^9$) moolixir if FJ\nwants to play it.\n\nHis hand always consists of $H$ cards at any given time ($1\\le H<N$). Initially,\nhis hand consists of cards $1$ through $H$. The remaining cards are in a draw\nqueue. Every time FJ plays a card in his hand, he will draw its replacement from\nthe front of the draw queue to his hand. Then, FJ will put the card he just\nplayed to the back of the draw queue. Initially, cards $H+1$ through $N$ are\narranged from the front to the back of the draw queue in that order.\n\nIn this game, time is measured in integer seconds. Initially, the game starts at\ntime $0$ with FJ having $0$ moolixir. Immediately before each of integer times\n$t=1,2,3,\\dots,$ moolixir increases by $1$. At each integer time, FJ may choose\nto play a card in his hand if its cost does not exceed FJ's current moolixir\ncount, which subtracts FJ's current moolixir count by the card's cost.\n\nFJ marks a subset of his cards $s_1, s_2, \\ldots, s_k$ as win-conditions\n($1\\le k\\le N$, $1\\le s_i\\le N$). If FJ has at least one win-condition in his\nhand, the next card he plays must be a win-condition.\n\nHe asks you $Q$ ($1 \\leq Q \\leq 2 \\cdot 10^5$) queries. Each query is of the\nfollowing form: what is the maximum number of win-conditions he could have\nplaced down within $t$ time ($1 \\leq t \\leq 10^{18}$)?\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe first line contains $N$ and $H$.\n\nThe second line contains $N$ integers $a_1, a_2, \\ldots, a_N$.\n\nThe third line contains an integer $k$, the number of win-conditions.\n\nThe fourth line contains $k$ distinct integers\n$s_1, s_2, \\ldots, s_k$.\n\nThe fifth line contains an integer $Q$.\n\nThe following $Q$ lines each contain an integer $t$, the time to answer for each\nquery.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each query, output the maximum number of win-conditions that FJ could've put\ndown within $t$ time.\n",
+    "samples": [
+      {
+        "input": "6 3\n2 4 3 5 7 6\n2\n1 4\n6\n1\n2\n3\n7\n10\n1000000000000000\n",
+        "output": "0\n1\n1\n2\n2\n142857142857143\n"
+      }
+    ],
+    "num_samples": 1,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1590",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 11,
+    "benchmark_contract_id": "usaco/season26contest3results/1590_silver_clash@812a1cec28329bab",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1590",
+      "test_data_url": "https://usaco.org/current/data/prob1_silver_season26contest3.zip",
+      "statement_text_sha256": "a107adcee5c5d879f2fb4a83be94b49476510d105aab2c03c53f9c4474fc15f2",
+      "test_data_zip_sha256": "8304d3718b9526428dc46c7b4291fddf568fa589efd2e0eb3976606b17ea6c09",
+      "test_corpus_sha256": "e45119a52db1dc9da32193f4b42621abb6e9a145649cf8f3fff413e1f65eba37",
+      "content_contract_sha256": "812a1cec28329bab59cc81006366f6cd30e8c16a287744e97f7c77ba7ba2f0ee"
+    },
+    "num_tests": 0
+  },
+  "1591_silver_milk_buckets": {
+    "problem_id": "1591_silver_milk_buckets",
+    "cp_id": 1591,
+    "problem_level": "silver",
+    "name": "Milk Buckets",
+    "description_no_samples": "There are $N$ ($1\\le N\\le 2\\cdot 10^5$) buckets in a stack where the $i$-th\nbucket from the top has capacity $a_i$ gallons ($1\\le a_i\\le 10^9$). A tap above\nthe top bucket sends one gallon of milk per second into the first bucket per\nsecond. There is also a pool below bucket $N$.\n\nWhen a bucket reaches its capacity after $t$ seconds, at the start of the\n$t+1$th second it flips to dump its contents into either the bucket below if it\nis not the last bucket or the pool otherwise (it reverts back to filling at the\nend of the $t+1$th second). A bucket cannot collect milk while it is flipped;\nany milk arriving at the bucket above during this second is lost. Additionally,\nany amount of milk exceeding the capacity of the bucket below is lost.\n\nHandle $Q$ ($1\\le Q\\le 3\\cdot 10^5$) queries, each specified by three integers\n$i$, $v$, and $t$:\n\nFirst, set $a_i=v$ ($1\\le i\\le N, 1\\le v \\le 10^9$).\n\nThen answer the following question: Suppose that at time $0$, all buckets as\nwell as the pool are empty. Determine the number of gallons of milk in the pool\nafter $t$ seconds\n($1\\le t\\le 10^{18}$).\n\nThe $a_i=v$ updates persist through later queries.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe first line contains $N$.\n\nThe second line contains $a_1\\dots a_N$.\n\nThe next line contains $Q$.\n\nThen the following $Q$ lines contain three integers $i$, $v$, and $t$. This\nmeans that you should set $a_i=v$ and then answer the question for $t$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nOutput the answer to each question on a separate line.\n",
+    "samples": [
+      {
+        "input": "3\n1 1 1\n30\n1 1 1\n1 1 2\n1 1 3\n1 1 4\n1 1 5\n1 1 6\n1 1 7\n1 1 8\n1 1 9\n1 1 10\n1 2 1\n1 2 2\n1 2 3\n1 2 4\n1 2 5\n1 2 6\n1 2 7\n1 2 8\n1 2 9\n1 2 10\n2 2 1\n2 2 2\n2 2 3\n2 2 4\n2 2 5\n2 2 6\n2 2 7\n2 2 8\n2 2 9\n2 2 10\n",
+        "output": "0\n0\n0\n1\n1\n2\n2\n3\n3\n4\n0\n0\n0\n0\n1\n1\n1\n2\n2\n2\n0\n0\n0\n0\n1\n1\n1\n2\n2\n2\n"
+      },
+      {
+        "input": "2\n1 2\n10\n1 1 1\n1 1 2\n1 1 3\n1 1 4\n1 1 5\n1 1 6\n1 1 7\n1 1 8\n1 1 9\n1 1 10\n",
+        "output": "0\n0\n0\n0\n2\n2\n2\n2\n4\n4\n"
+      },
+      {
+        "input": "3\n1 1 1\n1\n1 1 1000000000000000000\n",
+        "output": "499999999999999999\n"
+      }
+    ],
+    "num_samples": 3,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1591",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 23,
+    "benchmark_contract_id": "usaco/season26contest3results/1591_silver_milk_buckets@629cfeaae62f68ed",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1591",
+      "test_data_url": "https://usaco.org/current/data/prob2_silver_season26contest3.zip",
+      "statement_text_sha256": "f6a0620e8e54df6ff6a54becf94de8a7a7c88488b0264d72155acaa99732a807",
+      "test_data_zip_sha256": "c1e74bebf03c783bedaa2c8cab67586d71597445abbd2aed3ffbc541e6808967",
+      "test_corpus_sha256": "9838aa3b06a8cfb490ebce1bf1e4fb8eebe21f7995b6bab0dcccfd0637fae39a",
+      "content_contract_sha256": "629cfeaae62f68ed9fccf39e1840cae2a6668adac1a720415fd728bce3accc76"
+    },
+    "num_tests": 0
+  },
+  "1592_silver_point_elimination": {
+    "problem_id": "1592_silver_point_elimination",
+    "cp_id": 1592,
+    "problem_level": "silver",
+    "name": "Point Elimination",
+    "description_no_samples": "You have $N$ ($2 \\leq N \\leq 10^5, N$ is even$)$ points $(x_i,y_i)$\n($1 \\leq x_i, y_i \\leq 10^6$) on an infinite 2D-coordinate plane.\n\nYou can perform the following two types of operations any number of times:\n\nChoose two points that are directly adjacent to each other (manhattan\ndistance of $1$), and remove both points.\n\nChoose any two points and swap their y-coordinates. Formally, points\n$(a,b)$ and $(c,d)$ become $(a,d)$ and $(c,b)$ respectively.\n\nDetermine if it is possible to eliminate all points on the board. Note that it\nmay be the case that two points may map to the same coordinate; they should\nstill be treated as different points. You also may not directly delete points on\nthe same coordinate, as they are technically not directly adjacent.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe first line contains $T$ ($1 \\leq T \\leq 5000$), the number of test cases.\n\nThe first line of each test case contains an integer $N$.\n\nThe following $N$ lines contain two integers $x_i$ and $y_i$.\n\nIt is guaranteed that the sum of $N$ over all test cases does not exceed\n$5\\cdot 10^5$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test case, output \"YES\" or \"NO\" on a new line.\n",
+    "samples": [
+      {
+        "input": "4\n2\n1 1\n1 1\n4\n6 10\n7 11\n8 1\n8 1\n6\n1 2\n1 3\n1 4\n1 5\n10 10\n11 10\n6\n1 1\n1 1\n1 1\n1 1\n10 10\n11 11\n",
+        "output": "NO\nYES\nYES\nNO\n"
+      }
+    ],
+    "num_samples": 1,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1592",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 11,
+    "benchmark_contract_id": "usaco/season26contest3results/1592_silver_point_elimination@2bfd4a218fa3d565",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1592",
+      "test_data_url": "https://usaco.org/current/data/prob3_silver_season26contest3.zip",
+      "statement_text_sha256": "afc81c2c79fe0d2ddacfc8bc2adbfc34772344a7adb6e19badeb55ce3cbfe48c",
+      "test_data_zip_sha256": "a81ae8556fa87b2eb44ead7625c63aaa31a1e28f2be9789d2d197cab83cf492f",
+      "test_corpus_sha256": "ccd8f72f2227c8f04664c3ee5ce2053edc4bc200bfbd676f31082969a2d8f5de",
+      "content_contract_sha256": "2bfd4a218fa3d56598b5204db494267c7d468d14b9445212bea82f45b68cb62f"
+    },
+    "num_tests": 0
+  },
+  "1593_gold_good_cyclic_shifts": {
+    "problem_id": "1593_gold_good_cyclic_shifts",
+    "cp_id": 1593,
+    "problem_level": "gold",
+    "name": "Good Cyclic Shifts",
+    "description_no_samples": "For a permutation $p_1,p_2,\\dots,p_N$ of $1\\dots N$ ($1\\le N\\le 2\\cdot 10^5$),\nlet $f(p)=\\sum_{i=1}^N \\frac{|p_i-i|}{2}$. A permutation is\ngood\nif it can be turned into the identity permutation using at most $f(p)$ swaps of\nadjacent elements.\n\nGiven a permutation, find which cyclic shifts of it are good.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe input consists of $T$ ($1\\le T\\le 10^5$) independent tests. Each test is\nspecified as follows:\n\nThe first line contains $N$.\n\nThe second line contains $p_1,p_2,\\dots,p_N$ ($1\\le p_i\\le N$), which is\nguaranteed to be a permutation of $1\\dots N$.\n\nIt is guaranteed that the sum of $N$ over all tests does not exceed $10^6$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test, output two lines:\n\nOn the first line, output the number of good cyclic shifts $k$.\n\nThen output a line with $k$ space-separated integers $s$ ($0\\le s<N$) in\nincreasing order, meaning that $p$ is good when cyclically shifted to the right\n$s$ times.\n",
+    "samples": [
+      {
+        "input": "3\n5\n5 4 3 2 1\n4\n1 2 4 3\n5\n1 2 3 4 5\n",
+        "output": "0\n\n2\n0 1\n5\n0 1 2 3 4\n"
+      }
+    ],
+    "num_samples": 1,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1593",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 11,
+    "benchmark_contract_id": "usaco/season26contest3results/1593_gold_good_cyclic_shifts@1270f9ba8e3052b0",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1593",
+      "test_data_url": "https://usaco.org/current/data/prob1_gold_season26contest3.zip",
+      "statement_text_sha256": "6498feec642f65804bff707e5e7bfa704488f4809b9a4bc5d9dceba8a55a2624",
+      "test_data_zip_sha256": "c281fb8995bba5079b5f2eacdc4536c9809384e077713b19bf09847f1003c10c",
+      "test_corpus_sha256": "8f5e927e8af336076ec46f0a395163847138c2f282c0fda8feae7017b08ededf",
+      "content_contract_sha256": "1270f9ba8e3052b01cb2332cf410c19f2dfb0eab039b45c2dac95024db67cf17"
+    },
+    "num_tests": 0
+  },
+  "1594_gold_picking_flowers": {
+    "problem_id": "1594_gold_picking_flowers",
+    "cp_id": 1594,
+    "problem_level": "gold",
+    "name": "Picking Flowers",
+    "description_no_samples": "**Note: The time limit for this problem is 3s, 1.5x the default.**\n\nFarmer John's farm structure can be represented as a connected undirected graph\nwith $N$ vertices and $M$ unweighted edges\n($2 \\leq N \\leq 2 \\cdot 10^5, N - 1 \\leq M \\leq 2 \\cdot 10^5$). Initially,\nFarmer John is at his barn, represented by farm $1$.\n\nInitially, farms $s_1, s_2, \\ldots, s_K$ contain flower fields and farms\n$d_1, d_2, \\ldots, d_L$ are destination farms. FJ calls a path pretty if:\n\nIt starts at farm $1$.\n\nIt ends at some destination farm $x$.\n\nThere is no shorter path starting at farm $1$ and ending at farm $x$.\n\nFJ visits all flower fields along the way.\n\nFJ can wave his magic wand and make up to one more farm contain a flower field (if it\ndoesn't already). However, FJ isn't very decisive. For farms $f$ numbered $2$\nthrough $N$, after FJ temporarily makes farm $f$ contain a flower field,\ndetermine if there exists a pretty path.\n\nNote that there are multiple test cases, and each case must be treated\nindependently.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe first line contains $T$ ($1 \\leq T \\leq 100$), the number of independent\ntest cases.\n\nThe first line of each test case contains $N$, $M$, $K$, and $L$\n($0 \\leq K \\leq N - 1, 1 \\leq L \\leq N - 1$).\n\nThe following line contains $s_1, s_2, \\ldots, s_K$ ($2 \\leq s_i \\leq N$, $s_i$\nare all distinct).\n\nThe following line contains $d_1, d_2, \\ldots, d_L$ ($2 \\leq d_i \\leq N$, $d_i$\nare all distinct).\n\nThe following $M$ lines contain $u$ and $v$, denoting there is an undirected\nedge between farms $u$ and $v$. All edges are considered to have equal length.\nIt is guaranteed that there aren't any multi-edges or self loops.\n\nIt is guaranteed that both the sum of $N$ and the sum of $M$ do not exceed\n$10^6$ over all test cases.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test case, output a binary string of length $N - 1$. The $i$'th\ncharacter in the string should be $1$ if the answer holds true for the\n$(i+1)$'th farm.\n",
+    "samples": [
+      {
+        "input": "1\n7 7 0 1\n\n5\n1 2\n2 3\n3 4\n4 5\n5 6\n6 7\n3 6\n",
+        "output": "111110\n"
+      },
+      {
+        "input": "1\n6 6 0 2\n\n5 3\n1 2\n2 3\n3 4\n4 5\n5 6\n2 5\n",
+        "output": "11010\n"
+      },
+      {
+        "input": "3\n4 3 2 1\n2 3\n4\n1 2\n2 3\n3 4\n4 4 2 1\n2 3\n4\n1 2\n1 3\n2 4\n3 4\n5 5 2 1\n2 4\n5\n1 2\n1 3\n2 4\n3 4\n4 5\n",
+        "output": "111\n000\n1011\n"
+      }
+    ],
+    "num_samples": 3,
+    "runtime_limit": 3,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1594",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 23,
+    "benchmark_contract_id": "usaco/season26contest3results/1594_gold_picking_flowers@b7bc6e0aaf1941ac",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1594",
+      "test_data_url": "https://usaco.org/current/data/prob2_gold_season26contest3.zip",
+      "statement_text_sha256": "c9292a9efc3c3bd9d3318577e9ad2b6677da85c74a4a2a6d4acd5b7775cfdb14",
+      "test_data_zip_sha256": "08b9034415f932317b3c0cb0906ab7ebb97d36edb2c3f3f8594bf89bcb81f5c1",
+      "test_corpus_sha256": "68b94fffa191ac10c6d25f4717bb70cb95c73e7223e97fb2a11d76a907fccae6",
+      "content_contract_sha256": "b7bc6e0aaf1941acc3f37eda24d888023f093ac138460f5411127eb0b1e8a5d4"
+    },
+    "num_tests": 0
+  },
+  "1595_gold_random_tree_generation": {
+    "problem_id": "1595_gold_random_tree_generation",
+    "cp_id": 1595,
+    "problem_level": "gold",
+    "name": "Random Tree Generation",
+    "description_no_samples": "Suppose the function $\\text{randint}(l,r)$ returns an integer independently and\nuniformly at random from the range $[l, r]$.\n\nBessie generates a random labeled tree on $N$ vertices\n($2 \\le N \\le 2\\cdot10^5$) using the following two-step process:\n\nStart with vertices labeled $1$ through $N$. For each $i$ from $2$ to $N$,\nadd an edge between vertex $i$ and $\\text{randint}(1, i-1)$.\n\nChoose a permutation $p_1,p_2,\\dots,p_N$ of $\\{1, 2, \\ldots, N\\}$ uniformly\nat random. Relabel every vertex $v$ as $p_v$.\n\nNow, Farmer John is looking at the edge set of the final tree and wants to know\nthe probability that the two-step process above produces a tree with exactly\nthis edge set. Can you determine this probability modulo $10^9+7$?\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe input consists of $T$ ($1\\le T\\le 10$) independent inputs. Each input is\nspecified as follows:\n\nThe first line contains $N$.\n\nThe next $N-1$ lines contain the edges of the tree specified by two\nspace-separated integers $u$ and $v$ ($1\\le u, v\\le N$). It is guaranteed that\nthese edges induce a tree.\n\nIt is guaranteed that the sum of $N$ across all tests does not exceed\n$5\\cdot 10^5$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test, output the probability modulo $10^9+7$ on a new line (note that the output\nprobability is a ratio of integers, so you will want to print the result of this division\nwhen working modulo $10^9+7$).\n",
+    "samples": [
+      {
+        "input": "4\n2\n2 1\n3\n1 2\n2 3\n4\n1 2\n2 3\n2 4\n4\n1 2\n2 3\n3 4\n",
+        "output": "1\n333333336\n83333334\n55555556\n"
+      }
+    ],
+    "num_samples": 1,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1595",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 21,
+    "benchmark_contract_id": "usaco/season26contest3results/1595_gold_random_tree_generation@91966338d353c02e",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1595",
+      "test_data_url": "https://usaco.org/current/data/prob3_gold_season26contest3.zip",
+      "statement_text_sha256": "82d7e369b16a803a469ddb12d51de1807ccfb1a42dfdd10de0407020b17d29e7",
+      "test_data_zip_sha256": "7cc9af755f01f126a8520abe39ef7dfb2a6e0a2662f8fc9b75dd0bbfe35fbc77",
+      "test_corpus_sha256": "1595620bfc186cf6cac3f1a9864c875dc8d093419641d59ea3e88f0edb9980fd",
+      "content_contract_sha256": "91966338d353c02e9e7c6006973852103f65363b438cf62ac29186855eb2fa40"
+    },
+    "num_tests": 0
+  },
+  "1596_platinum_all_pairs_shortest_paths": {
+    "problem_id": "1596_platinum_all_pairs_shortest_paths",
+    "cp_id": 1596,
+    "problem_level": "platinum",
+    "name": "All Pairs Shortest Paths",
+    "description_no_samples": "You have a bunch of triangular regions that tessellate an infinite 2D plane.\nThe tesselation is defined as follows (see the diagram for a better\nunderstanding):\n\nRecall that Euler's formula states that $e^{ix}=\\cos (x)+i\\sin (x)$ for real\n$x$. First, draw a vertex at $x+y\\exp(\\pi i/3)$ on the complex plane for all\nintegers $x,y$.\n\nThen for every three vertices from the step above forming an equilateral\ntriangle with side length 1, draw the edges forming its border. Additionally,\ndraw a vertex at the center of the triangle and edges from the center of the\ntriangle to each of three outer vertices.\n\nYou are given $N$ ($2\\le N\\le 2\\cdot 10^5$) input points, each of which lies\nstrictly within some region (i.e., not on any vertex or edge). For any pair of\nthe input points, define the distance between them to be the smallest number of\nedges crossed when drawing a path from one point to the other that doesn't pass\nthrough any vertex.\n\nOutput the sum of all $N(N-1)/2$ pairwise distances between the input points.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe first line contains $T$ ($T\\ge 1$), the number of independent tests. Each\ntest is specified as follows:\n\nThe first line contains $N$.\n\nThe next $N$ lines each contain three integers $x$, $y$, and $z$\n($0\\le x,y<10^6, 0\\le z<12$) representing a point at\n$x+y\\exp(\\pi i/3)+ \\epsilon\\cdot \\exp((1+2z)\\pi i/12)$ on the complex plane\n($\\epsilon$ being a small positive number).\n\nIt is guaranteed that the sum of $N$ over all tests doesn't exceed\n$2\\cdot 10^5$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test, output the sum of all $N(N-1)/2$ pairwise distances on a new\nline.\n",
+    "samples": [
+      {
+        "input": "6\n2\n0 0 0\n0 0 0\n2\n0 0 0\n1 1 7\n2\n0 0 0\n0 0 6\n3\n0 0 1\n0 0 5\n0 0 9\n2\n0 2 11\n1 1 1\n2\n2 0 11\n1 1 1\n",
+        "output": "0\n3\n6\n12\n2\n6\n"
+      }
+    ],
+    "num_samples": 1,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1596",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 21,
+    "benchmark_contract_id": "usaco/season26contest3results/1596_platinum_all_pairs_shortest_paths@291215e895c58651",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1596",
+      "test_data_url": "https://usaco.org/current/data/prob1_platinum_season26contest3.zip",
+      "statement_text_sha256": "0cce1967aaa1c38ebb9c2df65974416f8b2b5e9831efd685de40ac22e64d5f5e",
+      "test_data_zip_sha256": "1ee4581f0a4ae1d26bbe6c1bc3e50099baf29b97b49650f6e2391642648f792e",
+      "test_corpus_sha256": "bd7c0e31ee390b6883d496757e9a29eaf230b64515d456ef529f9405db9a861b",
+      "content_contract_sha256": "291215e895c5865174fd3eb3d1f25169ba17bd473d2439d434a88e3b81f56a6a"
+    },
+    "num_tests": 0
+  },
+  "1597_platinum_blast_damage": {
+    "problem_id": "1597_platinum_blast_damage",
+    "cp_id": 1597,
+    "problem_level": "platinum",
+    "name": "Blast Damage",
+    "description_no_samples": "Bessie is playing a video game where she needs to defeat a line of $N$ enemies\nwith initial HPs given by the list $v_1\\dots v_N$\n($1\\le N\\le 2\\cdot 10^5, 0\\le v_i\\le 10^9$). In one attack, she can perform the\nfollowing sequence of steps:\n\nChoose $i$ such that the $i$th enemy is still alive (that is,\n$v_i>0$).\n\nDeal one damage to the $i$th enemy and all enemies adjacent to it that are\nstill alive. Specifically, for each $j\\in [\\max(i-1, 1), \\min(i+1, N)]$, if\n$v_j>0$, subtract one from\n$v_j$.\n\nHelp Bessie determine the minimum number of attacks she needs to defeat all\nenemies (that is, reduce all $v_i$ to 0).\n\nAdditionally, you are given a parameter $M$ ($0\\le M\\le 2$). If $M>0$, please\noutput a construction achieving the minimum number of attacks with a small\nnumber of runs, where a run consists of attacking the same enemy consecutively.\n\nLet $R$ be the number of runs in your construction. Your construction should be\nin the following format: output $R$ on its own line, followed by $R$ lines each\ncontaining two integers $i$ and $r$ ($1\\le i\\le N, 0\\le r\\le 10^9$), meaning\nthat Bessie attacks the $i$-th enemy $r$ times consecutively.\n\nDepending on the value of $M$, $R$ must satisfy one of the following\nconstraints:\n\n$M=1$: $R\\le 2N$ (it can be proven that a construction always exists).\n\n$M=2$: $R\\le f(N)$, where $f(N)$ is the maximum minimum number of runs over\nall lists of length $N$.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nEach input consists of $T$ ($1\\le T\\le 10^5$) independent tests. The first line\ncontains $T$ and $M$.\n\nEach test is specified as follows:\n\nThe first line contains $N$.\n\nThe second line contains $v_1\\dots v_N$.\n\nIt is guaranteed that the sum of $N$ over all tests does not exceed $10^6$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test, output the minimum number of attacks on the first line.\n\nThen if $M>0$, output $R+1$ additional lines as specified above. Any valid\nconstruction will be accepted.\n",
+    "samples": [
+      {
+        "input": "2 0\n1\n10\n3\n6 1 7\n",
+        "output": "10\n12\n"
+      },
+      {
+        "input": "2 1\n1\n10\n3\n6 1 7\n",
+        "output": "10\n2\n1 0\n1 10\n12\n4\n2 1\n1 5\n3 2\n3 4\n"
+      },
+      {
+        "input": "2 2\n1\n10\n3\n6 1 7\n",
+        "output": "10\n1\n1 10\n12\n3\n2 1\n3 6\n1 5\n"
+      }
+    ],
+    "num_samples": 3,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1597",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 13,
+    "benchmark_contract_id": "usaco/season26contest3results/1597_platinum_blast_damage@e9f9c2a748ddf035",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1597",
+      "test_data_url": "https://usaco.org/current/data/prob2_platinum_season26contest3.zip",
+      "statement_text_sha256": "b58fe2f8fca6483db265f1023ea9131fba8919800c90dde87951c932a9181315",
+      "test_data_zip_sha256": "4bb537261785e435ad8351052e4e313b0a1d12c7f66d658f5008b3b4461acb70",
+      "test_corpus_sha256": "35ff794e1750ec8f1293a1c4ee25eed3f4ef62824aacb45d945c37d78205b345",
+      "content_contract_sha256": "e9f9c2a748ddf03580bfdceaa1be3f962b44137d65329aaf4337c4bf007f8413"
+    },
+    "num_tests": 0
+  },
+  "1598_platinum_min_max_subarrays_ii": {
+    "problem_id": "1598_platinum_min_max_subarrays_ii",
+    "cp_id": 1598,
+    "problem_level": "platinum",
+    "name": "Min Max Subarrays II",
+    "description_no_samples": "You are given integers $N,Q$ $(1 \\leq N, Q \\leq 2 \\cdot 10^5)$ and $Q$\nconstraints represented by four integers $t_i,l_i,r_i,k_i$\n$(1 \\leq t_i \\leq 2, 1 \\leq l_i \\leq r_i \\leq N, 0 \\leq k_i \\leq 10^9,$ all\n$k_i$ are distinct$).$\n\nConstruct an array $a$ consisting of $N$ integers between $0$ and $10^9$ such\nthat for all $1 \\leq i \\leq Q$, $\\min a[l_i ... r_i]=k_i$ if $t_i=1$ and\n$\\max a[l_i ... r_i]=k_i$ if $t_i=2$. If multiple valid arrays exist, print any.\nIf no valid array exists, print $-1$.\n\nINPUT FORMAT (input arrives from the terminal / stdin):\n\nThe first line contains an integer $T$ ($1 \\leq T \\leq 10^4$) representing the\nnumber of independent test cases.\n\nFor each test case, the first line contains two integers $N, Q$.\n\nThe next $Q$ lines each contain 4 integers $t_i$ $l_i$ $r_i$ $k_i$.\n\nIt is guaranteed that neither the sum of $N$ nor the sum of $Q$ over all test\ncases exceed $2 \\cdot 10^5$.\n\nOUTPUT FORMAT (print output to the terminal / stdout):\n\nFor each test case, if a valid array exists, output $N$ space-separated integers\n$a_1\\dots a_N$ on a new line. Otherwise, print $-1$.\n",
+    "samples": [
+      {
+        "input": "3\n2 2\n1 1 2 1\n1 1 2 2\n2 2\n1 1 2 1\n1 2 2 2\n4 1\n2 2 4 3\n",
+        "output": "-1\n1 2\n0 3 0 0\n"
+      },
+      {
+        "input": "4\n2 2\n1 1 2 1\n2 1 2 2\n3 2\n1 1 2 3\n2 2 3 1\n5 2\n1 1 2 3\n1 4 5 2\n4 4\n1 1 4 1\n1 2 3 2\n2 1 2 5\n2 3 4 6\n",
+        "output": "1 2\n-1\n3 3 0 2 2\n1 5 2 6\n"
+      }
+    ],
+    "num_samples": 2,
+    "runtime_limit": 2,
+    "memory_limit": 256,
+    "problem_link": "https://usaco.org/index.php?page=viewproblem2&cpid=1598",
+    "contest_link": "https://usaco.org/index.php?page=season26contest3results",
+    "expected_judge_test_count": 14,
+    "benchmark_contract_id": "usaco/season26contest3results/1598_platinum_min_max_subarrays_ii@00a7c2d169e4c128",
+    "source_provenance": {
+      "publisher": "USACO",
+      "contest_page": "season26contest3results",
+      "statement_url": "https://usaco.org/index.php?page=viewproblem2&cpid=1598",
+      "test_data_url": "https://usaco.org/current/data/prob3_platinum_season26contest3.zip",
+      "statement_text_sha256": "68b5876b31ed76977a8da992e583136b9628d2d9689fb8c1c6da5c5d879770b1",
+      "test_data_zip_sha256": "7e36675cf1d01ca6eb5f5481001e512a569be7aeb30178a877e002c0a8c7dc73",
+      "test_corpus_sha256": "c0dca066d1411fc682143c6bf7267395f009e945a63e8a046b063238e580dcc4",
+      "content_contract_sha256": "00a7c2d169e4c1283b0996210c4b813256d6ec51bc5482d1737a560bd62d8765"
+    },
+    "num_tests": 0
+  }
+}

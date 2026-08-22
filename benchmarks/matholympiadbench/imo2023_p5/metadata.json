@@ -23,6 +23,19 @@
   ],
   "split": "test",
   "solved": false,
+  "benchmark_revision": "matholympiadbench-latest12-integrity-v2",
+  "semantics_revision": 2,
+  "upstream_dataset_repository": "https://huggingface.co/datasets/Goedel-LM/MathOlympiadBench",
+  "upstream_dataset_revision": "390cec5f70461573a41f9be1576777264e2fc3d1",
+  "upstream_dataset_artifact": "MOBench.jsonl",
+  "upstream_repository": "https://github.com/dwrensha/compfiles",
+  "upstream_problem_path": "Compfiles/Imo2023P5.lean",
+  "upstream_statement_commit": "832bb381d9fcdccd1e34e5ae58d3d7ddc4b716c0",
+  "upstream_resolution_commit": "bdc6550f227feab8a6b1f9ef0bf3d5bbba470715",
+  "contextswarm_fix_commit": "5ce40d200affbb9e9d432da1a49d565a1c5ab7b0",
+  "derivation_status": "contextswarm_repaired_fork",
+  "contract_scope": "the natural-language positive-integer domain is an explicit 0 < n hypothesis; current Compfiles instead totalizes n = 0",
+  "result_compatibility": "incompatible_with_pre_correction_statement_results",
   "curated_corrections": [
     "imo2023_p5_positive_integer_hypothesis"
   ]

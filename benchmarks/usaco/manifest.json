@@ -1,0 +1,20 @@
+{
+  "benchmark_revision": "usaco-season26-contest3-official-content-v2",
+  "candidate_filename": "result.cpp",
+  "contextswarm_source": {
+    "path": "definitions/coding/usaco_contests/season26_contest3_full12",
+    "repository": "https://github.com/shiyegao/ContextSwarm",
+    "revision": "cfed6e508193a0eeebdc56e1e8846f70a0ecc635"
+  },
+  "dataset": "usaco",
+  "integrity_manifest": "benchmark_integrity.json",
+  "language": "cpp",
+  "problem_ids": "problem_ids.json",
+  "provenance": "PROVENANCE.md",
+  "public_metadata": "public_dataset/usaco_2025_dict.json",
+  "runnable_with_contextswarm_mini": false,
+  "schema_version": "contextswarm_mini_benchmark_bundle_v1",
+  "subset": "season26_contest3_full12",
+  "task_count": 12,
+  "verification_profile": "coding_usaco_contest"
+}

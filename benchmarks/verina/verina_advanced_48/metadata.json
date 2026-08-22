@@ -1,0 +1,24 @@
+{
+  "problem_id": "verina/verina_advanced_48.lean",
+  "slug": "verina_advanced_48",
+  "subset": "advanced",
+  "namespace": "verina_advanced_48",
+  "theorem_name": "mergeSort_spec_satisfied",
+  "source_benchmark": "Goedel-Code-Prover/benchmark/verina_bench.json",
+  "source_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+  "source_json_sha256": "2db247946216c8f1cd3421136686273511f59e2284876712743d41ba82df19b0",
+  "baseline_sha256": "860cc359f67ba4c6afff057d7e4caa7c903acba33c1b686431bddb1869f49742",
+  "benchmark_revision": "verina-functional-hard12-integrity-v2",
+  "semantics_revision": 1,
+  "upstream_repository": "https://github.com/sunblaze-ucb/verina",
+  "upstream_problem_path": "datasets/verina/verina_advanced_48/task.lean",
+  "upstream_description_path": "datasets/verina/verina_advanced_48/description.txt",
+  "upstream_introduction_commit": "6866f2980402566dcd8c51266c53d629bfae35c0",
+  "upstream_reference_commit": "66b3ce5014edafb20cb26b87c681e7f31847249f",
+  "derivation_status": "functional_projection_with_excluded_algorithm_claim",
+  "contract_scope": "sorted permutation produced by the checked insertion-sort implementation",
+  "excluded_claims": [
+    "merge-sort algorithm identity",
+    "divide-and-conquer implementation"
+  ]
+}

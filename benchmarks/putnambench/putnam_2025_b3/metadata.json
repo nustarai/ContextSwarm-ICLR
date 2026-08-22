@@ -1,0 +1,22 @@
+{
+  "dataset": "putnambench",
+  "problem_id": "putnam_2025_b3",
+  "slug": "putnam_2025_b3",
+  "subset": "putnam",
+  "namespace": null,
+  "theorem_name": "putnam_2025_b3",
+  "theorem_names": [
+    "putnam_2025_b3"
+  ],
+  "imports": [
+    "Mathlib"
+  ],
+  "lean_env_id": "formal_putnambench",
+  "source_kind": "putnambench_project_multi_assignment",
+  "source_file": "lean4/src/putnam_2025_b3.lean",
+  "source_revision": "77ea5a04b28b284f2b95f5c02dd46096bf75d33b",
+  "year": 2025,
+  "part": "B",
+  "problem_number": 3,
+  "lean_toolchain": "leanprover/lean4:v4.27.0"
+}

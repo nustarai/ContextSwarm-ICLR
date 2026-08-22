@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "benchmark_revision": "icpc-wf-2025-statement-faithful-derived-v1",
+  "audited_on": "2026-08-22",
+  "claim_scope": "statement_faithful_derived",
+  "official_judge_parity_claimed": false,
+  "problem_count": 12,
+  "history": {
+    "contextswarm_problem_configs_introduction_commit": "c6598036d41ddbdf458ce2ba61483f24533be5d0",
+    "contextswarm_aggregate_introduction_commit": "61fe1d41f2babf89b40a85e2b14340b93213964a",
+    "judge_package_bootstrap_commit": "4773cb134e7673d600acc672c17182f316652830"
+  },
+  "statement_source": {
+    "publisher": "ICPC",
+    "contest_index_url": "https://worldfinals.icpc.global/problems/2025/finals/index.html",
+    "source_kind": "official_single_problem_pdfs"
+  },
+  "judge_contract": {
+    "repository": "https://github.com/shiyegao/ContextSwarmJudge",
+    "revision": "cc16c9768c659f3bfc1b0536f9de0b06317a180f",
+    "resident_service_version": "2026-08-22.07",
+    "package_root": "packages/icpc_wf_2025"
+  },
+  "public_reference": {
+    "repository": "https://github.com/openai/openai-icpc-2025",
+    "revision": "37cfae422caed99a8b550cd7219e5590798b6bf0",
+    "role": "public_non_official_accepted_reference",
+    "source_manifest": "packages/icpc_wf_2025/reference_source_manifest.json"
+  },
+  "validation": {
+    "input_domain_gate": "scripts/validate_icpc_wf_2025_input_domains.py",
+    "audit_command": "python3 scripts/audit_icpc_wf_2025_packages.py --check",
+    "certified_problem_count": 12,
+    "audited_input_count": 902,
+    "audit_issues": 0,
+    "audit_warnings": 0
+  },
+  "evidence": {
+    "reference_provenance": "packages/icpc_wf_2025/REFERENCE_PROVENANCE.md",
+    "experiment_scope": "packages/icpc_wf_2025/EXPERIMENT_SCOPE.md",
+    "audit_report": "packages/icpc_wf_2025/audit_report.md",
+    "reference_source_manifest": "packages/icpc_wf_2025/reference_source_manifest.json"
+  }
+}

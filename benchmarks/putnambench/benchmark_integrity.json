@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "benchmark_revision": "putnambench-2025-latest12-curated-v1",
+  "upstream_repository": "https://github.com/trishullab/PutnamBench",
+  "upstream_source_revision": "77ea5a04b28b284f2b95f5c02dd46096bf75d33b",
+  "contextswarm_import_commit": "129edc7877d500fbc488ad6e544759bf29dd450f",
+  "answer_materialization_commit": "54c3a91b9b1e18f4d3aeecb00adc341a98fb04a4",
+  "result_compatibility": "compatible_with_current_materialized_contract",
+  "historical_boundary": "Results produced before answer_materialization_commit used placeholder answer definitions and are not valid results for this revision.",
+  "entries": {
+    "putnam_2025_a1": {
+      "derivation_status": "exact_upstream_snapshot",
+      "baseline_sha256": "0d979d98eced20ff7ee6f1fe0d246e734b316e962296bc4e7098699ac92082bf",
+      "upstream_sha256": "0d979d98eced20ff7ee6f1fe0d246e734b316e962296bc4e7098699ac92082bf"
+    },
+    "putnam_2025_a2": {
+      "derivation_status": "answer_placeholder_materialized",
+      "baseline_sha256": "6462f97472619311f110460448710894bda2cf09a48ba961d2969f708127f02f",
+      "upstream_sha256": "18c4f97d6b2ba9324adf954b70aa826f844f0e73e75c1270c701bb6b430f4f67"
+    },
+    "putnam_2025_a3": {
+      "derivation_status": "answer_placeholder_materialized",
+      "baseline_sha256": "e0d44a4cf05c4e811bef7d54bcc714a22be0b0ba721e727ed68bf2cf449b4b7b",
+      "upstream_sha256": "6b3dbf09f0de48d3856d1807def0a6bf2ec7c679e50ec6ec4fb69c9ff52fc507"
+    },
+    "putnam_2025_a4": {
+      "derivation_status": "answer_placeholder_materialized",
+      "baseline_sha256": "a84402568c9badf8b8566398bda24faa303f12471c9c8e8761e32ee2cde9c85d",
+      "upstream_sha256": "41b49d75e495c19a809f22bf547bdf25c3f1a82b1cac42c73395e7765f7cbbe3"
+    },
+    "putnam_2025_a5": {
+      "derivation_status": "equivalent_answer_placeholder_materialized",
+      "baseline_sha256": "3570e4d85ddc0dc1f5d281f22cc54e5e724af9b0db1556cce793acbef8a76fe0",
+      "upstream_sha256": "9c7671614af00f159cf04532d6aa70b8c4b2bea45559dba33d47c2ed4c529bd1"
+    },
+    "putnam_2025_a6": {
+      "derivation_status": "exact_upstream_snapshot",
+      "baseline_sha256": "a5ad05e28fd4623a18b7ebe3c49f7fb09117b14b390eefe2cf0a6b8614c48eb6",
+      "upstream_sha256": "a5ad05e28fd4623a18b7ebe3c49f7fb09117b14b390eefe2cf0a6b8614c48eb6"
+    },
+    "putnam_2025_b1": {
+      "derivation_status": "exact_upstream_snapshot",
+      "baseline_sha256": "80d035ae3e86493d3a09f8acc39601e6dba4e380e217c085c491e202b7ced6c7",
+      "upstream_sha256": "80d035ae3e86493d3a09f8acc39601e6dba4e380e217c085c491e202b7ced6c7"
+    },
+    "putnam_2025_b2": {
+      "derivation_status": "exact_upstream_snapshot",
+      "baseline_sha256": "5cfb42eef38b09ea4a1464f010bf495ca4d24a5d0cea3c8d57ce5d182221d638",
+      "upstream_sha256": "5cfb42eef38b09ea4a1464f010bf495ca4d24a5d0cea3c8d57ce5d182221d638"
+    },
+    "putnam_2025_b3": {
+      "derivation_status": "answer_placeholder_materialized",
+      "baseline_sha256": "4a3ccf56d95e7257ea8d6c4ff3f66c2e36a4cc4f08c86df93687a3ccec847ece",
+      "upstream_sha256": "93e79f0d15edab6f95f2ac3b43245017b52dca6d757eb058c65e830a1784bf3f"
+    },
+    "putnam_2025_b4": {
+      "derivation_status": "exact_upstream_snapshot",
+      "baseline_sha256": "0deb9dfec98b4e0a2cf5c8d8b124094a3b1a037333dee47822a98a77c7d36df6",
+      "upstream_sha256": "0deb9dfec98b4e0a2cf5c8d8b124094a3b1a037333dee47822a98a77c7d36df6"
+    },
+    "putnam_2025_b5": {
+      "derivation_status": "exact_upstream_snapshot",
+      "baseline_sha256": "15a9972e3020332f87827dde52a154e90d3f391b9c8a3500c199fd77280b05cd",
+      "upstream_sha256": "15a9972e3020332f87827dde52a154e90d3f391b9c8a3500c199fd77280b05cd"
+    },
+    "putnam_2025_b6": {
+      "derivation_status": "answer_placeholder_materialized",
+      "baseline_sha256": "3578feaf78423a10a6039b88f8303e816521650b45d91e4aa07fdea0b19be751",
+      "upstream_sha256": "2d7150abb75505cd3d50b916d4845c9b31eda95207bd149adf37658f605a4385"
+    }
+  }
+}

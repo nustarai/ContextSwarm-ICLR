@@ -1,0 +1,64 @@
+{
+  "bundles": [
+    {
+      "benchmark_revision": "usaco-season26-contest3-official-content-v2",
+      "dataset": "usaco",
+      "path": "usaco",
+      "runnable_with_contextswarm_mini": false,
+      "subset": "season26_contest3_full12",
+      "task_count": 12
+    },
+    {
+      "aliases": [
+        "icpc"
+      ],
+      "benchmark_revision": "icpc-wf-2025-statement-faithful-derived-v1",
+      "dataset": "icpc_wf_2025",
+      "path": "icpc_wf_2025",
+      "runnable_with_contextswarm_mini": false,
+      "subset": "all",
+      "task_count": 12
+    },
+    {
+      "benchmark_revision": "putnambench-2025-latest12-curated-v1",
+      "dataset": "putnambench",
+      "path": "putnambench",
+      "runnable_with_contextswarm_mini": false,
+      "subset": "latest12",
+      "task_count": 12
+    },
+    {
+      "aliases": [
+        "imobench",
+        "om_bench"
+      ],
+      "benchmark_revision": "matholympiadbench-latest12-integrity-v2",
+      "dataset": "matholympiadbench",
+      "path": "matholympiadbench",
+      "runnable_with_contextswarm_mini": true,
+      "subset": "latest12",
+      "task_count": 12
+    },
+    {
+      "benchmark_revision": "clever-hard12-integrity-v2",
+      "dataset": "clever",
+      "path": "clever",
+      "runnable_with_contextswarm_mini": false,
+      "subset": "hard12",
+      "task_count": 12
+    },
+    {
+      "benchmark_revision": "verina-functional-hard12-integrity-v2",
+      "dataset": "verina",
+      "path": "verina",
+      "runnable_with_contextswarm_mini": false,
+      "subset": "hard12",
+      "task_count": 12
+    }
+  ],
+  "contextswarm_source": {
+    "repository": "https://github.com/shiyegao/ContextSwarm",
+    "revision": "cfed6e508193a0eeebdc56e1e8846f70a0ecc635"
+  },
+  "schema_version": "contextswarm_mini_benchmark_catalog_v1"
+}

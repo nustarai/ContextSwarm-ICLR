@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "benchmark_revision": "usaco-season26-contest3-official-content-v2",
+  "publisher": "USACO",
+  "contest_page": "season26contest3results",
+  "cp_id_range": [1587, 1598],
+  "audited_on": "2026-08-22",
+  "contextswarm_suite_introduction_commit": "9318cb9e88b27fb3cd16c675f8f348f4abd5e702",
+  "contextswarm_public_projection_commit": "92a98684ae3aefddb14bb3c1130c9e8de7fd486b",
+  "importer": "ContextSwarmJudge/scripts/import_legacy_usaco_season26.py",
+  "judge_contract": {
+    "repository": "https://github.com/shiyegao/ContextSwarmJudge",
+    "revision": "cc16c9768c659f3bfc1b0536f9de0b06317a180f",
+    "resident_service_version": "2026-08-22.07"
+  },
+  "public_metadata": "public_dataset/usaco_2025_dict.json",
+  "expected_problem_contracts_sha256": "70a802bf47b23ff384fd5755940fae69429b4327bcaf68a1b2345f0c754de1f7",
+  "expected_resident_dataset_contract_sha256": "72aad502630fc27913012d2e689d7604a4a61ec2b4847265ba25ca9c437a9221",
+  "resident_requirement": "exact_problem_id_set_problem_counts_ready_counts_contract_ids_test_counts_test_corpus_hashes_and_dataset_contract_digest_must_match",
+  "semantic_checker_problem_ids": [
+    "1589_bronze_swap_to_win",
+    "1597_platinum_blast_damage",
+    "1598_platinum_min_max_subarrays_ii"
+  ],
+  "official_solution_canaries": {
+    "validated_on": "2026-08-22",
+    "scope": "all_resident_official_test_pairs",
+    "execution_path": "ContextSwarmJudge -> embedded Rust OJ -> resident semantic checker",
+    "combined_ledger_bytes": 38439,
+    "retained_test_output_bytes": 0,
+    "entries": [
+      {
+        "problem_id": "1589_bronze_swap_to_win",
+        "source_url": "https://usaco.org/current/data/sol_prob3_bronze_season26contest3.html",
+        "source_code_sha256": "96eb4c4e05835d79edb07ac8e88dda4017fabd0711371ec543ddde0ab02d99e2",
+        "status": "AC",
+        "passed": 12,
+        "total": 12,
+        "response_bytes": 3210,
+        "max_memory_kib": 8424
+      },
+      {
+        "problem_id": "1597_platinum_blast_damage",
+        "source_url": "https://usaco.org/current/data/sol_prob2_platinum_season26contest3.html",
+        "source_code_sha256": "8a10676d6947429bc299672c5476da2e0d7c6d3acd7768e33a7bf2b533f3625d",
+        "status": "AC",
+        "passed": 13,
+        "total": 13,
+        "response_bytes": 3439,
+        "max_memory_kib": 17536,
+        "case_8_memory_kib": 12556,
+        "case_8_runtime_ms": 200
+      },
+      {
+        "problem_id": "1598_platinum_min_max_subarrays_ii",
+        "source_url": "https://usaco.org/current/data/sol_prob3_platinum_season26contest3.html",
+        "source_code_sha256": "b188340248c88bade550dbb9d32d6ec1ee4ed93fec23d0d08643ff3708d0906a",
+        "status": "AC",
+        "passed": 14,
+        "total": 14,
+        "response_bytes": 3647,
+        "max_memory_kib": 39620
+      }
+    ]
+  }
+}

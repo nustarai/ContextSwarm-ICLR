@@ -21,6 +21,14 @@ row is reached.
 In terms of n, determine the greatest k such that in each Japanese triangle
 there is a ninja path containing at least k red dots.
 
+## Formalization Revision
+
+This task is a documented repaired fork of the original MOBench row. ContextSwarm
+commit `5ce40d200affbb9e9d432da1a49d565a1c5ab7b0` made the natural-language
+positive-integer domain explicit with `0 < n`. Current Compfiles instead handles
+`n = 0` by totalizing the answer, so these are two valid but distinct repairs.
+Proof artifacts for the pre-correction theorem header must not be reused here.
+
         ## Task Surface
 
         - Baseline file: `baseline/imo2023_p5.lean`.

@@ -1,0 +1,32 @@
+{
+  "dataset": "clever",
+  "problem_id": "cleverbench_18_v2",
+  "slug": "cleverbench_18_v2",
+  "subset": "clever",
+  "namespace": "cleverbench_18_v2",
+  "theorem_name": "implementation_postcond_satisfied",
+  "theorem_names": [
+    "implementation_postcond_satisfied"
+  ],
+  "imports": [
+    "Mathlib",
+    "Std",
+    "Tacs"
+  ],
+  "source_kind": "clever_project_multi_assignment",
+  "source_benchmark": "Goedel-Code-Prover/benchmark/clever_bench.json",
+  "source_commit": "e9b744b32ad57b7775902597181ae6d42d471bc0",
+  "source_json_sha256": "f9c40ba9c1cff83452f0abdd9a23b023b808b7a74f5fe8f0df414e4cf972eb42",
+  "source_index": 18,
+  "baseline_sha256": "5d70f72979786169aa517cb5c2d30ed9deb6ac43b8238e82c1b888403f280b3b",
+  "benchmark_revision": "clever-hard12-integrity-v2",
+  "semantics_revision": 2,
+  "supersedes_problem_id": "cleverbench_18",
+  "result_compatibility": "incompatible_with_cleverbench_18_results",
+  "upstream_repository": "https://github.com/trishullab/clever",
+  "upstream_problem_path": "src/lean4/human_eval/problem_18.lean",
+  "upstream_reference_commit": "830a9a9f3fcd6afa68379fb9d9b58d5083754147",
+  "upstream_fix_commit": "c462ac1e1840f04fa48cca4f4dfbaf527d1df362",
+  "derivation_status": "official_fix_synced",
+  "contract_scope": "overlapping occurrence count; an empty substring occurs string.length times"
+}
