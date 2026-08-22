@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 
 from .config import ExperimentConfig
 from .evaluator import (
+    CodingEvaluator,
     EvaluatorError,
     LeanEvaluator,
     safe_worker_response,
@@ -43,14 +44,23 @@ def run_preflight(
     *,
     declaration_index: DeclarationIndex | None = None,
 ) -> dict[str, Any]:
-    """Check binary/config/Lean reachability without exposing credentials."""
+    """Check worker transport and the selected Judge contract.
+
+    Formal and coding Judges deliberately have different readiness contracts.
+    A coding arm must not run a Lean kernel probe or require a Mathlib
+    declaration index; conversely, the established formal checks remain
+    unchanged for formal manifests.
+    """
     if not config.lean_server_url:
         raise PreflightError(
             "CONTEXTSWARM_JUDGE_URL must be set for a real preflight"
         )
     output_dir.mkdir(parents=True, exist_ok=True)
+    judge_kind = str(getattr(config, "judge_kind", "formal") or "formal").strip().lower()
+    if judge_kind not in {"formal", "coding"}:
+        raise PreflightError("judge.kind must be formal or coding")
     if declaration_index is None:
-        if config.formal_tools_enabled:
+        if config.formal_tools_enabled and judge_kind != "coding":
             try:
                 declaration_index = prepare_declaration_index(
                     config,
@@ -69,6 +79,8 @@ def run_preflight(
         "lean": {},
         "formal_tools": {},
     }
+    if judge_kind == "coding":
+        report.update({"judge_kind": "coding", "judge": {}, "coding": {}})
     agent = PiAgent(config)
     binary = Path(agent.binary())
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -97,6 +109,45 @@ def run_preflight(
             report["aisw"]["fast_mode_policy"] = policy
             if policy.get("allow_codex_fast_mode") is not True:
                 raise PreflightError("NuRouter runtime policy did not explicitly allow fast mode")
+
+    # Coding Judge admission is a health/contract check only.  In particular,
+    # do not synthesize a Lean theorem probe for C++ tasks: doing so would route
+    # a coding arm through the wrong evaluator and could consume formal Judge
+    # capacity before the experiment starts.
+    if judge_kind == "coding":
+        try:
+            evaluator = CodingEvaluator(
+                config.lean_server_url,
+                timeout_seconds=config.lean_timeout_seconds,
+                max_lifecycle_seconds=config.lean_max_lifecycle_seconds,
+                verification_profile=config.lean_verification_profile,
+                judge_mode=config.lean_judge_mode,
+            )
+            health = evaluator.health()
+            safe = _safe_coding_health(health, config)
+            _validate_coding_health(safe, config)
+            report["coding"] = safe
+            report["judge"] = safe
+            # Coding bundles do not use the formal declaration-index surface.
+            report["formal_tools"] = {
+                "enabled": False,
+                "declaration_index": declaration_index.info.public_dict(),
+            }
+        except PreflightError:
+            raise
+        except EvaluatorError as exc:
+            raise PreflightError(
+                f"coding Judge transport is unavailable ({exc.category})"
+            ) from None
+        except Exception:
+            raise PreflightError(
+                "coding Judge transport is unavailable (unexpected_error)"
+            ) from None
+        (output_dir / "transport_preflight.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return report
 
     try:
         evaluator = LeanEvaluator(
@@ -228,6 +279,205 @@ def run_preflight(
         encoding="utf-8",
     )
     return report
+
+
+def _coding_dataset_name(config: ExperimentConfig) -> str:
+    """Derive a bounded dataset label without recording an operator path."""
+
+    candidate = str(getattr(config, "dataset_root", "") or "").strip().lower()
+    if "usaco" in candidate:
+        return "usaco"
+    if "icpc" in candidate:
+        return "icpc"
+    raw = getattr(config, "extra", {})
+    if isinstance(raw, dict):
+        payload = raw.get("raw")
+        if isinstance(payload, dict):
+            experiment = payload.get("experiment")
+            if isinstance(experiment, dict):
+                value = str(experiment.get("dataset") or "").strip().lower()
+                if value in {"usaco", "icpc", "icpc_wf_2025"}:
+                    return "usaco" if value == "usaco" else "icpc"
+    return "coding"
+
+
+def _safe_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _safe_coding_health(
+    payload: Any,
+    config: ExperimentConfig,
+) -> dict[str, Any]:
+    """Retain only bounded, non-sensitive coding Judge health evidence."""
+
+    if not isinstance(payload, dict):
+        raise PreflightError("coding Judge health response is malformed")
+    result: dict[str, Any] = {
+        "judge_kind": "coding",
+        "dataset": _coding_dataset_name(config),
+    }
+    for key in ("ok", "degraded"):
+        if key in payload and isinstance(payload[key], bool):
+            result[key] = payload[key]
+    for key in ("service", "api_version", "evaluate_endpoint", "resident_service_version"):
+        value = payload.get(key)
+        if isinstance(value, str) and len(value) <= 256:
+            # ``sanitize_worker_text`` intentionally redacts slash-prefixed
+            # paths.  The public endpoint is a fixed protocol literal, so keep
+            # only that exact value for contract validation/artifacts.
+            result[key] = (
+                "/api/judge/evaluate"
+                if key == "evaluate_endpoint" and value == "/api/judge/evaluate"
+                else sanitize_worker_text(value, 256)
+            )
+    # Do not write package roots, OJ URLs, or any other operator path/endpoint
+    # into run artifacts.  Their presence is represented as a boolean contract
+    # fact only.
+    result["package_root_present"] = bool(str(payload.get("package_root") or "").strip())
+    result["oj_base_url_present"] = bool(str(payload.get("oj_base_url") or "").strip())
+
+    coding_jobs = payload.get("coding_jobs")
+    if isinstance(coding_jobs, dict):
+        safe_jobs: dict[str, Any] = {}
+        if isinstance(coding_jobs.get("enabled"), bool):
+            safe_jobs["enabled"] = coding_jobs["enabled"]
+        for key in (
+            "closed",
+            "worker_count",
+            "max_pending_jobs",
+            "queue_size",
+            "raw_queue_size",
+            "oldest_queue_wait_ms",
+            "jobs_total",
+        ):
+            if key in coding_jobs:
+                parsed = _safe_nonnegative_int(coding_jobs.get(key))
+                if parsed is not None:
+                    safe_jobs[key] = parsed
+        counts = coding_jobs.get("status_counts")
+        if isinstance(counts, dict):
+            safe_counts: dict[str, int] = {}
+            for key, value in counts.items():
+                if isinstance(key, str) and re.fullmatch(r"[a-z_]{1,40}", key):
+                    parsed = _safe_nonnegative_int(value)
+                    if parsed is not None:
+                        safe_counts[key] = parsed
+            safe_jobs["status_counts"] = dict(sorted(safe_counts.items()))
+        autoscale = coding_jobs.get("autoscale")
+        if isinstance(autoscale, dict):
+            safe_auto: dict[str, Any] = {}
+            for key in (
+                "enabled",
+                "capacity_mode",
+                "worker_count",
+                "max_workers",
+                "queued_jobs",
+                "running_jobs",
+                "available_memory_mb",
+            ):
+                value = autoscale.get(key)
+                if isinstance(value, bool) or isinstance(value, str):
+                    safe_auto[key] = sanitize_worker_text(value, 80)
+                else:
+                    parsed = _safe_nonnegative_int(value)
+                    if parsed is not None:
+                        safe_auto[key] = parsed
+            safe_jobs["autoscale"] = safe_auto
+        result["coding_jobs"] = safe_jobs
+
+    # The coding capacity projection is exposed at the top level by the Judge.
+    capacity: dict[str, Any] = {}
+    for key in ("configured_workers", "ready_workers", "busy_workers", "queued_jobs"):
+        parsed = _safe_nonnegative_int(payload.get(key))
+        if parsed is not None:
+            capacity[key] = parsed
+    if capacity:
+        result["capacity"] = capacity
+
+    compute = payload.get("compute_executor")
+    if isinstance(compute, dict):
+        safe_compute: dict[str, Any] = {}
+        for key in ("mode", "process_workers", "active_process_tasks", "waiting_tasks"):
+            value = compute.get(key)
+            if isinstance(value, str):
+                safe_compute[key] = sanitize_worker_text(value, 80)
+            else:
+                parsed = _safe_nonnegative_int(value)
+                if parsed is not None:
+                    safe_compute[key] = parsed
+        result["compute_executor"] = safe_compute
+
+    inventory = payload.get("legacy_usaco")
+    if isinstance(inventory, dict):
+        safe_inventory: dict[str, Any] = {}
+        for key in ("enabled", "ready"):
+            if isinstance(inventory.get(key), bool):
+                safe_inventory[key] = inventory[key]
+        for key in ("problem_count", "ready_problem_count"):
+            parsed = _safe_nonnegative_int(inventory.get(key))
+            if parsed is not None:
+                safe_inventory[key] = parsed
+        result["legacy_usaco"] = safe_inventory
+    return result
+
+
+def _validate_coding_health(
+    health: dict[str, Any],
+    config: ExperimentConfig,
+) -> None:
+    """Validate the coding Judge health/worker/dataset contract fail-closed."""
+
+    if health.get("ok") is not True:
+        raise PreflightError("coding Judge health is not ready")
+    if health.get("service") != "contextswarm-judge":
+        raise PreflightError("coding Judge service identity is invalid")
+    if health.get("api_version") != "v1":
+        raise PreflightError("coding Judge API version is invalid")
+    if health.get("evaluate_endpoint") != "/api/judge/evaluate":
+        raise PreflightError("coding Judge evaluate contract is invalid")
+    if not str(health.get("resident_service_version") or "").strip():
+        raise PreflightError("coding Judge resident service version is missing")
+
+    jobs = health.get("coding_jobs")
+    if not isinstance(jobs, dict):
+        raise PreflightError("coding Judge health lacks coding_jobs capacity")
+    if jobs.get("enabled") is not True:
+        raise PreflightError("coding Judge job service is not enabled")
+    worker_count = jobs.get("worker_count")
+    if worker_count is None:
+        worker_count = (health.get("capacity") or {}).get("configured_workers")
+    if not isinstance(worker_count, int) or isinstance(worker_count, bool) or worker_count <= 0:
+        raise PreflightError("coding Judge has no configured workers")
+    capacity = health.get("capacity") or {}
+    ready = capacity.get("ready_workers")
+    if not isinstance(ready, int) or isinstance(ready, bool) or ready <= 0:
+        raise PreflightError("coding Judge has no ready workers")
+    queue_size = jobs.get("queue_size")
+    if queue_size is not None and (not isinstance(queue_size, int) or isinstance(queue_size, bool) or queue_size < 0):
+        raise PreflightError("coding Judge queue capacity is malformed")
+
+    dataset = str(health.get("dataset") or "coding")
+    if dataset == "usaco":
+        inventory = health.get("legacy_usaco")
+        if not isinstance(inventory, dict) or inventory.get("ready") is not True:
+            raise PreflightError("coding Judge USACO dataset is not ready")
+        total = inventory.get("problem_count")
+        ready_count = inventory.get("ready_problem_count")
+        if not isinstance(total, int) or total <= 0 or ready_count != total:
+            raise PreflightError("coding Judge USACO dataset inventory is incomplete")
+    elif not health.get("package_root_present"):
+        # ICPC packages are resolved from the Judge package root.  Do not expose
+        # the path, but fail admission if that contract is absent.
+        raise PreflightError("coding Judge package bundle is not configured")
+    if not health.get("oj_base_url_present"):
+        raise PreflightError("coding Judge OJ endpoint is not configured")
 
 
 def _kernel_probe(evaluator: Any, output_dir: Path) -> Verdict:

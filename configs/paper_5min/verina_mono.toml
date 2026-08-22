@@ -1,0 +1,9 @@
+extends = ["_verina.toml"]
+
+[experiment]
+name = "paper-5min-verina-mono"
+output_root = "runs/paper_5min/verina/mono"
+mode = "mono"
+communication = "none"
+max_parallel = 1
+episodes_per_task = 1

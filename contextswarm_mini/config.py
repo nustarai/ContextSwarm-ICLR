@@ -170,6 +170,7 @@ class ExperimentConfig:
     aisw_coordinator_url: str
     aisw_account: str
     aisw_group: str
+    aisw_max_in_flight: int
     aisw_lease_wait_seconds: int
     aisw_lease_retry_interval_seconds: int
     lean_server_url: str
@@ -180,6 +181,7 @@ class ExperimentConfig:
     lean_verification_profile: str
     lean_judge_mode: str
     lean_require_result_cache_disabled: bool
+    judge_kind: str
     formal_tools_enabled: bool
     formal_tools_version: str
     formal_tools_evaluate_calls_per_task: int
@@ -201,6 +203,30 @@ class ExperimentConfig:
     @property
     def uses_cps(self) -> bool:
         return self.mode == "cps" and self.communication != "none"
+
+    @property
+    def is_coding(self) -> bool:
+        return self.judge_kind == "coding"
+
+    @property
+    def dataset_name(self) -> str:
+        """Return the manifest-selected public dataset label.
+
+        Dataset identity is part of the benchmark bundle, rather than a
+        runner default.  Prefer the explicit ``[experiment].dataset`` value
+        when present, then the bundle path name.  Keep the value bounded and
+        filesystem-independent so it is safe to include in run metadata.
+        """
+
+        raw = self.extra.get("raw") if isinstance(self.extra, dict) else None
+        if isinstance(raw, Mapping):
+            experiment = raw.get("experiment")
+            if isinstance(experiment, Mapping):
+                explicit = _text(experiment.get("dataset"))
+                if explicit:
+                    return explicit
+        name = self.dataset_root.name.strip()
+        return name or "unknown"
 
     @property
     def resolved_output_root(self) -> Path:
@@ -225,6 +251,7 @@ class ExperimentConfig:
             "mode": self.mode,
             "communication": self.communication,
             "dataset_root": str(self.dataset_root),
+            "dataset": self.dataset_name,
             "problem_ids_path": str(self.problem_ids_path),
             "max_parallel": self.max_parallel,
             "initial_agents_per_task": self.initial_agents_per_task,
@@ -253,6 +280,7 @@ class ExperimentConfig:
             "aisw_coordinator_configured": bool(self.aisw_coordinator_url),
             "aisw_account_configured": bool(self.aisw_account),
             "aisw_group_configured": bool(self.aisw_group),
+            "aisw_max_in_flight": self.aisw_max_in_flight,
             "lean_server_configured": bool(self.lean_server_url),
             "lean_env_id": self.lean_env_id,
             "lean_timeout_seconds": self.lean_timeout_seconds,
@@ -261,6 +289,7 @@ class ExperimentConfig:
             "lean_verification_profile": self.lean_verification_profile,
             "lean_judge_mode": self.lean_judge_mode,
             "lean_require_result_cache_disabled": self.lean_require_result_cache_disabled,
+            "judge_kind": self.judge_kind,
             "formal_tools_enabled": self.formal_tools_enabled,
             "formal_tools_version": self.formal_tools_version,
             "formal_tools_evaluate_calls_per_task": self.formal_tools_evaluate_calls_per_task,
@@ -305,6 +334,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         aisw_payload = payload.get("nurouter")
     aisw = _as_dict(aisw_payload, "aisw")
     lean = _as_dict(payload.get("lean"), "lean")
+    judge = _as_dict(payload.get("judge"), "judge")
     formal_tools = _as_dict(payload.get("formal_tools"), "formal_tools")
     docker = _as_dict(payload.get("docker"), "docker")
     allocation = _as_dict(payload.get("allocation"), "allocation")
@@ -438,6 +468,11 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     coordinator = _text(aisw.get("coordinator_url"))
     account = _text(aisw.get("account"))
     group = _text(aisw.get("group"))
+    aisw_max_in_flight = _positive_int(
+        aisw.get("max_in_flight"),
+        "aisw.max_in_flight",
+        12,
+    )
     lease_wait = _positive_int(aisw.get("lease_wait_seconds"), "aisw.lease_wait_seconds", 7200)
     lease_retry = _positive_int(
         aisw.get("lease_retry_interval_seconds"),
@@ -447,29 +482,46 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
 
     # The raw endpoint is an operator secret/capability.  It must enter only
     # through the supervisor environment, never through a tracked manifest.
-    if _text(lean.get("server_url")):
+    judge_kind = _text(judge.get("kind"), "formal").lower()
+    if judge_kind not in {"formal", "coding"}:
+        raise ConfigError("judge.kind must be formal or coding")
+    if _text(lean.get("server_url")) or _text(judge.get("server_url")):
         raise ConfigError(
-            "lean.server_url is not allowed in manifests; set CONTEXTSWARM_JUDGE_URL at runtime"
+            "judge endpoint URLs are not allowed in manifests; set CONTEXTSWARM_JUDGE_URL at runtime"
         )
     lean_url = _text(os.environ.get("CONTEXTSWARM_JUDGE_URL"))
-    lean_env = _text(lean.get("env_id"), "formal_matholympiadbench")
-    lean_timeout = _positive_int(lean.get("timeout_seconds"), "lean.timeout_seconds", 300)
+    # ``[judge]`` is the generic spelling used by coding manifests.  Keep the
+    # historical ``[lean]`` fields as a fallback so all existing formal
+    # manifests retain byte-for-byte behavior.
+    def _judge_value(name: str, default: Any) -> Any:
+        return judge[name] if name in judge else lean.get(name, default)
+
+    lean_env = _text(_judge_value("env_id", "formal_matholympiadbench"))
+    lean_timeout = _positive_int(
+        _judge_value("timeout_seconds", 300), "judge.timeout_seconds", 300
+    )
     lean_max_lifecycle = _positive_int(
-        lean.get("max_lifecycle_seconds"),
-        "lean.max_lifecycle_seconds",
+        _judge_value("max_lifecycle_seconds", max(3_600, (8 * lean_timeout) + 120)),
+        "judge.max_lifecycle_seconds",
         max(3_600, (8 * lean_timeout) + 120),
     )
     lean_max_evaluations = _positive_int(
-        lean.get("max_concurrent_evaluations"),
-        "lean.max_concurrent_evaluations",
+        _judge_value("max_concurrent_evaluations", 1),
+        "judge.max_concurrent_evaluations",
         1,
     )
-    profile = _text(lean.get("verification_profile"), "formal_proof")
-    judge_mode = _text(lean.get("judge_mode"), "fast")
-    require_result_cache_disabled = bool(
-        lean.get("require_result_cache_disabled", False)
+    profile = _text(
+        _judge_value("verification_profile", "formal_proof" if judge_kind == "formal" else "coding_contest")
     )
-    formal_tools_enabled = bool(formal_tools.get("enabled", True))
+    judge_mode = _text(_judge_value("judge_mode", "fast" if judge_kind == "formal" else "coding"))
+    require_result_cache_disabled = bool(
+        _judge_value("require_result_cache_disabled", False)
+    )
+    formal_tools_enabled = bool(
+        formal_tools.get("enabled", judge_kind == "formal")
+    )
+    if judge_kind == "coding" and formal_tools_enabled:
+        raise ConfigError("coding judge manifests cannot enable formal_tools")
     formal_tools_version = _text(
         formal_tools.get("surface_version"),
         "contextswarm_mini_formal_tools_v1",
@@ -529,6 +581,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         aisw_coordinator_url=coordinator,
         aisw_account=account,
         aisw_group=group,
+        aisw_max_in_flight=aisw_max_in_flight,
         aisw_lease_wait_seconds=lease_wait,
         aisw_lease_retry_interval_seconds=lease_retry,
         lean_server_url=lean_url,
@@ -539,6 +592,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         lean_verification_profile=profile,
         lean_judge_mode=judge_mode,
         lean_require_result_cache_disabled=require_result_cache_disabled,
+        judge_kind=judge_kind,
         formal_tools_enabled=formal_tools_enabled,
         formal_tools_version=formal_tools_version,
         formal_tools_evaluate_calls_per_task=_positive_int(

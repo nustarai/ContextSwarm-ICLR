@@ -48,6 +48,20 @@ def _task(root: Path, slug: str = "task") -> Task:
     )
 
 
+def _coding_task(root: Path, slug: str = "task") -> Task:
+    return Task(
+        slug=slug,
+        root=root,
+        problem_text="coding problem",
+        baseline_code="#include <bits/stdc++.h>\nint main() { return 0; }\n",
+        metadata={
+            "problem_id": "coding-task",
+            "language": "cpp",
+            "candidate_filename": "result.cpp",
+        },
+    )
+
+
 class _RecordingEvaluator:
     def __init__(self) -> None:
         self.calls: list[tuple[Task, Path, float | None]] = []
@@ -524,6 +538,43 @@ class JudgeBrokerTests(unittest.TestCase):
                 self.assertEqual(checkpoint["status"], status)
                 self.assertTrue(searched["ok"])
 
+    def test_coding_terminal_feedback_statuses_unlock_cps_with_job_provenance(self) -> None:
+        for status in ("WA", "PE", "CE", "MLE", "TLE", "RE"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                workdir = root / "worker"
+                workdir.mkdir()
+                candidate = workdir / "result.cpp"
+                candidate.write_text("int main() { return 0; }\n", encoding="utf-8")
+                store = CPSStore(root / "cps.sqlite3")
+                broker = JudgeBroker(
+                    _CheckpointEvaluator(status, judge_job_id="coding-job"),
+                    threading.BoundedSemaphore(1),
+                    audit_path=root / "audit.jsonl",
+                    min_probe_interval_seconds=0,
+                ).start()
+                try:
+                    with broker.session(
+                        actor_id="coding-agent",
+                        workdir=workdir,
+                        candidates={"task": (_coding_task(root), candidate)},
+                        deadline_monotonic=time.monotonic() + 3,
+                        cps_store=store,
+                        communication="blackboard",
+                    ) as env:
+                        checkpoint = _post(
+                            env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {}
+                        )
+                        searched = _post(
+                            env["CONTEXTSWARM_JUDGE_URL"], "cps_search", {}
+                        )
+                finally:
+                    broker.close()
+
+                self.assertTrue(checkpoint["accepted"])
+                self.assertEqual(checkpoint["status"], status)
+                self.assertTrue(searched["ok"])
+
     def test_local_rejected_checkpoint_requires_raw_job_id_to_be_absent(self) -> None:
         base = {
             "accepted": True,
@@ -950,6 +1001,45 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertIn('"actor_id": "agent-a"', audit)
             self.assertNotIn(candidate.read_text(), audit)
             self.assertNotIn("wrong-token", audit)
+
+    def test_coding_capability_binds_result_cpp_and_immutable_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.cpp"
+            original = "#include <iostream>\nint main() { return 0; }\n"
+            candidate.write_text(original, encoding="utf-8")
+            evaluator = _SnapshotEvaluator(candidate)
+            audit_path = root / "judge_checks.jsonl"
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=audit_path,
+                min_probe_interval_seconds=0,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="coding-agent",
+                    workdir=workdir,
+                    candidates={"task": (_coding_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 2,
+                ) as env:
+                    result = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {}
+                    )
+            finally:
+                broker.close()
+
+            audit = json.loads(audit_path.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(result["status"], "VERIFY_FAIL")
+            self.assertEqual(evaluator.sources, [original])
+            self.assertEqual(
+                result["candidate_sha256"],
+                hashlib.sha256(original.encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(audit["candidate_sha256"], result["candidate_sha256"])
+            self.assertNotEqual(candidate.read_text(encoding="utf-8"), original)
 
     def test_probe_and_audit_use_the_same_immutable_candidate_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2183,13 +2273,17 @@ class JudgeBrokerTests(unittest.TestCase):
             self.assertEqual(results[0]["status"], "TASK_CANCELLED")
             self.assertEqual(store.search(task_id="task"), [])
 
-    def test_candidate_must_be_result_inside_assigned_workspace(self) -> None:
+    def test_candidate_must_match_task_filename_inside_assigned_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             workdir = root / "worker"
             workdir.mkdir()
             outside = root / "result.lean"
             outside.write_text("proof")
+            wrong_formal = workdir / "result.cpp"
+            wrong_formal.write_text("int main() {}\n")
+            wrong_coding = workdir / "result.lean"
+            wrong_coding.write_text("proof\n")
             broker = JudgeBroker(
                 _RecordingEvaluator(),
                 threading.BoundedSemaphore(1),
@@ -2204,8 +2298,42 @@ class JudgeBrokerTests(unittest.TestCase):
                         deadline_monotonic=10**12,
                     ):
                         pass
+                with self.assertRaises(ValueError):
+                    with broker.session(
+                        actor_id="agent",
+                        workdir=workdir,
+                        candidates={"task": (_task(root), wrong_formal)},
+                        deadline_monotonic=10**12,
+                    ):
+                        pass
+                with self.assertRaises(ValueError):
+                    with broker.session(
+                        actor_id="agent",
+                        workdir=workdir,
+                        candidates={"task": (_coding_task(root), wrong_coding)},
+                        deadline_monotonic=10**12,
+                    ):
+                        pass
             finally:
                 broker.close()
+
+    def test_public_policy_declares_task_bound_candidate_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            broker = JudgeBroker(
+                _RecordingEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=Path(temporary) / "audit.jsonl",
+            )
+            policy = broker.public_policy()
+
+        self.assertEqual(
+            policy["candidate_selection"],
+            "runner_bound_task_candidate_filename",
+        )
+        self.assertEqual(
+            policy["allowed_candidate_filenames"],
+            ["result.cpp", "result.lean"],
+        )
 
 
 if __name__ == "__main__":

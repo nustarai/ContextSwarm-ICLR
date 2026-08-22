@@ -1,0 +1,9 @@
+extends = ["_usaco.toml"]
+
+[experiment]
+name = "paper-5min-usaco-mono"
+output_root = "runs/paper_5min/usaco/mono"
+mode = "mono"
+communication = "none"
+max_parallel = 1
+episodes_per_task = 1

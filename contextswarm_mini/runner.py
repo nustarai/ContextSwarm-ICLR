@@ -33,7 +33,7 @@ from .allocation import (
 )
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
-from .evaluator import LeanEvaluator, MockEvaluator, sanitize_worker_text
+from .evaluator import CodingEvaluator, LeanEvaluator, MockEvaluator, sanitize_worker_text
 from .elastic_scheduler import AgentAssignment, ElasticScheduler
 from .formal_tools import (
     DeclarationIndex,
@@ -49,6 +49,20 @@ from .models import AgentResult, Task, Verdict
 from .pi_agent import PiAgent
 from .preflight import PreflightError, run_preflight
 from .prompts import build_mono_prompt, build_task_prompt
+
+
+def _candidate_name(task: Task) -> str:
+    return task.candidate_filename
+
+
+def _baseline_glob(task: Task) -> str:
+    return "*.cpp" if _candidate_name(task) == "result.cpp" else "*.lean"
+
+
+def _candidate_path(root: Path, task: Task) -> Path:
+    """Return the mutable candidate path for either benchmark language."""
+
+    return root / _candidate_name(task)
 
 
 def utc_now() -> str:
@@ -1085,25 +1099,127 @@ def load_tasks(config: ExperimentConfig) -> list[Task]:
         raise ConfigError(f"cannot load problem ids: {ids_path}: {exc}") from exc
     if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
         raise ConfigError(f"problem_ids must be a list of strings: {ids_path}")
+
+    manifest_path = dataset_root / "manifest.json"
+    try:
+        bundle_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        bundle_manifest = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"cannot load benchmark manifest: {manifest_path}: {exc}") from exc
+    if not isinstance(bundle_manifest, dict):
+        raise ConfigError(f"benchmark manifest is not an object: {manifest_path}")
+
+    bundle_language = str(bundle_manifest.get("language") or "").strip().lower()
+    coding_bundle = config.is_coding or bundle_language in {"cpp", "c++", "c"}
+    public_metadata: dict[str, Any] = {}
+    public_metadata_name = str(bundle_manifest.get("public_metadata") or "").strip()
+    if public_metadata_name:
+        public_metadata_path = dataset_root / public_metadata_name
+        try:
+            loaded_public_metadata = json.loads(
+                public_metadata_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(
+                f"cannot load benchmark public metadata: {public_metadata_path}: {exc}"
+            ) from exc
+        if not isinstance(loaded_public_metadata, dict):
+            raise ConfigError(
+                f"benchmark public metadata is not an object: {public_metadata_path}"
+            )
+        public_metadata = loaded_public_metadata
+
     tasks: list[Task] = []
     for slug in ids:
         root = dataset_root / slug
-        try:
-            metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
-            problem_text = (root / "problem.md").read_text(encoding="utf-8")
-            baseline_files = sorted((root / "baseline").glob("*.lean"))
-        except OSError as exc:
-            raise ConfigError(f"incomplete task {slug}: {exc}") from exc
-        if not baseline_files:
-            raise ConfigError(f"task {slug} has no baseline/*.lean")
+        metadata_path = root / "metadata.json"
+        if metadata_path.is_file():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ConfigError(f"cannot load task metadata {metadata_path}: {exc}") from exc
+        elif coding_bundle:
+            metadata = dict(public_metadata.get(slug) or {})
+        else:
+            raise ConfigError(f"incomplete task {slug}: missing {metadata_path}")
         if not isinstance(metadata, dict):
-            raise ConfigError(f"metadata is not an object: {root / 'metadata.json'}")
+            raise ConfigError(f"metadata is not an object: {metadata_path}")
+        metadata = dict(metadata)
+        for key in (
+            "language",
+            "candidate_filename",
+            "dataset",
+            "benchmark_revision",
+            "verification_profile",
+        ):
+            value = bundle_manifest.get(key)
+            if value is not None:
+                metadata.setdefault(key, value)
+        metadata.setdefault("problem_id", slug)
+
+        problem_path = root / "problem.md"
+        if problem_path.is_file():
+            try:
+                problem_text = problem_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ConfigError(f"cannot load task statement {problem_path}: {exc}") from exc
+        elif coding_bundle and metadata.get("description_no_samples") is not None:
+            title = str(metadata.get("name") or slug)
+            body = str(metadata.get("description_no_samples") or "").rstrip()
+            sample_blocks: list[str] = []
+            samples = metadata.get("samples")
+            if isinstance(samples, list):
+                for index, sample in enumerate(samples, start=1):
+                    if not isinstance(sample, Mapping):
+                        continue
+                    sample_input = str(sample.get("input") or "").rstrip("\n")
+                    sample_output = str(sample.get("output") or "").rstrip("\n")
+                    sample_blocks.append(
+                        f"### Sample {index}\n\nInput:\n```text\n{sample_input}\n```\n\n"
+                        f"Output:\n```text\n{sample_output}\n```"
+                    )
+            sample_text = "\n\n".join(sample_blocks)
+            problem_text = f"# {title}\n\n{body}"
+            if sample_text:
+                problem_text += f"\n\n## Samples\n\n{sample_text}"
+            problem_text += "\n"
+        else:
+            raise ConfigError(f"incomplete task {slug}: missing {problem_path}")
+
+        baseline_files = sorted((root / "baseline").glob("*.lean")) or sorted(
+            (root / "baseline").glob("*.cpp")
+        )
+        if baseline_files:
+            baseline_source = baseline_files[0]
+            try:
+                baseline_code = baseline_source.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ConfigError(f"cannot load task baseline {baseline_source}: {exc}") from exc
+            metadata.setdefault("baseline_filename", baseline_source.name)
+            inferred_coding = baseline_source.suffix.lower() == ".cpp"
+        elif coding_bundle:
+            baseline_code = (
+                "#include <bits/stdc++.h>\n"
+                "using namespace std;\n\n"
+                "int main() {\n"
+                "    ios::sync_with_stdio(false);\n"
+                "    cin.tie(nullptr);\n"
+                "    return 0;\n"
+                "}\n"
+            )
+            metadata.setdefault("baseline_filename", "baseline.cpp")
+            inferred_coding = True
+        else:
+            raise ConfigError(f"task {slug} has no baseline source")
+        metadata.setdefault("candidate_filename", "result.cpp" if inferred_coding else "result.lean")
+        metadata.setdefault("language", "cpp" if inferred_coding else "lean")
         tasks.append(
             Task(
                 slug=slug,
                 root=root,
                 problem_text=problem_text,
-                baseline_code=baseline_files[0].read_text(encoding="utf-8"),
+                baseline_code=baseline_code,
                 metadata=metadata,
             )
         )
@@ -1136,6 +1252,8 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "allocation": config.allocation.public_dict(),
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
+        "judge_kind": config.judge_kind,
+        "aisw_max_in_flight": config.aisw_max_in_flight,
         "model": config.model,
         "thinking": config.thinking,
         "lean_server_configured": bool(config.lean_server_url),
@@ -1251,10 +1369,18 @@ def run_experiment(
 
     store = CPSStore(run_dir / "cps.sqlite3") if config.uses_cps else None
     policy = make_policy(config.communication, store)
-    evaluator = (
-        MockEvaluator(prove_without_sorry=mock_proved)
-        if mock_agent
-        else LeanEvaluator(
+    if mock_agent:
+        evaluator = MockEvaluator(prove_without_sorry=mock_proved)
+    elif config.is_coding:
+        evaluator = CodingEvaluator(
+            config.lean_server_url,
+            timeout_seconds=config.lean_timeout_seconds,
+            max_lifecycle_seconds=config.lean_max_lifecycle_seconds,
+            verification_profile=config.lean_verification_profile,
+            judge_mode=config.lean_judge_mode,
+        )
+    else:
+        evaluator = LeanEvaluator(
             config.lean_server_url,
             lean_env_id=config.lean_env_id,
             timeout_seconds=config.lean_timeout_seconds,
@@ -1262,7 +1388,6 @@ def run_experiment(
             verification_profile=config.lean_verification_profile,
             judge_mode=config.lean_judge_mode,
         )
-    )
     if mock_agent and not callable(
         getattr(evaluator, "expected_task_contract_sha256", None)
     ):
@@ -1649,6 +1774,7 @@ def _run_mono(
     )
     early_lock = threading.RLock()
     early_proofs: dict[str, _EarlyProofCredit] = {}
+    full_score_event = threading.Event()
     expected_contracts = {
         task.slug: _expected_task_contract(evaluator, task) for task in tasks
     }
@@ -1657,7 +1783,8 @@ def _run_mono(
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
-        reasons=("runner_failure", "remote_settlement_unconfirmed"),
+        full_score_event,
+        reasons=("runner_failure", "remote_settlement_unconfirmed", "full_score"),
     )
 
     def admit_early_proof(
@@ -1676,7 +1803,7 @@ def _run_mono(
             with early_lock:
                 if task.slug in early_proofs:
                     return
-                verified = worker_dir / "verified" / task.slug / "result.lean"
+                verified = _candidate_path(worker_dir / "verified" / task.slug, task)
                 _atomic_promote_source(snapshot.source, verified, snapshot.sha256)
                 credit = _EarlyProofCredit(
                     verdict=verdict,
@@ -1703,6 +1830,8 @@ def _run_mono(
                     source="judge_check",
                 )
                 early_proofs[task.slug] = credit
+                if config.cancel_on_proved and len(early_proofs) == len(tasks):
+                    full_score_event.set()
         except Exception:
             callback_failure.record()
             raise
@@ -1711,7 +1840,7 @@ def _run_mono(
         result = _mock_result("mono", "bundle", 1)
     else:
         candidates = {
-            task.slug: (task, worker_dir / "tasks" / task.slug / "result.lean")
+            task.slug: (task, _candidate_path(worker_dir / "tasks" / task.slug, task))
             for task in tasks
         }
         with judge_broker.session(
@@ -1723,7 +1852,7 @@ def _run_mono(
             cancel_event=run_cancel_event,
         ) as broker_env:
             result = pi_agent.run(
-                task_id="matholympiadbench-latest12",
+                task_id=f"{config.name}-bundle",
                 actor_id="mono",
                 episode=1,
                 prompt=prompt,
@@ -1740,7 +1869,7 @@ def _run_mono(
     logger.event("agent_finished", **result.as_dict())
     verdicts: dict[str, Verdict] = {}
     for task in tasks:
-        candidate = worker_dir / "tasks" / task.slug / "result.lean"
+        candidate = _candidate_path(worker_dir / "tasks" / task.slug, task)
         with early_lock:
             credit = early_proofs.get(task.slug)
         if credit is not None:
@@ -1818,7 +1947,7 @@ def _run_elastic_cps(
         )
         best_dir = task_root / "best"
         best_dir.mkdir(parents=True, exist_ok=True)
-        best_path = best_dir / "result.lean"
+        best_path = _candidate_path(best_dir, task)
         if not best_path.exists():
             best_path.write_text(task.baseline_code, encoding="utf-8")
         state.best_candidate = best_path
@@ -1858,10 +1987,12 @@ def _run_elastic_cps(
     initial_assignment_count = 0
     adaptive_assignments = 0
     callback_failure = _CallbackFailureState()
+    full_score_event = threading.Event()
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
-        reasons=("runner_failure", "remote_settlement_unconfirmed"),
+        full_score_event,
+        reasons=("runner_failure", "remote_settlement_unconfirmed", "full_score"),
     )
 
     assert policy.store is not None
@@ -2290,7 +2421,7 @@ def _run_elastic_cps(
         _stage_task(state.task, workdir, config=config)
         assert state.best_candidate is not None
         with state.lock:
-            shutil.copy2(state.best_candidate, workdir / "result.lean")
+            shutil.copy2(state.best_candidate, _candidate_path(workdir, state.task))
         return workdir, state.best_candidate
 
     def execute_assignment(assignment: AgentAssignment) -> Any:
@@ -2300,7 +2431,7 @@ def _run_elastic_cps(
         workdir, best_path = prepare_workspace(state, assignment)
         actor = assignment.agent_id
         task = state.task
-        candidate_path = workdir / "result.lean"
+        candidate_path = _candidate_path(workdir, task)
 
         def admit_task_proof(
             verdict: Verdict,
@@ -2404,7 +2535,13 @@ def _run_elastic_cps(
                         state.completed_attempts += 1
                     if config.cancel_on_proved:
                         state.cancel_event.set()
+                    if config.cancel_on_proved and all(
+                        current_state.solved for current_state in states.values()
+                    ):
+                        full_score_event.set()
                     return True
+
+        candidate_path = _candidate_path(workdir, task)
 
         def admit_early_proof(
             proved_task: Task,
@@ -2460,8 +2597,8 @@ def _run_elastic_cps(
         )
         prompt += (
             "\n\nElastic CPS handoff:\n"
-            "The runner has pre-seeded result.lean with the strongest usable candidate "
-            "from earlier assignments on this task. Keep your candidate in result.lean; "
+            f"The runner has pre-seeded {task.candidate_filename} with the strongest usable candidate "
+            f"from earlier assignments on this task. Keep your candidate in {task.candidate_filename}; "
             "the runner will merge the strongest verified candidate."
         )
 
@@ -2476,7 +2613,7 @@ def _run_elastic_cps(
             with judge_broker.session(
                 actor_id=actor,
                 workdir=workdir,
-                candidates={task.slug: (task, workdir / "result.lean")},
+                candidates={task.slug: (task, candidate_path)},
                 deadline_monotonic=deadline,
                 cps_store=store,
                 communication=config.communication,
@@ -2539,7 +2676,7 @@ def _run_elastic_cps(
             verdict = _evaluate_candidate(
                 evaluator,
                 task,
-                workdir / "result.lean",
+                candidate_path,
                 deadline,
                 evaluator_gate,
                 cancel_event=assignment_cancel_event,
@@ -2911,10 +3048,14 @@ def _run_task_workers(
     judge_broker: JudgeBroker,
 ) -> list[tuple[AgentResult, Verdict]]:
     callback_failure = _CallbackFailureState()
+    full_score_event = threading.Event()
+    solved_lock = threading.Lock()
+    solved_tasks: set[str] = set()
     run_cancel_event = _AnyCancelEvent(
         callback_failure,
         _evaluator_remote_settlement_event(evaluator),
-        reasons=("runner_failure", "remote_settlement_unconfirmed"),
+        full_score_event,
+        reasons=("runner_failure", "remote_settlement_unconfirmed", "full_score"),
     )
 
     def execute(task: Task) -> tuple[AgentResult, Verdict]:
@@ -2927,6 +3068,7 @@ def _run_task_workers(
         early_credit: _EarlyProofCredit | None = None
         expected_contract = _expected_task_contract(evaluator, task)
         allow_mock_provenance = _allows_mock_provenance(evaluator)
+        candidate_path = _candidate_path(workdir, task)
 
         def admit_early_proof(
             proved_task: Task,
@@ -2945,7 +3087,7 @@ def _run_task_workers(
                 with early_lock:
                     if early_credit is not None:
                         return
-                    verified = workdir / "verified" / "result.lean"
+                    verified = _candidate_path(workdir / "verified", task)
                     _atomic_promote_source(snapshot.source, verified, snapshot.sha256)
                     credit = _EarlyProofCredit(
                         verdict=verdict,
@@ -2970,6 +3112,11 @@ def _run_task_workers(
                         source="judge_check",
                     )
                     early_credit = credit
+                    if verdict.score >= 1.0 and normalize_verdict_status(verdict.status) in _AUTHORITATIVE_PROVED_STATUSES:
+                        with solved_lock:
+                            solved_tasks.add(task.slug)
+                            if config.cancel_on_proved and len(solved_tasks) == len(tasks):
+                                full_score_event.set()
             except Exception:
                 callback_failure.record()
                 raise
@@ -2995,7 +3142,7 @@ def _run_task_workers(
                 with judge_broker.session(
                     actor_id=actor,
                     workdir=workdir,
-                    candidates={task.slug: (task, workdir / "result.lean")},
+                    candidates={task.slug: (task, candidate_path)},
                     deadline_monotonic=deadline,
                     cps_store=policy.store if policy.enabled else None,
                     communication=config.communication if policy.enabled else "none",
@@ -3024,7 +3171,7 @@ def _run_task_workers(
             if credit is not None:
                 _atomic_promote_source(
                     credit.candidate_source,
-                    workdir / "result.lean",
+                    candidate_path,
                     credit.candidate_sha256,
                 )
                 verdict = credit.verdict
@@ -3032,7 +3179,7 @@ def _run_task_workers(
                 verdict = _evaluate_candidate(
                     evaluator,
                     task,
-                    workdir / "result.lean",
+                    candidate_path,
                     deadline,
                     evaluator_gate,
                     cancel_event=run_cancel_event,
@@ -3045,11 +3192,16 @@ def _run_task_workers(
                 verdict = _within_horizon(verdict, deadline)
                 verdict = _enforce_verdict_provenance(
                     verdict,
-                    workdir / "result.lean",
+                    candidate_path,
                     expected_task_contract_sha256=expected_contract,
                     allow_mock_provenance=allow_mock_provenance,
                 )
                 logger.scoreboard(verdict, episode=episode, agent_id=actor)
+            if verdict.score >= 1.0 and normalize_verdict_status(verdict.status) in _AUTHORITATIVE_PROVED_STATUSES:
+                with solved_lock:
+                    solved_tasks.add(task.slug)
+                    if config.cancel_on_proved and len(solved_tasks) == len(tasks):
+                        full_score_event.set()
             logger.event(
                 "evaluation_finished",
                 **verdict.as_dict(),
@@ -3108,16 +3260,16 @@ def _stage_task(
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "problem.md").write_text(task.problem_text, encoding="utf-8")
     baseline_dir = destination / "baseline"
-    baseline_dir.mkdir(exist_ok=True)
-    baseline_source = next(iter(sorted(task.root.glob("baseline/*.lean"))))
-    shutil.copy2(baseline_source, baseline_dir / baseline_source.name)
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    baseline_source = baseline_dir / task.baseline_filename
+    baseline_source.write_text(task.baseline_code, encoding="utf-8")
     (destination / "metadata.json").write_text(
         json.dumps(task.metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    result = destination / "result.lean"
+    result = _candidate_path(destination, task)
     if not result.exists():
-        shutil.copy2(baseline_source, result)
+        result.write_text(task.baseline_code, encoding="utf-8")
     if config.formal_tools_enabled:
         stage_worker_tools(
             destination,
@@ -3321,10 +3473,10 @@ def _remote_settlement_verdict(
 
 def _candidate_source(config: ExperimentConfig, task: Task, run_dir: Path) -> Path:
     if config.mode == "mono":
-        return run_dir / "workers" / "mono" / "tasks" / task.slug / "result.lean"
+        return _candidate_path(run_dir / "workers" / "mono" / "tasks" / task.slug, task)
     if config.uses_cps:
-        return run_dir / "workers" / task.slug / "best" / "result.lean"
-    return run_dir / "workers" / task.slug / "result.lean"
+        return _candidate_path(run_dir / "workers" / task.slug / "best", task)
+    return _candidate_path(run_dir / "workers" / task.slug, task)
 
 
 def _freeze_closeout_candidates(
@@ -3340,7 +3492,7 @@ def _freeze_closeout_candidates(
     rows: list[dict[str, Any]] = []
     for task in tasks:
         source = _candidate_source(config, task, run_dir)
-        destination = root / task.slug / "result.lean"
+        destination = _candidate_path(root / task.slug, task)
         digest: str | None = None
         error: str | None = None
         try:
@@ -3688,16 +3840,24 @@ def _run_closeout(
 
 
 def _write_mono_bundle(worker_dir: Path, tasks: Iterable[Task]) -> None:
+    task_list = list(tasks)
     solutions: dict[str, str] = {}
-    for task in tasks:
-        candidate = worker_dir / "tasks" / task.slug / "result.lean"
+    for task in task_list:
+        candidate = _candidate_path(worker_dir / "tasks" / task.slug, task)
         try:
             solutions[task.slug] = candidate.read_text(encoding="utf-8")
         except OSError:
             solutions[task.slug] = ""
     (worker_dir / "result.json").write_text(
         json.dumps(
-            {"schema_version": "formal_lean_single_run_bundle_v1", "solutions": solutions},
+            {
+                "schema_version": (
+                    "coding_cpp_single_run_bundle_v1"
+                    if any(task.candidate_filename == "result.cpp" for task in task_list)
+                    else "formal_lean_single_run_bundle_v1"
+                ),
+                "solutions": solutions,
+            },
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -4100,7 +4260,7 @@ def _write_final(
         "status": status,
         "mode": config.mode,
         "communication": config.communication,
-        "dataset": "matholympiadbench",
+        "dataset": config.dataset_name,
         "score": sum(item["score"] for item in rows.values()),
         "max_score": len(rows),
         "verdicts": rows,

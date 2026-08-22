@@ -69,6 +69,23 @@ failure, is useful feedback even when it is not a proof.
 If that tool is busy or unavailable, continue static proof reasoning or leave the best
 candidate for the runner; never create a local or raw-network fallback. The user prompt
 defines the assigned proof task and, when present, the controlled CPS protocol."""
+_CODING_SOLVER_SYSTEM_PROMPT = """You are a bounded competitive-programming construction worker, not a general-purpose coding agent.
+Work only on the assigned C++ contest task and use only the explicitly provided tools.
+Read the statement in problem.md and the immutable baseline in baseline/; keep your
+best submission in result.cpp. Do not modify the statement or baseline. Do not
+execute shell commands, spawn background or parallel processes, install software,
+download data, or make raw network requests. The controlled ContextSwarmJudge owns
+compilation, test execution, resource limits, and semantic checking: submit every
+authoritative attempt through the runner-provided judge_check tool. The
+CONTEXTSWARM_JUDGE_URL value is injected only as a session-scoped capability for
+that tool; never read it, construct another client, or contact it directly.
+Complete an early judge_check checkpoint after initial file inspection and before
+extended solution search or CPS communication; do not wait for a polished program.
+Compile errors, wrong answers, runtime errors, time/memory limits, and other
+job-bound terminal candidate results are useful feedback rather than experiment
+infrastructure failures. If judge_check is busy or unavailable, continue static
+reasoning or leave the strongest result.cpp; never create a local compiler/Judge
+fallback. The user prompt defines the assigned task and controlled CPS protocol."""
 _FORMAL_SOLVER_SYSTEM_PROMPT = """You are a bounded formal-proof construction worker, not a general-purpose coding agent.
 Work only on the assigned result.lean and use only the explicitly provided tools.
 Do not execute shell commands except the exact bounded helper commands documented
@@ -177,6 +194,8 @@ class PiAgent:
             (
                 _ISOLATED_SYSTEM_PROMPT
                 if isolated
+                else _CODING_SOLVER_SYSTEM_PROMPT
+                if self.config.is_coding
                 else _FORMAL_SOLVER_SYSTEM_PROMPT
                 if self.config.formal_tools_enabled
                 else _SOLVER_SYSTEM_PROMPT
@@ -309,6 +328,13 @@ class PiAgent:
                 "CONTEXTSWARM_WORKDIR": str(workdir),
                 "CONTEXTSWARM_EXPERIMENT_MODE": self.config.mode,
                 "CONTEXTSWARM_EXPERIMENT_SEED": str(self.config.seed),
+                "CONTEXTSWARM_CANDIDATE_FILENAME": (
+                    "result.cpp" if self.config.is_coding else "result.lean"
+                ),
+                "CONTEXTSWARM_LANGUAGE": "cpp" if self.config.is_coding else "lean",
+                "EXPERIMENT_CONFIG_AISW_MAX_IN_FLIGHT": str(
+                    self.config.aisw_max_in_flight
+                ),
                 "CONTEXTSWARM_FORMAL_COMMAND_TIMEOUT_SECONDS": str(
                     self.config.formal_tools_command_timeout_seconds
                 ),

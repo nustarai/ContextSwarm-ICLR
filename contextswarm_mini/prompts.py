@@ -1,4 +1,4 @@
-"""Stable worker prompts for the three paper-facing protocols."""
+"""Stable worker prompts for formal and coding experiment protocols."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Iterable
 from .models import Task
 
 
-SOLVER_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
+FORMAL_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
 - Use only `judge_check`, the experiment-provided controlled Judge interface, for
   authoritative Lean checking. When the manifest exposes the bounded formal-helper
   surface, `python3 evaluate.py` and `./formal_query ...` are advisory diagnostics
@@ -43,6 +43,44 @@ SOLVER_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
 - Your allowed proof context is this assigned workspace plus shared candidates,
   CPS state, and helper tools explicitly provided by the runner in this prompt.
   Do not browse unrelated workers, sessions, host paths, or runtime internals.
+"""
+
+# Historical callers import this name.  Keep it as an alias so existing formal
+# prompt and problem-statement contracts remain byte-for-byte compatible.
+SOLVER_EXECUTION_CONTRACT = FORMAL_EXECUTION_CONTRACT
+
+
+CODING_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
+- Use only `judge_check`, the experiment-provided controlled Judge interface, for
+  authoritative C++ compilation, execution, and test verdicts. The Judge owns
+  the compiler, runtime sandbox, test data, and resource limits; its terminal
+  result is the only authority for success.
+- `CONTEXTSWARM_JUDGE_URL` is reserved for that runner-owned capability. It is
+  session-scoped and is not permission to construct another client, contact an
+  endpoint, or inspect Judge implementation details. Never read, print, modify,
+  or contact it yourself.
+- A mandatory early Judge checkpoint is required for every assigned task. After
+  reading the statement and current `result.cpp`, immediately submit the current
+  candidate through `judge_check` before optional diagnostics, coordination,
+  recipient discovery, or extended solution search. Do not wait for a polished
+  solution: compile errors, wrong answers, resource limits, and execution
+  limits are useful job-bound feedback. Afterward, keep checks serial and submit
+  again only after a material edit.
+- Never invoke a local compiler, executable test runner, online judge, solver, or
+  other verification service. Do not install or download compilers, libraries,
+  packages, test data, caches, or solver infrastructure.
+- Do not run resource-heavy local computation or start background, detached, or
+  parallel processes. In particular, do not fan out candidate checks or use
+  shell job control, `xargs -P`, GNU Parallel, subprocess pools, or similar
+  mechanisms.
+- Never call a raw Judge or evaluator HTTP endpoint with curl, wget, Python,
+  JavaScript, or another network client. Use `judge_check` only.
+- If `judge_check` is temporarily unavailable, overloaded, or returns a
+  retryable result, wait/retry only through `judge_check` within the experiment
+  budget, or leave the strongest candidate in `result.cpp` for the runner.
+- Your allowed context is this assigned workspace plus shared CPS state and
+  helper tools explicitly provided by the runner. Do not browse unrelated
+  workers, sessions, host paths, or runtime internals.
 """
 
 
@@ -104,6 +142,24 @@ Do not inspect helper source, alter capability metadata, or use any other shell
 command."""
 
 
+def _is_coding_task(task: Task) -> bool:
+    """Whether ``task`` is a C++ Judge task (formal remains the default)."""
+
+    return task.candidate_filename == "result.cpp"
+
+
+def _execution_contract(task: Task) -> str:
+    return CODING_EXECUTION_CONTRACT if _is_coding_task(task) else FORMAL_EXECUTION_CONTRACT
+
+
+def _candidate_context(task: Task) -> tuple[str, str, str]:
+    """Return candidate filename, baseline glob, and candidate noun."""
+
+    if _is_coding_task(task):
+        return "result.cpp", "baseline/*.cpp", "solution"
+    return "result.lean", "baseline/*.lean", "proof"
+
+
 def build_task_prompt(
     task: Task,
     *,
@@ -115,29 +171,38 @@ def build_task_prompt(
     digest: str = "",
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
-    return f"""You are worker {agent_id}, episode {episode}, in a bounded formal-proof experiment.
+    candidate, baseline_glob, noun = _candidate_context(task)
+    coding = _is_coding_task(task)
+    kind = "coding" if coding else "formal-proof"
+    statement = (
+        f"The public statement is in problem.md. The immutable starting skeleton is in {baseline_glob}.\n"
+        f"Write your candidate solution only to {candidate} and preserve the source contract."
+        if coding
+        else f"The public statement is in problem.md. The immutable starting skeleton is in baseline/.\n"
+        f"Write your candidate proof only to {candidate} and preserve the theorem statement,\n"
+        "imports, namespace, and source contract."
+    )
+    return f"""You are worker {agent_id}, episode {episode}, in a bounded {kind} experiment.
 
 Task: {task.slug}
 Workspace: {task_workspace}
-The public statement is in problem.md. The immutable starting skeleton is in baseline/.
-Write your candidate proof only to result.lean and preserve the theorem statement,
-imports, namespace, and source contract. The controlled external Judge, accessed
-only through `judge_check`, is the only authority for success; do not claim success
-from intuition, a text scan, or a local proof process.
+{statement} The controlled external Judge, accessed only through `judge_check`, is
+the only authority for success; do not claim success from intuition, a text scan,
+or a local verification process.
 
-{SOLVER_EXECUTION_CONTRACT}
+{_execution_contract(task)}
 
 {_communication_instructions(communication_enabled)}
 
-{_formal_tools_instructions(formal_tools_enabled)}
+{_formal_tools_instructions(formal_tools_enabled and not coding)}
 
 Relevant shared context (possibly empty):
 ---
 {context}
 ---
 
-Work in small proof-construction increments. Inspect the existing result.lean first,
-make a concrete candidate, and leave the best candidate in result.lean before ending.
+Work in small {noun}-construction increments. Inspect the existing {candidate} first,
+make a concrete candidate, and leave the best candidate in {candidate} before ending.
 When feedback is useful, check one candidate at a time with `judge_check`.
 """
 
@@ -149,34 +214,51 @@ def build_mono_prompt(
     communication_enabled: bool,
     formal_tools_enabled: bool = False,
 ) -> str:
-    task_lines = "\n".join(f"- {task.slug}: tasks/{task.slug}/" for task in tasks)
-    return f"""You are the Mono baseline worker for a fixed MathOlympiadBench latest12 bundle.
+    task_list = list(tasks)
+    if not task_list:
+        raise ValueError("build_mono_prompt requires at least one task")
+    coding_values = {_is_coding_task(task) for task in task_list}
+    if len(coding_values) != 1:
+        raise ValueError("Mono prompt cannot mix formal and coding tasks")
+    coding = coding_values.pop()
+    candidate = "result.cpp" if coding else "result.lean"
+    baseline_glob = "baseline/*.cpp" if coding else "baseline/*.lean"
+    contract = CODING_EXECUTION_CONTRACT if coding else FORMAL_EXECUTION_CONTRACT
+    noun = "solutions" if coding else "proofs"
+    bundle_kind = "coding" if coding else "formal"
+    task_lines = "\n".join(f"- {task.slug}: tasks/{task.slug}/" for task in task_list)
+    return f"""You are the Mono baseline worker for a fixed 12-task {bundle_kind} bundle.
 
 One Pi session must work through the following task directories serially:
 {task_lines}
 
-For each task, read its problem.md and baseline/*.lean, then write the candidate to
-tasks/<slug>/result.lean (the runner also maintains the aggregate result.json bundle).
+For each task, read its problem.md and {baseline_glob}, then write the candidate to
+tasks/<slug>/{candidate} (the runner also maintains the aggregate result bundle).
 Do not modify the source statement or baseline. The runner
 evaluates every candidate after this session and counts only canonical PROVED verdicts.
 
-{SOLVER_EXECUTION_CONTRACT}
+{contract}
 
 {_communication_instructions(communication_enabled)}
 
-{_formal_tools_instructions(formal_tools_enabled)}
+{_formal_tools_instructions(formal_tools_enabled and not coding)}
 
-Use the available wall-clock budget on concrete proof construction. Leave every
+Use the available wall-clock budget on concrete {noun} construction. Leave every
 task directory with its best candidate, even if some targets remain incomplete.
 """
 
 
 def build_finalization_prompt(task: Task, *, digest: str = "") -> str:
-    return f"""Re-open {task.slug}/result.lean and leave the strongest candidate in place.
-Review the latest evaluator feedback and any relevant shared handoff below. Do not
-change the theorem contract or add proof-bypass declarations.
+    candidate, _baseline_glob, noun = _candidate_context(task)
+    guard = (
+        "Do not change the problem contract or add non-solution code."
+        if _is_coding_task(task)
+        else "Do not change the theorem contract or add proof-bypass declarations."
+    )
+    return f"""Re-open {task.slug}/{candidate} and leave the strongest {noun} in place.
+Review the latest evaluator feedback and any relevant shared handoff below. {guard}
 
-{SOLVER_EXECUTION_CONTRACT}
+{_execution_contract(task)}
 
 {digest or '(no shared handoff)'}
 """

@@ -42,6 +42,7 @@ _MIN_PROBE_INTERVAL_SECONDS = 1.0
 _PROBE_ADMISSION_TIMEOUT_SECONDS: float | None = None
 _BROKER_DRAIN_TIMEOUT_SECONDS = 5.0
 _RUNNER_ONLY_CPS_KINDS = frozenset({"validation_result"})
+_ALLOWED_CANDIDATE_FILENAMES = frozenset({"result.lean", "result.cpp"})
 _LEAN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.₀-₉ⁿ¹²³@]*$")
 _IMPORT_LINE = re.compile(r"(?m)^\s*import\s+[^\n]+\s*$")
 _DEFAULT_TACTICS = (
@@ -83,6 +84,15 @@ _JUDGE_CHECKPOINT_TERMINAL_STATUSES = frozenset(
         "CHEATING",
         "RESOURCE_LIMIT",
         "EXECUTION_TIMEOUT",
+        # Coding Judge candidate-attempt outcomes.  These unlock CPS only
+        # after the same candidate/task/job provenance checks as formal
+        # terminal feedback below; a status label by itself is insufficient.
+        "WA",
+        "PE",
+        "CE",
+        "MLE",
+        "TLE",
+        "RE",
     }
 )
 _CHECKPOINT_VALUE_UNSET = object()
@@ -434,7 +444,8 @@ class JudgeBroker:
             "min_probe_interval_seconds": self.min_probe_interval_seconds,
             "probe_admission_deadline": "session_remaining_horizon",
             "probe_admission_timeout_seconds": self.probe_admission_timeout_seconds,
-            "candidate_selection": "runner_bound_result_lean",
+            "candidate_selection": "runner_bound_task_candidate_filename",
+            "allowed_candidate_filenames": sorted(_ALLOWED_CANDIDATE_FILENAMES),
             "candidate_submission": "immutable_source_snapshot",
             "shares_final_evaluator_gate": True,
             "submitted_job_cancellation": "delete_on_probe_cancel_or_deadline",
@@ -508,11 +519,17 @@ class JudgeBroker:
                 "evaluator must expose expected_task_contract_sha256(task)"
             )
         for task_id, (task, candidate_path) in candidates.items():
+            candidate_filename = str(task.candidate_filename)
+            if candidate_filename not in _ALLOWED_CANDIDATE_FILENAMES:
+                raise ValueError("task declares an unsupported candidate filename")
             candidate = Path(candidate_path).resolve()
-            if candidate.name != "result.lean" or not _is_relative_to(
+            if candidate.name != candidate_filename or not _is_relative_to(
                 candidate, resolved_workdir
             ):
-                raise ValueError("broker candidates must be result.lean inside the assigned workdir")
+                raise ValueError(
+                    "broker candidate must match the task-declared filename "
+                    "inside the assigned workdir"
+                )
             if str(task_id) != task.slug:
                 raise ValueError("broker task key must match the bound task slug")
             contract_sha256 = _safe_hash(expected_contract(task))
@@ -736,7 +753,7 @@ class JudgeBroker:
         try:
             # Freeze exactly what this capability call submits before waiting
             # for the shared Judge gate.  The worker may continue editing its
-            # result.lean while queued, but neither the request nor its audit
+            # candidate file while queued, but neither the request nor its audit
             # hash can then drift to a different file state.
             try:
                 snapshot = _candidate_snapshot(
@@ -751,7 +768,7 @@ class JudgeBroker:
             except (OSError, UnicodeError):
                 result = _control_result(
                     "CANDIDATE_SNAPSHOT_ERROR",
-                    "The runner could not freeze result.lean for Judge submission.",
+                    "The runner could not freeze the task candidate for Judge submission.",
                     retryable=True,
                 )
                 return self._finish_judge_check(
@@ -1278,7 +1295,7 @@ class JudgeBroker:
             result = {
                 **_control_result(
                     "CANDIDATE_SNAPSHOT_ERROR",
-                    "The runner could not freeze result.lean for diagnostic evaluation.",
+                    "The runner could not freeze the task candidate for diagnostic evaluation.",
                     retryable=True,
                 ),
                 "call_number": call_number,

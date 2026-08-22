@@ -124,17 +124,39 @@ function relativeInside(path, cwd) {
   return rel.split(sep).join("/");
 }
 
+// The runner binds the candidate filename per worker session.  Keep the
+// historical formal default and reject every other spelling so task data cannot
+// widen this capability into an arbitrary path.
+function candidateFilename() {
+  const configured = String(process.env.CONTEXTSWARM_CANDIDATE_FILENAME ?? "").trim();
+  return configured === "result.cpp" || configured === "result.lean"
+    ? configured
+    : "result.lean";
+}
+
+function candidateExtension() {
+  return candidateFilename() === "result.cpp" ? "cpp" : "lean";
+}
+
+function escapedCandidateFilename() {
+  return candidateFilename().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function isReadableFile(rel) {
+  const candidate = candidateFilename();
+  const candidatePattern = escapedCandidateFilename();
+  const extension = candidateExtension();
   return (
-    ["problem.md", "result.lean", "metadata.json", "PUBLIC_FILES.md"].includes(rel) ||
-    /^baseline\/[^/]+\.lean$/.test(rel) ||
-    /^tasks\/[^/]+\/(?:problem\.md|result\.lean|metadata\.json|PUBLIC_FILES\.md)$/.test(rel) ||
-    /^tasks\/[^/]+\/baseline\/[^/]+\.lean$/.test(rel)
+    ["problem.md", candidate, "metadata.json", "PUBLIC_FILES.md"].includes(rel) ||
+    new RegExp(`^baseline/[^/]+\\.${extension}$`).test(rel) ||
+    new RegExp(`^tasks/[^/]+/(?:problem\\.md|${candidatePattern}|metadata\\.json|PUBLIC_FILES\\.md)$`).test(rel) ||
+    new RegExp(`^tasks/[^/]+/baseline/[^/]+\\.${extension}$`).test(rel)
   );
 }
 
 function isWritableCandidate(rel) {
-  return rel === "result.lean" || /^tasks\/[^/]+\/result\.lean$/.test(rel);
+  const candidate = candidateFilename();
+  return rel === candidate || new RegExp(`^tasks/[^/]+/${escapedCandidateFilename()}$`).test(rel);
 }
 
 // Unlike read/search paths, the final candidate may not exist yet (the write
@@ -250,6 +272,9 @@ function formalHelperRelative(rawTarget, ctx) {
 }
 
 function isAllowedFormalCommand(command, ctx) {
+  // Coding workers never receive the formal helper capability, and must not
+  // be able to reach it even if a tool-call event is forged locally.
+  if (candidateFilename() !== "result.lean") return false;
   const tokens = boundedShellTokens(command);
   if (!tokens) return false;
   const mode = String(process.env.CONTEXTSWARM_EXPERIMENT_MODE ?? "").trim().toLowerCase();
@@ -289,7 +314,10 @@ function installPathGuard(pi) {
       }
       const rel = writableRelative(input.path, cwd);
       if (!rel) {
-        return { block: true, reason: "write/edit is restricted to assigned result.lean" };
+        return {
+          block: true,
+          reason: `write/edit is restricted to assigned ${candidateFilename()}`,
+        };
       }
       return;
     }
@@ -326,7 +354,7 @@ function installPathGuard(pi) {
       if (!isAllowedFormalCommand(command, ctx)) {
         return {
           block: true,
-          reason: "bash is restricted to the staged evaluate.py and formal_query helpers",
+          reason: "bash is restricted to the staged formal helper commands",
         };
       }
       const configuredTimeout = Number(
@@ -342,14 +370,17 @@ function installPathGuard(pi) {
 export default function registerContextSwarmSolverTools(pi) {
   installPathGuard(pi);
 
+  const candidate = candidateFilename();
+  const language = candidate === "result.cpp" ? "C++" : "Lean";
+
   registerBrokerTool(pi, {
     name: "judge_check",
     label: "Controlled Judge Check",
     description:
-      "Submit the runner-bound result.lean to the controlled external Lean Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.",
-    promptSnippet: "Check the current result.lean through the controlled external Judge",
+      `Submit the runner-bound ${candidate} to the controlled external ${language} Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.`,
+    promptSnippet: `Check the current ${candidate} through the controlled external Judge`,
     promptGuidelines: [
-      "Use judge_check one candidate at a time; never attempt local Lean or raw Judge access.",
+      "Use judge_check one candidate at a time; never attempt local compilation or raw Judge access.",
       "A retryable busy result is not permission to use a local fallback.",
     ],
     parameters: objectSchema({
