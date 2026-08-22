@@ -227,6 +227,7 @@ class AllocationCoreTests(unittest.TestCase):
         for reason in (
             "ok\noperator transcript",
             "\u202eevil",
+            "c1\u0085control",
             "file:///tmp/private",
             "secret payload",
             "x\x00y",

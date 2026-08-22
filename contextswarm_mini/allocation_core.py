@@ -327,7 +327,7 @@ def _scheduler_reason_is_safe(value: Any) -> bool:
     if any(
         ord(char) < 0x20
         or ord(char) == 0x7F
-        or unicodedata.category(char) == "Cf"
+        or unicodedata.category(char) in {"Cc", "Cf", "Cs"}
         for char in stripped
     ):
         return False
