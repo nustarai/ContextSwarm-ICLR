@@ -219,7 +219,18 @@ class ElasticScheduler:
     @property
     def unsolved_tasks(self) -> tuple[str, ...]:
         with self._lock:
-            return tuple(task_id for task_id, state in self._tasks.items() if not state.solved)
+            # Retired tasks are intentionally unresolved, but they are no
+            # longer admissible.  Exposing them as ``unsolved`` makes policy
+            # snapshots advertise phantom work after an attempt cap and can
+            # cause an allocator to repeatedly target a task which the
+            # scheduler will reject.  Keep this view aligned with the
+            # eligibility contract used by ``next_assignment`` and
+            # ``has_pending_initial``.
+            return tuple(
+                task_id
+                for task_id, state in self._tasks.items()
+                if not state.solved and state.retired_reason is None
+            )
 
     @property
     def has_pending_initial(self) -> bool:
