@@ -2,12 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${CONTEXTSWARM_MINI_IMAGE:-contextswarm-iclr-mini:latest}"
 AISW_BINARY="${CONTEXTSWARM_NUROUTER_BINARY:-${CONTEXTSWARM_AISW_BINARY:-${HOME}/.local/share/contextswarm/aisw-linux-aarch64}}"
 NODE_CONFIG="${CONTEXTSWARM_NUROUTER_NODE_CONFIG:-${CONTEXTSWARM_AISW_NODE_CONFIG:-}}"
 AISW_METADATA="${CONTEXTSWARM_AISW_LAUNCHER_METADATA:-}"
 CODEX_HOME="${CONTEXTSWARM_CODEX_HOME:-}"
-MEMORY="${CONTEXTSWARM_MINI_MEMORY:-16g}"
 CONFIG="configs/cps.toml"
 COMMAND="run"
 MOCK=0
@@ -89,6 +87,44 @@ if [[ ! -f "${ROOT_DIR}/${CONFIG}" && ! -f "${CONFIG}" ]]; then
   echo "manifest not found: ${CONFIG}" >&2
   exit 2
 fi
+
+if ! RESOLVED_DOCKER_CONFIG="$(
+  PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 - "${CONFIG}" "${ROOT_DIR}" <<'PY'
+from pathlib import Path
+import sys
+
+from contextswarm_mini.config import ConfigError, load_config
+
+try:
+    config = load_config(sys.argv[1], Path(sys.argv[2]))
+except (ConfigError, OSError, ValueError) as exc:
+    print(f"docker manifest resolution failed: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+print(config.docker_image)
+print(config.docker_memory_mb)
+PY
+)"; then
+  exit 2
+fi
+mapfile -t RESOLVED_DOCKER_VALUES <<<"${RESOLVED_DOCKER_CONFIG}"
+if [[ "${#RESOLVED_DOCKER_VALUES[@]}" -ne 2 ]]; then
+  echo "docker manifest resolution returned an invalid payload" >&2
+  exit 2
+fi
+
+IMAGE="${CONTEXTSWARM_MINI_IMAGE:-${RESOLVED_DOCKER_VALUES[0]}}"
+MEMORY="${CONTEXTSWARM_MINI_MEMORY:-${RESOLVED_DOCKER_VALUES[1]}m}"
+if [[ "${#IMAGE}" -gt 512 || ! "${IMAGE}" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$ ]]; then
+  echo "invalid Docker image from manifest or CONTEXTSWARM_MINI_IMAGE" >&2
+  exit 2
+fi
+if [[ "${#MEMORY}" -gt 32 || ! "${MEMORY}" =~ ^[1-9][0-9]*([bBkKmMgG])?$ ]]; then
+  echo "invalid Docker memory from manifest or CONTEXTSWARM_MINI_MEMORY" >&2
+  exit 2
+fi
+
 mkdir -p "${ROOT_DIR}/runs"
 
 DOCKER_ARGS=(
