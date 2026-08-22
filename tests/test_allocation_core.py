@@ -90,7 +90,10 @@ class AllocationCoreTests(unittest.TestCase):
             TraceFeatures(drag=math.inf)
 
     def test_strict_llm_parser_and_task_state_fallback(self) -> None:
-        snap = snapshot(task("a", checker_quality=0.1), task("b", checker_quality=0.9))
+        snap = snapshot(
+            task("a", checker_quality=0.1, trace=TraceFeatures(actionability=0.5)),
+            task("b", checker_quality=0.9),
+        )
         raw = json.dumps({"decision_id": "d1", "task_id": "a", "reason": "route", "trace_reference_ids": []})
         self.assertEqual(parse_llm_scheduler_output(raw, snap)[0], "a")
         with self.assertRaises(ValueError):
@@ -102,6 +105,25 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertTrue(decision.fallback)
         self.assertEqual(decision.selected_task_id, "b")
         self.assertEqual(dict(decision.task_scores), dict(TaskStateScorer().score_snapshot(snap)))
+        self.assertEqual(decision.trace_increments["a"], 0.25)
+
+        failed = ReadOnlyLLMSchedulerPolicy(
+            lambda current, prompt: (_ for _ in ()).throw(ConnectionError("offline"))
+        ).choose(snap)
+        self.assertTrue(failed.fallback)
+        self.assertEqual(failed.selected_task_id, "b")
+        self.assertIn("ConnectionError", failed.fallback_reason)
+        self.assertEqual(failed.scheduler_cost.calls, 1)
+
+    def test_llm_does_not_call_without_admission_capacity(self) -> None:
+        calls = []
+        snap = AllocationStateSnapshot("d", 1, 0, 1, 1, 1, 0, 0, (task("a"),))
+        decision = ReadOnlyLLMSchedulerPolicy(
+            lambda current, prompt: calls.append(prompt)
+        ).choose(snap)
+        self.assertEqual(calls, [])
+        self.assertEqual(decision.selected_task_id, "")
+        self.assertIsNone(decision.scheduler_cost)
 
 
 if __name__ == "__main__":

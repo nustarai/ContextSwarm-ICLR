@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, fields
 import hashlib
 import json
 import math
+import time
 from types import MappingProxyType
 from typing import Any, Callable, ClassVar, Mapping
 
@@ -486,6 +487,10 @@ class LLMSchedulerCost:
         for name in ("calls", "input_tokens", "output_tokens", "reservation_slots"):
             object.__setattr__(self, name, _nonnegative_int(name, getattr(self, name)))
         latency = _finite("latency_seconds", self.latency_seconds, minimum=0.0)
+        if self.calls != 1:
+            raise ValueError("one scheduler-call cost record must have calls=1")
+        if self.reservation_slots != 1:
+            raise ValueError("one scheduler call must reserve exactly one capacity slot")
         occupied = self.occupied_slot_seconds
         if occupied is None:
             occupied = latency * self.reservation_slots
@@ -738,29 +743,55 @@ class ReadOnlyLLMSchedulerPolicy:
         )
 
     def choose(self, snapshot: AllocationStateSnapshot) -> AllocationDecision:
-        response = self._invoke(snapshot, self.prompt(snapshot))
+        if not snapshot.eligible_task_ids or snapshot.free_slots == 0:
+            return AllocationDecision(
+                decision_id=snapshot.decision_id,
+                state_id=snapshot.state_id,
+                decision_index=snapshot.decision_index,
+                policy=self.name,
+                selected_task_id="",
+                reason="no eligible admission capacity",
+            )
+        started = time.monotonic()
+        invocation_error = ""
+        try:
+            response = self._invoke(snapshot, self.prompt(snapshot))
+        except Exception as exc:  # provider/coordinator noise is a recoverable decision failure
+            invocation_error = f"scheduler invocation failed: {type(exc).__name__}"
+            response = LLMSchedulerResponse(
+                "",
+                returncode=1,
+                latency_seconds=max(0.0, time.monotonic() - started),
+            )
         if not isinstance(response, LLMSchedulerResponse):
             raise TypeError("LLM scheduler invoker must return LLMSchedulerResponse")
-        error = ""
+        error = invocation_error
         selected = ""
         reason = ""
         references: tuple[str, ...] = ()
-        if response.returncode != 0:
-            error = f"scheduler returned {response.returncode}"
-        elif response.timed_out:
-            error = "scheduler timed out"
-        else:
-            try:
-                selected, reason, references = parse_llm_scheduler_output(response.output, snapshot)
-            except ValueError as exc:
-                error = str(exc)
+        if not error:
+            if response.returncode != 0:
+                error = f"scheduler returned {response.returncode}"
+            elif response.timed_out:
+                error = "scheduler timed out"
+            else:
+                try:
+                    selected, reason, references = parse_llm_scheduler_output(
+                        response.output, snapshot
+                    )
+                except ValueError as exc:
+                    error = str(exc)
         if error:
             fallback = self._fallback.choose(snapshot)
             selected = fallback.selected_task_id
             reason = "scheduler decision rejected; deterministic task-state fallback"
-        task_scores = self._fallback.scorer.score_snapshot(snapshot)
-        trace_increments = {task.task_id: 0.0 for task in snapshot.eligible_tasks}
-        scores = dict(task_scores)
+        trace_scorer = TraceStateScorer(self._fallback.scorer)
+        task_scores = trace_scorer.task_scorer.score_snapshot(snapshot)
+        trace_increments = trace_scorer.increments(snapshot)
+        scores = {
+            task_id: task_scores[task_id] + trace_increments[task_id]
+            for task_id in task_scores
+        }
         return AllocationDecision(
             decision_id=snapshot.decision_id,
             state_id=snapshot.state_id,
