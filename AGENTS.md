@@ -1,10 +1,38 @@
-# ContextSwarm ICLR Mini local contract
+# ContextSwarm ICLR working contract
 
-- This directory is an independent artifact. Do not edit or reset the sibling
+- This worktree is an independent artifact. Do not edit or reset the sibling
   upstream `ContextSwarm` worktree.
-- Keep Mono and Parallel communication-free. New CPS policies must be selected
-  by manifest and must preserve the same task/model/time/evaluator contract.
-- Do not put NuRouter/AISW tokens, node.toml contents, or private endpoints in
-  tracked files or run summaries.
+- Keep credentials, `node.toml` contents, and private endpoints out of tracked
+  files and run summaries.
+- Preserve the registered comparison contract. Allocation arms may differ only
+  in their manifest-selected policy; keep tasks, model, horizon, CPS capacity,
+  evaluator/Judge contract, and runtime limits fixed across arms. Keep Mono and
+  Parallel communication-free. Do not tune non-policy parameters between arms
+  in response to observed outcomes.
+- A formal arm ends at full score or at its configured horizon. There is no
+  separate “stable convergence” requirement. A failed individual attempt must
+  not terminate the arm while time and slots remain: retain the best candidate
+  and CPS state, record the failure, and refill the released slot.
+- Provider/coordinator/network instability is recoverable runtime noise. Retry
+  with backoff within the same horizon; when a session exhausts its retries,
+  resume or relaunch only the affected agent/slot from persisted state. Do not
+  restart, discard, or invalidate the whole arm solely because of transient
+  OAuth, coordinator, timeout, 429, 5xx, or connection errors. Retry time still
+  counts against the fixed horizon.
+- A job-bound terminal Judge result about the submitted candidate—including
+  compile/verification failure, `RESOURCE_LIMIT`, and `EXECUTION_TIMEOUT`—is a
+  candidate-attempt outcome by default. Record it as feedback/zero progress and
+  continue; do not call it an experiment infrastructure failure or retune
+  resource limits merely because it occurred. A status label or a `retryable`
+  flag alone is not grounds for discarding the arm.
+- Classify a Judge problem as infrastructure only with candidate-independent
+  evidence: for example a failed health/control check, a pre-admission
+  transport outage, a malformed or contradictory receipt, or a job that cannot
+  be reconciled to a terminal receipt. Retry/reconcile confirmed transient
+  infrastructure failures within the remaining horizon. A delayed cancellation
+  must not kill unrelated tasks; quarantine only the affected remote capacity
+  until it settles. Abort an arm only when authoritative evaluation cannot be
+  recovered, and report that as a runner/Judge protocol failure rather than a
+  candidate failure.
 - Before handing off a change, run `python3 -m compileall -q contextswarm_mini`,
   `python3 -m unittest discover -s tests`, and a `configs/smoke.toml` mock run.
