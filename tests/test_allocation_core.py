@@ -125,6 +125,16 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(decision.selected_task_id, "")
         self.assertIsNone(decision.scheduler_cost)
 
+    def test_llm_invalid_invoker_response_is_one_charged_fallback(self) -> None:
+        snap = snapshot(task("a", checker_quality=0.1), task("b", checker_quality=0.9))
+        decision = ReadOnlyLLMSchedulerPolicy(
+            lambda _current, _prompt: None
+        ).choose(snap)
+        self.assertTrue(decision.fallback)
+        self.assertEqual(decision.selected_task_id, "b")
+        self.assertEqual(decision.scheduler_cost.calls, 1)
+        self.assertIn("invalid response", decision.fallback_reason)
+
     def test_llm_can_use_its_owned_scheduler_reservation(self) -> None:
         calls = []
         snap = AllocationStateSnapshot(

@@ -784,7 +784,21 @@ class ReadOnlyLLMSchedulerPolicy:
                 latency_seconds=max(0.0, time.monotonic() - started),
             )
         if not isinstance(response, LLMSchedulerResponse):
-            raise TypeError("LLM scheduler invoker must return LLMSchedulerResponse")
+            # A runner-owned provider adapter is untrusted at this boundary:
+            # a malformed transport result is still one attempted scheduler
+            # call, not an arm-level infrastructure failure.  Charge the
+            # bounded call and use the same deterministic fallback as other
+            # provider/JSON failures.
+            invocation_error = (
+                invocation_error
+                or "scheduler invoker returned invalid response: "
+                + type(response).__name__
+            )
+            response = LLMSchedulerResponse(
+                "",
+                returncode=1,
+                latency_seconds=max(0.0, time.monotonic() - started),
+            )
         error = invocation_error
         selected = ""
         reason = ""
