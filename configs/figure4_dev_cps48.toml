@@ -1,0 +1,64 @@
+extends = ["allocation_1h_cps48.toml"]
+
+# Development-only Figure 4 substrate.  It keeps the registered 12-task CPS48
+# initial pool (12 x 4) but uses a short horizon so all four allocation paths
+# can be exercised before the Figure 3 selector is frozen.  Formal repeats must
+# replace this disabled selector contract with the selected Figure 3 identity.
+[experiment]
+name = "mobench-figure4-dev-cps48"
+output_root = "runs/figure4_dev"
+time_limit_seconds = 180
+seed = 39
+figure4_phase = "development"
+
+[selection]
+enabled = false
+visibility = "project_shared"
+seed = 39
+tie_break = "trace_id_asc"
+direct_messages = false
+# Legacy allocation development still carries the strongest per-task candidate
+# into each refill.  Formal Figure 4 replaces this sentinel with the selected
+# enabled selector identity while retaining the same task-local transfer rule.
+candidate_transfer = true
+
+# Shared hard bounds for the read-only scheduler wire prompt.  These values
+# are explicit in the common Figure 4 substrate so all four arms inherit the
+# same policy-independent contract.
+[allocation]
+prompt_max_bytes = 65536
+prompt_max_tokens = 65536
+
+[allocation.task_state]
+checker_quality = 1.0
+recent_progress = 1.0
+starvation = 1.0
+failure_no_progress = 1.0
+
+[allocation.trace_state]
+actionability = 1.0
+evidence_association = 1.0
+positive_feedback = 1.0
+negative_feedback = 1.0
+density_penalty_weight = 1.0
+duplicate_component_weight = 1.0
+refutation_component_weight = 1.0
+staleness_component_weight = 1.0
+lineage_stagnation_component_weight = 1.0
+
+[allocation.normalization]
+progress_window_seconds = 600.0
+starvation_window_seconds = 600.0
+failure_saturation = 3.0
+frontier_saturation = 4.0
+association_saturation = 4.0
+feedback_exposure_floor = 1.0
+duplicate_saturation = 4.0
+refutation_saturation = 4.0
+staleness_saturation = 4.0
+lineage_stagnation_saturation = 4.0
+staleness_window_seconds = 600.0
+lineage_stagnation_window_seconds = 600.0
+
+[pi]
+timeout_seconds = 180

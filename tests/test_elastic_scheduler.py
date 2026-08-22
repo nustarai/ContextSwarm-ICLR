@@ -65,6 +65,18 @@ class ElasticSchedulerTests(unittest.TestCase):
         self.assertTrue(snapshot["retired"])
         self.assertEqual(snapshot["retired_reason"], "attempt_budget_exhausted")
 
+    def test_unsolved_tasks_excludes_retired_work(self) -> None:
+        scheduler = ElasticScheduler(
+            ["retired", "live"], max_parallel=2, initial_agents=1, horizon=20
+        )
+        lease = scheduler.next_assignment_for("retired")
+        self.assertIsNotNone(lease)
+        assert lease is not None
+        scheduler.finish(lease, retire_reason="attempt_budget_exhausted")
+
+        self.assertEqual(scheduler.unsolved_tasks, ("live",))
+        self.assertNotIn("retired", scheduler.unsolved_tasks)
+
     def test_retired_task_does_not_leave_a_phantom_initial_quota(self) -> None:
         scheduler = ElasticScheduler(
             ["a", "b"],

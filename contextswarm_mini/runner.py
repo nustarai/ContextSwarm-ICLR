@@ -29,6 +29,7 @@ from .allocation import (
     TaskProgress,
     TaskProgressSnapshot,
     UniformAllocationPolicy,
+    _combine_fallback_reasons,
     normalize_verdict_status,
 )
 from .agent_recovery import (
@@ -37,9 +38,38 @@ from .agent_recovery import (
     run_with_recovery,
 )
 from .artifacts import atomic_write_json
+from .allocation_core import (
+    AllocationStateSnapshot,
+    LLMSchedulerResponse,
+    TaskScoreWeights,
+    TaskState,
+    TraceFeatures,
+    TraceScoreWeights,
+    create_allocation_policy,
+)
+from .allocation_audit import (
+    AllocationAuditRecord,
+    append_allocation_audit,
+    build_figure4_run_summary,
+    canonical_json_sha256,
+    write_figure4_run_summary,
+)
+from .allocation_trace_bridge import (
+    AllocationTraceView,
+    TraceProjectionBridge,
+    TraceProjectionLimits,
+    feedback_values_from_config,
+    policy_reads_trace,
+)
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
-from .evaluator import CodingEvaluator, LeanEvaluator, MockEvaluator, sanitize_worker_text
+from .evaluator import (
+    CodingEvaluator,
+    LeanEvaluator,
+    MockEvaluator,
+    sanitize_worker_identifier,
+    sanitize_worker_text,
+)
 from .elastic_scheduler import AgentAssignment, ElasticScheduler
 from .formal_tools import (
     DeclarationIndex,
@@ -651,6 +681,7 @@ class _ElasticTaskState:
     last_progress_at: float = 0.0
     cancel_event: threading.Event = field(default_factory=threading.Event)
     early_proofs: dict[str, _EarlyProofCredit] = field(default_factory=dict)
+    checker_outcome_ids: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -676,10 +707,8 @@ _AUTHORITATIVE_PROVED_STATUSES = {"PROVED", "AC", "PASS", "PASSED"}
 _RETRYABLE_CLOSEOUT_INFRA_STATUSES = {
     "EVALUATOR_ERROR",
     "EVALUATOR_TIMEOUT",
-    "EXECUTION_TIMEOUT",
     "INFRASTRUCTURE_ERROR",
     "REJECTED_OVERLOADED",
-    "RESOURCE_LIMIT",
 }
 
 
@@ -710,8 +739,77 @@ def _is_authoritative_proved(verdict: Verdict) -> bool:
         and float(verdict.score) >= 1.0
         and _normalized_sha256(verdict.candidate_sha256) is not None
         and _normalized_sha256(verdict.task_contract_sha256) is not None
-        and str(verdict.judge_job_id or "").strip()
+        and _bound_judge_job_id(verdict.judge_job_id) is not None
     )
+
+
+def _bound_judge_job_id(value: Any) -> str | None:
+    """Accept only a redacted-safe remote Judge identifier.
+
+    A truthy value is not sufficient provenance: URLs, filesystem paths,
+    whitespace-containing strings, and non-string objects can otherwise be
+    mistaken for a job identity and leak into candidate-attempt accounting.
+    Keep the same bounded identifier grammar used at the broker boundary.
+    """
+
+    if not isinstance(value, str):
+        return None
+    return sanitize_worker_identifier(value)
+
+
+def _verdict_checker_outcome_ids(verdict: Verdict) -> tuple[str, ...]:
+    """Extract stable, bounded ordinary Judge receipt IDs from a verdict.
+
+    Trace allocation must not infer checker state from free-form feedback or
+    status labels.  Only explicit receipt/job identity fields are admitted,
+    and every value passes the same opaque-ID sanitizer used by Judge
+    provenance.  The result is deterministic and safe to persist in the
+    run-local task state.
+    """
+
+    response = verdict.response if isinstance(verdict.response, Mapping) else {}
+    candidates: list[Any] = [
+        verdict.judge_job_id,
+        response.get("judge_job_id"),
+        response.get("receipt_id"),
+        response.get("outcome_id"),
+        response.get("verifier_receipt_id"),
+        response.get("judge_receipt_id"),
+    ]
+    nested = response.get("response")
+    if isinstance(nested, Mapping):
+        candidates.extend(
+            nested.get(key)
+            for key in (
+                "judge_job_id",
+                "receipt_id",
+                "outcome_id",
+                "verifier_receipt_id",
+                "judge_receipt_id",
+            )
+        )
+    result = {
+        safe
+        for candidate in candidates
+        if (safe := _bound_judge_job_id(candidate)) is not None
+    }
+    return tuple(sorted(result))
+
+
+def _has_job_or_mock_provenance(
+    value: Any,
+    response: Mapping[str, Any],
+    *,
+    allow_mock_provenance: bool,
+) -> bool:
+    """Allow the explicit test-only mock exception without masking bad IDs."""
+
+    if value is None:
+        return bool(
+            allow_mock_provenance
+            and _response_value(response, "mock") is True
+        )
+    return _bound_judge_job_id(value) is not None
 
 
 def _prior_authoritative_proof(
@@ -762,11 +860,16 @@ def _prior_authoritative_proof(
 def _authoritative_proof_matches(
     verdict: Verdict,
     *,
+    expected_task_id: str | None = None,
     candidate_sha256: str,
     task_contract_sha256: str,
 ) -> bool:
     return bool(
         _is_authoritative_proved(verdict)
+        and (
+            expected_task_id is None
+            or verdict.task_id == str(expected_task_id).strip()
+        )
         and _normalized_sha256(verdict.candidate_sha256) == candidate_sha256
         and _normalized_sha256(verdict.task_contract_sha256) == task_contract_sha256
     )
@@ -776,6 +879,72 @@ def _retryable_closeout_infrastructure_failure(verdict: Verdict) -> bool:
     return bool(
         _normalized_verdict_status(verdict) in _RETRYABLE_CLOSEOUT_INFRA_STATUSES
         and _response_value(verdict.response, "retryable") is True
+    )
+
+
+def _is_bound_terminal_candidate_failure(
+    evaluator: Any,
+    task: Task,
+    candidate: _FrozenCandidate,
+    verdict: Verdict,
+) -> bool:
+    """Recognize a job-bound terminal failure for the frozen candidate.
+
+    ``RESOURCE_LIMIT`` and ``EXECUTION_TIMEOUT`` are Judge outcomes of the
+    submitted candidate, even when a provider adds a ``retryable`` hint.  A
+    prior proof must therefore not turn a fresh, candidate-bound failure into
+    an authority contradiction or an infrastructure failure.  Require the
+    same provenance tuple used for authoritative receipts so malformed or
+    unbound envelopes do not silently enter this path.
+    """
+
+    if _normalized_verdict_status(verdict) not in {
+        "RESOURCE_LIMIT",
+        "EXECUTION_TIMEOUT",
+    }:
+        return False
+    if verdict.task_id != task.slug:
+        return False
+    candidate_sha = _normalized_sha256(candidate.sha256)
+    observed_candidate_sha = _normalized_sha256(verdict.candidate_sha256)
+    if candidate_sha is None or observed_candidate_sha != candidate_sha:
+        return False
+    try:
+        expected_contract = _normalized_sha256(_expected_task_contract(evaluator, task))
+    except Exception:
+        expected_contract = None
+    observed_contract = _normalized_sha256(verdict.task_contract_sha256)
+    if expected_contract is None or observed_contract != expected_contract:
+        return False
+    # Candidate/task/job provenance is the binding evidence.  Provider hints
+    # such as ``retryable`` and free-form ``terminal_reason`` values are not
+    # authoritative classifiers and must not turn a bound Judge outcome into
+    # infrastructure noise.  Explicitly marked legacy mock evaluators have no
+    # remote job id, but their mock marker is the test-only equivalent of that
+    # receipt binding.
+    return _has_job_or_mock_provenance(
+        verdict.judge_job_id,
+        verdict.response,
+        allow_mock_provenance=_allows_mock_provenance(evaluator),
+    )
+
+
+def _mark_closeout_candidate_attempt(observed: Verdict) -> Verdict:
+    """Mark a bound terminal Judge result as ordinary candidate feedback."""
+
+    response = dict(observed.response)
+    response["closeout_candidate_attempt"] = True
+    return Verdict(
+        task_id=observed.task_id,
+        status=observed.status,
+        score=0.0,
+        elapsed_seconds=observed.elapsed_seconds,
+        response=response,
+        error=observed.error,
+        candidate_sha256=observed.candidate_sha256,
+        task_contract_sha256=observed.task_contract_sha256,
+        judge_job_id=observed.judge_job_id,
+        cache_reused=observed.cache_reused,
     )
 
 
@@ -905,6 +1074,12 @@ def _verdict_priority(verdict: Verdict | None) -> tuple[int, float]:
 _AUTHORITATIVE_CANDIDATE_STATUSES = frozenset(
     {"PROVED", "COMPILES_WITH_SORRY", "VERIFY_FAIL"}
 )
+_JOB_BOUND_CANDIDATE_ATTEMPT_STATUSES = frozenset(
+    {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
+)
+_CANDIDATE_ATTEMPT_STATUSES = (
+    _AUTHORITATIVE_CANDIDATE_STATUSES | _JOB_BOUND_CANDIDATE_ATTEMPT_STATUSES
+)
 _INFRASTRUCTURE_VERDICT_STATUSES = frozenset(
     {
         "EVALUATOR_ERROR",
@@ -934,13 +1109,11 @@ _MANIFEST_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+\.toml")
 
 def _is_infrastructure_verdict(verdict: Verdict) -> bool:
     status = normalize_verdict_status(verdict.status)
-    return bool(
-        status in _INFRASTRUCTURE_VERDICT_STATUSES
-        or (
-            status in {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
-            and _response_value(verdict.response, "retryable") is True
-        )
-    )
+    # Candidate-bound terminal Judge statuses are ordinary zero-progress
+    # attempts even when a provider supplies a retryable hint.  Only statuses
+    # in the explicit infrastructure set (which carry candidate-independent
+    # evidence) may degrade the arm.
+    return status in _INFRASTRUCTURE_VERDICT_STATUSES
 
 
 def _runtime_provenance(
@@ -1087,18 +1260,46 @@ def _has_authoritative_provenance(
     verdict: Verdict,
     candidate: Path,
     *,
+    expected_task_id: str,
     expected_task_contract_sha256: str,
     allow_mock_provenance: bool,
 ) -> bool:
+    return bool(
+        normalize_verdict_status(verdict.status)
+        in _AUTHORITATIVE_CANDIDATE_STATUSES
+        and _has_candidate_attempt_provenance(
+            verdict,
+            candidate,
+            expected_task_id=expected_task_id,
+            expected_task_contract_sha256=expected_task_contract_sha256,
+            allow_mock_provenance=allow_mock_provenance,
+        )
+    )
+
+
+def _has_candidate_attempt_provenance(
+    verdict: Verdict,
+    candidate: Path,
+    *,
+    expected_task_id: str,
+    expected_task_contract_sha256: str,
+    allow_mock_provenance: bool,
+) -> bool:
+    """Validate a terminal Judge receipt against exact candidate bytes."""
+
     candidate_hash = str(verdict.candidate_sha256 or "").lower()
     contract_hash = str(verdict.task_contract_sha256 or "").lower()
+    expected_id = str(expected_task_id).strip()
     return bool(
-        normalize_verdict_status(verdict.status) in _AUTHORITATIVE_CANDIDATE_STATUSES
+        normalize_verdict_status(verdict.status) in _CANDIDATE_ATTEMPT_STATUSES
+        and expected_id
+        and verdict.task_id == expected_id
         and _SHA256_RE.fullmatch(candidate_hash)
         and contract_hash == expected_task_contract_sha256
-        and (
-            verdict.judge_job_id
-            or (allow_mock_provenance and verdict.response.get("mock") is True)
+        and _has_job_or_mock_provenance(
+            verdict.judge_job_id,
+            verdict.response,
+            allow_mock_provenance=allow_mock_provenance,
         )
         and _file_sha256(candidate) == candidate_hash
     )
@@ -1108,6 +1309,7 @@ def _has_authoritative_snapshot_provenance(
     verdict: Verdict,
     snapshot: CandidateSnapshot,
     *,
+    expected_task_id: str,
     expected_task_contract_sha256: str,
     allow_mock_provenance: bool,
 ) -> bool:
@@ -1118,11 +1320,14 @@ def _has_authoritative_snapshot_provenance(
     return bool(
         normalize_verdict_status(verdict.status) == "PROVED"
         and float(verdict.score) >= 1.0
+        and str(expected_task_id).strip()
+        and verdict.task_id == str(expected_task_id).strip()
         and _SHA256_RE.fullmatch(candidate_hash)
         and contract_hash == expected_task_contract_sha256
-        and (
-            verdict.judge_job_id
-            or (allow_mock_provenance and verdict.response.get("mock") is True)
+        and _has_job_or_mock_provenance(
+            verdict.judge_job_id,
+            verdict.response,
+            allow_mock_provenance=allow_mock_provenance,
         )
         and candidate_hash == snapshot.sha256
     )
@@ -1132,6 +1337,7 @@ def _enforce_verdict_provenance(
     verdict: Verdict,
     candidate: Path,
     *,
+    expected_task_id: str,
     expected_task_contract_sha256: str,
     allow_mock_provenance: bool,
 ) -> Verdict:
@@ -1139,11 +1345,12 @@ def _enforce_verdict_provenance(
 
     status = normalize_verdict_status(verdict.status)
     requires_provenance = (
-        status in _AUTHORITATIVE_CANDIDATE_STATUSES or float(verdict.score) > 0.0
+        status in _CANDIDATE_ATTEMPT_STATUSES or float(verdict.score) > 0.0
     )
-    if not requires_provenance or _has_authoritative_provenance(
+    if not requires_provenance or _has_candidate_attempt_provenance(
         verdict,
         candidate,
+        expected_task_id=expected_task_id,
         expected_task_contract_sha256=expected_task_contract_sha256,
         allow_mock_provenance=allow_mock_provenance,
     ):
@@ -1159,7 +1366,7 @@ def _enforce_verdict_provenance(
             "reported_candidate_sha256": verdict.candidate_sha256,
             "actual_candidate_sha256": _file_sha256(candidate),
         },
-        error="authoritative or positive verdict failed candidate-bound provenance checks",
+        error="candidate attempt or positive verdict failed candidate-bound provenance checks",
         candidate_sha256=verdict.candidate_sha256,
         task_contract_sha256=verdict.task_contract_sha256,
         judge_job_id=verdict.judge_job_id,
@@ -1217,7 +1424,7 @@ def _publish_authoritative_validation(
     contract_hash = str(verdict.task_contract_sha256 or "").lower()
     if (
         not policy.enabled
-        or normalize_verdict_status(verdict.status) not in _AUTHORITATIVE_CANDIDATE_STATUSES
+        or normalize_verdict_status(verdict.status) not in _CANDIDATE_ATTEMPT_STATUSES
         or not _SHA256_RE.fullmatch(candidate_hash)
         or not _SHA256_RE.fullmatch(contract_hash)
         or not (verdict.judge_job_id or verdict.response.get("mock") is True)
@@ -1282,9 +1489,23 @@ def _allocation_runtime_metrics(
     max_parallel: int,
     policy_latency_seconds: float,
 ) -> dict[str, Any]:
+    events = tuple(history)
+    converted_agent_ids = {
+        str(event.get("agent_id") or "")
+        for event in events
+        if str(event.get("event") or "") == "reservation_completed"
+        and str(event.get("outcome") or "") == "converted_to_solver"
+        and str(event.get("agent_id") or "")
+    }
     admitted: dict[str, tuple[str, float]] = {}
     finished: dict[str, float] = {}
-    for event in history:
+    reservations: dict[str, tuple[int, float]] = {}
+    reservation_seconds = 0.0
+    reservation_count = 0
+    reservation_outcomes: Counter[str] = Counter()
+    occupied = 0
+    max_occupied = 0
+    for event in events:
         event_type = str(event.get("event") or "")
         agent_id = str(event.get("agent_id") or "")
         if event_type == "agent_admitted" and agent_id:
@@ -1292,8 +1513,45 @@ def _allocation_runtime_metrics(
                 str(event.get("task_id") or ""),
                 float(event.get("admitted_at") or run_started_monotonic),
             )
+            if agent_id not in converted_agent_ids:
+                occupied += 1
+            max_occupied = max(max_occupied, occupied)
         elif event_type == "agent_finished" and agent_id:
             finished[agent_id] = float(event.get("finished_at") or deadline)
+            if agent_id in admitted:
+                occupied = max(0, occupied - 1)
+        elif event_type == "reservation_acquired":
+            reservation_id = str(event.get("reservation_id") or "")
+            if reservation_id:
+                slots = int(event.get("slots") or 0)
+                reservations[reservation_id] = (
+                    slots,
+                    float(event.get("acquired_at") or run_started_monotonic),
+                )
+                reservation_count += 1
+                occupied += slots
+                max_occupied = max(max_occupied, occupied)
+        elif event_type == "reservation_completed":
+            reservation_id = str(event.get("reservation_id") or "")
+            held = reservations.get(reservation_id)
+            if held is not None:
+                slots, started = held
+                completed = float(event.get("completed_at") or deadline)
+                completed_slots = int(event.get("slots") or slots)
+                completed_slots = min(slots, max(0, completed_slots))
+                reservation_seconds += completed_slots * max(
+                    0.0,
+                    min(deadline, completed) - max(run_started_monotonic, started),
+                )
+                outcome = str(event.get("outcome") or "unknown")
+                remaining = slots - completed_slots
+                if remaining:
+                    reservations[reservation_id] = (remaining, started)
+                else:
+                    reservations.pop(reservation_id, None)
+                if outcome != "converted_to_solver":
+                    occupied = max(0, occupied - completed_slots)
+                reservation_outcomes[outcome] += 1
     per_task: dict[str, float] = {}
     solver_seconds = 0.0
     for agent_id, (task_id, started) in admitted.items():
@@ -1304,12 +1562,32 @@ def _allocation_runtime_metrics(
         per_task[task_id] = per_task.get(task_id, 0.0) + duration
     capacity_seconds = max(0.0, deadline - run_started_monotonic) * max_parallel
     solver_utilization = solver_seconds / capacity_seconds if capacity_seconds else 0.0
-    compute_seconds = solver_seconds + max(0.0, policy_latency_seconds)
+    for slots, started in reservations.values():
+        reservation_seconds += slots * max(
+            0.0, min(deadline, deadline) - max(run_started_monotonic, started)
+        )
+    # Provider/model latency and reserved CPS capacity are deliberately
+    # separate.  A zero-duration reservation is still zero slot-seconds;
+    # policy latency must never be substituted as capacity occupancy.
+    scheduler_compute_seconds = reservation_seconds
+    compute_seconds = solver_seconds + scheduler_compute_seconds
     compute_utilization = compute_seconds / capacity_seconds if capacity_seconds else 0.0
+    if compute_seconds > capacity_seconds + max(1e-9, capacity_seconds * 1e-9):
+        raise RuntimeError("solver plus scheduler occupancy exceeded CPS capacity")
+    if max_occupied > max_parallel:
+        raise RuntimeError("observed occupied slots exceeded CPS capacity")
     return {
         "solver_agent_seconds": round(solver_seconds, 6),
-        "scheduler_compute_seconds": round(max(0.0, policy_latency_seconds), 6),
+        "scheduler_compute_seconds": round(scheduler_compute_seconds, 6),
+        "scheduler_reserved_slot_seconds": round(reservation_seconds, 6),
+        "scheduler_capacity_reservations": reservation_count,
+        "scheduler_reservation_outcomes": dict(sorted(reservation_outcomes.items())),
+        "scheduler_policy_latency_seconds": round(
+            max(0.0, policy_latency_seconds), 6
+        ),
         "capacity_seconds": round(capacity_seconds, 6),
+        "occupied_slot_seconds": round(compute_seconds, 6),
+        "max_occupied_slots": max_occupied,
         "solver_slot_utilization": round(min(1.0, solver_utilization), 8),
         "compute_slot_utilization": round(min(1.0, compute_utilization), 8),
         "per_task_agent_seconds": {
@@ -1318,7 +1596,87 @@ def _allocation_runtime_metrics(
     }
 
 
-def _scheduler_token_usage(trace_path: Path) -> dict[str, int]:
+def _scheduler_decision_ledger(
+    rows: Iterable[Mapping[str, Any]],
+) -> dict[str, int]:
+    """Derive LLM scheduler counters from the charged decision ledger.
+
+    ``scheduler_outcome`` describes the provider invocation, while
+    ``disposition`` describes the runner's admission lifecycle.  A valid call
+    can therefore finish with ``scheduler_outcome=accepted`` but
+    ``disposition=not_admitted_horizon`` when it crosses the fixed run
+    deadline during admission revalidation.  Figure 4 artifacts must count
+    that as a horizon truncation consistently across all summary layers.
+
+    Only rows carrying one scheduler-cost object are charged.  The helper is
+    deliberately literal about boolean fields so malformed artifact values do
+    not silently turn into valid counters; the closeout validator reports the
+    corresponding lifecycle mismatch separately.
+    """
+
+    charged = [
+        row
+        for row in rows
+        if str(row.get("policy") or "") == "llm_scheduler"
+        and row.get("scheduler_cost") is not None
+    ]
+    return {
+        "calls": len(charged),
+        "fallback_count": sum(row.get("fallback") is True for row in charged),
+        "invalid_outputs": sum(
+            row.get("invalid_output") is True
+            or str(row.get("scheduler_outcome") or "") == "invalid_output"
+            or (
+                row.get("fallback") is True
+                and "scheduler output" in str(row.get("fallback_reason") or "")
+            )
+            for row in charged
+        ),
+        "provider_errors": sum(
+            str(row.get("scheduler_outcome") or "") == "provider_error"
+            or row.get("recoverable_invocation_error") is True
+            for row in charged
+        ),
+        "policy_timeouts": sum(
+            str(row.get("scheduler_outcome") or "") == "policy_timeout"
+            for row in charged
+        ),
+        "horizon_truncations": sum(
+            str(row.get("scheduler_outcome") or "") == "horizon_truncated"
+            or row.get("agent_run_horizon_reached") is True
+            or row.get("run_horizon_reached") is True
+            or str(row.get("disposition") or "") == "not_admitted_horizon"
+            for row in charged
+        ),
+    }
+
+
+def _scheduler_call_id_is_valid(value: Any) -> bool:
+    """Validate the bounded textual shape used by scheduler lifecycle joins."""
+
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip()
+    if not normalized or len(normalized) > 512:
+        return False
+    return not any(
+        ord(char) < 0x20 or ord(char) == 0x7F for char in normalized
+    )
+
+
+def _pi_token_usage(
+    trace_path: Path,
+    *,
+    scheduler: bool | None = None,
+) -> dict[str, int]:
+    """Aggregate per-session token high-water marks without double counting.
+
+    Pi emits cumulative usage on multiple events.  Maxima within each stable
+    session are additive across sessions.  ``scheduler`` partitions allocation
+    model sessions from solver sessions so Figure 4 never attributes one
+    model's tokens to the other.
+    """
+
     per_session: dict[str, dict[str, int]] = {}
     try:
         lines = trace_path.read_text(encoding="utf-8").splitlines()
@@ -1329,22 +1687,252 @@ def _scheduler_token_usage(trace_path: Path) -> dict[str, int]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not str(row.get("actor_id") or "").startswith("allocation-scheduler-"):
+        actor_id = str(row.get("actor_id") or "")
+        is_scheduler = actor_id.startswith("allocation-scheduler-")
+        if scheduler is not None and is_scheduler is not scheduler:
             continue
-        session = str(row.get("session_id") or row.get("actor_id") or "unknown")
+        session = str(row.get("session_id") or actor_id or "unknown")
         usage = per_session.setdefault(session, {})
         for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens"):
             value = row.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 usage[key] = max(usage.get(key, 0), value)
+    input_tokens = sum(row.get("input_tokens", 0) for row in per_session.values())
+    output_tokens = sum(row.get("output_tokens", 0) for row in per_session.values())
     return {
-        "scheduler_model_sessions": len(per_session),
-        "scheduler_input_tokens": sum(row.get("input_tokens", 0) for row in per_session.values()),
-        "scheduler_output_tokens": sum(row.get("output_tokens", 0) for row in per_session.values()),
-        "scheduler_cache_read_tokens": sum(row.get("cache_read_tokens", 0) for row in per_session.values()),
-        "scheduler_cache_write_tokens": sum(row.get("cache_write_tokens", 0) for row in per_session.values()),
-        "scheduler_total_tokens": sum(row.get("total_tokens", 0) for row in per_session.values()),
+        "model_sessions": len(per_session),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": sum(
+            row.get("cache_read_tokens", 0) for row in per_session.values()
+        ),
+        "cache_write_tokens": sum(
+            row.get("cache_write_tokens", 0) for row in per_session.values()
+        ),
+        # Some providers omit totalTokens.  Input + output is the portable
+        # comparison measure and the Figure 4 artifact's exact invariant.
+        "total_tokens": input_tokens + output_tokens,
     }
+
+
+def _scheduler_token_usage(trace_path: Path) -> dict[str, int]:
+    usage = _pi_token_usage(trace_path, scheduler=True)
+    return {f"scheduler_{key}": value for key, value in usage.items()}
+
+
+def _solver_token_usage(trace_path: Path) -> dict[str, int]:
+    usage = _pi_token_usage(trace_path, scheduler=False)
+    return {f"solver_{key}": value for key, value in usage.items()}
+
+
+_FIGURE4_POLICIES = frozenset(
+    {"uniform_refill", "task_state", "trace_state", "llm_scheduler"}
+)
+
+
+def _core_snapshot_from_legacy(
+    snapshot: TaskProgressSnapshot,
+    config: ExperimentConfig,
+    *,
+    scheduler_reserved_slots: int | None = None,
+    owned_scheduler_reservation_slots: int = 0,
+    trace_view: AllocationTraceView | None = None,
+) -> AllocationStateSnapshot:
+    """Project the legacy runner snapshot into the issue #39 immutable API.
+
+    Task-State callers must omit ``trace_view`` and therefore receive an exact
+    zero projection. Trace-State/LLM callers may supply one already-bounded,
+    immutable view from :mod:`allocation_trace_bridge`.
+    """
+
+    tasks = tuple(
+        TaskState(
+            task_id=task.task_id,
+            eligible=task.eligible,
+            active_allocations=task.active_agents,
+            checker_quality=max(0.0, min(1.0, task.best_score)),
+            recent_progress=math.exp(
+                -max(0.0, task.seconds_since_progress)
+                / max(1.0, config.allocation.normalization["progress_window_seconds"])
+            ),
+            starvation=min(
+                1.0,
+                max(0.0, task.seconds_since_last_assignment)
+                / max(1.0, config.allocation.normalization["starvation_window_seconds"]),
+            ),
+            failure_no_progress=min(
+                1.0,
+                max(0, task.consecutive_failures)
+                / max(1.0, config.allocation.normalization["failure_saturation"]),
+            ),
+            trace=(
+                TraceFeatures(**trace_view.for_task(task.task_id).as_core_kwargs())
+                if trace_view is not None
+                else TraceFeatures()
+            ),
+            trace_reference_ids=(
+                trace_view.references_for_task(task.task_id)
+                if trace_view is not None
+                else ()
+            ),
+            trace_source_outcome_ids=(
+                trace_view.for_task(task.task_id).source_outcome_ids
+                if trace_view is not None
+                else ()
+            ),
+            checker_outcome_ids=tuple(task.checker_outcome_ids),
+        )
+        for task in snapshot.tasks
+    )
+    task_weights = config.allocation.task_state
+    trace_weights = config.allocation.trace_state
+    parameters = {
+        "task_state": dict(task_weights),
+        "trace_state": dict(trace_weights),
+        "normalization": dict(config.allocation.normalization),
+        # Prompt bounds are part of the manifest-owned allocation identity,
+        # even for non-LLM arms.  A changed bound must invalidate the same
+        # state/config hash rather than silently reusing an old decision.
+        "prompt_max_bytes": config.allocation.prompt_max_bytes,
+        "prompt_max_tokens": config.allocation.prompt_max_tokens,
+    }
+    allocation_config_sha256 = hashlib.sha256(
+        json.dumps(
+            parameters,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    active_solver_slots = sum(task.active_allocations for task in tasks)
+    # ``TaskProgressSnapshot.free_slots`` is sourced from the elastic
+    # scheduler's *occupied* capacity.  When callers do not pass the explicit
+    # reservation count, recover it from the immutable capacity equation so a
+    # concurrent LLM reservation cannot silently disappear from the core
+    # snapshot.  Explicit values are used for the invoking reservation because
+    # they also carry the owned-slot marker consumed by the LLM gate.
+    if scheduler_reserved_slots is None:
+        scheduler_reserved_slots = max(
+            0,
+            config.max_parallel - active_solver_slots - snapshot.free_slots,
+        )
+    scheduler_reserved_slots = int(scheduler_reserved_slots)
+    owned_scheduler_reservation_slots = int(owned_scheduler_reservation_slots)
+    if scheduler_reserved_slots < 0 or owned_scheduler_reservation_slots < 0:
+        raise ValueError("scheduler reservation counts must be non-negative")
+    free_slots = int(snapshot.free_slots)
+    if active_solver_slots + scheduler_reserved_slots + free_slots != config.max_parallel:
+        # Keep the projection deterministic even when a legacy caller supplied
+        # a stale free-slot count.  The scheduler is authoritative for the
+        # physical reservation count; deriving free capacity here preserves
+        # the core snapshot's conservation invariant.
+        free_slots = max(0, config.max_parallel - active_solver_slots - scheduler_reserved_slots)
+    return AllocationStateSnapshot(
+        decision_id=f"decision-{snapshot.decision_index:08d}",
+        decision_index=snapshot.decision_index,
+        elapsed_seconds=snapshot.elapsed_seconds,
+        remaining_seconds=snapshot.remaining_seconds,
+        total_capacity=config.max_parallel,
+        active_solver_slots=active_solver_slots,
+        scheduler_reserved_slots=scheduler_reserved_slots,
+        free_slots=free_slots,
+        tasks=tasks,
+        owned_scheduler_reservation_slots=owned_scheduler_reservation_slots,
+        trace_watermark=trace_view.watermark if trace_view is not None else "",
+        allocation_config_sha256=allocation_config_sha256,
+        allocation_parameters=parameters,
+    )
+
+
+def _core_state_causal_fingerprint(snapshot: AllocationStateSnapshot) -> str:
+    """Hash all global decision state while ignoring clock-only drift.
+
+    ``elapsed_seconds``/``remaining_seconds`` and the normalized recency and
+    starvation values derived solely from wall-clock age naturally move while
+    a provider reasons.  Treating those fields as stale would reject every
+    otherwise unchanged LLM result.  All other task, trace, watermark,
+    capacity, and manifest fields are causal inputs and therefore remain in
+    this fingerprint, including ineligible tasks.
+    """
+
+    task_rows: list[dict[str, Any]] = []
+    for task in snapshot.tasks:
+        row = task.public_dict(include_trace=True)
+        row.pop("recent_progress", None)
+        row.pop("starvation", None)
+        task_rows.append(row)
+    canonical = {
+        "schema_version": AllocationStateSnapshot.SCHEMA_VERSION,
+        "total_capacity": snapshot.total_capacity,
+        "active_solver_slots": snapshot.active_solver_slots,
+        "scheduler_reserved_slots": snapshot.scheduler_reserved_slots,
+        "owned_scheduler_reservation_slots": snapshot.owned_scheduler_reservation_slots,
+        "free_slots": snapshot.free_slots,
+        "trace_watermark": snapshot.trace_watermark,
+        "allocation_config_sha256": snapshot.allocation_config_sha256,
+        "allocation_parameters": snapshot.public_dict()["allocation_parameters"],
+        "task_order": [task.task_id for task in snapshot.tasks],
+        "tasks": task_rows,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _legacy_decision_from_core(core: Any) -> AllocationDecision:
+    """Keep existing runner/artifact consumers compatible with core decisions."""
+
+    scheduler_outcome = core.scheduler_outcome
+    if core.scheduler_cost is None or scheduler_outcome in {
+        "not_invoked",
+        "horizon_truncated",
+    } or core.agent_run_horizon_reached:
+        agent_result_valid: bool | None = None
+    else:
+        # ``agent_result_valid`` is a legacy projection of the scheduler
+        # outcome, not a claim that a fallback was a valid model response.
+        # Provider errors, policy timeouts, and malformed output are all
+        # failed scheduler attempts and therefore map to False.
+        agent_result_valid = scheduler_outcome == "accepted"
+
+    return AllocationDecision(
+        decision_index=core.decision_index,
+        policy=core.policy,
+        selected_task_id=core.selected_task_id,
+        reason=core.reason,
+        evidence_piece_ids=list(core.trace_reference_ids),
+        latency_seconds=(
+            float(core.scheduler_cost.latency_seconds)
+            if core.scheduler_cost is not None
+            else 0.0
+        ),
+        fallback=core.fallback,
+        fallback_reason=core.fallback_reason,
+        agent_result_valid=agent_result_valid,
+        agent_id=(f"allocation-scheduler-{core.decision_index}" if core.scheduler_cost is not None else ""),
+        agent_task_id="__allocation__" if core.scheduler_cost is not None else "",
+        agent_episode=core.decision_index if core.scheduler_cost is not None else None,
+        scores=dict(core.scores),
+        features={
+            task_id: {"task_score": float(core.task_scores.get(task_id, 0.0)),
+                      "trace_increment": float(core.trace_increments.get(task_id, 0.0))}
+            for task_id in core.scores
+        },
+        agent_run_horizon_reached=bool(
+            getattr(core, "agent_run_horizon_reached", False)
+        ),
+        scheduler_call_id=core.scheduler_call_id,
+        scheduler_outcome=scheduler_outcome,
+        invalid_output=core.invalid_output,
+        recoverable_invocation_error=core.recoverable_invocation_error,
+    )
 
 
 def _runtime_limit_snapshot() -> dict[str, Any]:
@@ -1601,6 +2189,8 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "max_attempts_per_task": config.max_attempts_per_task,
         "assignment_policy": config.assignment_policy,
         "allocation": config.allocation.public_dict(),
+        "selection": config.selection.public_dict(),
+        "figure4_phase": config.figure4_phase,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
         "judge_kind": config.judge_kind,
@@ -1637,6 +2227,9 @@ def run_experiment(
     logger = RunLogger(run_dir)
     manifest_snapshot = config.public_dict()
     manifest_snapshot["run_id"] = run_id
+    # Preserve benchmark order as an explicit comparison input.  Sorting task
+    # IDs in a summary can silently change paired allocation vectors.
+    manifest_snapshot["ordered_task_ids"] = [task.slug for task in tasks]
     manifest_snapshot["started_at"] = utc_now()
     manifest_snapshot["repo_root"] = str(config.repo_root)
     manifest_snapshot["effective_runtime_limits"] = _runtime_limit_snapshot()
@@ -2241,6 +2834,7 @@ def _run_mono(
             if not _has_authoritative_snapshot_provenance(
                 verdict,
                 snapshot,
+                expected_task_id=task.slug,
                 expected_task_contract_sha256=expected_contracts[task.slug],
                 allow_mock_provenance=allow_mock_provenance,
             ):
@@ -2462,6 +3056,7 @@ def _run_mono(
             verdict = _enforce_verdict_provenance(
                 verdict,
                 candidate,
+                expected_task_id=task.slug,
                 expected_task_contract_sha256=expected_contracts[task.slug],
                 allow_mock_provenance=allow_mock_provenance,
             )
@@ -2531,6 +3126,9 @@ def _run_elastic_cps(
     assignments_path = run_dir / "elastic_assignments.jsonl"
     decisions_path = run_dir / "allocation_decisions.jsonl"
     decisions_path.write_text("", encoding="utf-8")
+    audit_path = run_dir / "allocation_audit.jsonl"
+    if config.allocation.policy == "trace_state":
+        audit_path.write_text("", encoding="utf-8")
     roster_path = run_dir / "actors.json"
     roster_lock = threading.RLock()
     allocation_lock = threading.RLock()
@@ -2543,6 +3141,8 @@ def _run_elastic_cps(
     results: list[tuple[AgentResult, Verdict]] = []
     results_lock = threading.RLock()
     scheduler_results_lock = threading.RLock()
+    scheduler_result_decisions: set[int] = set()
+    scheduler_unfinalized_results: dict[int, AgentResult] = {}
     evaluation_backlog_limit = max(
         2,
         config.max_parallel + config.lean_max_concurrent_evaluations,
@@ -2591,6 +3191,180 @@ def _run_elastic_cps(
         # after all broker sessions have been revoked/drained.
         for task_state in states.values():
             task_state.cancel_event.set()
+
+    def record_checker_outcomes(state: _ElasticTaskState, verdict: Verdict) -> None:
+        """Persist only explicit Judge receipt IDs for future projections."""
+
+        outcome_ids = _verdict_checker_outcome_ids(verdict)
+        if not outcome_ids:
+            return
+        with state.lock:
+            state.checker_outcome_ids.update(outcome_ids)
+
+    def record_scheduler_result(result: AgentResult) -> None:
+        """Publish exactly one scheduler result/event for a charged decision."""
+
+        index = result.decision_index
+        if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+            raise RuntimeError("scheduler result is missing a valid decision index")
+        with scheduler_results_lock:
+            if index in scheduler_result_decisions:
+                raise RuntimeError("duplicate scheduler result decision index")
+            scheduler_result_decisions.add(index)
+            scheduler_result_sink.append(result)
+        logger.event("allocation_scheduler_finished", **result.as_dict())
+
+    def stage_scheduler_result(result: AgentResult) -> None:
+        index = result.decision_index
+        if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+            raise RuntimeError("scheduler result is missing a valid decision index")
+        with scheduler_results_lock:
+            if index in scheduler_result_decisions or index in scheduler_unfinalized_results:
+                raise RuntimeError("duplicate scheduler result decision index")
+            scheduler_unfinalized_results[index] = result
+
+    def check_scheduler_result_lifecycle() -> RuntimeError | None:
+        """Return a stable failure when an invoked scheduler result is orphaned.
+
+        Core LLM invocation stages its process result before policy parsing.
+        Every charged decision must consume exactly that staged row (or create
+        one bounded synthetic row for a pre-invocation failure).  Keep this
+        final check independent of the artifact reader in ``_run_health`` so a
+        malformed policy response cannot leave an in-process orphan that is
+        silently discarded when the CPS helper unwinds.
+        """
+
+        with scheduler_results_lock:
+            leftovers = tuple(sorted(scheduler_unfinalized_results))
+            finalized = frozenset(scheduler_result_decisions)
+        if not leftovers:
+            if config.allocation.policy != "llm_scheduler":
+                return None
+            charged_indexes = []
+            for decision in getattr(allocator, "decisions", ()):
+                if getattr(decision, "scheduler_cost", None) is not None:
+                    index = getattr(decision, "decision_index", None)
+                    if (
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or index <= 0
+                    ):
+                        return RuntimeError(
+                            "allocation scheduler charged decision has an invalid index"
+                        )
+                    charged_indexes.append(index)
+            charged = frozenset(charged_indexes)
+            if len(charged_indexes) != len(charged):
+                return RuntimeError(
+                    "allocation scheduler charged decision indexes are duplicated"
+                )
+            if finalized != charged:
+                missing = sorted(charged - finalized)
+                unexpected = sorted(finalized - charged)
+                return RuntimeError(
+                    "allocation scheduler lifecycle cardinality mismatch "
+                    f"(missing={missing[:8]}, unexpected={unexpected[:8]})"
+                )
+            return None
+        # Decision indexes are runner-generated positive integers.  They are
+        # safe to expose as bounded diagnostics and contain no provider data.
+        preview = ",".join(str(index) for index in leftovers[:8])
+        if len(leftovers) > 8:
+            preview += ",..."
+        return RuntimeError(
+            "allocation scheduler lifecycle left unfinalized result(s) "
+            f"(count={len(leftovers)}, indexes={preview})"
+        )
+
+    def _validate_core_decision_index(
+        decision: Any,
+        expected_index: int,
+    ) -> int:
+        """Require a policy result to remain bound to its input snapshot.
+
+        ``AllocationDecision`` validates the *shape* of ``decision_index`` but
+        cannot know which snapshot produced a result.  The runner owns that
+        causal binding.  In particular, do not coerce values here: accepting
+        ``True``, ``"1"`` or ``1.5`` would create lifecycle artifacts that do
+        not correspond to the scheduler reservation which was charged.
+        """
+
+        if (
+            isinstance(expected_index, bool)
+            or not isinstance(expected_index, int)
+            or expected_index <= 0
+        ):
+            raise RuntimeError("scheduler invocation snapshot has an invalid decision index")
+        index = getattr(decision, "decision_index", None)
+        if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+            raise RuntimeError("scheduler decision returned an invalid decision index")
+        if index != expected_index:
+            raise RuntimeError(
+                "scheduler decision index does not match its invocation snapshot"
+            )
+        return index
+
+    def reconcile_scheduler_result(
+        decision: Any,
+        *,
+        expected_index: int | None = None,
+    ) -> None:
+        """Materialize a bounded result when the policy caught an invoker error.
+
+        The pure LLM policy deliberately catches provider/adapter exceptions
+        and returns a charged deterministic fallback.  If the exception was
+        raised before the runner-owned invoker produced an ``AgentResult``, the
+        decision would otherwise have a cost record but no result or finished
+        event.  Synthesize only that missing lifecycle record; never duplicate
+        a result already emitted by the invoker.
+        """
+
+        if expected_index is None:
+            index = getattr(decision, "decision_index", None)
+            if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+                raise RuntimeError("scheduler decision returned an invalid decision index")
+        else:
+            index = _validate_core_decision_index(decision, expected_index)
+        cost = getattr(decision, "scheduler_cost", None)
+        with scheduler_results_lock:
+            # A real invoker result is staged before policy output parsing.  A
+            # policy must not erase the cost record after such an invocation;
+            # doing so would otherwise silently orphan the staged result and
+            # make the scheduler appear to have made no call.
+            if cost is None:
+                if index in scheduler_unfinalized_results:
+                    raise RuntimeError(
+                        "staged scheduler result has no scheduler cost"
+                    )
+                return
+            if index in scheduler_result_decisions:
+                raise RuntimeError("duplicate scheduler result decision index")
+            result = scheduler_unfinalized_results.pop(index, None)
+            if result is None:
+                now = utc_now()
+                result = AgentResult(
+                    agent_id=f"allocation-scheduler-{index}", task_id="__allocation__",
+                    episode=index, returncode=1, started_at=now, finished_at=now,
+                    command=["<scheduler-invocation-failed>"],
+                    error_tail="scheduler invocation ended before a process result was available",
+                    mocked=mock_agent, decision_index=index,
+                )
+            elif (
+                isinstance(result.decision_index, bool)
+                or not isinstance(result.decision_index, int)
+                or result.decision_index != index
+            ):
+                raise RuntimeError(
+                    "staged scheduler result does not match its decision index"
+                )
+            result.scheduler_call_id = str(decision.scheduler_call_id)
+            result.scheduler_outcome = str(decision.scheduler_outcome)
+            result.invalid_output = bool(decision.invalid_output)
+            result.recoverable_invocation_error = bool(decision.recoverable_invocation_error)
+            result.run_horizon_reached = bool(decision.agent_run_horizon_reached)
+            scheduler_result_decisions.add(index)
+            scheduler_result_sink.append(result)
+        logger.event("allocation_scheduler_finished", **result.as_dict())
 
     def invoke_scheduler_agent(
         snapshot: TaskProgressSnapshot,
@@ -2650,12 +3424,255 @@ def _run_elastic_cps(
             if not run_horizon_is_limiter and result.run_horizon_reached:
                 result.run_horizon_reached = False
         result.decision_index = index
-        with scheduler_results_lock:
-            scheduler_result_sink.append(result)
-        logger.event("allocation_scheduler_finished", **result.as_dict())
+        record_scheduler_result(result)
         return result
 
-    if config.allocation.policy == "uniform":
+    def invoke_core_scheduler_agent(
+        snapshot: AllocationStateSnapshot,
+        prompt: str,
+    ) -> LLMSchedulerResponse:
+        started = time.monotonic()
+        actor_id = f"allocation-scheduler-{snapshot.decision_index}"
+        if mock_agent:
+            result = _mock_result(actor_id, "__allocation__", snapshot.decision_index)
+            selected = snapshot.eligible_task_ids[0] if snapshot.eligible_task_ids else ""
+            result.output_tail = json.dumps(
+                {
+                    "decision_id": snapshot.decision_id,
+                    "task_id": selected,
+                    "reason": "mock scheduler decision",
+                    "trace_reference_ids": [],
+                },
+                sort_keys=True,
+            )
+        else:
+            workdir = run_dir / "allocation_scheduler" / f"decision-{snapshot.decision_index:06d}"
+            workdir.mkdir(parents=True, exist_ok=True)
+            policy_deadline = time.monotonic() + config.allocation.agent_timeout_seconds
+            scheduler_deadline = min(deadline, policy_deadline)
+            run_horizon_is_limiter = deadline <= policy_deadline
+            result = pi_agent.run(
+                task_id="__allocation__",
+                actor_id=actor_id,
+                episode=snapshot.decision_index,
+                prompt=prompt,
+                workdir=workdir,
+                deadline_monotonic=scheduler_deadline,
+                isolated=True,
+                cancel_event=run_cancel_event,
+            )
+            result.run_horizon_reached = bool(
+                result.timed_out
+                and run_horizon_is_limiter
+                and time.monotonic() >= deadline
+            )
+        result.decision_index = snapshot.decision_index
+        stage_scheduler_result(result)
+        latency = max(0.0, time.monotonic() - started)
+        return LLMSchedulerResponse(
+            output=result.output_tail,
+            returncode=result.returncode,
+            timed_out=result.timed_out,
+            latency_seconds=latency,
+            occupied_slot_seconds=latency,
+            run_horizon_reached=result.run_horizon_reached,
+        )
+
+    core_decisions: dict[int, tuple[AllocationStateSnapshot, Any]] = {}
+    # Keep one bridge instance for the run, but bind each materialization to
+    # the live selector runtime.  Passing only the SQLite path would bypass
+    # the runtime's pinned/causal snapshot protocol and (when a runtime is
+    # present) fail the bridge's store-identity guard.
+    normalization = config.allocation.normalization
+    trace_parameters = config.allocation.trace_state
+    # The projection adapter consumes the same manifest-owned normalizers as
+    # the core scorer.  Constructing these limits once per run keeps all four
+    # comparison arms on one immutable contract while retaining the bridge's
+    # fail-closed behavior for unavailable stores.
+    trace_projection_bridge = TraceProjectionBridge(
+        limits=TraceProjectionLimits(
+            actionability_saturation=int(normalization["frontier_saturation"]),
+            association_saturation=int(normalization["association_saturation"]),
+            duplicate_saturation=int(normalization["duplicate_saturation"]),
+            refutation_saturation=int(normalization["refutation_saturation"]),
+            staleness_saturation=int(normalization["staleness_saturation"]),
+            lineage_stagnation_saturation=int(
+                normalization["lineage_stagnation_saturation"]
+            ),
+            duplicate_weight=float(trace_parameters["duplicate_component_weight"]),
+            refutation_weight=float(trace_parameters["refutation_component_weight"]),
+            stale_weight=float(trace_parameters["staleness_component_weight"]),
+            lineage_stagnation_weight=float(
+                trace_parameters["lineage_stagnation_component_weight"]
+            ),
+            feedback_kappa=float(normalization["feedback_exposure_floor"]),
+            recency_window_seconds=float(normalization["staleness_window_seconds"]),
+            staleness_window_seconds=float(normalization["staleness_window_seconds"]),
+            stagnation_window_seconds=float(
+                normalization["lineage_stagnation_window_seconds"]
+            ),
+        )
+    )
+
+    # Trace rows may carry event timestamps.  Projection recency and
+    # stagnation must be evaluated at the same fixed wall-clock cut for every
+    # page in one allocation decision; deriving this from each page's newest
+    # row would make the score depend on pagination order.  The run's horizon
+    # origin is an already-pinned epoch/monotonic pair, so elapsed decision
+    # time can be converted without consulting an untrusted source clock.
+    trace_reference_monotonic = time.monotonic()
+    # Align the epoch cut with the runner's horizon origin rather than with
+    # entry to this helper (which may be delayed by setup).  This keeps event
+    # ages comparable to the elapsed time already recorded in snapshots.
+    trace_reference_epoch = time.time() - max(
+        0.0, trace_reference_monotonic - run_started_monotonic
+    )
+    # One immutable as-of time per allocation decision.  The LLM path reads
+    # the projection once before invoking the provider and once during
+    # admission revalidation; both reads must use the same cut or legitimate
+    # recency drift would make every provider response stale.
+    trace_reference_times: dict[int, float] = {}
+
+    def allocation_trace_view(
+        task_ids: Iterable[str],
+        *,
+        reference_time: float | None = None,
+    ) -> AllocationTraceView | None:
+        """Read trace state only for the two registered trace-aware arms."""
+
+        if not policy_reads_trace(config.allocation.policy):
+            return None
+        # The fallback is the bridge call instant and is only used by legacy
+        # test harnesses that invoke this helper outside the scheduler loop.
+        at = reference_time
+        if at is None:
+            at = trace_reference_epoch + max(
+                0.0, time.monotonic() - trace_reference_monotonic
+            )
+        ordinary_outcome_ids: set[str] = set()
+        for state in states.values():
+            with state.lock:
+                ordinary_outcome_ids.update(state.checker_outcome_ids)
+        return trace_projection_bridge.read(
+            task_ids,
+            selection_runtime=selection_runtime,
+            store=None,
+            feedback_values=feedback_values_from_config(config),
+            ordinary_outcome_ids=tuple(sorted(ordinary_outcome_ids)),
+            reference_time=at,
+        )
+
+    class _CoreAllocatorAdapter:
+        def __init__(self, core_policy: Any) -> None:
+            self.core_policy = core_policy
+            self.decisions: list[Any] = []
+
+        def choose(
+            self,
+            legacy_snapshot: TaskProgressSnapshot,
+            *,
+            scheduler_reserved_slots: int | None = None,
+            owned_scheduler_reservation_slots: int = 0,
+        ) -> AllocationDecision:
+            decision_reference_time = trace_reference_epoch + max(
+                0.0, legacy_snapshot.elapsed_seconds
+            )
+            trace_reference_times[legacy_snapshot.decision_index] = (
+                decision_reference_time
+            )
+            trace_view = allocation_trace_view(
+                (item.task_id for item in legacy_snapshot.tasks),
+                reference_time=decision_reference_time,
+            )
+            core_snapshot = _core_snapshot_from_legacy(
+                legacy_snapshot,
+                config,
+                scheduler_reserved_slots=scheduler_reserved_slots,
+                owned_scheduler_reservation_slots=owned_scheduler_reservation_slots,
+                trace_view=trace_view,
+            )
+            core_decision = self.core_policy.choose(core_snapshot)
+            _validate_core_decision_index(
+                core_decision,
+                core_snapshot.decision_index,
+            )
+            reconcile_scheduler_result(
+                core_decision,
+                expected_index=core_snapshot.decision_index,
+            )
+            self.decisions.append(core_decision)
+            core_decisions[core_decision.decision_index] = (core_snapshot, core_decision)
+            return _legacy_decision_from_core(core_decision)
+
+        def fallback(
+            self,
+            legacy_snapshot: TaskProgressSnapshot,
+            reason: str,
+            *,
+            prior: AllocationDecision | None = None,
+        ) -> AllocationDecision:
+            replacement = self.choose(legacy_snapshot)
+            decision = prior or replacement
+            decision.selected_task_id = replacement.selected_task_id
+            decision.fallback = True
+            decision.fallback_reason = _combine_fallback_reasons(
+                decision.fallback_reason, reason
+            )
+            return decision
+
+        def summary(self) -> dict[str, Any]:
+            latencies = [
+                float(item.scheduler_cost.latency_seconds)
+                for item in self.decisions
+                if item.scheduler_cost is not None
+            ]
+            charged = [item for item in self.decisions if item.scheduler_cost is not None]
+            outcomes = Counter(item.scheduler_outcome for item in charged)
+            return {
+                "schema_version": "contextswarm_allocation_summary_v2",
+                "policy": config.allocation.policy,
+                "decision_count": len(self.decisions),
+                "fallback_count": sum(item.fallback for item in charged),
+                "agent_calls": len(charged),
+                "invalid_outputs": sum(item.invalid_output for item in charged),
+                "provider_errors": outcomes.get("provider_error", 0),
+                "policy_timeouts": outcomes.get("policy_timeout", 0),
+                "horizon_truncations": outcomes.get("horizon_truncated", 0),
+                "total_latency_seconds": round(sum(latencies), 6),
+                "max_latency_seconds": round(max(latencies, default=0.0), 6),
+                "scheduler_cost": {
+                    "calls": len(charged),
+                    "reserved_slot_seconds": round(
+                        sum(
+                            float(item.scheduler_cost.occupied_slot_seconds or 0.0)
+                            for item in self.decisions
+                            if item.scheduler_cost is not None
+                        ),
+                        6,
+                    ),
+                    "invalid_outputs": sum(item.invalid_output for item in charged),
+                    "fallback_count": sum(item.fallback for item in charged),
+                    "provider_errors": outcomes.get("provider_error", 0),
+                    "policy_timeouts": outcomes.get("policy_timeout", 0),
+                    "horizon_truncations": outcomes.get("horizon_truncated", 0),
+                },
+            }
+
+    if config.allocation.policy in _FIGURE4_POLICIES:
+        core_policy = create_allocation_policy(
+            config.allocation.policy,
+            task_weights=TaskScoreWeights.from_mapping(config.allocation.task_state),
+            trace_weights=TraceScoreWeights.from_mapping(config.allocation.trace_state),
+            prompt_max_bytes=config.allocation.prompt_max_bytes,
+            prompt_max_tokens=config.allocation.prompt_max_tokens,
+            llm_invoker=(
+                invoke_core_scheduler_agent
+                if config.allocation.policy == "llm_scheduler"
+                else None
+            ),
+        )
+        allocator: Any = _CoreAllocatorAdapter(core_policy)
+    elif config.allocation.policy == "uniform":
         allocator: Any = UniformAllocationPolicy(task_order)
     elif config.allocation.policy == "formula":
         allocator = FormulaAllocationPolicy(task_order, config.allocation.formula)
@@ -2664,11 +3681,27 @@ def _run_elastic_cps(
 
     def build_snapshot(index: int) -> TaskProgressSnapshot:
         now_mono = time.monotonic()
-        cps = store.progress_snapshot(
-            task_order,
-            recent_limit=config.allocation.piece_limit_per_task,
-            body_chars=config.allocation.piece_body_chars,
-        )
+        if config.allocation.policy in _FIGURE4_POLICIES:
+            # The ordinary Figure 4 state is built without consulting the CPS
+            # store. Trace-State/LLM receive projection data through the
+            # selector bridge, never through Task-State recency or counts.
+            cps = {
+                task_id: {
+                    "latest_created_at": "",
+                    "piece_count": 0,
+                    "validation_piece_count": 0,
+                    "strategy_piece_count": 0,
+                    "duplicate_piece_count": 0,
+                    "recent_pieces": [],
+                }
+                for task_id in task_order
+            }
+        else:
+            cps = store.progress_snapshot(
+                task_order,
+                recent_limit=config.allocation.piece_limit_per_task,
+                body_chars=config.allocation.piece_body_chars,
+            )
         scheduler_unsolved = set(scheduler.unsolved_tasks)
         progress_rows: list[TaskProgress] = []
         for task_id in task_order:
@@ -2683,10 +3716,11 @@ def _run_elastic_cps(
                 last_status = state.last_verdict_status
                 last_feedback = state.last_feedback
                 failures = state.consecutive_failures
+                checker_outcome_ids = tuple(sorted(state.checker_outcome_ids))
                 assignment_age = max(0.0, now_mono - state.last_assignment_at)
                 progress_age = max(0.0, now_mono - state.last_progress_at)
             piece_age = _seconds_since_cps_timestamp(str(stats["latest_created_at"]))
-            if piece_age is not None:
+            if config.allocation.policy not in _FIGURE4_POLICIES and piece_age is not None:
                 progress_age = min(progress_age, piece_age)
             capped = config.max_attempts_per_task > 0 and attempts >= config.max_attempts_per_task
             eligible = (
@@ -2718,6 +3752,7 @@ def _run_elastic_cps(
                     strategy_piece_count=int(stats["strategy_piece_count"]),
                     duplicate_piece_count=int(stats["duplicate_piece_count"]),
                     recent_pieces=pieces,
+                    checker_outcome_ids=checker_outcome_ids,
                 )
             )
         return TaskProgressSnapshot(
@@ -2801,6 +3836,30 @@ def _run_elastic_cps(
         }
         if selection_enabled:
             row["selection_config_id"] = config.selection.selection_config_id
+        core_record = core_decisions.get(decision.decision_index)
+        if core_record is not None:
+            core_snapshot, core_decision = core_record
+            row.update(
+                {
+                    "schema_version": "contextswarm_allocation_decision_v2",
+                    "decision_id": core_decision.decision_id,
+                    "state_id": core_decision.state_id,
+                    "eligible_task_ids": list(core_snapshot.eligible_task_ids),
+                    "task_only_scores": dict(core_decision.task_scores),
+                    "trace_increments": dict(core_decision.trace_increments),
+                    "total_scores": dict(core_decision.scores),
+                    "allocation_config_sha256": core_snapshot.allocation_config_sha256,
+                    "scheduler_cost": (
+                        core_decision.scheduler_cost.public_dict()
+                        if core_decision.scheduler_cost is not None
+                        else None
+                    ),
+                    "scheduler_call_id": core_decision.scheduler_call_id,
+                    "scheduler_outcome": core_decision.scheduler_outcome,
+                    "invalid_output": core_decision.invalid_output,
+                    "recoverable_invocation_error": core_decision.recoverable_invocation_error,
+                }
+            )
         if execution_snapshot is not None:
             row["execution_snapshot"] = execution_snapshot.as_dict()
         with decisions_path.open("a", encoding="utf-8") as handle:
@@ -2822,6 +3881,10 @@ def _run_elastic_cps(
             agent_task_id=decision.agent_task_id,
             agent_episode=decision.agent_episode,
             agent_run_horizon_reached=decision.agent_run_horizon_reached,
+            scheduler_call_id=decision.scheduler_call_id,
+            scheduler_outcome=decision.scheduler_outcome,
+            invalid_output=decision.invalid_output,
+            recoverable_invocation_error=decision.recoverable_invocation_error,
             assigned_agent_id=assignment.agent_id if assignment is not None else None,
             disposition=disposition,
             selection_config_id=(
@@ -2872,9 +3935,24 @@ def _run_elastic_cps(
         """Claim one lease; only post-initial claims invoke the treatment policy."""
         nonlocal decision_index
         nonlocal adaptive_assignments
+        # A scheduler reservation belongs to this claim until admission
+        # converts it or an explicit branch releases it.  Keep the handle at
+        # claim scope so exceptions in snapshot/projection/audit code cannot
+        # leak physical capacity.
+        scheduler_reservation = None
         allocation_lock.acquire()
         try:
             while time.monotonic() < deadline:
+                if scheduler_reservation is not None:
+                    # Expected stale/horizon branches release their own
+                    # reservation.  This idempotent guard covers a continue
+                    # or a newly added branch that otherwise carries an old
+                    # handle into the next decision iteration.
+                    scheduler.release_reservation(
+                        scheduler_reservation,
+                        reason="claim_iteration_cleanup",
+                    )
+                    scheduler_reservation = None
                 if _evaluator_remote_unsettled_jobs(evaluator) > 0:
                     record_run_failure()
                     return None
@@ -2895,17 +3973,45 @@ def _run_elastic_cps(
                     return accept_assignment(assignment, phase="initial")
 
                 decision_index += 1
-                snapshot = build_snapshot(decision_index)
-                if not snapshot.eligible_task_ids:
+                pre_reservation_snapshot = build_snapshot(decision_index)
+                if not pre_reservation_snapshot.eligible_task_ids:
                     return None
-                if config.allocation.policy == "agent":
+                if config.allocation.policy == "llm_scheduler":
+                    scheduler_reservation = scheduler.acquire_reservation(
+                        slots=1,
+                        purpose=f"llm_scheduler_decision_{decision_index}",
+                    )
+                    if scheduler_reservation is None:
+                        return None
+                    # Rebuild after acquiring the physical slot.  The prompt
+                    # reports every live reservation and marks exactly the
+                    # invoking slot as owned, so capacity stays conserved even
+                    # when this is the last free slot.
+                    snapshot = build_snapshot(decision_index)
+                else:
+                    snapshot = pre_reservation_snapshot
+                if config.allocation.policy in {"agent", "llm_scheduler"}:
                     # A released solver slot can run its own read-only scheduler
                     # call.  Release only the orchestration lock while the model
                     # reasons so simultaneous completions keep all compute slots
                     # occupied; index/snapshot and final admission remain atomic.
                     allocation_lock.release()
                     try:
-                        decision = allocator.choose(snapshot)
+                        if config.allocation.policy == "llm_scheduler":
+                            decision = allocator.choose(
+                                snapshot,
+                                scheduler_reserved_slots=scheduler.reservation_slots,
+                                owned_scheduler_reservation_slots=1,
+                            )
+                        else:
+                            decision = allocator.choose(snapshot)
+                    except BaseException:
+                        if scheduler_reservation is not None:
+                            scheduler.release_reservation(
+                                scheduler_reservation,
+                                reason="scheduler_exception",
+                            )
+                        raise
                     finally:
                         allocation_lock.acquire()
                 else:
@@ -2915,7 +4021,13 @@ def _run_elastic_cps(
                 retire_exhausted_tasks()
                 assignment = None
                 execution_snapshot: TaskProgressSnapshot | None = None
+                llm_execution_core_snapshot: AllocationStateSnapshot | None = None
                 if decision.agent_run_horizon_reached:
+                    if scheduler_reservation is not None:
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="horizon_reached",
+                        )
                     record_decision(
                         decision,
                         snapshot,
@@ -2923,6 +4035,61 @@ def _run_elastic_cps(
                         disposition="not_admitted_horizon",
                     )
                     return None
+                if config.allocation.policy == "llm_scheduler":
+                    if time.monotonic() >= deadline or scheduler.horizon_reached:
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="horizon_reached",
+                        )
+                        record_decision(
+                            decision,
+                            snapshot,
+                            None,
+                            disposition="not_admitted_horizon",
+                        )
+                        return None
+                    # Revalidate the entire immutable decision state while the
+                    # same capacity slot remains physically held.  Stale model
+                    # output is never silently recomputed or admitted.
+                    execution_snapshot = build_snapshot(snapshot.decision_index)
+                    llm_execution_core_snapshot = _core_snapshot_from_legacy(
+                        execution_snapshot,
+                        config,
+                        scheduler_reserved_slots=scheduler.reservation_slots,
+                        owned_scheduler_reservation_slots=1,
+                        trace_view=allocation_trace_view(
+                            (item.task_id for item in execution_snapshot.tasks),
+                            reference_time=trace_reference_times.get(
+                                decision.decision_index,
+                                trace_reference_epoch
+                                + max(0.0, execution_snapshot.elapsed_seconds),
+                            ),
+                        ),
+                    )
+                    core_record = core_decisions.get(decision.decision_index)
+                    invocation_core_snapshot = core_record[0] if core_record is not None else None
+                    if (
+                        invocation_core_snapshot is None
+                        or _core_state_causal_fingerprint(invocation_core_snapshot)
+                        != _core_state_causal_fingerprint(llm_execution_core_snapshot)
+                    ):
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="stale_decision",
+                        )
+                        record_decision(
+                            decision,
+                            snapshot,
+                            None,
+                            execution_snapshot=execution_snapshot,
+                            disposition="not_admitted_stale",
+                        )
+                        if (
+                            execution_snapshot.eligible_task_ids
+                            and scheduler.remaining_slots > 0
+                        ):
+                            continue
+                        return None
                 valid_agent_decision = (
                     config.allocation.policy == "agent"
                     and decision.agent_result_valid is True
@@ -2961,9 +4128,27 @@ def _run_elastic_cps(
                         return None
                     assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 elif time.monotonic() < deadline and decision.selected_task_id:
-                    assignment = scheduler.next_assignment_for(decision.selected_task_id)
+                    if scheduler_reservation is not None:
+                        try:
+                            assignment = scheduler.admit_reserved(
+                                scheduler_reservation,
+                                decision.selected_task_id,
+                            )
+                        except BaseException:
+                            scheduler.release_reservation(
+                                scheduler_reservation,
+                                reason="admission_exception",
+                            )
+                            raise
+                    else:
+                        assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 if assignment is None and time.monotonic() < deadline:
                     if scheduler.horizon_reached:
+                        if scheduler_reservation is not None:
+                            scheduler.release_reservation(
+                                scheduler_reservation,
+                                reason="horizon_reached",
+                            )
                         record_decision(
                             decision,
                             snapshot,
@@ -2988,6 +4173,31 @@ def _run_elastic_cps(
                         ):
                             continue
                         return None
+                    if scheduler_reservation is not None:
+                        # An LLM choice is relative to the whole bounded state.
+                        # If its reserved admission loses the selected task,
+                        # do not run the generic fallback: that path invokes
+                        # the model again and admits through an unreserved
+                        # solver slot.  Release this call's reservation, log
+                        # the stale attempt, and retry from a fresh state with
+                        # a fresh reservation when capacity remains.
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="decision_became_stale",
+                        )
+                        record_decision(
+                            decision,
+                            snapshot,
+                            None,
+                            execution_snapshot=execution_snapshot,
+                            disposition="not_admitted_stale",
+                        )
+                        if (
+                            execution_snapshot.eligible_task_ids
+                            and scheduler.remaining_slots > 0
+                        ):
+                            continue
+                        return None
                     if not execution_snapshot.eligible_task_ids:
                         # A deterministic decision can legitimately lose its
                         # final target to a peer between snapshot and admit.
@@ -2998,8 +4208,16 @@ def _run_elastic_cps(
                             execution_snapshot=execution_snapshot,
                             disposition="not_admitted_stale",
                         )
+                        if scheduler_reservation is not None:
+                            scheduler.release_reservation(
+                                scheduler_reservation,
+                                reason="no_eligible_tasks",
+                            )
                         return None
-                    if execution_snapshot.eligible_task_ids:
+                    if (
+                        execution_snapshot.eligible_task_ids
+                        and config.allocation.policy != "llm_scheduler"
+                    ):
                         decision = allocator.fallback(
                             execution_snapshot,
                             "selected task became ineligible before admission",
@@ -3008,6 +4226,11 @@ def _run_elastic_cps(
                         if decision.selected_task_id:
                             assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 if assignment is None:
+                    if scheduler_reservation is not None:
+                        scheduler.release_reservation(
+                            scheduler_reservation,
+                            reason="decision_not_admitted",
+                        )
                     record_decision(
                         decision,
                         snapshot,
@@ -3023,10 +4246,54 @@ def _run_elastic_cps(
                     assignment,
                     execution_snapshot=execution_snapshot,
                 )
+                if config.allocation.policy == "trace_state":
+                    core_record = core_decisions.get(decision.decision_index)
+                    if core_record is not None:
+                        core_snapshot, core_decision = core_record
+                        task_counterfactual = create_allocation_policy(
+                            "task_state",
+                            task_weights=TaskScoreWeights.from_mapping(
+                                config.allocation.task_state
+                            ),
+                        ).choose(core_snapshot)
+                        append_allocation_audit(
+                            audit_path,
+                            AllocationAuditRecord.create(
+                                state_id=core_snapshot.state_id,
+                                decision_id=core_snapshot.decision_id,
+                                eligible_task_ids=core_snapshot.eligible_task_ids,
+                                allocation_config_sha256=core_snapshot.allocation_config_sha256,
+                                task_only_scores=core_decision.task_scores,
+                                trace_increments=core_decision.trace_increments,
+                                trace_total_scores=core_decision.scores,
+                                allocation_before={
+                                    task.task_id: task.active_allocations
+                                    for task in core_snapshot.tasks
+                                },
+                                trace_state_selected_task_id=core_decision.selected_task_id,
+                                task_state_selected_task_id=task_counterfactual.selected_task_id,
+                                admitted_task_id=assignment.task_id,
+                                fallback_reason=decision.fallback_reason,
+                                active_slots_before=core_snapshot.active_solver_slots,
+                                active_slots_after=core_snapshot.active_solver_slots + 1,
+                                free_slots_before=core_snapshot.free_slots,
+                                free_slots_after=max(0, core_snapshot.free_slots - 1),
+                                scheduler_reserved_slots_before=core_snapshot.scheduler_reserved_slots,
+                                scheduler_reserved_slots_after=core_snapshot.scheduler_reserved_slots,
+                                total_capacity=core_snapshot.total_capacity,
+                            ),
+                        )
                 return assignment
             return None
         finally:
-            allocation_lock.release()
+            try:
+                if scheduler_reservation is not None:
+                    scheduler.release_reservation(
+                        scheduler_reservation,
+                        reason="claim_exit_cleanup",
+                    )
+            finally:
+                allocation_lock.release()
 
     def prepare_workspace(state: _ElasticTaskState, assignment: AgentAssignment) -> tuple[Path, Path]:
         workdir = state.task_root / "agents" / assignment.agent_id
@@ -3065,6 +4332,7 @@ def _run_elastic_cps(
             a positive scoreboard row, and cancel peers.
             """
 
+            record_checker_outcomes(state, verdict)
             with allocation_lock:
                 with state.lock:
                     if state.solved:
@@ -3168,6 +4436,7 @@ def _run_elastic_cps(
                 if proved_task.slug != task.slug or not _has_authoritative_snapshot_provenance(
                     verdict,
                     snapshot,
+                    expected_task_id=task.slug,
                     expected_task_contract_sha256=expected_contracts[task.slug],
                     allow_mock_provenance=allow_mock_provenance,
                 ):
@@ -3380,18 +4649,26 @@ def _run_elastic_cps(
             verdict = _enforce_verdict_provenance(
                 verdict,
                 candidate_path,
+                expected_task_id=task.slug,
                 expected_task_contract_sha256=expected_contracts[task.slug],
                 allow_mock_provenance=allow_mock_provenance,
             )
+            record_checker_outcomes(state, verdict)
 
-        candidate_is_usable = _has_authoritative_provenance(
+        candidate_attempt_is_bound = _has_candidate_attempt_provenance(
             verdict,
             candidate_path,
+            expected_task_id=task.slug,
             expected_task_contract_sha256=expected_contracts[task.slug],
             allow_mock_provenance=allow_mock_provenance,
         )
+        candidate_can_promote = (
+            candidate_attempt_is_bound
+            and normalize_verdict_status(verdict.status)
+            in _AUTHORITATIVE_CANDIDATE_STATUSES
+        )
         feedback = _allocation_feedback(verdict)
-        proof_candidate = verdict.score >= 1.0 and candidate_is_usable
+        proof_candidate = verdict.score >= 1.0 and candidate_can_promote
         if proof_candidate:
             admitted = admit_task_proof(
                 verdict,
@@ -3453,7 +4730,7 @@ def _run_elastic_cps(
                 else:
                     prior_priority = _verdict_priority(state.best_verdict)
                     improved = (
-                        candidate_is_usable
+                        candidate_can_promote
                         and _verdict_priority(verdict) > prior_priority
                     )
                     state.last_verdict_status = verdict.status
@@ -3481,7 +4758,7 @@ def _run_elastic_cps(
                             prior_priority=list(prior_priority),
                             new_priority=list(_verdict_priority(verdict)),
                         )
-                    elif candidate_is_usable:
+                    elif candidate_attempt_is_bound:
                         state.consecutive_failures += 1
 
         if superseded:
@@ -3685,7 +4962,18 @@ def _run_elastic_cps(
         # a bounded queue join, not a solver-slot join.
         evaluation_executor.shutdown(wait=True, cancel_futures=False)
 
+    # Do this check after all worker/evaluator futures have settled.  A worker
+    # exception may interrupt policy reconciliation, but it must not make a
+    # staged scheduler process result disappear without a terminal runner
+    # failure being recorded.
+    lifecycle_failure = check_scheduler_result_lifecycle()
+    # Preserve the runner's stable worker/admission failure contract when a
+    # worker already latched the fatal bit.  The lifecycle probe above still
+    # observes and reports orphaned staged rows in the no-worker-error case;
+    # it must not mask the primary failure with a secondary cleanup message.
     callback_failure.raise_if_failed()
+    if lifecycle_failure is not None:
+        raise lifecycle_failure
 
     seen_tasks = {verdict.task_id for _, verdict in results}
     for task in tasks:
@@ -3701,16 +4989,65 @@ def _run_elastic_cps(
         encoding="utf-8",
     )
     allocation_summary = allocator.summary()
-    allocation_summary.update(
-        _allocation_runtime_metrics(
-            scheduler.history(),
-            run_started_monotonic=run_started_monotonic,
-            deadline=deadline,
-            max_parallel=config.max_parallel,
-            policy_latency_seconds=float(allocation_summary["total_latency_seconds"]),
-        )
+    runtime_metrics = _allocation_runtime_metrics(
+        scheduler.history(),
+        run_started_monotonic=run_started_monotonic,
+        deadline=deadline,
+        max_parallel=config.max_parallel,
+        policy_latency_seconds=float(allocation_summary["total_latency_seconds"]),
     )
+    allocation_summary.update(runtime_metrics)
+    # The charged allocation-decision log is the authoritative outcome
+    # ledger.  In particular, a provider call may be accepted but lose the
+    # fixed-horizon admission race; retain that lifecycle outcome in every
+    # public counter section instead of relying on the in-memory scheduler
+    # outcome alone.
+    decision_rows, decision_rows_valid = _read_jsonl_objects(decisions_path)
+    if decision_rows_valid and config.allocation.policy == "llm_scheduler":
+        scheduler_ledger = _scheduler_decision_ledger(decision_rows)
+        for key in (
+            "fallback_count",
+            "invalid_outputs",
+            "provider_errors",
+            "policy_timeouts",
+            "horizon_truncations",
+        ):
+            allocation_summary[key] = scheduler_ledger[key]
+    # Keep the nested cost object and the top-level lifecycle metrics on one
+    # ledger.  Per-call model latency is not a capacity measure; only the
+    # reservation history determines occupied slot-seconds.
+    scheduler_cost_summary = dict(allocation_summary.get("scheduler_cost") or {})
+    scheduler_cost_summary.update(
+        {
+            "calls": int(allocation_summary.get("agent_calls", 0)),
+            "latency_seconds": float(allocation_summary["total_latency_seconds"]),
+            "capacity_reservations": int(
+                runtime_metrics["scheduler_capacity_reservations"]
+            ),
+            "occupied_capacity_slot_seconds": float(
+                runtime_metrics["scheduler_reserved_slot_seconds"]
+            ),
+            "reserved_slot_seconds": float(
+                runtime_metrics["scheduler_reserved_slot_seconds"]
+            ),
+        }
+    )
+    if decision_rows_valid and config.allocation.policy == "llm_scheduler":
+        scheduler_cost_summary.update(
+            {
+                key: scheduler_ledger[key]
+                for key in (
+                    "fallback_count",
+                    "invalid_outputs",
+                    "provider_errors",
+                    "policy_timeouts",
+                    "horizon_truncations",
+                )
+            }
+        )
+    allocation_summary["scheduler_cost"] = scheduler_cost_summary
     allocation_summary.update(_scheduler_token_usage(run_dir / "pi_events.jsonl"))
+    allocation_summary.update(_solver_token_usage(run_dir / "pi_events.jsonl"))
     allocation_summary["initial_pool_size"] = len(initial_assignments)
     allocation_summary["initial_assignments"] = initial_assignment_count
     allocation_summary["adaptive_assignments"] = adaptive_assignments
@@ -3799,6 +5136,7 @@ def _run_task_workers(
                 if proved_task.slug != task.slug or not _has_authoritative_snapshot_provenance(
                     verdict,
                     snapshot,
+                    expected_task_id=task.slug,
                     expected_task_contract_sha256=expected_contract,
                     allow_mock_provenance=allow_mock_provenance,
                 ):
@@ -4055,6 +5393,7 @@ def _run_task_workers(
                 verdict = _enforce_verdict_provenance(
                     verdict,
                     candidate_path,
+                    expected_task_id=task.slug,
                     expected_task_contract_sha256=expected_contract,
                     allow_mock_provenance=allow_mock_provenance,
                 )
@@ -4456,6 +5795,7 @@ def _evaluate_closeout_candidate(
     return _enforce_verdict_provenance(
         verdict,
         candidate.path,
+        expected_task_id=task.slug,
         expected_task_contract_sha256=_expected_task_contract(evaluator, task),
         allow_mock_provenance=_allows_mock_provenance(evaluator),
     )
@@ -4524,6 +5864,23 @@ def _run_closeout(
                 "remote_settlement_unconfirmed",
                 mismatch,
             )
+        # A job-bound terminal resource/timeout receipt is ordinary
+        # candidate-attempt feedback even when no earlier solver authority is
+        # available.  Classify it before the prior-authority branch so health
+        # and scoreboard semantics are identical for both paths.
+        if _is_bound_terminal_candidate_failure(
+            evaluator,
+            task,
+            candidate,
+            observed,
+        ):
+            return _CloseoutDecision(
+                _mark_closeout_candidate_attempt(observed),
+                observed,
+                prior,
+                "evaluated",
+                mismatch,
+            )
         if prior is None:
             return _CloseoutDecision(
                 observed,
@@ -4538,6 +5895,7 @@ def _run_closeout(
         assert candidate_sha is not None and contract_sha is not None
         if _authoritative_proof_matches(
             observed,
+            expected_task_id=task.slug,
             candidate_sha256=candidate_sha,
             task_contract_sha256=contract_sha,
         ):
@@ -4763,6 +6121,19 @@ def _read_jsonl_objects(path: Path) -> tuple[list[dict[str, Any]], bool]:
     return rows, True
 
 
+def _artifact_nonnegative_int(value: Any) -> int | None:
+    """Return a strict JSON integer used by closeout ledgers, or ``None``.
+
+    Artifact validation must not accept booleans, integral-looking floats, or
+    numeric strings: accepting those shapes would hide schema corruption at
+    the exact point where capacity conservation is audited.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def _run_health(
     run_dir: Path,
     config: ExperimentConfig,
@@ -4804,14 +6175,9 @@ def _run_health(
     }
     for verdict in verdicts.values():
         status = normalize_verdict_status(verdict.status)
-        retryable_terminal_limit = bool(
-            status in {"EXECUTION_TIMEOUT", "RESOURCE_LIMIT"}
-            and _response_value(verdict.response, "retryable") is True
-        )
         if (
             status in incomplete_closeout_statuses
             or status in _NONTERMINAL_VERDICT_STATUSES
-            or retryable_terminal_limit
         ):
             issues.add("closeout_incomplete")
         if status == "AUTHORITY_CONFLICT":
@@ -4971,8 +6337,21 @@ def _run_health(
     assigned_count = finished_count = evaluated_count = 0
     scheduler_invalid_outputs = 0
     scheduler_fallbacks = 0
+    scheduler_provider_errors = 0
     scheduler_summary_agent_calls: int | None = None
+    scheduler_summary_cost_calls: int | None = None
+    scheduler_summary_cost_provider_errors: int | None = None
+    scheduler_summary_cost_invalid_outputs: int | None = None
+    scheduler_summary_cost_fallback_count: int | None = None
+    scheduler_summary_cost_policy_timeouts: int | None = None
+    scheduler_summary_cost_horizon_truncations: int | None = None
+    scheduler_charged_decisions = 0
+    llm_call_id_errors = 0
     scheduler_active_slots: int | None = None
+    scheduler_reservation_slots: int | None = None
+    scheduler_occupied_slots: int | None = None
+    scheduler_remaining_slots: int | None = None
+    scheduler_reservation_leak_count = 0
     if config.uses_cps:
         decisions, decisions_valid = _read_jsonl_objects(
             run_dir / "allocation_decisions.jsonl"
@@ -4995,6 +6374,14 @@ def _run_health(
             )
             for row in agent_decisions
         )
+        llm_decision_indexes = Counter(
+            str(row.get("decision_index"))
+            for row in decisions
+            if str(row.get("policy") or "") == "llm_scheduler"
+            and row.get("scheduler_cost") is not None
+        )
+        scheduler_charged_decisions = sum(llm_decision_indexes.values())
+        scheduler_ledger = _scheduler_decision_ledger(decisions)
         try:
             allocation_summary = json.loads(
                 (run_dir / "allocation_summary.json").read_text(encoding="utf-8")
@@ -5002,7 +6389,44 @@ def _run_health(
             if isinstance(allocation_summary, Mapping):
                 raw_agent_calls = allocation_summary.get("agent_calls")
                 if raw_agent_calls is not None:
-                    scheduler_summary_agent_calls = int(raw_agent_calls)
+                    scheduler_summary_agent_calls = _artifact_nonnegative_int(
+                        raw_agent_calls
+                    )
+                raw_scheduler_cost = allocation_summary.get("scheduler_cost")
+                if isinstance(raw_scheduler_cost, Mapping):
+                    # Keep the nested scheduler-cost ledger on the same
+                    # strict artifact boundary as the top-level counters.
+                    # In particular, do not accept ``True``, ``4.0``, or
+                    # ``"4"`` as a call count: those shapes can conceal a
+                    # forged or partially-written closeout summary.
+                    scheduler_summary_cost_calls = _artifact_nonnegative_int(
+                        raw_scheduler_cost.get("calls")
+                    )
+                    scheduler_summary_cost_provider_errors = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("provider_errors")
+                        )
+                    )
+                    scheduler_summary_cost_invalid_outputs = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("invalid_outputs")
+                        )
+                    )
+                    scheduler_summary_cost_fallback_count = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("fallback_count")
+                        )
+                    )
+                    scheduler_summary_cost_policy_timeouts = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("policy_timeouts")
+                        )
+                    )
+                    scheduler_summary_cost_horizon_truncations = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("horizon_truncations")
+                        )
+                    )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             allocation_summary = None
         if config.allocation.policy == "agent":
@@ -5017,6 +6441,122 @@ def _run_health(
                 or scheduler_summary_agent_calls != len(scheduler_agents)
             ):
                 issues.add("allocation_scheduler_closeout_mismatch")
+        elif config.allocation.policy == "llm_scheduler":
+            # A pure LLM policy charges one bounded scheduler call whenever a
+            # decision carries ``scheduler_cost``.  The provider may fail
+            # before producing a process-level result; the runner then emits a
+            # synthetic result, but the lifecycle cardinality remains exact.
+            # Compare only decision indexes here: unlike the legacy ``agent``
+            # policy, LLM decisions intentionally do not expose process
+            # identity fields in the allocation decision artifact, and a
+            # recoverable fallback may legitimately have a non-zero result.
+            scheduler_result_indexes = Counter(
+                str(item.decision_index) for item in scheduler_agents
+            )
+            scheduler_event_indexes = Counter(
+                str(row.get("decision_index")) for row in scheduler_event_rows
+            )
+            llm_result_call_ids = Counter(
+                str(item.scheduler_call_id or "") for item in scheduler_agents
+            )
+            llm_event_call_ids = Counter(
+                str(row.get("scheduler_call_id") or row.get("decision_id") or "")
+                for row in scheduler_event_rows
+            )
+            llm_decision_call_ids = Counter(
+                str(row.get("scheduler_call_id") or row.get("decision_id") or "")
+                for row in decisions
+                if str(row.get("policy") or "") == "llm_scheduler"
+                and row.get("scheduler_cost") is not None
+            )
+            llm_cost_errors = 0
+            llm_outcome_errors = 0
+            llm_call_id_errors = 0
+            # The core LLM arm does not use the legacy ``agent`` policy's
+            # result-valid bit.  Its charged decision ledger is therefore the
+            # authoritative source for fallback/invalid/provider counters in
+            # run health.  These are bounded arm outcomes, not infrastructure
+            # issues, because the policy records a deterministic fallback.
+            llm_charged_decisions = [
+                row
+                for row in decisions
+                if str(row.get("policy") or "") == "llm_scheduler"
+                and row.get("scheduler_cost") is not None
+            ]
+            scheduler_invalid_outputs = scheduler_ledger["invalid_outputs"]
+            scheduler_fallbacks = scheduler_ledger["fallback_count"]
+            scheduler_provider_errors = scheduler_ledger["provider_errors"]
+            scheduler_policy_timeout_outcomes = scheduler_ledger["policy_timeouts"]
+            scheduler_horizon_outcomes = scheduler_ledger["horizon_truncations"]
+            # This health counter is the public horizon ledger, so it must
+            # include a late admission disposition even when the provider
+            # process itself returned successfully before the deadline.
+            scheduler_horizon_truncations = scheduler_horizon_outcomes
+            for row in decisions:
+                if str(row.get("policy") or "") != "llm_scheduler":
+                    continue
+                cost = row.get("scheduler_cost")
+                outcome = row.get("scheduler_outcome")
+                if cost is None:
+                    if outcome not in {"not_invoked", None}:
+                        llm_cost_errors += 1
+                    continue
+                decision_id = row.get("decision_id")
+                scheduler_call_id = row.get("scheduler_call_id")
+                if (
+                    not _scheduler_call_id_is_valid(decision_id)
+                    or not _scheduler_call_id_is_valid(scheduler_call_id)
+                    or scheduler_call_id != decision_id
+                ):
+                    llm_call_id_errors += 1
+                if not isinstance(cost, Mapping) or cost.get("calls") != 1:
+                    llm_cost_errors += 1
+                invalid = bool(row.get("invalid_output"))
+                provider = bool(row.get("recoverable_invocation_error"))
+                horizon = bool(row.get("run_horizon_reached") or row.get("agent_run_horizon_reached"))
+                if invalid != (outcome == "invalid_output"):
+                    llm_outcome_errors += 1
+                if provider and outcome != "provider_error":
+                    llm_outcome_errors += 1
+                if horizon and outcome != "horizon_truncated":
+                    llm_outcome_errors += 1
+                if outcome == "horizon_truncated" and (not isinstance(cost, Mapping) or cost.get("calls") != 1 or row.get("fallback")):
+                    llm_outcome_errors += 1
+            if (
+                scheduler_result_indexes != llm_decision_indexes
+                or scheduler_event_indexes != llm_decision_indexes
+                or llm_result_call_ids != llm_event_call_ids
+                or llm_result_call_ids != llm_decision_call_ids
+                or any(not key for key in llm_result_call_ids)
+                or llm_cost_errors
+                or llm_outcome_errors
+                or llm_call_id_errors
+                or scheduler_summary_agent_calls != scheduler_charged_decisions
+                or scheduler_summary_cost_calls != scheduler_charged_decisions
+                or scheduler_summary_cost_calls != len(scheduler_agents)
+                or scheduler_summary_cost_calls != len(scheduler_event_rows)
+                or scheduler_summary_cost_provider_errors != scheduler_provider_errors
+                or scheduler_summary_cost_invalid_outputs != scheduler_invalid_outputs
+                or scheduler_summary_cost_fallback_count != scheduler_fallbacks
+                or scheduler_summary_cost_policy_timeouts
+                != scheduler_policy_timeout_outcomes
+                or scheduler_summary_cost_horizon_truncations
+                != scheduler_horizon_outcomes
+            ):
+                issues.add("allocation_scheduler_closeout_mismatch")
+            if scheduler_summary_cost_calls != scheduler_charged_decisions:
+                issues.add("allocation_scheduler_cost_cardinality_mismatch")
+            if any(
+                actual != expected
+                for actual, expected in (
+                    (scheduler_summary_cost_provider_errors, scheduler_provider_errors),
+                    (scheduler_summary_cost_invalid_outputs, scheduler_invalid_outputs),
+                    (scheduler_summary_cost_fallback_count, scheduler_fallbacks),
+                    (scheduler_summary_cost_policy_timeouts, scheduler_policy_timeout_outcomes),
+                    (scheduler_summary_cost_horizon_truncations, scheduler_horizon_outcomes),
+                )
+            ):
+                issues.add("allocation_scheduler_cost_summary_mismatch")
         assignments, assignments_valid = _read_jsonl_objects(
             run_dir / "elastic_assignments.jsonl"
         )
@@ -5064,15 +6604,111 @@ def _run_health(
             scheduler_state = json.loads(
                 (run_dir / "elastic_scheduler_state.json").read_text(encoding="utf-8")
             )
-            scheduler_active_slots = int(scheduler_state["active_slots"])
-            task_rows = scheduler_state.get("tasks") or {}
-            if scheduler_active_slots != 0 or any(
-                int(row.get("active_agents") or 0) != 0
-                for row in task_rows.values()
-                if isinstance(row, Mapping)
+            if not isinstance(scheduler_state, Mapping):
+                raise TypeError("scheduler state must be an object")
+            scheduler_active_slots = _artifact_nonnegative_int(
+                scheduler_state.get("active_slots")
+            )
+            scheduler_reservation_slots = _artifact_nonnegative_int(
+                scheduler_state.get("reservation_slots")
+            )
+            scheduler_occupied_slots = _artifact_nonnegative_int(
+                scheduler_state.get("occupied_slots")
+            )
+            scheduler_remaining_slots = _artifact_nonnegative_int(
+                scheduler_state.get("remaining_slots")
+            )
+            max_parallel = _artifact_nonnegative_int(
+                scheduler_state.get("max_parallel")
+            )
+            reservations = scheduler_state.get("reservations")
+            task_rows = scheduler_state.get("tasks")
+            if any(
+                value is None
+                for value in (
+                    scheduler_active_slots,
+                    scheduler_reservation_slots,
+                    scheduler_occupied_slots,
+                    scheduler_remaining_slots,
+                    max_parallel,
+                )
+            ) or not isinstance(reservations, Mapping) or not isinstance(
+                task_rows, Mapping
             ):
+                raise TypeError("scheduler capacity ledger is malformed")
+
+            assert scheduler_active_slots is not None
+            assert scheduler_reservation_slots is not None
+            assert scheduler_occupied_slots is not None
+            assert scheduler_remaining_slots is not None
+            assert max_parallel is not None
+
+            reservation_entry_slots = 0
+            for reservation_id, reservation_row in reservations.items():
+                if (
+                    not isinstance(reservation_id, str)
+                    or not reservation_id.strip()
+                    or not isinstance(reservation_row, Mapping)
+                ):
+                    raise TypeError("scheduler reservation entry is malformed")
+                entry_slots = _artifact_nonnegative_int(
+                    reservation_row.get("slots")
+                )
+                if entry_slots is None or entry_slots == 0:
+                    raise TypeError("scheduler reservation slot count is malformed")
+                reservation_entry_slots += entry_slots
+
+            task_active_slots = 0
+            for task_id, task_row in task_rows.items():
+                if (
+                    not isinstance(task_id, str)
+                    or not task_id.strip()
+                    or not isinstance(task_row, Mapping)
+                ):
+                    raise TypeError("scheduler task entry is malformed")
+                active_agents = _artifact_nonnegative_int(
+                    task_row.get("active_agents")
+                )
+                if active_agents is None:
+                    raise TypeError("scheduler task active count is malformed")
+                task_active_slots += active_agents
+
+            malformed_totals = (
+                task_active_slots != scheduler_active_slots
+                or reservation_entry_slots != scheduler_reservation_slots
+                or scheduler_active_slots + scheduler_reservation_slots
+                != scheduler_occupied_slots
+                or scheduler_occupied_slots + scheduler_remaining_slots
+                != max_parallel
+                or max_parallel != config.max_parallel
+            )
+            scheduler_reservation_leak_count = (
+                scheduler_reservation_slots + len(reservations)
+            )
+            if scheduler_active_slots != 0 or task_active_slots != 0:
                 issues.add("scheduler_not_closed")
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            if malformed_totals:
+                issues.add("scheduler_capacity_invalid")
+            if (
+                scheduler_reservation_slots != 0
+                or scheduler_occupied_slots != 0
+                or scheduler_remaining_slots != max_parallel
+                or bool(reservations)
+            ):
+                issues.add("allocation_scheduler_reservation_leak")
+            if scheduler_reservation_slots != 0:
+                issues.add("scheduler_reservations_not_released")
+            if scheduler_occupied_slots != 0:
+                issues.add("scheduler_occupied_slots_not_released")
+        except (
+            AttributeError,
+            OSError,
+            KeyError,
+            OverflowError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             issues.add("scheduler_state_invalid_or_missing")
 
     return {
@@ -5098,13 +6734,28 @@ def _run_health(
         "allocation_scheduler_oom_or_exit_137_count": scheduler_oom_or_137,
         "allocation_scheduler_invalid_output_count": scheduler_invalid_outputs,
         "allocation_scheduler_fallback_count": scheduler_fallbacks,
+        "allocation_scheduler_provider_error_count": scheduler_provider_errors,
+        "allocation_scheduler_call_id_error_count": (
+            llm_call_id_errors if config.allocation.policy == "llm_scheduler" else 0
+        ),
+        "allocation_scheduler_charged_decision_count": scheduler_charged_decisions,
         "allocation_scheduler_summary_agent_calls": scheduler_summary_agent_calls,
+        "allocation_scheduler_summary_cost_calls": scheduler_summary_cost_calls,
+        "allocation_scheduler_summary_cost_provider_errors": scheduler_summary_cost_provider_errors,
+        "allocation_scheduler_summary_cost_invalid_outputs": scheduler_summary_cost_invalid_outputs,
+        "allocation_scheduler_summary_cost_fallback_count": scheduler_summary_cost_fallback_count,
+        "allocation_scheduler_summary_cost_policy_timeouts": scheduler_summary_cost_policy_timeouts,
+        "allocation_scheduler_summary_cost_horizon_truncations": scheduler_summary_cost_horizon_truncations,
         "judge_probe_count": len(probe_rows),
         "judge_probe_infrastructure_error_count": probe_infrastructure_errors,
         "assigned_count": assigned_count,
         "finished_count": finished_count,
         "evaluated_count": evaluated_count,
         "scheduler_active_slots": scheduler_active_slots,
+        "scheduler_reservation_slots": scheduler_reservation_slots,
+        "scheduler_occupied_slots": scheduler_occupied_slots,
+        "scheduler_remaining_slots": scheduler_remaining_slots,
+        "scheduler_reservation_leak_count": scheduler_reservation_leak_count,
     }
 
 
@@ -5163,10 +6814,305 @@ def _write_final(
         ),
         "finished_at": utc_now(),
     }
+    if config.allocation.policy in _FIGURE4_POLICIES:
+        summary_path = _write_figure4_summary(
+            run_dir,
+            config,
+            verdicts,
+            all_agent_rows,
+            allocation_summary,
+        )
+        final["figure4_run_summary"] = summary_path.name
+        final["figure4_run_summary_schema"] = "contextswarm_figure4_run_summary_v1"
     (run_dir / "final.json").write_text(
         json.dumps(final, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def _write_figure4_summary(
+    run_dir: Path,
+    config: ExperimentConfig,
+    verdicts: Mapping[str, Verdict],
+    agent_results: Iterable[Mapping[str, Any]],
+    allocation_summary: Mapping[str, Any] | None,
+) -> Path:
+    """Emit the machine-readable per-repeat Figure 4 development artifact."""
+
+    try:
+        meta = json.loads((run_dir / "run_meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meta = {}
+    try:
+        history = [
+            json.loads(line)
+            for line in (run_dir / "scoreboard_history.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError):
+        history = []
+    proof_times: dict[str, float] = {}
+    for row in history:
+        try:
+            if str(row.get("source") or "") == "closeout" or float(
+                row.get("score") or 0.0
+            ) < 1.0:
+                continue
+            task_id = str(row.get("task_id") or "")
+            elapsed = float(row.get("horizon_elapsed_seconds"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            task_id
+            and math.isfinite(elapsed)
+            and 0.0 <= elapsed <= config.time_limit_seconds
+            and (task_id not in proof_times or elapsed < proof_times[task_id])
+        ):
+            proof_times[task_id] = elapsed
+    cumulative = 0
+    accepted_history: list[dict[str, Any]] = []
+    for task_id, elapsed in sorted(proof_times.items(), key=lambda item: (item[1], item[0])):
+        cumulative += 1
+        accepted_history.append(
+            {
+                "elapsed_seconds": round(elapsed, 6),
+                "accepted_score": cumulative,
+                "task_id": task_id,
+            }
+        )
+
+    raw_extra = config.extra.get("raw", {}) if isinstance(config.extra, Mapping) else {}
+    experiment_raw = raw_extra.get("experiment", {}) if isinstance(raw_extra, Mapping) else {}
+    selection_raw = raw_extra.get("selection", {}) if isinstance(raw_extra, Mapping) else {}
+    if not isinstance(experiment_raw, Mapping):
+        experiment_raw = {}
+    if not isinstance(selection_raw, Mapping):
+        selection_raw = {}
+    raw_repeat = experiment_raw.get(
+        "paired_repeat_id", config.extra.get("paired_repeat_id", config.seed)
+    )
+    try:
+        repeat = int(raw_repeat)
+    except (TypeError, ValueError):
+        repeat = int(config.seed)
+    # Development manifests historically used "dev".  The public schema
+    # requires an integer paired identity, so bind non-numeric values to the
+    # paired seed until an explicit numeric repeat is registered.
+
+    selected = getattr(config, "selection", None)
+    if selected is not None and callable(getattr(selected, "public_dict", None)):
+        selector_identity = selected.public_dict()
+    else:
+        selector_identity = dict(selection_raw)
+        selector_identity.setdefault("enabled", False)
+        selector_identity.setdefault("selector_name", "development_unfrozen")
+        selector_identity.setdefault("selector_version", "development_v1")
+        selector_identity.setdefault("visibility", "project_shared")
+        selector_identity.setdefault("direct_messages", False)
+        selector_identity.setdefault("candidate_transfer", False)
+        selector_identity["selection_config_id"] = canonical_json_sha256(
+            {
+                key: value
+                for key, value in selector_identity.items()
+                if key != "selection_config_id"
+            }
+        )
+    selector_config_sha256 = str(
+        selector_identity.get("selection_config_id") or ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", selector_config_sha256):
+        selector_config_sha256 = canonical_json_sha256(
+            {
+                key: value
+                for key, value in selector_identity.items()
+                if key != "selection_config_id"
+            }
+        )
+        selector_identity["selection_config_id"] = selector_config_sha256
+
+    task_order_value = meta.get("ordered_task_ids", meta.get("tasks"))
+    if not isinstance(task_order_value, list) or set(task_order_value) != set(verdicts):
+        task_order_value = list(verdicts)
+    task_order = [str(task_id) for task_id in task_order_value]
+    initial_allocation = {
+        task_id: config.initial_agents_per_task for task_id in task_order
+    }
+    candidate_transfer = bool(
+        selector_identity.get("candidate_transfer", True)
+        if bool(selector_identity.get("enabled", False))
+        else True
+    )
+    inference_settings = {
+        "thinking": config.thinking,
+        "fast_mode": config.fast_mode,
+        "pi_timeout_seconds": config.pi_timeout_seconds,
+        "pi_http_idle_timeout_ms": config.pi_http_idle_timeout_ms,
+        "retry_enabled": config.pi_retry_enabled,
+        "retry_max_retries": config.pi_retry_max_retries,
+        "provider_max_retries": config.pi_provider_max_retries,
+    }
+    evaluator_contract = {
+        "judge_kind": config.judge_kind,
+        "environment_id": config.lean_env_id,
+        "verification_profile": config.lean_verification_profile,
+        "judge_mode": config.lean_judge_mode,
+        "timeout_seconds": config.lean_timeout_seconds,
+        "max_lifecycle_seconds": config.lean_max_lifecycle_seconds,
+        "max_concurrent_evaluations": config.lean_max_concurrent_evaluations,
+        "result_cache_disabled_required": config.lean_require_result_cache_disabled,
+    }
+    contract = {
+        "dataset": config.dataset_name,
+        "ordered_task_ids": task_order,
+        "selection": selector_identity,
+        "figure4_phase": getattr(config, "figure4_phase", ""),
+        "paired_repeat_id": repeat,
+        "paired_seed": config.seed,
+        "selector_identity": selector_identity,
+        "selector_config_sha256": selector_config_sha256,
+        "trace_visibility": str(
+            selector_identity.get("visibility") or "project_shared"
+        ),
+        "model": config.model,
+        "inference_settings": inference_settings,
+        "evaluator": evaluator_contract,
+        "runtime_limits": dict(meta.get("effective_runtime_limits") or {}),
+        "horizon_seconds": config.time_limit_seconds,
+        "total_capacity": config.max_parallel,
+        "initial_allocation": initial_allocation,
+        "communication": config.communication,
+        "direct_messages_enabled": False,
+        "candidate_transfer": candidate_transfer,
+        "stopping_rule": "full_score_or_horizon",
+    }
+    contract_hash = canonical_json_sha256(contract)
+
+    agents = list(agent_results)
+    solver_agents = [
+        row
+        for row in agents
+        if row.get("task_id") != "__allocation__"
+        and not str(row.get("agent_id") or "").startswith("scheduler-")
+    ]
+    scheduler_agents = [row for row in agents if row.get("task_id") == "__allocation__"]
+    allocation = dict(allocation_summary or {})
+    solver_usage = {
+        "calls": len(solver_agents),
+        "input_tokens": int(allocation.get("solver_input_tokens", 0)),
+        "output_tokens": int(allocation.get("solver_output_tokens", 0)),
+        "cache_read_tokens": int(allocation.get("solver_cache_read_tokens", 0)),
+        "cache_write_tokens": int(allocation.get("solver_cache_write_tokens", 0)),
+        "total_tokens": int(allocation.get("solver_total_tokens", 0)),
+        "slot_seconds": float(allocation.get("solver_agent_seconds", 0.0)),
+        "max_occupied_slots": int(allocation.get("max_occupied_slots", 0)),
+    }
+    event_rows, _ = _read_jsonl_objects(run_dir / "events.jsonl")
+    evaluation_rows = [
+        row
+        for row in event_rows
+        if row.get("event") == "evaluation_finished"
+        and str(row.get("source") or "") != "closeout"
+    ]
+    judge_rows, _ = _read_jsonl_objects(run_dir / "judge_checks.jsonl")
+    evaluator_calls = len(evaluation_rows)
+    evaluator_admissions = len(evaluation_rows)
+    evaluator_usage = {
+        "calls": evaluator_calls,
+        "admissions": evaluator_admissions,
+        "terminal_receipts": sum(
+            bool(row.get("judge_job_id"))
+            or (
+                isinstance(row.get("response"), Mapping)
+                and row["response"].get("mock") is True
+            )
+            for row in evaluation_rows
+        ),
+        "judge_check_calls": len(judge_rows),
+        "judge_check_admissions": sum(
+            row.get("accepted") is True for row in judge_rows
+        ),
+    }
+    decision_rows, _ = _read_jsonl_objects(run_dir / "allocation_decisions.jsonl")
+    # The decision log is the canonical outcome ledger.  Derive all public
+    # counter sections from these same charged rows so fallback/invalid/
+    # horizon outcomes cannot diverge between nested cost and metrics.
+    scheduler_ledger = _scheduler_decision_ledger(decision_rows)
+    fallback_count = scheduler_ledger["fallback_count"]
+    invalid_output_count = scheduler_ledger["invalid_outputs"]
+    horizon_truncation_count = scheduler_ledger["horizon_truncations"]
+    scheduler_cost = {
+        "calls": scheduler_ledger["calls"],
+        "input_tokens": int(allocation.get("scheduler_input_tokens", 0)),
+        "output_tokens": int(allocation.get("scheduler_output_tokens", 0)),
+        "total_tokens": int(allocation.get("scheduler_total_tokens", 0)),
+        "latency_seconds": float(allocation.get("total_latency_seconds", 0.0)),
+        "capacity_reservations": int(
+            allocation.get("scheduler_capacity_reservations", 0)
+        ),
+        "occupied_capacity_slot_seconds": float(
+            allocation.get("scheduler_reserved_slot_seconds", 0.0)
+        ),
+        "reserved_slot_seconds": float(
+            allocation.get("scheduler_reserved_slot_seconds", 0.0)
+        ),
+        "invalid_outputs": invalid_output_count,
+        "fallback_count": fallback_count,
+        "provider_errors": scheduler_ledger["provider_errors"],
+        "policy_timeouts": scheduler_ledger["policy_timeouts"],
+        "horizon_truncations": horizon_truncation_count,
+    }
+    allocation_metrics = {
+        "decisions": len(decision_rows),
+        "admitted_decisions": sum(
+            str(row.get("disposition") or "") == "assigned" for row in decision_rows
+        ),
+        "fallbacks": fallback_count,
+        "invalid_outputs": invalid_output_count,
+        "horizon_truncations": horizon_truncation_count,
+        "stale_decisions": sum(
+            str(row.get("disposition") or "") == "not_admitted_stale"
+            for row in decision_rows
+        ),
+    }
+    parameters = {
+        "task_state": dict(config.allocation.task_state),
+        "trace_state": dict(config.allocation.trace_state),
+        "normalization": dict(config.allocation.normalization),
+        "prompt_max_bytes": config.allocation.prompt_max_bytes,
+        "prompt_max_tokens": config.allocation.prompt_max_tokens,
+    }
+    allocation_hash = canonical_json_sha256(parameters)
+    summary = build_figure4_run_summary(
+        run_id=str(meta.get("run_id") or run_dir.name),
+        policy=config.allocation.policy,
+        paired_seed=config.seed,
+        repeat=repeat,
+        paired_repeat_id=repeat,
+        comparison_contract_id=contract_hash,
+        comparison_contract=contract,
+        task_order=task_order,
+        horizon_seconds=config.time_limit_seconds,
+        total_capacity=config.max_parallel,
+        initial_allocation=initial_allocation,
+        accepted_score_history=accepted_history,
+        max_score=max(1, len(task_order)),
+        solver_usage=solver_usage,
+        evaluator_usage=evaluator_usage,
+        scheduler_cost=scheduler_cost,
+        allocation_metrics=allocation_metrics,
+        allocation_parameters=parameters,
+        allocation_config_sha256=allocation_hash,
+    )
+    summary["comparison_contract_id"] = contract_hash
+    summary["selector_config_sha256"] = selector_config_sha256
+    summary["inference_settings"] = inference_settings
+    summary["runtime_limits"] = contract["runtime_limits"]
+    summary["evaluator_contract"] = evaluator_contract
+    path = run_dir / "figure4_run_summary.json"
+    write_figure4_run_summary(path, summary)
+    return path
 
 
 def _judge_result_cache_evidence(

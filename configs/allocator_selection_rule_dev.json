@@ -1,0 +1,54 @@
+{
+  "bootstrap": {
+    "confidence": 0.95,
+    "draws": 10000,
+    "method": "paired_block_percentile",
+    "quantile": "linear",
+    "seed": 39039
+  },
+  "guardrails": {
+    "fallback_rate_max": 0.1,
+    "require_per_block": true,
+    "scheduler_occupied_capacity_fraction_max": 0.05,
+    "scheduler_token_fraction_max": 0.05,
+    "total_slot_seconds_factor_max": 1.000000001
+  },
+  "metric": {
+    "aggregation": "mean",
+    "direction": "max",
+    "field": "nauc",
+    "name": "fixed_horizon_nauc",
+    "require_history": true
+  },
+  "minimum_validation_repeats": 8,
+  "phase": "development_validation",
+  "policies": [
+    "uniform_refill",
+    "task_state",
+    "trace_state",
+    "llm_scheduler"
+  ],
+  "posthoc_tuning": false,
+  "rule_id": "figure4_allocator_selection_v1",
+  "schema_version": "contextswarm_allocator_selection_rule_v1",
+  "target_k": 6,
+  "tie_break": [
+    "mean_nauc_desc",
+    "bootstrap_lcb95_desc",
+    "median_time_to_k_asc",
+    "registry_order"
+  ],
+  "validation_split": {
+    "kind": "paired_repeat_ids",
+    "paired_repeat_ids": [
+      "dev-validation-01",
+      "dev-validation-02",
+      "dev-validation-03",
+      "dev-validation-04",
+      "dev-validation-05",
+      "dev-validation-06",
+      "dev-validation-07",
+      "dev-validation-08"
+    ]
+  }
+}

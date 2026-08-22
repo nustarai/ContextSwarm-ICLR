@@ -168,6 +168,57 @@ _FORMULA_DEFAULTS: dict[str, float] = {
 }
 
 
+_TASK_STATE_DEFAULTS: dict[str, float] = {
+    "checker_quality": 1.0,
+    "recent_progress": 1.0,
+    "starvation": 1.0,
+    "failure_no_progress": 1.0,
+}
+
+_TRACE_STATE_DEFAULTS: dict[str, float] = {
+    "actionability": 1.0,
+    "evidence_association": 1.0,
+    "positive_feedback": 1.0,
+    "negative_feedback": 1.0,
+    # ``density_penalty_weight`` and the four component coefficients are the
+    # registered D formula.  The historical ``drag`` key is accepted below
+    # as a compatibility alias but is canonicalized to density_penalty_weight
+    # before hashing or emitting artifacts.
+    "density_penalty_weight": 1.0,
+    "duplicate_component_weight": 1.0,
+    "refutation_component_weight": 1.0,
+    "staleness_component_weight": 1.0,
+    "lineage_stagnation_component_weight": 1.0,
+}
+
+_TRACE_STATE_LEGACY_ALIASES: dict[str, str] = {
+    "drag": "density_penalty_weight",
+    "duplication_component_weight": "duplicate_component_weight",
+}
+
+_ALLOCATION_NORMALIZATION_DEFAULTS: dict[str, float] = {
+    "progress_window_seconds": 600.0,
+    "starvation_window_seconds": 600.0,
+    "failure_saturation": 3.0,
+    # Trace projection normalizers are part of the same manifest-owned
+    # identity.  They are harmless for task-only arms but must remain fixed
+    # across all Figure 4 policies.
+    "frontier_saturation": 4.0,
+    "association_saturation": 4.0,
+    "feedback_exposure_floor": 1.0,
+    "duplicate_saturation": 4.0,
+    "refutation_saturation": 4.0,
+    "staleness_saturation": 4.0,
+    "lineage_stagnation_saturation": 4.0,
+    "staleness_window_seconds": 600.0,
+    "lineage_stagnation_window_seconds": 600.0,
+}
+
+_FIGURE4_ALLOCATION_POLICIES = frozenset(
+    {"uniform_refill", "task_state", "trace_state", "llm_scheduler"}
+)
+
+
 _SELECTOR_NAMES = frozenset(
     {
         "random",
@@ -265,6 +316,22 @@ class SelectionConfig:
         ).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
 
+    @property
+    def identity_frozen(self) -> bool:
+        """Whether this config carries a complete immutable selector identity."""
+
+        return bool(
+            self.enabled
+            and self.selector_name
+            and self.selector_version
+            and self.visibility == "project_shared"
+            and self.trace_slot_limit > 0
+            and self.context_token_budget > 0
+            and self.tokenizer
+            and self.tie_break == "trace_id_asc"
+            and not self.direct_messages
+        )
+
     def public_dict(self) -> dict[str, Any]:
         result = self.hash_inputs()
         result["selection_config_id"] = self.selection_config_id
@@ -357,12 +424,6 @@ def _parse_selection(value: Any) -> SelectionConfig:
         if "candidate_transfer" in selection
         else False
     )
-    if enabled and (direct_messages or candidate_transfer):
-        raise ConfigError(
-            "enabled selection requires direct_messages = false and "
-            "candidate_transfer = false"
-        )
-
     return SelectionConfig(
         enabled=enabled,
         selector_name=selector_name,
@@ -388,6 +449,13 @@ class AllocationConfig:
     piece_body_chars: int
     agent_timeout_seconds: int
     formula: dict[str, float]
+    task_state: dict[str, float]
+    trace_state: dict[str, float]
+    normalization: dict[str, float]
+    # Hard, manifest-owned bounds for the read-only LLM scheduler wire prompt.
+    # They remain arm-invariant even when another arm does not consume them.
+    prompt_max_bytes: int
+    prompt_max_tokens: int
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -396,6 +464,11 @@ class AllocationConfig:
             "piece_body_chars": self.piece_body_chars,
             "agent_timeout_seconds": self.agent_timeout_seconds,
             "formula": dict(sorted(self.formula.items())),
+            "task_state": dict(sorted(self.task_state.items())),
+            "trace_state": dict(sorted(self.trace_state.items())),
+            "normalization": dict(sorted(self.normalization.items())),
+            "prompt_max_bytes": self.prompt_max_bytes,
+            "prompt_max_tokens": self.prompt_max_tokens,
         }
 
 
@@ -416,6 +489,7 @@ class ExperimentConfig:
     assignment_policy: str
     allocation: AllocationConfig
     selection: SelectionConfig
+    figure4_phase: str
     episodes_per_task: int
     max_tasks: int
     time_limit_seconds: int
@@ -531,6 +605,7 @@ class ExperimentConfig:
             "assignment_policy": self.assignment_policy,
             "allocation": self.allocation.public_dict(),
             "selection": self.selection.public_dict(),
+            "figure4_phase": self.figure4_phase,
             "episodes_per_task": self.episodes_per_task,
             "max_tasks": self.max_tasks,
             "time_limit_seconds": self.time_limit_seconds,
@@ -614,6 +689,15 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     docker = _as_dict(payload.get("docker"), "docker")
     allocation = _as_dict(payload.get("allocation"), "allocation")
     allocation_formula = _as_dict(allocation.get("formula"), "allocation.formula")
+    allocation_task_state = _as_dict(
+        allocation.get("task_state"), "allocation.task_state"
+    )
+    allocation_trace_state = _as_dict(
+        allocation.get("trace_state"), "allocation.trace_state"
+    )
+    allocation_normalization = _as_dict(
+        allocation.get("normalization"), "allocation.normalization"
+    )
     selection_config = _parse_selection(payload.get("selection"))
 
     mode = _text(experiment.get("mode"), "cps").lower()
@@ -638,6 +722,18 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
             raise ConfigError(
                 "enabled selection requires experiment.communication = blackboard"
             )
+
+    figure4_phase = _text(experiment.get("figure4_phase")).lower()
+    if figure4_phase not in {"", "development", "formal"}:
+        raise ConfigError(
+            "experiment.figure4_phase must be development or formal when set"
+        )
+    if figure4_phase and mode != "cps":
+        raise ConfigError("Figure 4 phase requires experiment.mode = cps")
+    if figure4_phase and communication != "blackboard":
+        raise ConfigError(
+            "Figure 4 phase requires experiment.communication = blackboard"
+        )
 
     dataset_raw = _text(experiment.get("dataset_root"), "benchmarks/matholympiadbench")
     problem_raw = _text(experiment.get("problem_ids"), "benchmarks/matholympiadbench/problem_ids.json")
@@ -664,8 +760,48 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     if assignment_policy not in {"least_active", "round_robin"}:
         raise ConfigError("experiment.assignment_policy must be least_active or round_robin")
     allocation_policy = _text(allocation.get("policy"), "uniform").lower()
-    if allocation_policy not in {"uniform", "formula", "agent"}:
-        raise ConfigError("allocation.policy must be uniform, formula, or agent")
+    allowed_allocation_policies = {
+        "uniform",
+        "formula",
+        "agent",
+        "uniform_refill",
+        "task_state",
+        "trace_state",
+        "llm_scheduler",
+    }
+    if allocation_policy not in allowed_allocation_policies:
+        raise ConfigError(
+            "allocation.policy must be one of "
+            + ", ".join(sorted(allowed_allocation_policies))
+        )
+    if figure4_phase and allocation_policy not in _FIGURE4_ALLOCATION_POLICIES:
+        raise ConfigError(
+            "Figure 4 phase requires one of the four registered allocation policies: "
+            + ", ".join(sorted(_FIGURE4_ALLOCATION_POLICIES))
+        )
+    if figure4_phase == "development" and selection_config.enabled:
+        raise ConfigError(
+            "Figure 4 development manifests require selection.enabled = false"
+        )
+    if selection_config.enabled and not figure4_phase:
+        if selection_config.direct_messages or selection_config.candidate_transfer:
+            raise ConfigError(
+                "enabled selection requires direct_messages = false and "
+                "candidate_transfer = false"
+            )
+    if figure4_phase == "development":
+        if selection_config.direct_messages or not selection_config.candidate_transfer:
+            raise ConfigError(
+                "Figure 4 development sentinel requires direct_messages = false and "
+                "candidate_transfer = true"
+            )
+    if figure4_phase == "formal":
+        if not selection_config.identity_frozen:
+            raise ConfigError(
+                "formal Figure 4 requires a complete frozen enabled selector identity"
+            )
+        if not selection_config.candidate_transfer:
+            raise ConfigError("formal Figure 4 requires candidate_transfer = true")
     unknown_formula = set(allocation_formula) - set(_FORMULA_DEFAULTS)
     if unknown_formula:
         raise ConfigError(
@@ -675,6 +811,69 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         key: _number(allocation_formula.get(key), f"allocation.formula.{key}", default)
         for key, default in _FORMULA_DEFAULTS.items()
     }
+    # Normalize the pre-component ``drag`` spelling before validating the
+    # manifest table.  A manifest that supplies both spellings with different
+    # values is contradictory and must fail closed rather than silently choose
+    # one coefficient.
+    trace_state_values = dict(allocation_trace_state)
+    for alias, canonical in _TRACE_STATE_LEGACY_ALIASES.items():
+        if alias not in trace_state_values:
+            continue
+        if canonical in trace_state_values:
+            try:
+                same = float(trace_state_values[alias]) == float(
+                    trace_state_values[canonical]
+                )
+            except (TypeError, ValueError, OverflowError):
+                same = False
+            if not same:
+                raise ConfigError(
+                    f"allocation.trace_state.{alias} contradicts "
+                    f"allocation.trace_state.{canonical}"
+                )
+        else:
+            trace_state_values[canonical] = trace_state_values[alias]
+        del trace_state_values[alias]
+
+    parameter_tables = (
+        ("allocation.task_state", allocation_task_state, _TASK_STATE_DEFAULTS),
+        ("allocation.trace_state", trace_state_values, _TRACE_STATE_DEFAULTS),
+        (
+            "allocation.normalization",
+            allocation_normalization,
+            _ALLOCATION_NORMALIZATION_DEFAULTS,
+        ),
+    )
+    parsed_parameter_tables: list[dict[str, float]] = []
+    for table_name, values, defaults in parameter_tables:
+        unknown = set(values) - set(defaults)
+        if unknown:
+            raise ConfigError(
+                f"unknown {table_name} fields: " + ", ".join(sorted(unknown))
+            )
+        parsed = {
+            key: _number(values.get(key), f"{table_name}.{key}", default)
+            for key, default in defaults.items()
+        }
+        if any(value < 0 for value in parsed.values()):
+            raise ConfigError(f"{table_name} fields must not be negative")
+        parsed_parameter_tables.append(parsed)
+    task_state_parameters, trace_state_parameters, normalization_parameters = (
+        parsed_parameter_tables
+    )
+    if any(value <= 0 for value in normalization_parameters.values()):
+        raise ConfigError("allocation.normalization fields must be positive")
+    for key in (
+        "frontier_saturation",
+        "association_saturation",
+        "duplicate_saturation",
+        "refutation_saturation",
+        "staleness_saturation",
+        "lineage_stagnation_saturation",
+    ):
+        value = normalization_parameters[key]
+        if not value.is_integer():
+            raise ConfigError(f"allocation.normalization.{key} must be an integer")
     for key in (
         "failure_penalty",
         "duplication_penalty",
@@ -707,6 +906,19 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
             120,
         ),
         formula=formula_parameters,
+        task_state=task_state_parameters,
+        trace_state=trace_state_parameters,
+        normalization=normalization_parameters,
+        prompt_max_bytes=_positive_int(
+            allocation.get("prompt_max_bytes"),
+            "allocation.prompt_max_bytes",
+            64 * 1024,
+        ),
+        prompt_max_tokens=_positive_int(
+            allocation.get("prompt_max_tokens"),
+            "allocation.prompt_max_tokens",
+            64 * 1024,
+        ),
     )
     episodes = _positive_int(experiment.get("episodes_per_task"), "experiment.episodes_per_task", 1)
     max_tasks = _nonnegative_int(experiment.get("max_tasks"), "experiment.max_tasks", 0)
@@ -868,6 +1080,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         assignment_policy=assignment_policy,
         allocation=allocation_config,
         selection=selection_config,
+        figure4_phase=figure4_phase,
         episodes_per_task=episodes,
         max_tasks=max_tasks,
         time_limit_seconds=horizon,

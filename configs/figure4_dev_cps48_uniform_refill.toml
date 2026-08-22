@@ -1,0 +1,8 @@
+extends = ["figure4_dev_cps48.toml"]
+
+[experiment]
+name = "mobench-figure4-dev-cps48-uniform-refill"
+output_root = "runs/figure4_dev/uniform_refill"
+
+[allocation]
+policy = "uniform_refill"

@@ -70,6 +70,10 @@ class AgentResult:
     mocked: bool = False
     decision_index: int | None = None
     run_horizon_reached: bool = False
+    scheduler_call_id: str | None = None
+    scheduler_outcome: str | None = None
+    invalid_output: bool = False
+    recoverable_invocation_error: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +92,10 @@ class AgentResult:
             "mocked": self.mocked,
             "decision_index": self.decision_index,
             "run_horizon_reached": self.run_horizon_reached,
+            "scheduler_call_id": self.scheduler_call_id,
+            "scheduler_outcome": self.scheduler_outcome,
+            "invalid_output": self.invalid_output,
+            "recoverable_invocation_error": self.recoverable_invocation_error,
         }
 
 

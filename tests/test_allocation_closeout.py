@@ -1023,7 +1023,7 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
             _codes(json.loads(positive.stdout), "uniform"),
         )
 
-    def test_retryable_resource_judge_receipts_are_infrastructure_failures(self) -> None:
+    def test_job_bound_resource_receipts_are_candidate_feedback(self) -> None:
         for status in ("RESOURCE_LIMIT", "EXECUTION_TIMEOUT"):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
                 paths = self._clean_runs(Path(temporary))
@@ -1042,12 +1042,104 @@ class AllocationCloseoutAuditTests(unittest.TestCase):
                 _write_jsonl(paths["uniform"] / "judge_checks.jsonl", rows)
                 terminal = _run_audit(paths)
 
-            self.assertEqual(retryable.returncode, 1)
-            self.assertIn(
-                "judge_check_failure_status",
-                _codes(json.loads(retryable.stdout), "uniform"),
+            self.assertEqual(
+                retryable.returncode,
+                0,
+                retryable.stdout + retryable.stderr,
             )
             self.assertEqual(terminal.returncode, 0, terminal.stdout + terminal.stderr)
+
+    def test_retryable_candidate_failure_chain_is_not_infrastructure(self) -> None:
+        for status in ("RESOURCE_LIMIT", "EXECUTION_TIMEOUT"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                paths = self._clean_runs(Path(temporary))
+                run = paths["uniform"]
+
+                final = _final("uniform")
+                verdict = final["verdicts"][TASKS[0]]
+                verdict.update(
+                    {
+                        "status": status,
+                        "response": {
+                            "formal_status": status,
+                            "retryable": True,
+                        },
+                    }
+                )
+                _write_json(run / "final.json", final)
+
+                events = _events("uniform")
+                evaluation = next(
+                    row
+                    for row in events
+                    if row.get("event") == "evaluation_finished"
+                )
+                evaluation.update(
+                    {
+                        "status": status,
+                        "response": {
+                            "formal_status": status,
+                            "retryable": True,
+                        },
+                    }
+                )
+                _sync_closeout_task(events, verdict)
+                _write_jsonl(run / "events.jsonl", events)
+                _write_jsonl(
+                    run / "scoreboard_history.jsonl",
+                    _closeout_scoreboard_rows(events),
+                )
+
+                trace = [
+                    json.loads(line)
+                    for line in (run / "communication_trace.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                trace[0]["payload"].update({"status": status, "score": 0.0})
+                _write_jsonl(run / "communication_trace.jsonl", trace)
+
+                judge = [
+                    json.loads(line)
+                    for line in (run / "judge_checks.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                judge[0].update({"status": status, "retryable": True})
+                _write_jsonl(run / "judge_checks.jsonl", judge)
+
+                result = _run_audit(paths)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            report = json.loads(result.stdout)
+            self.assertNotIn(
+                "evaluator_infrastructure_error",
+                _codes(report, "uniform"),
+            )
+
+    def test_unbound_resource_receipt_fails_provenance_not_infrastructure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._clean_runs(Path(temporary))
+            rows = [
+                json.loads(line)
+                for line in (paths["uniform"] / "judge_checks.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            rows[0].update(
+                {
+                    "status": "RESOURCE_LIMIT",
+                    "retryable": True,
+                    "judge_job_id": None,
+                }
+            )
+            _write_jsonl(paths["uniform"] / "judge_checks.jsonl", rows)
+            result = _run_audit(paths)
+
+        self.assertEqual(result.returncode, 1)
+        codes = _codes(json.loads(result.stdout), "uniform")
+        self.assertIn("judge_check_provenance_incomplete", codes)
+        self.assertNotIn("judge_check_failure_status", codes)
 
     def test_fresh_closeout_proof_needs_no_solver_feedback_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

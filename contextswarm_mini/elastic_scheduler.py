@@ -15,11 +15,12 @@ have elapsed.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 import threading
 import time
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,28 @@ class AgentAssignment:
 
 # This name is convenient for clients which model a claimed worker as a lease.
 AgentLease = AgentAssignment
+
+
+@dataclass(frozen=True)
+class SlotReservation:
+    """Capacity held for non-solver work such as an LLM scheduler call.
+
+    Reservations count against :attr:`ElasticScheduler.occupied_slots` but do
+    not change the legacy solver-only :attr:`ElasticScheduler.active_slots`.
+    ``reservation_id`` is stable for the lifetime of the scheduler and can be
+    persisted by integrations for reconciliation.
+    """
+
+    reservation_id: str
+    slots: int
+    purpose: str
+    acquired_at: float
+
+
+@dataclass
+class _ReservationState:
+    reservation: SlotReservation
+    remaining_slots: int
 
 
 @dataclass
@@ -98,6 +121,8 @@ class ElasticScheduler:
         self._tasks: dict[str, _TaskState] = {}
         self._active: dict[str, AgentAssignment] = {}
         self._active_by_task: dict[str, dict[str, AgentAssignment]] = {}
+        self._reservations: dict[str, _ReservationState] = {}
+        self._next_reservation_id = 1
         self._cursor = 0
         self._initial_cursor = 0
         self._history: list[dict[str, object]] = []
@@ -169,8 +194,22 @@ class ElasticScheduler:
             return len(self._active)
 
     @property
+    def reservation_slots(self) -> int:
+        """Number of capacity slots held by non-solver reservations."""
+        with self._lock:
+            return sum(state.remaining_slots for state in self._reservations.values())
+
+    @property
+    def occupied_slots(self) -> int:
+        """Total solver and reserved capacity currently occupied."""
+        with self._lock:
+            return len(self._active) + sum(
+                state.remaining_slots for state in self._reservations.values()
+            )
+
+    @property
     def remaining_slots(self) -> int:
-        return max(0, self.max_parallel - self.active_slots)
+        return max(0, self.max_parallel - self.occupied_slots)
 
     @property
     def solved_tasks(self) -> frozenset[str]:
@@ -180,7 +219,18 @@ class ElasticScheduler:
     @property
     def unsolved_tasks(self) -> tuple[str, ...]:
         with self._lock:
-            return tuple(task_id for task_id, state in self._tasks.items() if not state.solved)
+            # Retired tasks are intentionally unresolved, but they are no
+            # longer admissible.  Exposing them as ``unsolved`` makes policy
+            # snapshots advertise phantom work after an attempt cap and can
+            # cause an allocator to repeatedly target a task which the
+            # scheduler will reject.  Keep this view aligned with the
+            # eligibility contract used by ``next_assignment`` and
+            # ``has_pending_initial``.
+            return tuple(
+                task_id
+                for task_id, state in self._tasks.items()
+                if not state.solved and state.retired_reason is None
+            )
 
     @property
     def has_pending_initial(self) -> bool:
@@ -196,7 +246,7 @@ class ElasticScheduler:
     @property
     def done(self) -> bool:
         with self._lock:
-            return not self._active and (
+            return not self._active and not self._reservations and (
                 not self._tasks
                 or all(
                     state.solved or state.retired_reason is not None
@@ -284,7 +334,10 @@ class ElasticScheduler:
         """Claim one available slot, or return ``None`` at capacity/horizon."""
         with self._lock:
             admitted_at = float(self._clock() if now is None else now)
-            if len(self._active) >= self.max_parallel or self._horizon_reached(admitted_at):
+            if (
+                self._occupied_slots_locked() >= self.max_parallel
+                or self._horizon_reached(admitted_at)
+            ):
                 return None
             state = self._select_task()
             if state is None:
@@ -306,7 +359,10 @@ class ElasticScheduler:
         normalized = self._task_id(task_id)
         with self._lock:
             admitted_at = float(self._clock() if now is None else now)
-            if len(self._active) >= self.max_parallel or self._horizon_reached(admitted_at):
+            if (
+                self._occupied_slots_locked() >= self.max_parallel
+                or self._horizon_reached(admitted_at)
+            ):
                 return None
             state = self._tasks.get(normalized)
             if state is None:
@@ -314,6 +370,160 @@ class ElasticScheduler:
             if state.solved or state.retired_reason is not None:
                 return None
             return self._admit_locked(state, admitted_at)
+
+    def _occupied_slots_locked(self) -> int:
+        return len(self._active) + sum(
+            state.remaining_slots for state in self._reservations.values()
+        )
+
+    def acquire_reservation(
+        self,
+        *,
+        slots: int = 1,
+        purpose: str = "external",
+        now: float | None = None,
+    ) -> SlotReservation | None:
+        """Atomically hold capacity, or return ``None`` at capacity/horizon.
+
+        The returned stable ID may be passed to :meth:`release_reservation` or
+        :meth:`admit_reserved`.  Callers should release in a ``finally`` block;
+        :meth:`reservation` provides that pattern as a context manager.
+        """
+        slot_count = self._positive_int(slots, "slots")
+        normalized_purpose = str(purpose).strip()
+        if not normalized_purpose:
+            raise ValueError("purpose must be non-empty")
+        with self._lock:
+            acquired_at = float(self._clock() if now is None else now)
+            if (
+                self._horizon_reached(acquired_at)
+                or self._occupied_slots_locked() + slot_count > self.max_parallel
+            ):
+                return None
+            reservation_id = f"reservation-{self._next_reservation_id}"
+            self._next_reservation_id += 1
+            reservation = SlotReservation(
+                reservation_id=reservation_id,
+                slots=slot_count,
+                purpose=normalized_purpose,
+                acquired_at=acquired_at,
+            )
+            self._reservations[reservation_id] = _ReservationState(
+                reservation=reservation,
+                remaining_slots=slot_count,
+            )
+            self._history.append(
+                {
+                    "event": "reservation_acquired",
+                    **reservation.__dict__,
+                }
+            )
+            return reservation
+
+    def release_reservation(
+        self,
+        reservation: str | SlotReservation,
+        *,
+        reason: str = "released",
+        now: float | None = None,
+    ) -> bool:
+        """Release all remaining slots in a reservation.
+
+        This operation is idempotent: unknown or already completed IDs return
+        ``False``.  That makes unconditional cleanup in error paths safe.
+        """
+        reservation_id = (
+            reservation.reservation_id
+            if isinstance(reservation, SlotReservation)
+            else str(reservation)
+        )
+        normalized_reason = str(reason).strip()
+        if not normalized_reason:
+            raise ValueError("reason must be non-empty")
+        with self._lock:
+            state = self._reservations.pop(reservation_id, None)
+            if state is None:
+                return False
+            self._history.append(
+                {
+                    "event": "reservation_completed",
+                    "reservation_id": reservation_id,
+                    "purpose": state.reservation.purpose,
+                    "slots": state.remaining_slots,
+                    "outcome": "released",
+                    "reason": normalized_reason,
+                    "completed_at": float(self._clock() if now is None else now),
+                }
+            )
+            return True
+
+    def admit_reserved(
+        self,
+        reservation: str | SlotReservation,
+        task_id: object,
+        *,
+        now: float | None = None,
+    ) -> AgentAssignment | None:
+        """Atomically convert one reserved slot into a solver assignment.
+
+        The reservation remains held when admission is rejected (for example,
+        at the horizon or for a solved task), so the caller can record the
+        failure and release it explicitly without a capacity gap.
+        """
+        reservation_id = (
+            reservation.reservation_id
+            if isinstance(reservation, SlotReservation)
+            else str(reservation)
+        )
+        normalized_task_id = self._task_id(task_id)
+        with self._lock:
+            reservation_state = self._reservations.get(reservation_id)
+            if reservation_state is None:
+                return None
+            admitted_at = float(self._clock() if now is None else now)
+            if self._horizon_reached(admitted_at):
+                return None
+            task_state = self._tasks.get(normalized_task_id)
+            if task_state is None:
+                raise KeyError(f"unknown task id: {normalized_task_id}")
+            if task_state.solved or task_state.retired_reason is not None:
+                return None
+
+            assignment = self._admit_locked(task_state, admitted_at)
+            reservation_state.remaining_slots -= 1
+            remaining = reservation_state.remaining_slots
+            if remaining == 0:
+                self._reservations.pop(reservation_id)
+            self._history.append(
+                {
+                    "event": "reservation_completed",
+                    "reservation_id": reservation_id,
+                    "purpose": reservation_state.reservation.purpose,
+                    "slots": 1,
+                    "outcome": "converted_to_solver",
+                    "agent_id": assignment.agent_id,
+                    "task_id": assignment.task_id,
+                    "remaining_reservation_slots": remaining,
+                    "completed_at": admitted_at,
+                }
+            )
+            return assignment
+
+    @contextmanager
+    def reservation(
+        self,
+        *,
+        slots: int = 1,
+        purpose: str = "external",
+        now: float | None = None,
+    ) -> Iterator[SlotReservation | None]:
+        """Acquire capacity and guarantee release on normal/error exit."""
+        held = self.acquire_reservation(slots=slots, purpose=purpose, now=now)
+        try:
+            yield held
+        finally:
+            if held is not None:
+                self.release_reservation(held, reason="context_exit")
 
     def _admit_locked(self, state: _TaskState, admitted_at: float) -> AgentAssignment:
         generation = state.next_generation
@@ -487,7 +697,19 @@ class ElasticScheduler:
                 "max_parallel": self.max_parallel,
                 "assignment_policy": self.assignment_policy,
                 "active_slots": len(self._active),
-                "remaining_slots": self.max_parallel - len(self._active),
+                "reservation_slots": sum(
+                    state.remaining_slots for state in self._reservations.values()
+                ),
+                "occupied_slots": self._occupied_slots_locked(),
+                "remaining_slots": self.max_parallel - self._occupied_slots_locked(),
+                "reservations": {
+                    reservation_id: {
+                        "slots": state.remaining_slots,
+                        "purpose": state.reservation.purpose,
+                        "acquired_at": state.reservation.acquired_at,
+                    }
+                    for reservation_id, state in self._reservations.items()
+                },
                 "horizon": self.horizon,
                 "elapsed": self.elapsed,
                 "horizon_reached": self._horizon_reached(float(self._clock())),
@@ -503,4 +725,10 @@ class ElasticScheduler:
 DynamicScheduler = ElasticScheduler
 
 
-__all__ = ["AgentAssignment", "AgentLease", "ElasticScheduler", "DynamicScheduler"]
+__all__ = [
+    "AgentAssignment",
+    "AgentLease",
+    "SlotReservation",
+    "ElasticScheduler",
+    "DynamicScheduler",
+]
