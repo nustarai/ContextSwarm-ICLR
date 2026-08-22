@@ -197,7 +197,18 @@ class Figure4RuntimeTests(unittest.TestCase):
         fallback = next(row for row in decisions if row["fallback"])
         self.assertIn("ConnectionError", fallback["fallback_reason"])
         self.assertEqual(fallback["scheduler_cost"]["calls"], 1)
-        self.assertIsNotNone(fallback["assigned_agent_id"])
+        # Admission races are expected: the fallback is still a charged
+        # decision even when a peer changes the state before reservation
+        # revalidation.  Lifecycle correctness is the stable contract.
+        self.assertIn(
+            fallback["disposition"],
+            {
+                "assigned",
+                "not_admitted_stale",
+                "not_admitted_horizon",
+                "not_admitted_ineligible",
+            },
+        )
         scheduler_state = json.loads(
             (run_dir / "elastic_scheduler_state.json").read_text(encoding="utf-8")
         )
@@ -207,6 +218,33 @@ class Figure4RuntimeTests(unittest.TestCase):
         self.assertNotIn("runner_or_worker_error", final["health"]["issues"])
         self.assertNotIn("scheduler_reservations_not_released", final["health"]["issues"])
         self.assertNotIn("scheduler_occupied_slots_not_released", final["health"]["issues"])
+        summary = json.loads(
+            (run_dir / "allocation_summary.json").read_text(encoding="utf-8")
+        )
+        charged_indexes = {
+            int(row["decision_index"])
+            for row in decisions
+            if row.get("scheduler_cost") is not None
+        }
+        result_indexes = {
+            int(row["decision_index"])
+            for row in final["allocation_scheduler_agents"]
+        }
+        event_indexes = {
+            int(row["decision_index"])
+            for row in _rows(run_dir / "events.jsonl")
+            if row.get("event") == "allocation_scheduler_finished"
+        }
+        self.assertEqual(result_indexes, charged_indexes)
+        self.assertEqual(event_indexes, charged_indexes)
+        self.assertEqual(
+            final["health"]["allocation_scheduler_charged_decision_count"],
+            len(charged_indexes),
+        )
+        self.assertAlmostEqual(
+            summary["scheduler_cost"]["reserved_slot_seconds"],
+            summary["scheduler_reserved_slot_seconds"],
+        )
 
     def test_llm_global_state_change_is_stale_and_not_admitted(self) -> None:
         original_choose = ReadOnlyLLMSchedulerPolicy.choose

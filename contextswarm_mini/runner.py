@@ -2951,6 +2951,7 @@ def _run_elastic_cps(
     results: list[tuple[AgentResult, Verdict]] = []
     results_lock = threading.RLock()
     scheduler_results_lock = threading.RLock()
+    scheduler_result_decisions: set[int] = set()
     evaluation_backlog_limit = max(
         2,
         config.max_parallel + config.lean_max_concurrent_evaluations,
@@ -2999,6 +3000,53 @@ def _run_elastic_cps(
         # after all broker sessions have been revoked/drained.
         for task_state in states.values():
             task_state.cancel_event.set()
+
+    def record_scheduler_result(result: AgentResult) -> None:
+        """Publish exactly one scheduler result/event for a charged decision."""
+
+        index = result.decision_index
+        if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+            raise RuntimeError("scheduler result is missing a valid decision index")
+        with scheduler_results_lock:
+            if index in scheduler_result_decisions:
+                raise RuntimeError("duplicate scheduler result decision index")
+            scheduler_result_decisions.add(index)
+            scheduler_result_sink.append(result)
+        logger.event("allocation_scheduler_finished", **result.as_dict())
+
+    def reconcile_scheduler_result(decision: Any) -> None:
+        """Materialize a bounded result when the policy caught an invoker error.
+
+        The pure LLM policy deliberately catches provider/adapter exceptions
+        and returns a charged deterministic fallback.  If the exception was
+        raised before the runner-owned invoker produced an ``AgentResult``, the
+        decision would otherwise have a cost record but no result or finished
+        event.  Synthesize only that missing lifecycle record; never duplicate
+        a result already emitted by the invoker.
+        """
+
+        cost = getattr(decision, "scheduler_cost", None)
+        if cost is None:
+            return
+        index = int(decision.decision_index)
+        with scheduler_results_lock:
+            if index in scheduler_result_decisions:
+                return
+        now = utc_now()
+        result = AgentResult(
+            agent_id=f"allocation-scheduler-{index}",
+            task_id="__allocation__",
+            episode=index,
+            returncode=1,
+            started_at=now,
+            finished_at=now,
+            command=["<scheduler-invocation-failed>"],
+            error_tail="scheduler invocation ended before a process result was available",
+            mocked=mock_agent,
+            decision_index=index,
+            run_horizon_reached=time.monotonic() >= deadline,
+        )
+        record_scheduler_result(result)
 
     def invoke_scheduler_agent(
         snapshot: TaskProgressSnapshot,
@@ -3058,9 +3106,7 @@ def _run_elastic_cps(
             if not run_horizon_is_limiter and result.run_horizon_reached:
                 result.run_horizon_reached = False
         result.decision_index = index
-        with scheduler_results_lock:
-            scheduler_result_sink.append(result)
-        logger.event("allocation_scheduler_finished", **result.as_dict())
+        record_scheduler_result(result)
         return result
 
     def invoke_core_scheduler_agent(
@@ -3103,9 +3149,7 @@ def _run_elastic_cps(
                 and time.monotonic() >= deadline
             )
         result.decision_index = snapshot.decision_index
-        with scheduler_results_lock:
-            scheduler_result_sink.append(result)
-        logger.event("allocation_scheduler_finished", **result.as_dict())
+        record_scheduler_result(result)
         latency = max(0.0, time.monotonic() - started)
         return LLMSchedulerResponse(
             output=result.output_tail,
@@ -3154,6 +3198,7 @@ def _run_elastic_cps(
                 trace_view=trace_view,
             )
             core_decision = self.core_policy.choose(core_snapshot)
+            reconcile_scheduler_result(core_decision)
             self.decisions.append(core_decision)
             core_decisions[core_decision.decision_index] = (core_snapshot, core_decision)
             return _legacy_decision_from_core(core_decision)
@@ -4480,15 +4525,34 @@ def _run_elastic_cps(
         encoding="utf-8",
     )
     allocation_summary = allocator.summary()
-    allocation_summary.update(
-        _allocation_runtime_metrics(
-            scheduler.history(),
-            run_started_monotonic=run_started_monotonic,
-            deadline=deadline,
-            max_parallel=config.max_parallel,
-            policy_latency_seconds=float(allocation_summary["total_latency_seconds"]),
-        )
+    runtime_metrics = _allocation_runtime_metrics(
+        scheduler.history(),
+        run_started_monotonic=run_started_monotonic,
+        deadline=deadline,
+        max_parallel=config.max_parallel,
+        policy_latency_seconds=float(allocation_summary["total_latency_seconds"]),
     )
+    allocation_summary.update(runtime_metrics)
+    # Keep the nested cost object and the top-level lifecycle metrics on one
+    # ledger.  Per-call model latency is not a capacity measure; only the
+    # reservation history determines occupied slot-seconds.
+    scheduler_cost_summary = dict(allocation_summary.get("scheduler_cost") or {})
+    scheduler_cost_summary.update(
+        {
+            "calls": int(allocation_summary.get("agent_calls", 0)),
+            "latency_seconds": float(allocation_summary["total_latency_seconds"]),
+            "capacity_reservations": int(
+                runtime_metrics["scheduler_capacity_reservations"]
+            ),
+            "occupied_capacity_slot_seconds": float(
+                runtime_metrics["scheduler_reserved_slot_seconds"]
+            ),
+            "reserved_slot_seconds": float(
+                runtime_metrics["scheduler_reserved_slot_seconds"]
+            ),
+        }
+    )
+    allocation_summary["scheduler_cost"] = scheduler_cost_summary
     allocation_summary.update(_scheduler_token_usage(run_dir / "pi_events.jsonl"))
     allocation_summary.update(_solver_token_usage(run_dir / "pi_events.jsonl"))
     allocation_summary["initial_pool_size"] = len(initial_assignments)
@@ -5764,6 +5828,7 @@ def _run_health(
     scheduler_invalid_outputs = 0
     scheduler_fallbacks = 0
     scheduler_summary_agent_calls: int | None = None
+    scheduler_charged_decisions = 0
     scheduler_active_slots: int | None = None
     scheduler_reservation_slots: int | None = None
     scheduler_occupied_slots: int | None = None
@@ -5790,6 +5855,13 @@ def _run_health(
             )
             for row in agent_decisions
         )
+        llm_decision_indexes = Counter(
+            str(row.get("decision_index"))
+            for row in decisions
+            if str(row.get("policy") or "") == "llm_scheduler"
+            and row.get("scheduler_cost") is not None
+        )
+        scheduler_charged_decisions = sum(llm_decision_indexes.values())
         try:
             allocation_summary = json.loads(
                 (run_dir / "allocation_summary.json").read_text(encoding="utf-8")
@@ -5810,6 +5882,27 @@ def _run_health(
                 or scheduler_result_identities != scheduler_decision_identities
                 or len(scheduler_event_rows) != len(scheduler_agents)
                 or scheduler_summary_agent_calls != len(scheduler_agents)
+            ):
+                issues.add("allocation_scheduler_closeout_mismatch")
+        elif config.allocation.policy == "llm_scheduler":
+            # A pure LLM policy charges one bounded scheduler call whenever a
+            # decision carries ``scheduler_cost``.  The provider may fail
+            # before producing a process-level result; the runner then emits a
+            # synthetic result, but the lifecycle cardinality remains exact.
+            # Compare only decision indexes here: unlike the legacy ``agent``
+            # policy, LLM decisions intentionally do not expose process
+            # identity fields in the allocation decision artifact, and a
+            # recoverable fallback may legitimately have a non-zero result.
+            scheduler_result_indexes = Counter(
+                str(item.decision_index) for item in scheduler_agents
+            )
+            scheduler_event_indexes = Counter(
+                str(row.get("decision_index")) for row in scheduler_event_rows
+            )
+            if (
+                scheduler_result_indexes != llm_decision_indexes
+                or scheduler_event_indexes != llm_decision_indexes
+                or scheduler_summary_agent_calls != scheduler_charged_decisions
             ):
                 issues.add("allocation_scheduler_closeout_mismatch")
         assignments, assignments_valid = _read_jsonl_objects(
@@ -5906,6 +5999,7 @@ def _run_health(
         "allocation_scheduler_oom_or_exit_137_count": scheduler_oom_or_137,
         "allocation_scheduler_invalid_output_count": scheduler_invalid_outputs,
         "allocation_scheduler_fallback_count": scheduler_fallbacks,
+        "allocation_scheduler_charged_decision_count": scheduler_charged_decisions,
         "allocation_scheduler_summary_agent_calls": scheduler_summary_agent_calls,
         "judge_probe_count": len(probe_rows),
         "judge_probe_infrastructure_error_count": probe_infrastructure_errors,

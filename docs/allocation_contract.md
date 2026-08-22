@@ -97,6 +97,16 @@ deterministic Task-State fallback.  Each call reserves one scheduler slot from
 the same fixed capacity while it is running; retry time remains inside the
 fixed horizon.  Calls, input/output tokens, latency, reservation count,
 occupied slot-seconds, invalid output count, and fallback count are recorded.
+Every decision carrying a scheduler cost is one charged call and must have
+exactly one scheduler lifecycle result and one
+`allocation_scheduler_finished` event with the same `decision_index`.  A
+provider/adapter failure may be represented by a synthetic nonzero result;
+that candidate-independent accounting record is recoverable fallback evidence,
+not by itself an infrastructure failure.  `latency_seconds` measures provider
+time only; `reserved_slot_seconds` and
+`occupied_capacity_slot_seconds` are computed from reservation acquire/release
+lifecycle events and must not be populated from latency when those quantities
+differ.
 
 ## Decision, counterfactual, and cost artifacts
 
