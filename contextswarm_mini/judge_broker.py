@@ -40,7 +40,13 @@ _MAX_REQUEST_BYTES = 32 * 1024
 _MAX_PROBE_CALLS_PER_SESSION = 32
 _MIN_PROBE_INTERVAL_SECONDS = 1.0
 _PROBE_ADMISSION_TIMEOUT_SECONDS: float | None = None
-_BROKER_DRAIN_TIMEOUT_SECONDS = 5.0
+# Closeout is outside the solver horizon.  A five-second drain was sufficient
+# for a single canary, but it races legitimate Judge handlers when several
+# formal arms revoke their sessions together: queued cancellation/receipt
+# reconciliation can take tens of seconds even after the remote service is
+# healthy.  Keep this bounded (and fail closed if it is genuinely stuck), but
+# leave enough time for the fixed Judge lifecycle to settle.
+_BROKER_DRAIN_TIMEOUT_SECONDS = 120.0
 _RUNNER_ONLY_CPS_KINDS = frozenset({"validation_result"})
 _ALLOWED_CANDIDATE_FILENAMES = frozenset({"result.lean", "result.cpp"})
 _LEAN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.₀-₉ⁿ¹²³@]*$")

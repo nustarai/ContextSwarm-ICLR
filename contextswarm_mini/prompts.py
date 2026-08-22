@@ -239,6 +239,11 @@ evaluates every candidate after this session and counts only canonical PROVED ve
 
 {contract}
 
+Mono task-selection rule: this session owns multiple task directories. For every
+`judge_check` call in Mono, pass the exact current task slug as
+`{{"task_id": "<slug>"}}`; never make a no-argument call. A single-task
+Parallel worker may omit `task_id`, but Mono may not.
+
 {_communication_instructions(communication_enabled)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}

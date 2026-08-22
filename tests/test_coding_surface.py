@@ -91,6 +91,15 @@ class CodingPromptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_mono_prompt([_coding_task(), formal], workspace="mono", communication_enabled=False)
 
+    def test_mono_requires_explicit_task_selection_for_judge_check(self) -> None:
+        prompt = build_mono_prompt(
+            [_coding_task("first"), _coding_task("second")],
+            workspace="mono",
+            communication_enabled=False,
+        )
+        self.assertIn('{"task_id": "<slug>"}', prompt)
+        self.assertIn("never make a no-argument call", prompt)
+
 
 class CodingPiPathGuardTests(unittest.TestCase):
     def test_result_cpp_is_readable_and_writable_when_bound(self) -> None:
