@@ -288,6 +288,44 @@ class Figure4RuntimeTests(unittest.TestCase):
         self.assertEqual(figure4["scheduler_cost"]["invalid_outputs"], 0)
         self.assertEqual(figure4["scheduler_cost"]["horizon_truncations"], 0)
 
+    def test_llm_nested_scheduler_cost_calls_tamper_degrades_health(self) -> None:
+        """A forged nested calls count must fail closeout reconciliation."""
+
+        original_health = runner_module._run_health
+
+        def tamper_nested_cost(run_dir, *args, **kwargs):
+            path = run_dir / "allocation_summary.json"
+            summary = json.loads(path.read_text(encoding="utf-8"))
+            summary["scheduler_cost"]["calls"] = 999
+            path.write_text(
+                json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            return original_health(run_dir, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                runner_module,
+                "_run_health",
+                side_effect=tamper_nested_cost,
+            ):
+                run_dir = run_experiment(
+                    _config("llm_scheduler", attempts=2),
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+            final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
+
+        health = final["health"]
+        self.assertFalse(health["ok"])
+        self.assertEqual(health["allocation_scheduler_summary_cost_calls"], 999)
+        self.assertNotEqual(
+            health["allocation_scheduler_summary_cost_calls"],
+            health["allocation_scheduler_charged_decision_count"],
+        )
+        self.assertIn("allocation_scheduler_cost_cardinality_mismatch", health["issues"])
+        self.assertIn("allocation_scheduler_closeout_mismatch", health["issues"])
+
     def test_llm_malformed_output_summary_is_selectable(self) -> None:
         original_choose = ReadOnlyLLMSchedulerPolicy.choose
         malformed_sent = False

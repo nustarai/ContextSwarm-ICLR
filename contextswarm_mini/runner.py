@@ -6021,6 +6021,11 @@ def _run_health(
     scheduler_provider_errors = 0
     scheduler_summary_agent_calls: int | None = None
     scheduler_summary_cost_calls: int | None = None
+    scheduler_summary_cost_provider_errors: int | None = None
+    scheduler_summary_cost_invalid_outputs: int | None = None
+    scheduler_summary_cost_fallback_count: int | None = None
+    scheduler_summary_cost_policy_timeouts: int | None = None
+    scheduler_summary_cost_horizon_truncations: int | None = None
     scheduler_charged_decisions = 0
     scheduler_active_slots: int | None = None
     scheduler_reservation_slots: int | None = None
@@ -6068,8 +6073,38 @@ def _run_health(
                     )
                 raw_scheduler_cost = allocation_summary.get("scheduler_cost")
                 if isinstance(raw_scheduler_cost, Mapping):
+                    # Keep the nested scheduler-cost ledger on the same
+                    # strict artifact boundary as the top-level counters.
+                    # In particular, do not accept ``True``, ``4.0``, or
+                    # ``"4"`` as a call count: those shapes can conceal a
+                    # forged or partially-written closeout summary.
                     scheduler_summary_cost_calls = _artifact_nonnegative_int(
                         raw_scheduler_cost.get("calls")
+                    )
+                    scheduler_summary_cost_provider_errors = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("provider_errors")
+                        )
+                    )
+                    scheduler_summary_cost_invalid_outputs = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("invalid_outputs")
+                        )
+                    )
+                    scheduler_summary_cost_fallback_count = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("fallback_count")
+                        )
+                    )
+                    scheduler_summary_cost_policy_timeouts = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("policy_timeouts")
+                        )
+                    )
+                    scheduler_summary_cost_horizon_truncations = (
+                        _artifact_nonnegative_int(
+                            raw_scheduler_cost.get("horizon_truncations")
+                        )
                     )
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             allocation_summary = None
@@ -6139,6 +6174,14 @@ def _run_health(
                 or bool(row.get("recoverable_invocation_error"))
                 for row in llm_charged_decisions
             )
+            scheduler_policy_timeout_outcomes = sum(
+                str(row.get("scheduler_outcome") or "") == "policy_timeout"
+                for row in llm_charged_decisions
+            )
+            scheduler_horizon_outcomes = sum(
+                str(row.get("scheduler_outcome") or "") == "horizon_truncated"
+                for row in llm_charged_decisions
+            )
             for row in decisions:
                 if str(row.get("policy") or "") != "llm_scheduler":
                     continue
@@ -6171,10 +6214,30 @@ def _run_health(
                 or llm_outcome_errors
                 or scheduler_summary_agent_calls != scheduler_charged_decisions
                 or scheduler_summary_cost_calls != scheduler_charged_decisions
+                or scheduler_summary_cost_calls != len(scheduler_agents)
+                or scheduler_summary_cost_calls != len(scheduler_event_rows)
+                or scheduler_summary_cost_provider_errors != scheduler_provider_errors
+                or scheduler_summary_cost_invalid_outputs != scheduler_invalid_outputs
+                or scheduler_summary_cost_fallback_count != scheduler_fallbacks
+                or scheduler_summary_cost_policy_timeouts
+                != scheduler_policy_timeout_outcomes
+                or scheduler_summary_cost_horizon_truncations
+                != scheduler_horizon_outcomes
             ):
                 issues.add("allocation_scheduler_closeout_mismatch")
             if scheduler_summary_cost_calls != scheduler_charged_decisions:
                 issues.add("allocation_scheduler_cost_cardinality_mismatch")
+            if any(
+                actual != expected
+                for actual, expected in (
+                    (scheduler_summary_cost_provider_errors, scheduler_provider_errors),
+                    (scheduler_summary_cost_invalid_outputs, scheduler_invalid_outputs),
+                    (scheduler_summary_cost_fallback_count, scheduler_fallbacks),
+                    (scheduler_summary_cost_policy_timeouts, scheduler_policy_timeout_outcomes),
+                    (scheduler_summary_cost_horizon_truncations, scheduler_horizon_outcomes),
+                )
+            ):
+                issues.add("allocation_scheduler_cost_summary_mismatch")
         assignments, assignments_valid = _read_jsonl_objects(
             run_dir / "elastic_assignments.jsonl"
         )
@@ -6356,6 +6419,11 @@ def _run_health(
         "allocation_scheduler_charged_decision_count": scheduler_charged_decisions,
         "allocation_scheduler_summary_agent_calls": scheduler_summary_agent_calls,
         "allocation_scheduler_summary_cost_calls": scheduler_summary_cost_calls,
+        "allocation_scheduler_summary_cost_provider_errors": scheduler_summary_cost_provider_errors,
+        "allocation_scheduler_summary_cost_invalid_outputs": scheduler_summary_cost_invalid_outputs,
+        "allocation_scheduler_summary_cost_fallback_count": scheduler_summary_cost_fallback_count,
+        "allocation_scheduler_summary_cost_policy_timeouts": scheduler_summary_cost_policy_timeouts,
+        "allocation_scheduler_summary_cost_horizon_truncations": scheduler_summary_cost_horizon_truncations,
         "judge_probe_count": len(probe_rows),
         "judge_probe_infrastructure_error_count": probe_infrastructure_errors,
         "assigned_count": assigned_count,
