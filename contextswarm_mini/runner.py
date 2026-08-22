@@ -2579,6 +2579,8 @@ def _run_elastic_cps(
             config.allocation.policy,
             task_weights=TaskScoreWeights.from_mapping(config.allocation.task_state),
             trace_weights=TraceScoreWeights.from_mapping(config.allocation.trace_state),
+            prompt_max_bytes=config.allocation.prompt_max_bytes,
+            prompt_max_tokens=config.allocation.prompt_max_tokens,
             llm_invoker=(
                 invoke_core_scheduler_agent
                 if config.allocation.policy == "llm_scheduler"

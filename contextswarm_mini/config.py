@@ -426,6 +426,11 @@ class AllocationConfig:
     task_state: dict[str, float]
     trace_state: dict[str, float]
     normalization: dict[str, float]
+    # Hard, manifest-owned bounds for the read-only LLM scheduler wire prompt.
+    # They are part of the allocation policy contract even when another arm
+    # does not consume them, so paired manifests cannot silently diverge.
+    prompt_max_bytes: int
+    prompt_max_tokens: int
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -437,6 +442,8 @@ class AllocationConfig:
             "task_state": dict(sorted(self.task_state.items())),
             "trace_state": dict(sorted(self.trace_state.items())),
             "normalization": dict(sorted(self.normalization.items())),
+            "prompt_max_bytes": self.prompt_max_bytes,
+            "prompt_max_tokens": self.prompt_max_tokens,
         }
 
 
@@ -845,6 +852,16 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         task_state=task_state_parameters,
         trace_state=trace_state_parameters,
         normalization=normalization_parameters,
+        prompt_max_bytes=_positive_int(
+            allocation.get("prompt_max_bytes"),
+            "allocation.prompt_max_bytes",
+            64 * 1024,
+        ),
+        prompt_max_tokens=_positive_int(
+            allocation.get("prompt_max_tokens"),
+            "allocation.prompt_max_tokens",
+            64 * 1024,
+        ),
     )
     episodes = _positive_int(experiment.get("episodes_per_task"), "experiment.episodes_per_task", 1)
     max_tasks = _nonnegative_int(experiment.get("max_tasks"), "experiment.max_tasks", 0)
