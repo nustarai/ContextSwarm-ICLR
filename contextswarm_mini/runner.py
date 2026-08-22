@@ -5690,6 +5690,19 @@ def _read_jsonl_objects(path: Path) -> tuple[list[dict[str, Any]], bool]:
     return rows, True
 
 
+def _artifact_nonnegative_int(value: Any) -> int | None:
+    """Return a strict JSON integer used by closeout ledgers, or ``None``.
+
+    Artifact validation must not accept booleans, integral-looking floats, or
+    numeric strings: accepting those shapes would hide schema corruption at
+    the exact point where capacity conservation is audited.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
 def _run_health(
     run_dir: Path,
     config: ExperimentConfig,
@@ -5899,6 +5912,7 @@ def _run_health(
     scheduler_reservation_slots: int | None = None
     scheduler_occupied_slots: int | None = None
     scheduler_remaining_slots: int | None = None
+    scheduler_reservation_leak_count = 0
     if config.uses_cps:
         decisions, decisions_valid = _read_jsonl_objects(
             run_dir / "allocation_decisions.jsonl"
@@ -6018,28 +6032,111 @@ def _run_health(
             scheduler_state = json.loads(
                 (run_dir / "elastic_scheduler_state.json").read_text(encoding="utf-8")
             )
-            scheduler_active_slots = int(scheduler_state["active_slots"])
-            scheduler_reservation_slots = int(scheduler_state["reservation_slots"])
-            scheduler_occupied_slots = int(scheduler_state["occupied_slots"])
-            scheduler_remaining_slots = int(scheduler_state["remaining_slots"])
-            task_rows = scheduler_state.get("tasks") or {}
-            if scheduler_active_slots != 0 or any(
-                int(row.get("active_agents") or 0) != 0
-                for row in task_rows.values()
-                if isinstance(row, Mapping)
+            if not isinstance(scheduler_state, Mapping):
+                raise TypeError("scheduler state must be an object")
+            scheduler_active_slots = _artifact_nonnegative_int(
+                scheduler_state.get("active_slots")
+            )
+            scheduler_reservation_slots = _artifact_nonnegative_int(
+                scheduler_state.get("reservation_slots")
+            )
+            scheduler_occupied_slots = _artifact_nonnegative_int(
+                scheduler_state.get("occupied_slots")
+            )
+            scheduler_remaining_slots = _artifact_nonnegative_int(
+                scheduler_state.get("remaining_slots")
+            )
+            max_parallel = _artifact_nonnegative_int(
+                scheduler_state.get("max_parallel")
+            )
+            reservations = scheduler_state.get("reservations")
+            task_rows = scheduler_state.get("tasks")
+            if any(
+                value is None
+                for value in (
+                    scheduler_active_slots,
+                    scheduler_reservation_slots,
+                    scheduler_occupied_slots,
+                    scheduler_remaining_slots,
+                    max_parallel,
+                )
+            ) or not isinstance(reservations, Mapping) or not isinstance(
+                task_rows, Mapping
             ):
+                raise TypeError("scheduler capacity ledger is malformed")
+
+            assert scheduler_active_slots is not None
+            assert scheduler_reservation_slots is not None
+            assert scheduler_occupied_slots is not None
+            assert scheduler_remaining_slots is not None
+            assert max_parallel is not None
+
+            reservation_entry_slots = 0
+            for reservation_id, reservation_row in reservations.items():
+                if (
+                    not isinstance(reservation_id, str)
+                    or not reservation_id.strip()
+                    or not isinstance(reservation_row, Mapping)
+                ):
+                    raise TypeError("scheduler reservation entry is malformed")
+                entry_slots = _artifact_nonnegative_int(
+                    reservation_row.get("slots")
+                )
+                if entry_slots is None or entry_slots == 0:
+                    raise TypeError("scheduler reservation slot count is malformed")
+                reservation_entry_slots += entry_slots
+
+            task_active_slots = 0
+            for task_id, task_row in task_rows.items():
+                if (
+                    not isinstance(task_id, str)
+                    or not task_id.strip()
+                    or not isinstance(task_row, Mapping)
+                ):
+                    raise TypeError("scheduler task entry is malformed")
+                active_agents = _artifact_nonnegative_int(
+                    task_row.get("active_agents")
+                )
+                if active_agents is None:
+                    raise TypeError("scheduler task active count is malformed")
+                task_active_slots += active_agents
+
+            malformed_totals = (
+                task_active_slots != scheduler_active_slots
+                or reservation_entry_slots != scheduler_reservation_slots
+                or scheduler_active_slots + scheduler_reservation_slots
+                != scheduler_occupied_slots
+                or scheduler_occupied_slots + scheduler_remaining_slots
+                != max_parallel
+                or max_parallel != config.max_parallel
+            )
+            scheduler_reservation_leak_count = (
+                scheduler_reservation_slots + len(reservations)
+            )
+            if scheduler_active_slots != 0 or task_active_slots != 0:
                 issues.add("scheduler_not_closed")
-            # A scheduler reservation is physical capacity, even while no
-            # solver lease is active.  A successful closeout therefore proves
-            # both ledgers are empty; otherwise an orphaned reservation could
-            # silently reduce refill capacity or contaminate a paired arm.
+            if malformed_totals:
+                issues.add("scheduler_capacity_invalid")
+            if (
+                scheduler_reservation_slots != 0
+                or scheduler_occupied_slots != 0
+                or scheduler_remaining_slots != max_parallel
+                or bool(reservations)
+            ):
+                issues.add("allocation_scheduler_reservation_leak")
             if scheduler_reservation_slots != 0:
                 issues.add("scheduler_reservations_not_released")
             if scheduler_occupied_slots != 0:
                 issues.add("scheduler_occupied_slots_not_released")
-            if scheduler_remaining_slots < 0:
-                issues.add("scheduler_capacity_invalid")
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        except (
+            AttributeError,
+            OSError,
+            KeyError,
+            OverflowError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
             issues.add("scheduler_state_invalid_or_missing")
 
     return {
@@ -6076,6 +6173,7 @@ def _run_health(
         "scheduler_reservation_slots": scheduler_reservation_slots,
         "scheduler_occupied_slots": scheduler_occupied_slots,
         "scheduler_remaining_slots": scheduler_remaining_slots,
+        "scheduler_reservation_leak_count": scheduler_reservation_leak_count,
     }
 
 
