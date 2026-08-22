@@ -384,28 +384,47 @@ def _retryable_closeout_infrastructure_failure(verdict: Verdict) -> bool:
     )
 
 
-def _reuse_authority_after_infrastructure_failure(
+def _mark_closeout_infrastructure_incomplete(
+    task: Task,
+    candidate: _FrozenCandidate,
     prior: Verdict,
     observed: Verdict,
 ) -> Verdict:
-    response = dict(prior.response)
+    """Return a zero-score fresh-closeout failure, never a reused proof.
+
+    A solver-phase Judge receipt can explain why the frozen candidate was
+    selected, but it cannot stand in for the independent outer closeout.  Do
+    not copy its ``PROVED`` status, score, or job id into the final verdict.
+    """
+
+    response = dict(observed.response)
     response["closeout_infra_incomplete"] = {
         "observed_status": _normalized_verdict_status(observed),
         "error_kind": _response_value(observed.response, "error_kind"),
         "terminal_reason": _response_value(observed.response, "terminal_reason"),
         "retryable": True,
     }
+    response["prior_authoritative_proof_available"] = True
+    response["fresh_closeout_confirmed"] = False
+    candidate_sha = _normalized_sha256(observed.candidate_sha256)
+    if candidate_sha is None:
+        candidate_sha = _normalized_sha256(candidate.sha256)
+    contract_sha = _normalized_sha256(observed.task_contract_sha256)
+    if contract_sha is None:
+        contract_sha = _normalized_sha256(prior.task_contract_sha256)
     return Verdict(
-        task_id=prior.task_id,
-        status="PROVED",
-        score=1.0,
-        elapsed_seconds=prior.elapsed_seconds,
+        task_id=task.slug,
+        status=_normalized_verdict_status(observed) or "CLOSEOUT_INCOMPLETE",
+        score=0.0,
+        elapsed_seconds=observed.elapsed_seconds,
         response=response,
-        error=prior.error,
-        candidate_sha256=prior.candidate_sha256,
-        task_contract_sha256=prior.task_contract_sha256,
-        judge_job_id=prior.judge_job_id,
-        cache_reused=prior.cache_reused,
+        error=observed.error or "fresh outer closeout did not complete",
+        candidate_sha256=candidate_sha,
+        task_contract_sha256=contract_sha,
+        # Keep only the fresh observation's receipt; the prior solver receipt
+        # is deliberately not promoted to final authority.
+        judge_job_id=observed.judge_job_id,
+        cache_reused=observed.cache_reused,
     )
 
 
@@ -3443,10 +3462,15 @@ def _run_closeout(
             )
         if _retryable_closeout_infrastructure_failure(observed):
             return _CloseoutDecision(
-                _reuse_authority_after_infrastructure_failure(prior, observed),
+                _mark_closeout_infrastructure_incomplete(
+                    task,
+                    candidate,
+                    prior,
+                    observed,
+                ),
                 observed,
                 prior,
-                "retryable_infra_reused",
+                "retryable_infra_unconfirmed",
             )
         return _CloseoutDecision(
             _authority_conflict_verdict(task, prior, observed),
@@ -3473,7 +3497,7 @@ def _run_closeout(
                     candidate_sha256=frozen[task.slug].sha256,
                     **decision.authority_mismatch,
                 )
-            if decision.disposition == "retryable_infra_reused":
+            if decision.disposition == "retryable_infra_unconfirmed":
                 logger.event(
                     "closeout_infra_incomplete",
                     task_id=task.slug,
@@ -3491,6 +3515,8 @@ def _run_closeout(
                     observed_retryable=True,
                     final_status=verdict.status,
                     final_score=verdict.score,
+                    prior_authoritative_proof_available=True,
+                    fresh_closeout_confirmed=False,
                 )
             elif decision.disposition == "authority_confirmed":
                 logger.event(
@@ -3539,14 +3565,22 @@ def _run_closeout(
                 agent_id="closeout",
                 episode=0,
                 observed_status=_normalized_verdict_status(decision.observed),
-                reused_authoritative_verdict=(
-                    decision.disposition == "retryable_infra_reused"
-                ),
+                # A prior solver proof is diagnostic linkage only.  It is never
+                # reused as the final official verdict when fresh closeout is
+                # incomplete.
+                reused_authoritative_verdict=False,
                 authoritative_proof_confirmed=(
                     decision.disposition == "authority_confirmed"
                 ),
                 closeout_infra_incomplete=(
-                    decision.disposition == "retryable_infra_reused"
+                    decision.disposition == "retryable_infra_unconfirmed"
+                ),
+                prior_authoritative_proof_available=(
+                    decision.prior_authority is not None
+                    and decision.disposition == "retryable_infra_unconfirmed"
+                ),
+                fresh_closeout_confirmed=(
+                    decision.disposition == "authority_confirmed"
                 ),
                 authority_conflict=(
                     decision.disposition == "authority_conflict"
@@ -3557,16 +3591,19 @@ def _run_closeout(
     logger.event(
         "closeout_finished",
         score=sum(verdict.score for verdict in ordered.values()),
-        reused_authoritative_verdicts=disposition_counts.get(
-            "retryable_infra_reused",
-            0,
-        ),
+        # Kept for schema compatibility; no authoritative verdict is reused
+        # when fresh closeout is incomplete.
+        reused_authoritative_verdicts=0,
         authoritative_proofs_confirmed=disposition_counts.get(
             "authority_confirmed",
             0,
         ),
         closeout_infra_incomplete=disposition_counts.get(
-            "retryable_infra_reused",
+            "retryable_infra_unconfirmed",
+            0,
+        ),
+        closeout_infra_unconfirmed=disposition_counts.get(
+            "retryable_infra_unconfirmed",
             0,
         ),
         authority_conflicts=disposition_counts.get("authority_conflict", 0),

@@ -345,7 +345,7 @@ class CloseoutLifecycleTests(unittest.TestCase):
         self.assertEqual(lifecycle["remote_unsettled_jobs"], 1)
         self.assertEqual(final["status"], "ERROR")
 
-    def test_retryable_closeout_infra_preserves_exact_solver_authority(self) -> None:
+    def test_retryable_closeout_infra_never_reuses_solver_authority(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             _SolverProofThenRetryableCloseout.calls = []
             config = replace(
@@ -369,9 +369,18 @@ class CloseoutLifecycleTests(unittest.TestCase):
 
             final = json.loads((run_dir / "final.json").read_text(encoding="utf-8"))
             verdict = final["verdicts"]["imo2024_p1"]
-            self.assertEqual(final["score"], 1.0)
-            self.assertEqual(verdict["status"], "PROVED")
-            self.assertEqual(verdict["judge_job_id"], "solver-authority")
+            # A solver-phase proof is not enough for AC.  The independent
+            # outer closeout failed retryably, so the run must not retain its
+            # score or job id as final authority.
+            self.assertEqual(final["score"], 0.0)
+            self.assertEqual(final["status"], "DEGRADED")
+            self.assertFalse(final["health"]["ok"])
+            self.assertEqual(verdict["status"], "RESOURCE_LIMIT")
+            self.assertEqual(verdict["judge_job_id"], "closeout-infra")
+            self.assertTrue(
+                verdict["response"]["prior_authoritative_proof_available"]
+            )
+            self.assertFalse(verdict["response"]["fresh_closeout_confirmed"])
             self.assertEqual(
                 verdict["response"]["closeout_infra_incomplete"]["observed_status"],
                 "RESOURCE_LIMIT",
@@ -391,8 +400,10 @@ class CloseoutLifecycleTests(unittest.TestCase):
             closeout = next(
                 row for row in events if row["event"] == "closeout_evaluation_finished"
             )
-            self.assertTrue(closeout["reused_authoritative_verdict"])
+            self.assertFalse(closeout["reused_authoritative_verdict"])
             self.assertTrue(closeout["closeout_infra_incomplete"])
+            self.assertTrue(closeout["prior_authoritative_proof_available"])
+            self.assertFalse(closeout["fresh_closeout_confirmed"])
             self.assertFalse(closeout["scoreboard_recorded"])
             scoreboard = [
                 json.loads(line)
