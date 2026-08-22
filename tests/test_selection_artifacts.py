@@ -10,6 +10,7 @@ from contextswarm_mini.selection_artifacts import (
     validate_attribution_joins, write_feedback, write_selector_decisions, write_exposures,
     write_relations,
 )
+from contextswarm_mini.selection_artifacts import _read_accepted_score_history
 
 
 class SelectionArtifactsTests(unittest.TestCase):
@@ -119,3 +120,37 @@ class SelectionArtifactsTests(unittest.TestCase):
         self.assertEqual(usage["model_sessions"], 2)
         self.assertEqual(usage["model_input_tokens"], 24)
         self.assertEqual(usage["model_total_tokens"], 28)
+
+    def test_score_history_clamps_terminal_settlement_after_horizon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scoreboard_history.jsonl").write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        {
+                            "task_id": "p1",
+                            "episode": 1,
+                            "score": 1.0,
+                            "horizon_elapsed_seconds": 10.25,
+                            "source": "final_evaluation",
+                        },
+                        {
+                            "task_id": "p1",
+                            "episode": 0,
+                            "score": 1.0,
+                            "horizon_elapsed_seconds": 10.5,
+                            "source": "closeout",
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            accepted = _read_accepted_score_history(root, ["p1"], 10.0)
+        self.assertEqual(accepted, [{
+            "task_id": "p1",
+            "episode": 1,
+            "score": 1.0,
+            "elapsed_seconds": 10.0,
+        }])

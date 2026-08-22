@@ -502,8 +502,15 @@ def _read_accepted_score_history(
             if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
                 raise ArtifactValidationError("scoreboard history has invalid elapsed time")
             elapsed = float(elapsed)
-            if not math.isfinite(elapsed) or elapsed < 0.0 or elapsed > horizon + 1e-9:
+            if not math.isfinite(elapsed) or elapsed < 0.0:
                 raise ArtifactValidationError("scoreboard history elapsed time is outside horizon")
+            # A solver attempt may finish just after the fixed horizon while
+            # the runner is settling its terminal receipt.  Such a row is
+            # still an ordinary candidate-attempt outcome, not an invalid
+            # artifact.  The score-time contract treats progress observed at
+            # or after the deadline as occurring at the deadline, so clamp it
+            # here to keep export validation consistent with runner metrics.
+            elapsed = min(elapsed, max(0.0, horizon))
         episode = raw.get("episode")
         if episode is not None and (
             isinstance(episode, bool) or not isinstance(episode, int) or episode < 0
