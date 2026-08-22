@@ -740,7 +740,7 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(evaluator.remote_unsettled_jobs, 1)
         self.assertTrue(evaluator.remote_settlement_event.is_set())
 
-    def test_unstructured_http_429_is_not_resubmitted_or_latched(self) -> None:
+    def test_unstructured_http_429_is_not_resubmitted_and_is_latched(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             server = _LifecycleServer("unconfirmed_429")
@@ -752,11 +752,12 @@ class EvaluatorLifecycleTests(unittest.TestCase):
                 )
                 verdict = evaluator.evaluate(_task(root), self._candidate(root))
 
-        self.assertEqual(verdict.status, "EVALUATOR_ERROR")
+        self.assertEqual(verdict.status, "REMOTE_SETTLEMENT_UNCONFIRMED")
         self.assertEqual(verdict.score, 0.0)
+        self.assertIs(verdict.response["remote_settlement_unconfirmed"], True)
         self.assertEqual(server.post_count, 1)
-        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
-        self.assertFalse(evaluator.remote_settlement_event.is_set())
+        self.assertEqual(evaluator.remote_unsettled_jobs, 1)
+        self.assertTrue(evaluator.remote_settlement_event.is_set())
 
     def test_huge_finite_lifecycle_deadline_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -446,10 +446,18 @@ class JudgeBrokerTests(unittest.TestCase):
             def do_POST(self) -> None:  # noqa: N802
                 self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 request_seen.set()
+                payload = json.dumps(
+                    {
+                        "error": "admission_capacity_exceeded",
+                        "message": "HTTP ingress capacity is exhausted",
+                    }
+                ).encode("utf-8")
                 self.send_response(429)
                 self.send_header("Retry-After", "20")
-                self.send_header("Content-Length", "0")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
+                self.wfile.write(payload)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server_thread = threading.Thread(target=server.serve_forever, daemon=True)

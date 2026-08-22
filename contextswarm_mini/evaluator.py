@@ -548,12 +548,16 @@ class LeanEvaluator:
                     and _confirmed_pre_admission_rejection(error_payload)
                 )
                 if confirmed_overload:
+                    explicit_retry_delay = _retry_after_seconds(
+                        retry_after,
+                        default=0.0,
+                    )
                     raise EvaluatorOverloadedError(
                         "Judge admission was definitively overloaded.",
                         category="judge_overloaded",
                         http_status=http_status,
                         attempts=attempt,
-                        retry_after_seconds=delay,
+                        retry_after_seconds=explicit_retry_delay,
                         response=error_payload,
                     ) from None
                 # Generic 429/503 responses are safe to replay for read-only
@@ -593,7 +597,7 @@ class LeanEvaluator:
                     ) from None
                 if (
                     is_job_submission
-                    and http_status >= 500
+                    and (http_status == 429 or http_status >= 500)
                     and not _bindable_terminal_job_receipt(error_payload)
                 ):
                     raise self._remote_submission_error(

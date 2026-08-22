@@ -653,7 +653,10 @@ class EvaluatorProbeTests(unittest.TestCase):
                     429,
                     "busy",
                     headers,
-                    None,
+                    BytesIO(
+                        b'{"error":"admission_capacity_exceeded",'
+                        b'"message":"HTTP ingress capacity is exhausted"}'
+                    ),
                 )
             return Response()
 
@@ -662,11 +665,14 @@ class EvaluatorProbeTests(unittest.TestCase):
         )
         with patch(
             "contextswarm_mini.evaluator.urlopen", side_effect=fake_urlopen
+        ), patch.object(
+            evaluator, "_combined_cancel_event", return_value=None
         ), patch("contextswarm_mini.evaluator.time.sleep") as sleep:
-            response = evaluator._request(
-                "POST", "/api/lean/jobs", {"code": "proof"}, timeout_seconds=20
+            verdict = evaluator.probe_source(
+                _task(Path(".")),
+                "import Mathlib\ntheorem task : True := by trivial\n",
             )
-        self.assertEqual(response["formal_status"], "VERIFY_FAIL")
+        self.assertEqual(verdict.status, "VERIFY_FAIL")
         self.assertEqual(attempts, 2)
         sleep.assert_called_once_with(7.25)
 
@@ -727,7 +733,10 @@ class EvaluatorProbeTests(unittest.TestCase):
                     429,
                     "busy",
                     headers,
-                    None,
+                    BytesIO(
+                        b'{"error":"admission_capacity_exceeded",'
+                        b'"message":"HTTP ingress capacity is exhausted"}'
+                    ),
                 )
             return Response()
 
@@ -736,6 +745,8 @@ class EvaluatorProbeTests(unittest.TestCase):
         )
         with patch(
             "contextswarm_mini.evaluator.urlopen", side_effect=fake_urlopen
+        ), patch.object(
+            evaluator, "_combined_cancel_event", return_value=None
         ), patch(
             "contextswarm_mini.evaluator.time.monotonic",
             side_effect=lambda: clock[0],
@@ -743,13 +754,12 @@ class EvaluatorProbeTests(unittest.TestCase):
             "contextswarm_mini.evaluator.time.sleep",
             side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
         ):
-            response = evaluator._request(
-                "POST",
-                "/api/lean/jobs",
-                {"code": "proof", "timeout": 10},
-                timeout_seconds=8,
+            verdict = evaluator.probe_source(
+                _task(Path(".")),
+                "import Mathlib\ntheorem task : True := by trivial\n",
+                deadline_monotonic=8,
             )
-        self.assertEqual(response["formal_status"], "VERIFY_FAIL")
+        self.assertEqual(verdict.status, "VERIFY_FAIL")
         self.assertEqual(submitted_timeouts, [8, 1])
 
 
