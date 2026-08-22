@@ -727,14 +727,42 @@ def _run_elastic_cps(
             "LOCAL_REJECTED",
             "MOCK_SKIPPED",
         }
+        task_solved = False
+        verdict_sha = str(verdict.response.get("candidate_sha256") or "")
         with state.lock:
-            verdict_sha = str(verdict.response.get("candidate_sha256") or "")
             if candidate_is_usable and verdict_sha in state.candidate_verdicts:
                 state.candidate_verdicts[verdict_sha] = verdict
                 try:
                     refresh_selected_candidate(state)
                 except OSError:
                     pass
+            handoff_proved = (
+                verdict.status == "PROVED"
+                and verdict.response.get("diagnostic_score") == 1.0
+                and state.selected_candidate_sha == verdict_sha
+            )
+            if handoff_proved and not state.solved:
+                # The runner-owned CPS handoff lane is diagnostic for scoring,
+                # but it still carries the same strict canonical proof receipt
+                # used before formal tools were introduced. Preserve the
+                # manifest's scheduling semantics without writing an early
+                # scoreboard row: stop future leases, and optionally interrupt
+                # already-running agents for this task.
+                state.solved = True
+                if config.cancel_on_proved:
+                    state.cancel_event.set()
+                task_solved = True
+        if task_solved:
+            scheduler.task_solved(task.slug)
+            logger.event(
+                "task_solved",
+                task_id=task.slug,
+                agent_id=actor,
+                episode=assignment.generation,
+                candidate_sha256=verdict_sha,
+                authority="cps_handoff",
+                cancel_on_proved=config.cancel_on_proved,
+            )
 
         # Closeout and late evaluator receipts are deliberately feedback-free.
         if policy.enabled and time.monotonic() < deadline:

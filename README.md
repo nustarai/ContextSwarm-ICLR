@@ -209,9 +209,11 @@ python3 evaluate.py
 `evaluate.py` 捕获当前 `result.lean` 的 immutable SHA-256 snapshot，再通过 run-owned
 Unix-socket broker 调用真实 Judge。它返回 `VERIFY_FAIL`、
 `COMPILES_WITH_SORRY`、`PROVED` 或明确的 timeout/resource/contract diagnostics；
-结果仅供 agent 改 proof，score 永远为 0，也不会把 CPS task 标成 solved、取消同题
-agent 或写 `scoreboard_history.jsonl`。最终候选仍由 feedback-free outer closeout
-重新提交 immutable bytes。
+这里的 agent-local 结果仅供 agent 改 proof，score 永远为 0，也不会把 CPS task
+标成 solved、取消同题 agent 或写 `scoreboard_history.jsonl`。CPS 原有的 runner-owned
+handoff evaluation 使用独立配额；它拿到严格 canonical `PROVED` 后仍按 manifest 将
+task 标成 solved，并在 `cancel_on_proved=true` 时中止同题在途 agent，但同样不提前
+计分。最终候选仍由 feedback-free outer closeout 重新提交 immutable bytes。
 
 `formal_query` 是 bounded Lean API/LSP scout：`search` 同时搜 task 公开文件和
 revision-matched Mathlib index；`decl` 找声明名；`check`/`type` 用 Judge 的

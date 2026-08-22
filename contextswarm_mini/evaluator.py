@@ -20,6 +20,10 @@ class EvaluatorError(RuntimeError):
     """A transport or malformed-verdict failure."""
 
 
+class _EvaluatorJobNotFoundError(EvaluatorError):
+    """A previously admitted Judge job is no longer retained by the server."""
+
+
 class EvaluatorOverloadedError(EvaluatorError):
     """A definitive pre-admission rejection which is safe to retry."""
 
@@ -149,6 +153,10 @@ class LeanEvaluator:
                 if isinstance(error_payload, Mapping)
                 else ""
             )
+            if status_code == 404:
+                raise _EvaluatorJobNotFoundError(
+                    f"Lean job was not found ({method} {path})"
+                ) from exc
             error_text = f"{error_code} {error_message}"
             confirmed_overload = (
                 isinstance(error_payload, Mapping)
@@ -757,6 +765,12 @@ class LeanEvaluator:
             )
             if cancelled:
                 current = cancelled
+        except _EvaluatorJobNotFoundError:
+            self._observe_lifecycle(
+                "settled",
+                {"job_id": job_id, "kind": "cancel_not_found"},
+            )
+            return _absent_job_receipt(job_id), None
         except EvaluatorError as exc:
             error = str(exc)
 
@@ -770,6 +784,12 @@ class LeanEvaluator:
                     f"/api/lean/jobs/{encoded}?wait_ms={wait_ms}",
                     timeout_seconds=max(0.1, remaining),
                 )
+            except _EvaluatorJobNotFoundError:
+                self._observe_lifecycle(
+                    "settled",
+                    {"job_id": job_id, "kind": "cancel_not_found"},
+                )
+                return _absent_job_receipt(job_id), None
             except EvaluatorError as exc:
                 error = str(exc)
                 break
@@ -778,6 +798,17 @@ class LeanEvaluator:
         if _terminal(current):
             self._observe_lifecycle("settled", {"job_id": job_id, "kind": "cancel_reconcile"})
         return current, error
+
+
+def _absent_job_receipt(job_id: str) -> dict[str, Any]:
+    """Represent an evicted/cancelled job as terminal for cleanup only."""
+
+    return {
+        "job_id": job_id,
+        "status": "cancelled",
+        "terminal_reason": "job_not_found",
+        "cancel_requested": True,
+    }
 
 
 class MockEvaluator:

@@ -421,6 +421,118 @@ class CloseoutLifecycleTests(unittest.TestCase):
             )
             self.assertLess(second_assignment, first_evaluation)
 
+    def test_cps_handoff_proof_marks_task_solved_and_stops_reassignment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("contextswarm_mini.runner.MockEvaluator", _ProvingEvaluator):
+                config = replace(
+                    load_config("configs/smoke.toml", ROOT),
+                    max_tasks=1,
+                    max_parallel=1,
+                    initial_agents_per_task=1,
+                    max_attempts_per_task=0,
+                    time_limit_seconds=2,
+                    cancel_on_proved=True,
+                    lean_max_concurrent_evaluations=1,
+                    lean_official_reserved_evaluations=0,
+                )
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=True,
+                    output_override=Path(temporary),
+                )
+
+            scheduler_state = json.loads(
+                (run_dir / "elastic_scheduler_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            task_state = next(iter(scheduler_state["tasks"].values()))
+            self.assertTrue(task_state["solved"])
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            solved = [row for row in events if row.get("event") == "task_solved"]
+            self.assertEqual(len(solved), 1)
+            self.assertEqual(solved[0]["authority"], "cps_handoff")
+            assignments = [
+                row for row in events if row.get("event") == "agent_assigned"
+            ]
+            self.assertLess(len(assignments), 10)
+
+    def test_cancel_on_proved_interrupts_other_active_cps_agents(self) -> None:
+        class RuntimeProvingEvaluator(_ProvingEvaluator):
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        class CancelAwarePiAgent:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def run(
+                self,
+                *,
+                task_id: str,
+                actor_id: str,
+                episode: int,
+                cancel_event: threading.Event | None = None,
+                **_kwargs: object,
+            ):
+                if episode == 1:
+                    return replace(
+                        _mock_result(actor_id, task_id, episode),
+                        mocked=False,
+                    )
+                assert cancel_event is not None
+                cancelled = cancel_event.wait(timeout=1.5)
+                return replace(
+                    _mock_result(actor_id, task_id, episode),
+                    returncode=-15 if cancelled else 0,
+                    cancelled=cancelled,
+                    mocked=False,
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = replace(
+                load_config("configs/smoke.toml", ROOT),
+                max_tasks=1,
+                max_parallel=2,
+                initial_agents_per_task=2,
+                max_attempts_per_task=0,
+                time_limit_seconds=2,
+                cancel_on_proved=True,
+                lean_max_concurrent_evaluations=1,
+                lean_official_reserved_evaluations=0,
+            )
+            with patch(
+                "contextswarm_mini.runner.LeanEvaluator",
+                RuntimeProvingEvaluator,
+            ), patch(
+                "contextswarm_mini.runner.PiAgent",
+                CancelAwarePiAgent,
+            ), patch(
+                "contextswarm_mini.runner.run_preflight",
+            ):
+                run_dir = run_experiment(
+                    config,
+                    mock_agent=False,
+                    output_override=Path(temporary),
+                )
+
+            final = json.loads(
+                (run_dir / "final.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(any(row["cancelled"] for row in final["agents"]))
+            scheduler_state = json.loads(
+                (run_dir / "elastic_scheduler_state.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            task_state = next(iter(scheduler_state["tasks"].values()))
+            self.assertTrue(task_state["solved"])
+
     def test_attempt_budget_does_not_cancel_already_admitted_agents(self) -> None:
         exhausted = threading.Event()
         original_event = RunLogger.event

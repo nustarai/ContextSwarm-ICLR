@@ -229,7 +229,12 @@ class _LifecycleServer:
 
             def do_GET(self) -> None:  # noqa: N802
                 elapsed = time.monotonic() - owner.submitted_at
-                if owner.mode in {
+                if owner.mode == "cancel_disappears" and owner.deletes:
+                    self._send(
+                        {"error": "job_not_found", "message": "job was evicted"},
+                        status_code=404,
+                    )
+                elif owner.mode in {
                     "queued_rejected_then_proved",
                     "queued_always_rejected",
                 }:
@@ -395,6 +400,29 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(verdict.score, 0.0)
         self.assertEqual(server.deletes, 1)
         self.assertTrue(verdict.response["cancel_requested"])
+
+    def test_cancelled_job_disappearing_is_reconciled_as_settled(self) -> None:
+        lifecycle: list[tuple[str, dict[str, object]]] = []
+        server = _LifecycleServer("cancel_disappears")
+        with server.running() as url:
+            response, error = LeanEvaluator(
+                url,
+                lean_env_id="test",
+                poll_interval_seconds=0.01,
+                cancel_grace_seconds=0.1,
+                lifecycle_observer=lambda event, payload: lifecycle.append(
+                    (event, dict(payload))
+                ),
+            ).cancel_job("job-1")
+
+        self.assertIsNone(error)
+        self.assertTrue(_terminal(response))
+        self.assertEqual(response["terminal_reason"], "job_not_found")
+        self.assertEqual(server.deletes, 1)
+        self.assertEqual(
+            [event for event, _payload in lifecycle],
+            ["cancel_requested", "settled"],
+        )
 
     def test_raw_failure_never_scores_stale_proved_marker(self) -> None:
         expected = {
