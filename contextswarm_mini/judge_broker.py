@@ -69,6 +69,11 @@ _FORMAL_NONCACHEABLE_STATUSES = frozenset(
         "REJECTED_OVERLOADED",
         "TASK_CANCELLED",
     }
+# CPS workers must first receive a real terminal Judge/local-contract result.
+# Admission, transport, provenance, and other control failures do not satisfy
+# this ordering contract.
+_JUDGE_CHECKPOINT_TERMINAL_STATUSES = frozenset(
+    {"PROVED", "COMPILES_WITH_SORRY", "VERIFY_FAIL", "LOCAL_REJECTED"}
 )
 
 
@@ -124,6 +129,7 @@ class _SessionClaim:
     probe_calls: int = 0
     last_probe_started: float = 0.0
     probe_active: bool = False
+    judge_checkpoint_reached: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     cps_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -1090,6 +1096,9 @@ class JudgeBroker:
             judge_job_id=result.get("judge_job_id"),
             cache_reused=result.get("cache_reused") is True,
         )
+        if _valid_judge_checkpoint(result):
+            with claim.lock:
+                claim.judge_checkpoint_reached = True
         return result
 
     def _acquire_evaluator_gate(
@@ -2030,6 +2039,20 @@ class JudgeBroker:
             failure = _cps_capability_failure(claim)
             if failure is not None:
                 return failure
+            # Mono/Parallel sessions do not carry a CPS store or communication
+            # capability. Preserve their historical CPS_UNAVAILABLE response
+            # rather than imposing a checkpoint requirement on an endpoint
+            # their solver cannot access.
+            if claim.cps_store is None or claim.communication == "none":
+                return self._cps_operation_locked(claim, operation, payload)
+            with claim.lock:
+                checkpoint_reached = claim.judge_checkpoint_reached
+            if not checkpoint_reached:
+                return _control_result(
+                    "JUDGE_CHECK_REQUIRED",
+                    "Complete a terminal judge_check before using CPS communication.",
+                    retryable=False,
+                )
             try:
                 return self._cps_operation_locked(claim, operation, payload)
             except RuntimeError:
@@ -2503,6 +2526,24 @@ def _safe_verdict_status(value: Any) -> str:
     if not re.fullmatch(r"[A-Z][A-Z0-9_:-]*", text):
         return "EVALUATOR_ERROR"
     return {"PASS": "PROVED", "AC": "PROVED", "PASSED": "PROVED"}.get(text, text)
+
+
+def _valid_judge_checkpoint(result: Mapping[str, Any]) -> bool:
+    """Recognize valid feedback without treating admission as verification."""
+
+    if result.get("accepted") is not True:
+        return False
+    status = _safe_verdict_status(result.get("status"))
+    if status not in _JUDGE_CHECKPOINT_TERMINAL_STATUSES:
+        return False
+    if _safe_hash(result.get("candidate_sha256")) is None or _safe_hash(
+        result.get("task_contract_sha256")
+    ) is None:
+        return False
+    job_id = sanitize_worker_identifier(result.get("judge_job_id"))
+    if status == "LOCAL_REJECTED":
+        return job_id is None
+    return job_id is not None
 
 
 def _safe_finite_float(value: Any) -> float:

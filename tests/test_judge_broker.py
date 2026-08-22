@@ -76,6 +76,32 @@ class _RecordingEvaluator:
         )
 
 
+class _SequenceEvaluator(_RecordingEvaluator):
+    def __init__(self, statuses: list[str]) -> None:
+        super().__init__()
+        self.statuses = list(statuses)
+
+    def probe(
+        self,
+        task: Task,
+        candidate: Path,
+        *,
+        deadline_monotonic: float | None,
+    ) -> Verdict:
+        self.calls.append((task, candidate, deadline_monotonic))
+        status = self.statuses.pop(0)
+        return Verdict(
+            task.slug,
+            status,
+            0.0,
+            0.0,
+            task_contract_sha256="a" * 64,
+            judge_job_id=(
+                None if status == "LOCAL_REJECTED" else f"job-{len(self.calls)}"
+            ),
+        )
+
+
 class _BlockingEvaluator(_RecordingEvaluator):
     def __init__(self) -> None:
         super().__init__()
@@ -1471,7 +1497,7 @@ class JudgeBrokerTests(unittest.TestCase):
             candidate.write_text("proof")
             store = CPSStore(root / "cps.sqlite3")
             broker = JudgeBroker(
-                _RecordingEvaluator(),
+                _SequenceEvaluator(["VERIFY_FAIL"]),
                 threading.BoundedSemaphore(1),
                 audit_path=root / "audit.jsonl",
             ).start()
@@ -1490,6 +1516,8 @@ class JudgeBrokerTests(unittest.TestCase):
                     ) as env,
                 ):
                     url = env["CONTEXTSWARM_JUDGE_URL"]
+                    checkpoint = _post(url, "judge_check", {})
+                    self.assertEqual(checkpoint["status"], "VERIFY_FAIL")
                     published = _post(
                         url,
                         "cps_publish",
@@ -1527,6 +1555,179 @@ class JudgeBrokerTests(unittest.TestCase):
                     expected_deadline,
                 )
                 self.assertTrue(callable(write.call_args.kwargs["cancel_guard"]))
+
+    def test_accepted_terminal_feedback_with_missing_provenance_does_not_unlock_cps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof")
+            store = CPSStore(root / "cps.sqlite3")
+            broker = JudgeBroker(
+                _RecordingEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=root / "audit.jsonl",
+                min_probe_interval_seconds=0,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="bound-agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3,
+                    cps_store=store,
+                    communication="blackboard",
+                ) as env:
+                    url = env["CONTEXTSWARM_JUDGE_URL"]
+                    feedback = _post(url, "judge_check", {})
+                    self.assertEqual(feedback["status"], "VERIFY_FAIL")
+                    self.assertTrue(feedback["accepted"])
+                    self.assertIsNone(feedback["task_contract_sha256"])
+                    blocked = _post(url, "cps_search", {})
+            finally:
+                broker.close()
+            self.assertEqual(blocked["status"], "JUDGE_CHECK_REQUIRED")
+
+    def test_cps_operations_require_a_terminal_judge_checkpoint_per_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof")
+            store = CPSStore(root / "cps.sqlite3")
+            evaluator = _SequenceEvaluator(["EVALUATOR_ERROR", "VERIFY_FAIL"])
+            gate = threading.BoundedSemaphore(1)
+            self.assertTrue(gate.acquire(timeout=0))
+            gate_held = True
+            broker = JudgeBroker(
+                evaluator,
+                gate,
+                audit_path=root / "audit.jsonl",
+                min_probe_interval_seconds=0,
+                probe_admission_timeout_seconds=0.02,
+            ).start()
+            blocked_calls = (
+                ("cps_search", {}),
+                ("cps_publish", {"title": "blocked", "body": "must not persist"}),
+                ("cps_actors", {}),
+                ("cps_send", {"body": "blocked"}),
+                ("cps_inbox", {}),
+                ("cps_ack", {"message_id": "missing"}),
+            )
+            try:
+                with broker.session(
+                    actor_id="bound-agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3,
+                    cps_store=store,
+                    communication="blackboard",
+                ) as env:
+                    url = env["CONTEXTSWARM_JUDGE_URL"]
+                    for operation, payload in blocked_calls:
+                        blocked = _post(url, operation, payload)
+                        self.assertEqual(blocked["status"], "JUDGE_CHECK_REQUIRED")
+                        self.assertFalse(blocked["accepted"])
+                    control = _post(url, "judge_check", {})
+                    self.assertEqual(control["status"], "JUDGE_ADMISSION_TIMEOUT")
+                    self.assertFalse(control["accepted"])
+                    gate.release()
+                    gate_held = False
+                    after_control = _post(url, "cps_search", {})
+                    self.assertEqual(after_control["status"], "JUDGE_CHECK_REQUIRED")
+                    first = _post(url, "judge_check", {})
+                    self.assertEqual(first["status"], "EVALUATOR_ERROR")
+                    self.assertTrue(first["accepted"])
+                    still_blocked = _post(url, "cps_search", {})
+                    self.assertEqual(still_blocked["status"], "JUDGE_CHECK_REQUIRED")
+                    terminal = _post(url, "judge_check", {})
+                    self.assertEqual(terminal["status"], "VERIFY_FAIL")
+                    self.assertTrue(terminal["accepted"])
+                    published = _post(
+                        url,
+                        "cps_publish",
+                        {"title": "allowed", "body": "after checkpoint"},
+                    )
+                    self.assertTrue(published["ok"])
+                with broker.session(
+                    actor_id="new-agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3,
+                    cps_store=store,
+                    communication="blackboard",
+                ) as env:
+                    fresh_session = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"], "cps_search", {}
+                    )
+                    self.assertEqual(fresh_session["status"], "JUDGE_CHECK_REQUIRED")
+            finally:
+                if gate_held:
+                    gate.release()
+                broker.close()
+
+            self.assertEqual(len(evaluator.calls), 2)
+            self.assertEqual(len(store.search(task_id="task")), 1)
+
+    def test_local_rejected_is_a_terminal_local_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof")
+            store = CPSStore(root / "cps.sqlite3")
+            broker = JudgeBroker(
+                _SequenceEvaluator(["LOCAL_REJECTED"]),
+                threading.BoundedSemaphore(1),
+                audit_path=root / "audit.jsonl",
+                min_probe_interval_seconds=0,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="bound-agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3,
+                    cps_store=store,
+                    communication="blackboard",
+                ) as env:
+                    url = env["CONTEXTSWARM_JUDGE_URL"]
+                    checkpoint = _post(url, "judge_check", {})
+                    self.assertEqual(checkpoint["status"], "LOCAL_REJECTED")
+                    self.assertTrue(checkpoint["accepted"])
+                    searched = _post(url, "cps_search", {})
+            finally:
+                broker.close()
+            self.assertTrue(searched["ok"])
+            self.assertEqual(searched["items"], [])
+
+    def test_non_cps_session_keeps_cps_unavailable_without_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workdir = root / "worker"
+            workdir.mkdir()
+            candidate = workdir / "result.lean"
+            candidate.write_text("proof")
+            broker = JudgeBroker(
+                _RecordingEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=root / "audit.jsonl",
+                min_probe_interval_seconds=0,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="mono",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3,
+                ) as env:
+                    result = _post(env["CONTEXTSWARM_JUDGE_URL"], "cps_search", {})
+            finally:
+                broker.close()
+            self.assertEqual(result["status"], "CPS_UNAVAILABLE")
 
     def test_cps_operations_fail_closed_after_horizon(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1573,7 +1774,7 @@ class JudgeBrokerTests(unittest.TestCase):
             candidate.write_text("proof")
             store = CPSStore(root / "cps.sqlite3")
             broker = JudgeBroker(
-                _RecordingEvaluator(),
+                _SequenceEvaluator(["VERIFY_FAIL"]),
                 threading.BoundedSemaphore(1),
                 audit_path=root / "audit.jsonl",
             ).start()
@@ -1601,6 +1802,11 @@ class JudgeBrokerTests(unittest.TestCase):
                         communication="blackboard",
                     ) as env,
                 ):
+                    checkpoint = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {}
+                    )
+                    self.assertEqual(checkpoint["status"], "VERIFY_FAIL")
+
                     def publish() -> None:
                         try:
                             results.append(
@@ -1639,7 +1845,7 @@ class JudgeBrokerTests(unittest.TestCase):
             candidate.write_text("proof")
             store = CPSStore(root / "cps.sqlite3")
             broker = JudgeBroker(
-                _RecordingEvaluator(),
+                _SequenceEvaluator(["VERIFY_FAIL"]),
                 threading.BoundedSemaphore(1),
                 audit_path=root / "audit.jsonl",
             ).start()
@@ -1668,6 +1874,11 @@ class JudgeBrokerTests(unittest.TestCase):
                         cancel_event=cancelled,
                     ) as env,
                 ):
+                    checkpoint = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"], "judge_check", {}
+                    )
+                    self.assertEqual(checkpoint["status"], "VERIFY_FAIL")
+
                     def publish() -> None:
                         try:
                             results.append(
