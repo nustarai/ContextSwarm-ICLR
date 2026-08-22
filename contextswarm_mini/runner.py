@@ -6581,6 +6581,33 @@ def _write_figure4_summary(
             row.get("accepted") is True for row in judge_rows
         ),
     }
+    decision_rows, _ = _read_jsonl_objects(run_dir / "allocation_decisions.jsonl")
+    llm_decisions = [
+        row
+        for row in decision_rows
+        if str(row.get("policy") or "") == "llm_scheduler"
+        and row.get("scheduler_cost") is not None
+    ]
+    # The decision log is the canonical outcome ledger.  Derive all public
+    # counter sections from these same charged rows so fallback/invalid/
+    # horizon outcomes cannot diverge between nested cost and metrics.
+    fallback_count = sum(row.get("fallback") is True for row in llm_decisions)
+    invalid_output_count = sum(
+        row.get("invalid_output") is True
+        or str(row.get("scheduler_outcome") or "") == "invalid_output"
+        or (
+            row.get("fallback") is True
+            and "scheduler output" in str(row.get("fallback_reason") or "")
+        )
+        for row in llm_decisions
+    )
+    horizon_truncation_count = sum(
+        str(row.get("scheduler_outcome") or "") == "horizon_truncated"
+        or row.get("agent_run_horizon_reached") is True
+        or row.get("run_horizon_reached") is True
+        or str(row.get("disposition") or "") == "not_admitted_horizon"
+        for row in llm_decisions
+    )
     raw_scheduler = dict(allocation.get("scheduler_cost") or {})
     scheduler_cost = {
         "calls": int(
@@ -6599,38 +6626,20 @@ def _write_figure4_summary(
         "reserved_slot_seconds": float(
             allocation.get("scheduler_reserved_slot_seconds", 0.0)
         ),
-        "invalid_outputs": int(
-            raw_scheduler.get(
-                "invalid_outputs",
-                allocation.get("invalid_outputs", allocation.get("invalid_output_count", 0)),
-            )
-        ),
-        "fallback_count": int(raw_scheduler.get("fallback_count", allocation.get("fallback_count", 0))),
+        "invalid_outputs": invalid_output_count,
+        "fallback_count": fallback_count,
         "provider_errors": int(raw_scheduler.get("provider_errors", allocation.get("provider_errors", 0))),
         "policy_timeouts": int(raw_scheduler.get("policy_timeouts", allocation.get("policy_timeouts", 0))),
-        "horizon_truncations": int(
-            raw_scheduler.get(
-                "horizon_truncations",
-                allocation.get("horizon_truncations", allocation.get("horizon_truncation_count", 0)),
-            )
-        ),
+        "horizon_truncations": horizon_truncation_count,
     }
-    decision_rows, _ = _read_jsonl_objects(run_dir / "allocation_decisions.jsonl")
     allocation_metrics = {
         "decisions": len(decision_rows),
         "admitted_decisions": sum(
             str(row.get("disposition") or "") == "assigned" for row in decision_rows
         ),
-        "fallbacks": sum(row.get("fallback") is True for row in decision_rows),
-        "invalid_outputs": sum(
-            bool(row.get("invalid_output"))
-            or row.get("scheduler_outcome") == "invalid_output"
-            for row in decision_rows
-        ),
-        "horizon_truncations": sum(
-            str(row.get("disposition") or "") == "not_admitted_horizon"
-            for row in decision_rows
-        ),
+        "fallbacks": fallback_count,
+        "invalid_outputs": invalid_output_count,
+        "horizon_truncations": horizon_truncation_count,
         "stale_decisions": sum(
             str(row.get("disposition") or "") == "not_admitted_stale"
             for row in decision_rows
