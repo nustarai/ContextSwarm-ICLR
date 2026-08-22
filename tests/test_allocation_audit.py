@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
@@ -29,6 +30,8 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(row.task_state_allocation_after, {"a": 1, "b": 1, "c": 2})
         self.assertEqual(row.capacity_delta_sum, 0)
         self.assertTrue(validate_capacity_conservation(row))
+        with self.assertRaises(ValueError):
+            validate_capacity_conservation(replace(row, capacity_delta_sum=1))
 
     def test_malformed_rows_fail_closed(self):
         with self.assertRaises(ValueError):

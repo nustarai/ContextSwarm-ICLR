@@ -174,7 +174,7 @@ class AllocationAuditRecord:
                 "trace_state_selected_task_id": self.trace_state_selected_task_id, "task_state_selected_task_id": self.task_state_selected_task_id, "admitted_task_id": self.admitted_task_id, "fallback_reason": self.fallback_reason,
                 "active_slots_before": self.active_slots_before, "active_slots_after": self.active_slots_after, "free_slots_before": self.free_slots_before, "free_slots_after": self.free_slots_after,
                 "scheduler_reserved_slots_before": self.scheduler_reserved_slots_before, "scheduler_reserved_slots_after": self.scheduler_reserved_slots_after, "total_capacity": self.total_capacity,
-                "capacity_delta_sum": 0, "capacity_conserved": True}
+                "capacity_delta_sum": self.capacity_delta_sum, "capacity_conserved": self.capacity_conserved}
 
     @classmethod
     def from_dict(cls, row: Mapping[str, Any]) -> "AllocationAuditRecord":
@@ -214,6 +214,8 @@ def read_allocation_audits(path: Path, *, expected_config_sha256: str | None = N
 
 def validate_capacity_conservation(record: AllocationAuditRecord) -> bool:
     """Revalidate an already-created/decoded record, failing closed."""
+    if record.capacity_delta_sum != 0 or record.capacity_conserved is not True:
+        raise ValueError("invalid emitted capacity-conservation result")
     return AllocationAuditRecord.create(**{k: v for k, v in record.as_dict().items() if k not in {"schema_version", "capacity_delta_sum", "capacity_conserved"}}) is not None
 
 
