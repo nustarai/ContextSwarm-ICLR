@@ -432,8 +432,13 @@ class AllocatorSelectionTests(unittest.TestCase):
         ].upper()
         with self.assertRaises(AllocatorSelectionError):
             select_allocator([row], _rule("r1"))
+        # Values beyond the IEEE-754 exact integer boundary cannot safely
+        # survive a JSON/artifact round trip and are rejected at the parser
+        # boundary.
+        self.assertEqual(_integer((1 << 53) - 1, "count"), (1 << 53) - 1)
         large = 9_007_199_254_740_993
-        self.assertEqual(_integer(large, "count"), large)
+        with self.assertRaises(AllocatorSelectionError):
+            _integer(large, "count")
         with self.assertRaises(AllocatorSelectionError):
             _integer(10**10000, "count")
 
