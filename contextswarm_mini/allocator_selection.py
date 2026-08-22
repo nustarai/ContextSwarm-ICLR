@@ -236,19 +236,81 @@ def _without_pair_identity(contract: Mapping[str, Any]) -> dict[str, Any]:
     return strip(contract, top=True)
 
 
+def _selector_identity(contract: Mapping[str, Any]) -> Any:
+    """Resolve selector identity aliases without conflating objects and names.
+
+    Producers in the wild use both a complete selector identity object
+    (``selector_identity``/``selection``) and a compatibility leaf alias
+    (``selection.selector_name``).  Those are related representations, not
+    values that can be compared byte-for-byte.  Complete-object aliases must
+    agree with one another; leaf aliases must agree with one another and, when
+    an object is present, with that object's selector name.
+    """
+
+    def read(path: str) -> Any:
+        current: Any = contract
+        for component in path.split("."):
+            if not isinstance(current, Mapping) or component not in current:
+                return _MISSING
+            current = current[component]
+        return current
+
+    candidates: list[tuple[str, Any]] = []
+    for path in ("selector_identity", "selector.identity"):
+        value = read(path)
+        if value is not _MISSING:
+            candidates.append((path, value))
+    selector_container = read("selector")
+    # ``selector = {identity = ...}`` is a wrapper, while a mapping without an
+    # identity child is itself a legacy full-identity object.
+    if selector_container is not _MISSING and not (
+        isinstance(selector_container, Mapping) and "identity" in selector_container
+    ):
+        candidates.append(("selector", selector_container))
+    for path in ("selector_name", "selection.selector_name"):
+        value = read(path)
+        if value is not _MISSING:
+            candidates.append((path, value))
+
+    objects = [(path, value) for path, value in candidates if isinstance(value, Mapping)]
+    leaves = [(path, value) for path, value in candidates if not isinstance(value, Mapping)]
+
+    if objects:
+        baseline = canonical_json(objects[0][1])
+        if any(canonical_json(value) != baseline for _, value in objects[1:]):
+            raise AllocatorSelectionError(
+                "contradictory selector identity object aliases"
+            )
+        identity: Any = objects[0][1]
+        object_name = identity.get("selector_name", _MISSING)
+        if leaves:
+            leaf_baseline = canonical_json(leaves[0][1])
+            if any(canonical_json(value) != leaf_baseline for _, value in leaves[1:]):
+                raise AllocatorSelectionError(
+                    "contradictory selector name aliases"
+                )
+            if object_name is not _MISSING and canonical_json(object_name) != leaf_baseline:
+                raise AllocatorSelectionError(
+                    "selector identity and selector name aliases disagree"
+                )
+    if not candidates:
+        raise AllocatorSelectionError(
+            "comparison_contract.selector_identity is missing"
+        )
+    if leaves:
+        baseline = canonical_json(leaves[0][1])
+        if any(canonical_json(value) != baseline for _, value in leaves[1:]):
+            raise AllocatorSelectionError("contradictory selector name aliases")
+    # Preserve the historical resolution priority after validation.
+    return candidates[0][1]
+
+
 def _contract_summary(contract: Mapping[str, Any], repeat_id: str, paired_seed: str) -> dict[str, Any]:
     """Validate the fixed comparison contract and return canonical metadata."""
 
     if not contract:
         raise AllocatorSelectionError("comparison_contract must not be empty")
-    selector = _get(
-        contract,
-        "selector_identity",
-        "selector.identity",
-        "selector",
-        "selector_name",
-        "selection.selector_name",
-    )
+    selector = _selector_identity(contract)
     if isinstance(selector, Mapping):
         if not selector:
             raise AllocatorSelectionError("selector identity must not be empty")

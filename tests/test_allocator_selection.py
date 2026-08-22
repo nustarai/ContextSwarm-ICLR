@@ -245,6 +245,29 @@ class AllocatorSelectionTests(unittest.TestCase):
         with self.assertRaises(AllocatorSelectionError):
             select_allocator(rows, _rule("r1", "r2"))
 
+    def test_runner_selector_identity_object_aliases_are_reconciled(self) -> None:
+        rows = _validation_rows()
+        for row in rows:
+            contract = row["comparison_contract"]
+            identity = {
+                "enabled": True,
+                "selector_name": "nustigmergy-v1",
+                "selection_config_id": "b" * 64,
+                "visibility": "project_shared",
+            }
+            contract["selector_identity"] = identity
+            contract["selection"] = copy.deepcopy(identity)
+            row["comparison_contract_sha256"] = canonical_sha256(contract)
+        ids = [f"r{i}" for i in range(1, 9)]
+        self.assertEqual(select_allocator(rows, _rule(*ids))["status"], "selected")
+
+        rows[0]["comparison_contract"]["selection"]["selector_name"] = "random"
+        rows[0]["comparison_contract_sha256"] = canonical_sha256(
+            rows[0]["comparison_contract"]
+        )
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(rows, _rule(*ids))
+
     def test_exact_four_arms_and_config_hash_fail_closed(self) -> None:
         row = _row("r1", 11)
         del row["arms"]["uniform_refill"]
