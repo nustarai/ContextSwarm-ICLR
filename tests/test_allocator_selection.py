@@ -14,6 +14,7 @@ from contextswarm_mini.allocator_selection import (
     PAIRED_SCHEMA,
     RULE_SCHEMA,
     SELECTION_SCHEMA,
+    _integer,
     canonical_sha256,
     development_rule,
     load_rule,
@@ -301,6 +302,33 @@ class AllocatorSelectionTests(unittest.TestCase):
         rule = _rule(*[f"missing{i}" for i in range(1, 9)])
         with self.assertRaises(AllocatorSelectionError):
             select_allocator([row], rule)
+
+    def test_rule_rejects_contradictory_guardrail_aliases(self) -> None:
+        rule = _rule(*[f"r{i}" for i in range(1, 9)])
+        rule["guardrails"]["scheduler_token_share_max"] = 0.06
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(_validation_rows(), rule)
+
+    def test_selection_requires_complete_score_history(self) -> None:
+        ids = [f"r{i}" for i in range(1, 9)]
+        rule = _rule(*ids)
+        rule["metric"]["require_history"] = False
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(_validation_rows(), rule)
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator(_validation_rows(), _rule(*ids), require_history=False)
+
+    def test_digests_are_lowercase_and_integer_parsing_is_exact(self) -> None:
+        row = _row("r1", 11)
+        row["comparison_contract_sha256"] = row[
+            "comparison_contract_sha256"
+        ].upper()
+        with self.assertRaises(AllocatorSelectionError):
+            select_allocator([row], _rule("r1"))
+        large = 9_007_199_254_740_993
+        self.assertEqual(_integer(large, "count"), large)
+        with self.assertRaises(AllocatorSelectionError):
+            _integer(10**10000, "count")
 
     def test_cost_cardinality_and_huge_values_fail_closed(self) -> None:
         rows = _validation_rows()

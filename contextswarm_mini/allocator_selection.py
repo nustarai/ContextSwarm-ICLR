@@ -140,14 +140,28 @@ def _finite(value: Any, name: str, *, minimum: float | None = None, maximum: flo
 
 
 def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
-    number = _finite(value, name, minimum=minimum)
-    if int(number) != number:
-        raise AllocatorSelectionError(f"{name} must be an integer")
-    return int(number)
+    """Parse integer counts without lossy float conversion."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AllocatorSelectionError(f"{name} must be numeric")
+    if isinstance(value, int):
+        if abs(value).bit_length() > 1024:
+            raise AllocatorSelectionError(f"{name} must be finite")
+        number = value
+    else:
+        if not math.isfinite(value) or not value.is_integer():
+            raise AllocatorSelectionError(f"{name} must be an integer")
+        if abs(value) > 2**53:
+            raise AllocatorSelectionError(
+                f"{name} exceeds exactly representable integer range"
+            )
+        number = int(value)
+    if number < minimum:
+        raise AllocatorSelectionError(f"{name} must be at least {minimum}")
+    return number
 
 
 def _sha(value: Any, name: str) -> str:
-    text = _text(value, name).lower()
+    text = _text(value, name)
     if not _SHA256.fullmatch(text):
         raise AllocatorSelectionError(f"{name} must be a lowercase SHA-256 digest")
     return text
@@ -411,12 +425,32 @@ def _contract_summary(contract: Mapping[str, Any], repeat_id: str, paired_seed: 
 
 
 def _threshold(mapping: Mapping[str, Any], *names: str, default: Any = _MISSING) -> Any:
+    found: list[tuple[str, Any]] = []
     for name in names:
-        if name in mapping:
-            value = mapping[name]
-            if isinstance(value, Mapping):
-                value = _get(value, "max", "threshold", default=_MISSING)
-            return value
+        if name not in mapping:
+            continue
+        value = mapping[name]
+        if isinstance(value, Mapping):
+            value = _get(value, "max", "threshold", default=_MISSING)
+        found.append((name, value))
+    if found:
+        baseline_name, baseline = found[0]
+        for name, value in found[1:]:
+            if (
+                isinstance(baseline, (int, float))
+                and not isinstance(baseline, bool)
+                and isinstance(value, (int, float))
+                and not isinstance(value, bool)
+            ):
+                equivalent = value == baseline
+            else:
+                equivalent = canonical_json(value) == canonical_json(baseline)
+            if not equivalent:
+                raise AllocatorSelectionError(
+                    f"contradictory aliases for guardrail {baseline_name} and {name}",
+                    code="invalid_rule",
+                )
+        return baseline
     if default is not _MISSING:
         return default
     raise AllocatorSelectionError(f"guardrails missing one of {', '.join(names)}")
@@ -981,6 +1015,11 @@ def parse_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
     metric = dict(_mapping(rule.get("metric"), "rule.metric"))
     if metric.get("name") not in {"fixed_horizon_nauc", "nauc"} or metric.get("field", "nauc") != "nauc" or metric.get("aggregation") != "mean" or metric.get("direction") != "max":
         raise AllocatorSelectionError("rule metric must be mean fixed-horizon nAUC", code="invalid_rule")
+    if metric.get("require_history", True) is not True:
+        raise AllocatorSelectionError(
+            "rule.metric.require_history must be true",
+            code="invalid_rule",
+        )
     split = dict(_mapping(rule.get("validation_split"), "rule.validation_split"))
     if split.get("kind") != "paired_repeat_ids":
         raise AllocatorSelectionError("validation split must enumerate paired repeat IDs", code="invalid_rule")
@@ -1040,7 +1079,7 @@ def parse_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
             "field": "nauc",
             "aggregation": "mean",
             "direction": "max",
-            "require_history": bool(metric.get("require_history", True)),
+            "require_history": True,
         },
         "validation_split": {"kind": "paired_repeat_ids", "paired_repeat_ids": list(ids)},
         "minimum_validation_repeats": minimum,
@@ -1188,8 +1227,12 @@ def select_allocator(source: str | Path | Iterable[Mapping[str, Any]], rule: Map
     if rule is None:
         raise AllocatorSelectionError("selection rule is required", code="invalid_rule")
     normalized_rule = load_rule(rule)
-    metric_requires_history = normalized_rule["metric"]["require_history"] if require_history is None else bool(require_history)
-    rows = load_paired_repeats(source, require_history=metric_requires_history)
+    if require_history is not None and require_history is not True:
+        raise AllocatorSelectionError(
+            "complete score history is mandatory for allocator selection",
+            code="invalid_rule",
+        )
+    rows = load_paired_repeats(source, require_history=True)
     validation_ids = tuple(normalized_rule["validation_split"]["paired_repeat_ids"])
     by_id = {row["paired_repeat_id"]: row for row in rows}
     missing = [item for item in validation_ids if item not in by_id]

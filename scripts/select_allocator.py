@@ -33,13 +33,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--paired-repeats", required=True, type=Path, help="Figure 4 paired-repeat JSONL/JSON artifact")
     parser.add_argument("--rule", required=True, type=Path, help="Frozen allocator-selection rule JSON")
     parser.add_argument("--output", required=True, type=Path, help="Destination allocator_selection.json")
-    parser.add_argument("--allow-missing-history", action="store_true", help="Development-only compatibility for pre-history paired rows")
     args = parser.parse_args(argv)
     try:
         result = select_allocator(
             args.paired_repeats,
             args.rule,
-            require_history=False if args.allow_missing_history else None,
         )
         if result.get("schema_version") != SELECTION_SCHEMA:
             raise AllocatorSelectionError("selector produced an invalid result schema")
