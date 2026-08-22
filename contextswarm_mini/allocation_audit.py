@@ -7,6 +7,7 @@ helpers validate the resulting integer vectors before publishing JSONL/JSON.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -20,6 +21,11 @@ AUDIT_SCHEMA = "contextswarm_allocation_audit_v1"
 RUN_SCHEMA = "contextswarm_figure4_run_summary_v1"
 PAIRED_SCHEMA = "contextswarm_figure4_paired_repeat_v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def _canonical_sha256(value: Mapping[str, Any]) -> str:
+    payload = json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _frozen_map(value: Mapping[str, Any], *, integer: bool = False) -> Mapping[str, Any]:
@@ -233,7 +239,9 @@ def build_figure4_run_summary(*, run_id: str, policy: str, paired_seed: int | st
     scheduler = dict(scheduler_cost or {})
     scheduler.setdefault("calls", 0); scheduler.setdefault("input_tokens", 0); scheduler.setdefault("output_tokens", 0); scheduler.setdefault("total_tokens", int(scheduler["input_tokens"]) + int(scheduler["output_tokens"])); scheduler.setdefault("latency_seconds", 0.0); scheduler.setdefault("reserved_slot_seconds", scheduler.get("occupied_capacity_slot_seconds", 0.0))
     alloc = dict(allocation_metrics or {}); alloc.setdefault("decisions", 0); alloc.setdefault("fallbacks", alloc.get("fallback_decisions", 0)); alloc.setdefault("fallback_rate", alloc["fallbacks"] / alloc["decisions"] if alloc["decisions"] else 0.0)
-    return {"schema_version": RUN_SCHEMA, "run_id": str(run_id), "policy": str(policy), "paired_seed": paired_seed, "repeat": repeat, "paired_repeat_id": str(repeat), "comparison_contract_id": comparison_contract_id, "comparison_contract": dict(comparison_contract or {}), "task_order": list(task_order), "horizon_seconds": float(horizon_seconds), "total_capacity": int(total_capacity), "initial_allocation": dict(initial_allocation), "accepted_score_history": history, "final_accepted_score": final, "max_score": float(max_score), "time_to_k": times, "time_to_k_seconds": times, "nauc": nauc, "solver_usage": dict(solver_usage or {}), "evaluator_usage": dict(evaluator_usage or {}), "scheduler_cost": scheduler, "llm_scheduler_cost": scheduler, "allocation_metrics": alloc, "allocation_decisions": alloc["decisions"], "fallback_decisions": alloc["fallbacks"], "fallback_rate": alloc["fallback_rate"], "allocation_parameters": dict(allocation_parameters or {}), "allocation_config_sha256": allocation_config_sha256, "comparison_contract_sha256": comparison_contract.get("sha256", "") if comparison_contract else ""}
+    contract = dict(comparison_contract or {})
+    contract_hash = _canonical_sha256(contract)
+    return {"schema_version": RUN_SCHEMA, "run_id": str(run_id), "policy": str(policy), "paired_seed": paired_seed, "repeat": repeat, "paired_repeat_id": str(repeat), "comparison_contract_id": comparison_contract_id or contract_hash, "comparison_contract": contract, "task_order": list(task_order), "horizon_seconds": float(horizon_seconds), "total_capacity": int(total_capacity), "initial_allocation": dict(initial_allocation), "accepted_score_history": history, "final_accepted_score": final, "max_score": float(max_score), "time_to_k": times, "time_to_k_seconds": times, "nauc": nauc, "solver_usage": dict(solver_usage or {}), "evaluator_usage": dict(evaluator_usage or {}), "scheduler_cost": scheduler, "llm_scheduler_cost": scheduler, "allocation_metrics": alloc, "allocation_decisions": alloc["decisions"], "fallback_decisions": alloc["fallbacks"], "fallback_rate": alloc["fallback_rate"], "allocation_parameters": dict(allocation_parameters or {}), "allocation_config_sha256": allocation_config_sha256, "comparison_contract_sha256": contract_hash}
 
 
 def write_figure4_run_summary(path: Path, summary: Mapping[str, Any]) -> None:
@@ -242,8 +250,28 @@ def write_figure4_run_summary(path: Path, summary: Mapping[str, Any]) -> None:
 
 
 def build_figure4_paired_repeat(*, paired_repeat_id: str, paired_seed: int | str, arms: Mapping[str, Mapping[str, Any]], comparison_contract: Mapping[str, Any] | None = None, registered_contrasts: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    if not arms: raise ValueError("paired repeat needs at least one arm")
-    return {"schema_version": PAIRED_SCHEMA, "paired_repeat_id": str(paired_repeat_id), "paired_seed": paired_seed, "comparison_contract": dict(comparison_contract or {}), "comparison_contract_sha256": (comparison_contract or {}).get("sha256", ""), "arms": {str(k): dict(v) for k, v in arms.items()}, "registered_contrasts": dict(registered_contrasts or {})}
+    required = {"uniform_refill", "task_state", "trace_state", "llm_scheduler"}
+    if set(arms) != required: raise ValueError("paired repeat must contain exactly the four Figure 4 arms")
+    arm_rows = {str(k): dict(v) for k, v in arms.items()}
+    for policy, row in arm_rows.items():
+        if row.get("policy", policy) != policy:
+            raise ValueError("paired arm policy does not match its key")
+        if "nauc" not in row or "final_accepted_score" not in row:
+            raise ValueError("paired arm is missing bootstrap metrics")
+    contrasts = dict(registered_contrasts or {})
+    if not contrasts:
+        for name, left, right in (
+            ("trace_state_minus_task_state", "trace_state", "task_state"),
+            ("task_state_minus_uniform_refill", "task_state", "uniform_refill"),
+            ("trace_state_minus_uniform_refill", "trace_state", "uniform_refill"),
+            ("llm_scheduler_minus_trace_state", "llm_scheduler", "trace_state"),
+        ):
+            contrasts[name] = {
+                metric: float(arm_rows[left][metric]) - float(arm_rows[right][metric])
+                for metric in ("nauc", "final_accepted_score")
+            }
+    contract = dict(comparison_contract or {})
+    return {"schema_version": PAIRED_SCHEMA, "paired_repeat_id": str(paired_repeat_id), "paired_seed": paired_seed, "comparison_contract": contract, "comparison_contract_sha256": _canonical_sha256(contract), "arms": arm_rows, "registered_contrasts": contrasts}
 
 
 def append_figure4_paired_repeat(path: Path, row: Mapping[str, Any]) -> None:

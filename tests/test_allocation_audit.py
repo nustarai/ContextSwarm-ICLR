@@ -7,6 +7,7 @@ from contextswarm_mini.allocation_audit import (
     AllocationAuditRecord,
     append_allocation_audit,
     build_figure4_run_summary,
+    build_figure4_paired_repeat,
     read_allocation_audits,
     validate_capacity_conservation,
 )
@@ -59,6 +60,16 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(summary["schema_version"], "contextswarm_figure4_run_summary_v1")
             self.assertEqual(summary["scheduler_cost"]["calls"], 1)
             self.assertEqual(summary["nauc"], .4)
+
+    def test_paired_repeat_has_bootstrap_ready_contrasts(self):
+        arms = {
+            policy: {"policy": policy, "nauc": nauc, "final_accepted_score": 1}
+            for policy, nauc in (("uniform_refill", .1), ("task_state", .2), ("trace_state", .4), ("llm_scheduler", .3))
+        }
+        row = build_figure4_paired_repeat(paired_repeat_id="r-1", paired_seed=4, arms=arms)
+        contrast = row["registered_contrasts"]["trace_state_minus_task_state"]
+        self.assertAlmostEqual(contrast["nauc"], .2)
+        self.assertEqual(len(row["comparison_contract_sha256"]), 64)
 
 
 if __name__ == "__main__":
