@@ -1017,6 +1017,16 @@ class TraceScoreWeights:
                 component_mode = True
                 value = _finite(name, value, minimum=0.0)
             object.__setattr__(self, name, value)
+        if (
+            self.duplication_component_weight is not None
+            and self.duplicate_component_weight is not None
+            and self.duplication_component_weight
+            != self.duplicate_component_weight
+        ):
+            raise ValueError(
+                "duplication_component_weight and duplicate_component_weight "
+                "contradict each other"
+            )
         object.__setattr__(self, "_component_mode", component_mode)
 
     @classmethod

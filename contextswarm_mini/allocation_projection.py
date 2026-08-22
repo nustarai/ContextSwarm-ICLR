@@ -646,6 +646,37 @@ class TraceAllocationProjection:
             )
         return result
 
+    def public_dict(self) -> dict[str, Any]:
+        """Return bounded feature/provenance fields for machine artifacts."""
+
+        result: dict[str, Any] = {
+            "task_id": self.task_id,
+            **self.as_core_kwargs(),
+            "frontier_count": self.frontier_count,
+            "association_count": self.association_count,
+            "feedback_exposure_count": self.feedback_exposure_count,
+            "positive_feedback_count": self.positive_feedback_count,
+            "negative_feedback_count": self.negative_feedback_count,
+            "duplicate_count": self.duplicate_count,
+            "refutation_count": self.refutation_count,
+            "stale_count": self.stale_count,
+            "lineage_stagnation_count": self.lineage_stagnation_count,
+            "watermark": self.watermark,
+            "source_outcome_ids": list(self.source_outcome_ids),
+            "zero_reason": self.zero_reason,
+            "positive_feedback_weight": self.positive_feedback_weight,
+            "negative_feedback_weight": self.negative_feedback_weight,
+            "active_trace_weight": self.active_trace_weight,
+            "active_lineage_weight": self.active_lineage_weight,
+            "drag_duplicate_proportion": self.drag_duplicate_proportion,
+            "drag_refutation_proportion": self.drag_refutation_proportion,
+            "drag_stale_proportion": self.drag_stale_proportion,
+            "drag_stagnation_proportion": self.drag_stagnation_proportion,
+        }
+        return result
+
+    as_dict = public_dict
+
 
 @dataclass(frozen=True)
 class TraceAllocationProjectionBatch:

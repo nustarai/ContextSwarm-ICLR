@@ -593,6 +593,66 @@ class AllocationTraceBridgeTests(unittest.TestCase):
         self.assertEqual(view.source, "selection_store_snapshot")
         self.assertEqual(view.references_for_task("task-a"), ())
 
+    def test_one_checker_receipt_cannot_reappear_as_association_feedback_or_trace_source(self) -> None:
+        receipt = "judge-receipt-1"
+        source = _SnapshotStore(
+            [
+                TraceProjectionSnapshotPage(
+                    records=(
+                        {
+                            "sequence": 1,
+                            "record_id": "trace-1",
+                            "task_id": "task-a",
+                            "kind": "piece_snapshot",
+                            "trace_id": "trace-1",
+                            "lineage_id": "lineage-1",
+                            "active": True,
+                        },
+                        {
+                            "sequence": 2,
+                            "record_id": receipt,
+                            "task_id": "task-a",
+                            "kind": "evidence_link",
+                            "trace_id": "trace-1",
+                            "lineage_id": "lineage-1",
+                            "evidence_id": receipt,
+                            "source_outcome_id": receipt,
+                        },
+                        {
+                            "sequence": 3,
+                            "record_id": "exposure-1",
+                            "task_id": "task-a",
+                            "kind": "worker_exposure",
+                            "trace_id": "trace-1",
+                            "evidence_id": "piece-1",
+                            "worker_id": "worker-1",
+                            "exposure_id": "exposure-1",
+                        },
+                        {
+                            "sequence": 4,
+                            "record_id": "feedback-1",
+                            "task_id": "task-a",
+                            "kind": "feedback_positive",
+                            "trace_id": "trace-1",
+                            "evidence_id": "piece-1",
+                            "worker_id": "worker-1",
+                            "exposure_id": "exposure-1",
+                            "terminal": True,
+                            "source_outcome_id": receipt,
+                        },
+                    ),
+                    trace_watermark="W",
+                )
+            ]
+        )
+        view = TraceProjectionBridge().read(
+            ["task-a"], store=source, ordinary_outcome_ids=(receipt,)
+        )
+        projection = view.for_task("task-a")
+        self.assertEqual(projection.evidence_association, 0.0)
+        self.assertEqual(projection.positive_feedback, 0.0)
+        self.assertNotIn(receipt, projection.source_outcome_ids)
+
     def test_opaque_source_watermark_changes_snapshot_identity(self) -> None:
         base = {
             "sequence": 1,

@@ -3484,6 +3484,7 @@ def _run_elastic_cps(
     # the runtime's pinned/causal snapshot protocol and (when a runtime is
     # present) fail the bridge's store-identity guard.
     normalization = config.allocation.normalization
+    trace_parameters = config.allocation.trace_state
     # The projection adapter consumes the same manifest-owned normalizers as
     # the core scorer.  Constructing these limits once per run keeps all four
     # comparison arms on one immutable contract while retaining the bridge's
@@ -3497,6 +3498,12 @@ def _run_elastic_cps(
             staleness_saturation=int(normalization["staleness_saturation"]),
             lineage_stagnation_saturation=int(
                 normalization["lineage_stagnation_saturation"]
+            ),
+            duplicate_weight=float(trace_parameters["duplicate_component_weight"]),
+            refutation_weight=float(trace_parameters["refutation_component_weight"]),
+            stale_weight=float(trace_parameters["staleness_component_weight"]),
+            lineage_stagnation_weight=float(
+                trace_parameters["lineage_stagnation_component_weight"]
             ),
             feedback_kappa=float(normalization["feedback_exposure_floor"]),
             recency_window_seconds=float(normalization["staleness_window_seconds"]),
