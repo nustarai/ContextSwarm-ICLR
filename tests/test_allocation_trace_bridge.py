@@ -427,6 +427,51 @@ class AllocationTraceBridgeTests(unittest.TestCase):
                 ["a"], as_of_watermark="W", cursor="c1", limit=4
             )
 
+    def test_bridge_accepts_bound_selection_runtime_without_selector_calls(self) -> None:
+        private = "runtime-private-query"
+        with tempfile.TemporaryDirectory() as temporary:
+            store = _selection_db(
+                Path(temporary) / "selection.sqlite3", private_marker=private
+            )
+
+            class Runtime:
+                selection_store = store
+                feedback_values = FEEDBACK_VALUES
+
+            view = TraceProjectionBridge().read(
+                ["task-a"],
+                selection_runtime=Runtime(),
+            )
+            self.assertEqual(view.source, "selection_store_snapshot")
+            self.assertEqual(view.for_task("task-a").positive_feedback_count, 1)
+            self.assertNotIn(private, repr(view))
+
+    def test_runtime_store_and_mapping_mismatch_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            first = _selection_db(
+                Path(temporary) / "first.sqlite3", private_marker="first"
+            )
+            second = _selection_db(
+                Path(temporary) / "second.sqlite3", private_marker="second"
+            )
+
+            class Runtime:
+                selection_store = first
+                feedback_values = FEEDBACK_VALUES
+
+            bridge = TraceProjectionBridge()
+            wrong_store = bridge.read(
+                ["task-a"], selection_runtime=Runtime(), store=second
+            )
+            self.assertEqual(wrong_store.source, "zero")
+
+            wrong_values = dict(FEEDBACK_VALUES)
+            wrong_values["useful"] = 0.0
+            wrong_mapping = bridge.read(
+                ["task-a"], selection_runtime=Runtime(), feedback_values=wrong_values
+            )
+            self.assertEqual(wrong_mapping.source, "zero")
+
     def test_zero_and_synthetic_fallbacks_are_deterministic(self) -> None:
         bridge = TraceProjectionBridge()
         first = bridge.read(["a", "b"])

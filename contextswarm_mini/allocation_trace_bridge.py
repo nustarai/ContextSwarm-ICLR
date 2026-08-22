@@ -285,7 +285,10 @@ def _bounded_reason(exc: BaseException) -> str:
 
 
 def _feedback_mapping(values: Mapping[str, Any] | None) -> dict[str, float]:
-    if values is None:
+    # Non-feedback selectors expose an explicit empty mapping.  That is a
+    # valid frozen configuration as long as the store has no effective
+    # feedback rows; ``read_complete_records`` enforces that latter condition.
+    if values is None or not values:
         return {}
     keys = {str(key) for key in values}
     if keys != _CANONICAL_FEEDBACK_KINDS:
@@ -656,9 +659,22 @@ class TraceProjectionBridge:
         task_ids: Iterable[str],
         *,
         store: Any | None = None,
+        selection_runtime: Any | None = None,
         feedback_values: Mapping[str, Any] | None = None,
         ordinary_outcome_ids: Iterable[str] = (),
     ) -> AllocationTraceView:
+        """Read one bounded projection at a single causal cut.
+
+        ``selection_runtime`` is an explicit integration path for Issue #38.
+        Passing the runtime (rather than reaching into it from the runner)
+        makes the store/feedback binding auditable: only its
+        ``selection_store`` and frozen ``feedback_values`` are consumed by
+        :class:`SelectionRuntimeTraceSource`.  A separately supplied
+        ``store`` must be the exact same object, and a separately supplied
+        feedback mapping must agree with the runtime mapping; otherwise the
+        bridge returns a deterministic zero view instead of combining state
+        from different selector configurations.
+        """
         ordered = _ordered_task_ids(task_ids, maximum=self.limits.max_tasks)
         ordinary_ids = tuple(
             sorted({str(value).strip() for value in ordinary_outcome_ids if str(value).strip()})
@@ -672,6 +688,27 @@ class TraceProjectionBridge:
                 source="synthetic",
                 complete=True,
             )
+        if selection_runtime is not None:
+            try:
+                runtime_store = getattr(selection_runtime, "selection_store", None)
+                if runtime_store is None:
+                    raise TypeError("selection runtime has no selection_store")
+                if store is not None and store is not runtime_store:
+                    raise ValueError("selection runtime/store binding mismatch")
+                runtime_values = getattr(selection_runtime, "feedback_values", None)
+                if feedback_values is not None:
+                    if _feedback_mapping(feedback_values) != _feedback_mapping(runtime_values):
+                        raise ValueError("selection runtime feedback mapping mismatch")
+                # Keep the runtime wrapper as the source so the pinned API is
+                # used even when the underlying store happens to expose a
+                # legacy protocol in the future.
+                store = SelectionRuntimeTraceSource(
+                    selection_runtime,
+                    max_records=self.limits.max_records,
+                )
+                feedback_values = runtime_values
+            except Exception as exc:
+                return self.zero(ordered, reason=_bounded_reason(exc))
         if store is None:
             return self.zero(ordered)
         snapshot_protocol = getattr(store, "read_allocation_projection_snapshot", None)
