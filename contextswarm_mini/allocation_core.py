@@ -48,6 +48,14 @@ MAX_ALLOCATION_PARAMETER_BYTES = 256 * 1024
 MAX_ALLOCATION_PARAMETER_INTEGER_DIGITS = 128
 MAX_SCHEDULER_REASON_CHARS = 1000
 MAX_SCHEDULER_REASON_BYTES = 4096
+# The pure policy may be used without the bounded Pi transport.  Reject an
+# untrusted provider response before stripping or JSON-decoding it so direct
+# callers cannot make the parser materialize an unbounded payload.  Keep both
+# limits: the character check is allocation-free, while the byte check handles
+# compact strings containing large UTF-8 code points.
+MAX_SCHEDULER_OUTPUT_CHARS = 64 * 1024
+MAX_SCHEDULER_OUTPUT_BYTES = 64 * 1024
+MAX_SCHEDULER_JSON_DEPTH = 64
 # The scheduler receives a bounded UTF-8 wire prompt.  The limit is a policy
 # input (and is therefore configurable by the runner), while this default keeps
 # direct users of the pure core safe when they do not have a manifest object.
@@ -1220,6 +1228,41 @@ def parse_llm_scheduler_output(
 ) -> tuple[str, str, tuple[str, ...]]:
     """Parse the exact, non-Markdown scheduler wire shape or raise ValueError."""
 
+    if not isinstance(raw_output, str):
+        raise ValueError("scheduler output must be a bounded UTF-8 string")
+    if len(raw_output) > MAX_SCHEDULER_OUTPUT_CHARS:
+        raise ValueError("scheduler output exceeds its bounded size")
+    try:
+        output_bytes = len(raw_output.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError("scheduler output must be a bounded UTF-8 string") from exc
+    if output_bytes > MAX_SCHEDULER_OUTPUT_BYTES:
+        raise ValueError("scheduler output exceeds its bounded size")
+
+    # The stdlib decoder's recursion behavior varies by Python release.  Do a
+    # small, allocation-free scan first so a deeply nested malformed response
+    # has one deterministic failure mode instead of relying on RecursionError.
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in raw_output:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > MAX_SCHEDULER_JSON_DEPTH:
+                raise ValueError("scheduler output exceeds the bounded JSON depth")
+        elif character in "]}":
+            depth = max(0, depth - 1)
+
     def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in pairs:
@@ -1232,19 +1275,27 @@ def parse_llm_scheduler_output(
         payload = json.loads(
             raw_output.strip(),
             object_pairs_hook=_pairs,
-            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f"invalid JSON constant {value}")),
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                ValueError("scheduler JSON contains a non-finite constant")
+            ),
         )
     # ``object_pairs_hook`` and ``parse_constant`` intentionally raise
     # ``ValueError`` for duplicate keys and non-finite JSON constants.  Keep
     # those wire-level failures inside the parser boundary so the caller can
     # apply its deterministic fallback instead of leaking an exception from
     # an untrusted provider payload.
-    except (AttributeError, TypeError, ValueError) as exc:
-        detail = str(exc).strip()
-        message = "scheduler output must be exactly one JSON object"
-        if detail:
-            message += f": {detail}"
-        raise ValueError(message) from exc
+    except RecursionError as exc:
+        raise ValueError("scheduler output exceeds the bounded JSON depth") from exc
+    except ValueError as exc:
+        # Only retain the two stable hook categories.  JSON decoder diagnostics
+        # and provider-controlled source text must not enter fallback artifacts.
+        detail = str(exc)
+        if detail in {
+            "scheduler JSON contains duplicate keys",
+            "scheduler JSON contains a non-finite constant",
+        }:
+            raise ValueError(detail) from exc
+        raise ValueError("scheduler output must be exactly one JSON object") from exc
     required = {"decision_id", "task_id", "reason", "trace_reference_ids"}
     if not isinstance(payload, dict) or set(payload) != required:
         raise ValueError("scheduler JSON must contain exactly decision_id, task_id, reason, trace_reference_ids")

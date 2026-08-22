@@ -204,6 +204,33 @@ class AllocationCoreTests(unittest.TestCase):
         self.assertEqual(wrong_type.selected_task_id, "b")
         self.assertEqual(wrong_type.scheduler_cost.calls, 1)
 
+    def test_llm_output_parser_is_bounded_and_does_not_leak_source_text(self) -> None:
+        snap = snapshot(task("a", checker_quality=0.1), task("b", checker_quality=0.9))
+
+        for output, message in (
+            ("x" * (64 * 1024 + 1), "bounded size"),
+            ("é" * (32 * 1024 + 1), "bounded size"),
+            ("[" * 65 + "0" + "]" * 65, "bounded JSON depth"),
+            ('{"decision_id":"/tmp/private/transcript"', "exactly one JSON object"),
+            ("\ud800", "bounded UTF-8 string"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(ValueError, message) as caught:
+                    parse_llm_scheduler_output(output, snap)
+                self.assertNotIn("/tmp/private/transcript", str(caught.exception))
+
+                decision = ReadOnlyLLMSchedulerPolicy(
+                    lambda _current, _prompt, raw=output: LLMSchedulerResponse(raw)
+                ).choose(snap)
+                self.assertTrue(decision.fallback)
+                self.assertEqual(decision.selected_task_id, "b")
+                self.assertEqual(decision.scheduler_cost.calls, 1)
+                self.assertIn(message, decision.fallback_reason)
+                self.assertNotIn("/tmp/private/transcript", decision.fallback_reason)
+
+        with self.assertRaisesRegex(ValueError, "bounded UTF-8 string"):
+            parse_llm_scheduler_output(None, snap)  # type: ignore[arg-type]
+
     def test_llm_fallback_audit_uses_manifest_trace_weights(self) -> None:
         snap = snapshot(
             task(
