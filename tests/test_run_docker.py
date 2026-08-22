@@ -55,12 +55,19 @@ class RunDockerManifestTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _write_parent_manifest(self, *, image: str, memory_mb: int) -> None:
+    def _write_parent_manifest(
+        self,
+        *,
+        image: str,
+        memory_mb: int,
+        network: str = "host",
+    ) -> None:
         self.parent_manifest.write_text(
             'extends = ["../configs/smoke.toml"]\n\n'
             "[docker]\n"
             f'image = "{image}"\n'
-            f"memory_mb = {memory_mb}\n",
+            f"memory_mb = {memory_mb}\n"
+            f'network = "{network}"\n',
             encoding="utf-8",
         )
 
@@ -104,6 +111,8 @@ class RunDockerManifestTests(unittest.TestCase):
         argv = self._captured_argv()
         self.assertEqual(argv[0], "run")
         self.assertEqual(argv[argv.index("--memory") + 1], "65536m")
+        self.assertEqual(argv[argv.index("--network") + 1], "host")
+        self.assertNotIn("--add-host", argv)
         config_index = argv.index("--config")
         self.assertEqual(argv[config_index - 1], "research/contextswarm-mini:paper")
         self.assertEqual(
@@ -124,6 +133,36 @@ class RunDockerManifestTests(unittest.TestCase):
             argv[argv.index("--config") - 1],
             "registry.example:5000/paper/mini:operator",
         )
+
+    def test_bridge_network_is_manifest_selected_with_host_gateway_alias(self) -> None:
+        self._write_parent_manifest(
+            image="research/contextswarm-mini:paper",
+            memory_mb=65_536,
+            network="bridge",
+        )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self._captured_argv()
+        self.assertEqual(argv[argv.index("--network") + 1], "bridge")
+        self.assertEqual(
+            argv[argv.index("--add-host") + 1],
+            "host.docker.internal:host-gateway",
+        )
+
+    def test_invalid_manifest_network_fails_before_docker(self) -> None:
+        self._write_parent_manifest(
+            image="research/contextswarm-mini:paper",
+            memory_mb=65_536,
+            network="experiment-net",
+        )
+
+        result = self._run()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("docker.network must be host or bridge", result.stderr)
+        self.assertFalse(self.capture.exists())
 
     def test_unsafe_manifest_and_operator_values_fail_before_docker(self) -> None:
         sentinel = self.temp / "must-not-exist"

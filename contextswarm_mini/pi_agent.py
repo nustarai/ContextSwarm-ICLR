@@ -34,6 +34,34 @@ _CPS_ENVIRONMENT_KEYS = frozenset(
         "CONTEXTSWARM_TASK_ROOT",
     }
 )
+_EVALUATOR_ENVIRONMENT_KEYS = frozenset(
+    {
+        "LEAN_AUTH_TOKEN",
+        "LEAN_SERVER_URL",
+        "LEAN_JUDGE_URL",
+        "JUDGE_URL",
+        "JUDGE_ENDPOINT",
+        "CONTEXTSWARM_JUDGE_URL",
+        "CONTEXTSWARM_JUDGE_ENDPOINT",
+        "CONTEXTSWARM_EVALUATOR_URL",
+        "EVALUATOR_URL",
+        "CONTEXTSWARM_LEAN_SERVER_URL",
+        "CONTEXTSWARM_LEAN_ENV_ID",
+        "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE",
+        "CONTEXTSWARM_LEAN_JUDGE_MODE",
+        "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS",
+        "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS",
+    }
+)
+
+
+def _is_evaluator_environment_key(key: str) -> bool:
+    normalized = str(key).strip().upper()
+    return (
+        normalized in _EVALUATOR_ENVIRONMENT_KEYS
+        or normalized.startswith("CONTEXTSWARM_LEAN_")
+        or normalized.startswith("CONTEXTSWARMJUDGE_")
+    )
 
 
 def now_iso() -> str:
@@ -101,7 +129,11 @@ class PiAgent:
         # never an implicit communication surface; CPS call sites explicitly
         # add the current run's values through ``extra_env`` below.
         for key in tuple(env):
-            if key in _CPS_ENVIRONMENT_KEYS or key.startswith("CONTEXTSWARM_CPS_"):
+            if (
+                key in _CPS_ENVIRONMENT_KEYS
+                or key.startswith("CONTEXTSWARM_CPS_")
+                or _is_evaluator_environment_key(key)
+            ):
                 env.pop(key, None)
         env.update(
             {
@@ -139,24 +171,12 @@ class PiAgent:
             )
         if extra_env:
             env.update({str(key): str(value) for key, value in extra_env.items()})
-        # The evaluator route is part of the manifest contract, not ambient
-        # operator or per-agent state.  Publish it after ``extra_env`` so a
-        # stale shell variable or communication payload cannot route an agent's
-        # optional checks to a different resident Judge stack.
-        env.update(
-            {
-                "CONTEXTSWARM_LEAN_SERVER_URL": self.config.lean_server_url,
-                "CONTEXTSWARM_LEAN_ENV_ID": self.config.lean_env_id,
-                "CONTEXTSWARM_LEAN_VERIFICATION_PROFILE": self.config.lean_verification_profile,
-                "CONTEXTSWARM_LEAN_JUDGE_MODE": self.config.lean_judge_mode,
-                "CONTEXTSWARM_LEAN_EXECUTION_TIMEOUT_SECONDS": str(
-                    self.config.lean_timeout_seconds
-                ),
-                "CONTEXTSWARM_LEAN_MAX_LIFECYCLE_SECONDS": str(
-                    self.config.lean_max_lifecycle_seconds
-                ),
-            }
-        )
+        # Pi workers only construct candidates.  The runner owns the evaluator
+        # route and budget, so neither ambient state nor a CPS payload may give
+        # an agent a direct Judge capability.
+        for key in tuple(env):
+            if _is_evaluator_environment_key(key):
+                env.pop(key, None)
         return env
 
     def run(

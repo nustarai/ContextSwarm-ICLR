@@ -104,18 +104,20 @@ except (ConfigError, OSError, ValueError) as exc:
 
 print(config.docker_image)
 print(config.docker_memory_mb)
+print(config.docker_network)
 PY
 )"; then
   exit 2
 fi
 mapfile -t RESOLVED_DOCKER_VALUES <<<"${RESOLVED_DOCKER_CONFIG}"
-if [[ "${#RESOLVED_DOCKER_VALUES[@]}" -ne 2 ]]; then
+if [[ "${#RESOLVED_DOCKER_VALUES[@]}" -ne 3 ]]; then
   echo "docker manifest resolution returned an invalid payload" >&2
   exit 2
 fi
 
 IMAGE="${CONTEXTSWARM_MINI_IMAGE:-${RESOLVED_DOCKER_VALUES[0]}}"
 MEMORY="${CONTEXTSWARM_MINI_MEMORY:-${RESOLVED_DOCKER_VALUES[1]}m}"
+NETWORK="${RESOLVED_DOCKER_VALUES[2]}"
 if [[ "${#IMAGE}" -gt 512 || ! "${IMAGE}" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@+-]*$ ]]; then
   echo "invalid Docker image from manifest or CONTEXTSWARM_MINI_IMAGE" >&2
   exit 2
@@ -124,18 +126,30 @@ if [[ "${#MEMORY}" -gt 32 || ! "${MEMORY}" =~ ^[1-9][0-9]*([bBkKmMgG])?$ ]]; the
   echo "invalid Docker memory from manifest or CONTEXTSWARM_MINI_MEMORY" >&2
   exit 2
 fi
+if [[ "${NETWORK}" != "host" && "${NETWORK}" != "bridge" ]]; then
+  echo "invalid Docker network from manifest" >&2
+  exit 2
+fi
 
 mkdir -p "${ROOT_DIR}/runs"
 
 DOCKER_ARGS=(
   --rm
   --init
-  --network host
   --memory "${MEMORY}"
   -v "${ROOT_DIR}:/opt/contextswarm:ro"
   -v "${ROOT_DIR}/runs:/opt/contextswarm/runs"
   -e "MINI_SWARM_NUROUTER_VERSION=${NUROUTER_VERSION}"
 )
+
+if [[ "${NETWORK}" == "bridge" ]]; then
+  DOCKER_ARGS+=(
+    --network bridge
+    --add-host "host.docker.internal:host-gateway"
+  )
+else
+  DOCKER_ARGS+=(--network host)
+fi
 
 if (( MOCK == 0 )); then
   if [[ ! -x "${AISW_BINARY}" ]]; then
