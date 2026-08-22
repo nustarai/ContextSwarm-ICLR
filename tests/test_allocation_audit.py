@@ -9,8 +9,10 @@ from contextswarm_mini.allocation_audit import (
     append_allocation_audit,
     build_figure4_run_summary,
     build_figure4_paired_repeat,
+    canonical_json_sha256,
     read_allocation_audits,
     validate_capacity_conservation,
+    write_figure4_run_summary,
 )
 
 
@@ -59,10 +61,74 @@ class AuditTests(unittest.TestCase):
             path = Path(td) / "audit.jsonl"; append_allocation_audit(path, _record())
             rows = read_allocation_audits(path, expected_config_sha256="c" * 64)
             self.assertEqual(len(rows), 1)
-            summary = build_figure4_run_summary(run_id="r", policy="trace_state", paired_seed=2, repeat=1, horizon_seconds=10, total_capacity=4, initial_allocation={"a": 1}, accepted_score_history=[{"elapsed_seconds": 2, "accepted_score": 1}], max_score=2, scheduler_cost={"calls": 1, "input_tokens": 4, "output_tokens": 2, "latency_seconds": 1.5, "reserved_slot_seconds": 1.5})
+            summary = build_figure4_run_summary(run_id="r", policy="llm_scheduler", paired_seed=2, repeat=1, horizon_seconds=10, total_capacity=4, initial_allocation={"a": 1}, accepted_score_history=[{"elapsed_seconds": 2, "accepted_score": 1}], max_score=2, scheduler_cost={"calls": 1, "input_tokens": 4, "output_tokens": 2, "latency_seconds": 1.5, "capacity_reservations": 1, "reserved_slot_seconds": 1.25}, allocation_metrics={"decisions": 1, "admitted_decisions": 1}, solver_usage={"calls": 1, "input_tokens": 10, "output_tokens": 3, "slot_seconds": 5.0}, evaluator_usage={"calls": 1, "admissions": 1, "terminal_receipts": 1})
             self.assertEqual(summary["schema_version"], "contextswarm_figure4_run_summary_v1")
             self.assertEqual(summary["scheduler_cost"]["calls"], 1)
             self.assertEqual(summary["nauc"], .4)
+            self.assertEqual(summary["time_to_k_seconds"], {"1": 2.0, "2": None})
+            self.assertEqual(summary["scheduler_cost"]["latency_seconds"], 1.5)
+            self.assertEqual(summary["scheduler_cost"]["reserved_slot_seconds"], 1.25)
+            self.assertEqual(summary["capacity_usage"]["occupied_slot_seconds"], 6.25)
+
+    def test_summary_uses_cumulative_history_and_exact_hashes(self):
+        parameters = {"task_state": {"checker_quality": 1.0}}
+        contract = {"dataset": "d", "label": "非 ASCII"}
+        summary = build_figure4_run_summary(
+            run_id="r",
+            policy="trace_state",
+            paired_seed=9,
+            repeat=3,
+            comparison_contract=contract,
+            task_order=["b", "a"],
+            horizon_seconds=10,
+            total_capacity=2,
+            initial_allocation={"b": 1, "a": 1},
+            accepted_score_history=[
+                {"elapsed_seconds": 2, "accepted_score": 1, "task_id": "b"},
+                {"elapsed_seconds": 7, "accepted_score": 2, "task_id": "a"},
+            ],
+            max_score=2,
+            allocation_parameters=parameters,
+            allocation_config_sha256=canonical_json_sha256(parameters),
+        )
+        self.assertEqual(summary["task_order"], ["b", "a"])
+        self.assertEqual(summary["final_accepted_score"], 2.0)
+        self.assertEqual(summary["nauc"], 0.55)
+        self.assertEqual(
+            summary["comparison_contract_sha256"], canonical_json_sha256(contract)
+        )
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "summary.json"
+            write_figure4_run_summary(path, summary)
+            tampered = dict(summary)
+            tampered["comparison_contract"] = {"dataset": "changed"}
+            with self.assertRaisesRegex(ValueError, "contract hash mismatch"):
+                write_figure4_run_summary(path, tampered)
+
+    def test_summary_rejects_capacity_and_count_mismatches(self):
+        common = dict(
+            run_id="r",
+            policy="llm_scheduler",
+            paired_seed=1,
+            repeat=1,
+            task_order=["a"],
+            horizon_seconds=10,
+            total_capacity=1,
+            initial_allocation={"a": 1},
+            accepted_score_history=[],
+            max_score=1,
+            allocation_metrics={"decisions": 1},
+        )
+        with self.assertRaisesRegex(ValueError, "exceed capacity"):
+            build_figure4_run_summary(
+                **common,
+                solver_usage={"slot_seconds": 9.5},
+                scheduler_cost={"reserved_slot_seconds": 1.0},
+            )
+        with self.assertRaisesRegex(ValueError, "fallbacks.*exceed"):
+            build_figure4_run_summary(
+                **{**common, "allocation_metrics": {"decisions": 1, "fallbacks": 2}}
+            )
 
     def test_paired_repeat_has_bootstrap_ready_contrasts(self):
         arms = {

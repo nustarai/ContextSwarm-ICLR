@@ -41,7 +41,13 @@ from .allocation_core import (
     TraceScoreWeights,
     create_allocation_policy,
 )
-from .allocation_audit import AllocationAuditRecord, append_allocation_audit
+from .allocation_audit import (
+    AllocationAuditRecord,
+    append_allocation_audit,
+    build_figure4_run_summary,
+    canonical_json_sha256,
+    write_figure4_run_summary,
+)
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
 from .evaluator import CodingEvaluator, LeanEvaluator, MockEvaluator, sanitize_worker_text
@@ -942,11 +948,23 @@ def _allocation_runtime_metrics(
     max_parallel: int,
     policy_latency_seconds: float,
 ) -> dict[str, Any]:
+    events = tuple(history)
+    converted_agent_ids = {
+        str(event.get("agent_id") or "")
+        for event in events
+        if str(event.get("event") or "") == "reservation_completed"
+        and str(event.get("outcome") or "") == "converted_to_solver"
+        and str(event.get("agent_id") or "")
+    }
     admitted: dict[str, tuple[str, float]] = {}
     finished: dict[str, float] = {}
     reservations: dict[str, tuple[int, float]] = {}
     reservation_seconds = 0.0
-    for event in history:
+    reservation_count = 0
+    reservation_outcomes: Counter[str] = Counter()
+    occupied = 0
+    max_occupied = 0
+    for event in events:
         event_type = str(event.get("event") or "")
         agent_id = str(event.get("agent_id") or "")
         if event_type == "agent_admitted" and agent_id:
@@ -954,25 +972,45 @@ def _allocation_runtime_metrics(
                 str(event.get("task_id") or ""),
                 float(event.get("admitted_at") or run_started_monotonic),
             )
+            if agent_id not in converted_agent_ids:
+                occupied += 1
+            max_occupied = max(max_occupied, occupied)
         elif event_type == "agent_finished" and agent_id:
             finished[agent_id] = float(event.get("finished_at") or deadline)
+            if agent_id in admitted:
+                occupied = max(0, occupied - 1)
         elif event_type == "reservation_acquired":
             reservation_id = str(event.get("reservation_id") or "")
             if reservation_id:
+                slots = int(event.get("slots") or 0)
                 reservations[reservation_id] = (
-                    int(event.get("slots") or 0),
+                    slots,
                     float(event.get("acquired_at") or run_started_monotonic),
                 )
+                reservation_count += 1
+                occupied += slots
+                max_occupied = max(max_occupied, occupied)
         elif event_type == "reservation_completed":
             reservation_id = str(event.get("reservation_id") or "")
-            held = reservations.pop(reservation_id, None)
+            held = reservations.get(reservation_id)
             if held is not None:
                 slots, started = held
                 completed = float(event.get("completed_at") or deadline)
-                reservation_seconds += slots * max(
+                completed_slots = int(event.get("slots") or slots)
+                completed_slots = min(slots, max(0, completed_slots))
+                reservation_seconds += completed_slots * max(
                     0.0,
                     min(deadline, completed) - max(run_started_monotonic, started),
                 )
+                outcome = str(event.get("outcome") or "unknown")
+                remaining = slots - completed_slots
+                if remaining:
+                    reservations[reservation_id] = (remaining, started)
+                else:
+                    reservations.pop(reservation_id, None)
+                if outcome != "converted_to_solver":
+                    occupied = max(0, occupied - completed_slots)
+                reservation_outcomes[outcome] += 1
     per_task: dict[str, float] = {}
     solver_seconds = 0.0
     for agent_id, (task_id, started) in admitted.items():
@@ -987,19 +1025,28 @@ def _allocation_runtime_metrics(
         reservation_seconds += slots * max(
             0.0, min(deadline, deadline) - max(run_started_monotonic, started)
         )
-    # Legacy agent arms predate capacity reservations. Keep their historical
-    # latency accounting; registered LLM Scheduler arms use actual reservation
-    # slot-seconds and never double-count model latency.
-    scheduler_compute_seconds = (
-        reservation_seconds if reservation_seconds else max(0.0, policy_latency_seconds)
-    )
+    # Provider/model latency and reserved CPS capacity are deliberately
+    # separate.  A zero-duration reservation is still zero slot-seconds;
+    # policy latency must never be substituted as capacity occupancy.
+    scheduler_compute_seconds = reservation_seconds
     compute_seconds = solver_seconds + scheduler_compute_seconds
     compute_utilization = compute_seconds / capacity_seconds if capacity_seconds else 0.0
+    if compute_seconds > capacity_seconds + max(1e-9, capacity_seconds * 1e-9):
+        raise RuntimeError("solver plus scheduler occupancy exceeded CPS capacity")
+    if max_occupied > max_parallel:
+        raise RuntimeError("observed occupied slots exceeded CPS capacity")
     return {
         "solver_agent_seconds": round(solver_seconds, 6),
         "scheduler_compute_seconds": round(scheduler_compute_seconds, 6),
         "scheduler_reserved_slot_seconds": round(reservation_seconds, 6),
+        "scheduler_capacity_reservations": reservation_count,
+        "scheduler_reservation_outcomes": dict(sorted(reservation_outcomes.items())),
+        "scheduler_policy_latency_seconds": round(
+            max(0.0, policy_latency_seconds), 6
+        ),
         "capacity_seconds": round(capacity_seconds, 6),
+        "occupied_slot_seconds": round(compute_seconds, 6),
+        "max_occupied_slots": max_occupied,
         "solver_slot_utilization": round(min(1.0, solver_utilization), 8),
         "compute_slot_utilization": round(min(1.0, compute_utilization), 8),
         "per_task_agent_seconds": {
@@ -1008,7 +1055,19 @@ def _allocation_runtime_metrics(
     }
 
 
-def _scheduler_token_usage(trace_path: Path) -> dict[str, int]:
+def _pi_token_usage(
+    trace_path: Path,
+    *,
+    scheduler: bool | None = None,
+) -> dict[str, int]:
+    """Aggregate per-session token high-water marks without double counting.
+
+    Pi emits cumulative usage on multiple events.  Maxima within each stable
+    session are additive across sessions.  ``scheduler`` partitions allocation
+    model sessions from solver sessions so Figure 4 never attributes one
+    model's tokens to the other.
+    """
+
     per_session: dict[str, dict[str, int]] = {}
     try:
         lines = trace_path.read_text(encoding="utf-8").splitlines()
@@ -1019,22 +1078,42 @@ def _scheduler_token_usage(trace_path: Path) -> dict[str, int]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not str(row.get("actor_id") or "").startswith("allocation-scheduler-"):
+        actor_id = str(row.get("actor_id") or "")
+        is_scheduler = actor_id.startswith("allocation-scheduler-")
+        if scheduler is not None and is_scheduler is not scheduler:
             continue
-        session = str(row.get("session_id") or row.get("actor_id") or "unknown")
+        session = str(row.get("session_id") or actor_id or "unknown")
         usage = per_session.setdefault(session, {})
         for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "total_tokens"):
             value = row.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                 usage[key] = max(usage.get(key, 0), value)
+    input_tokens = sum(row.get("input_tokens", 0) for row in per_session.values())
+    output_tokens = sum(row.get("output_tokens", 0) for row in per_session.values())
     return {
-        "scheduler_model_sessions": len(per_session),
-        "scheduler_input_tokens": sum(row.get("input_tokens", 0) for row in per_session.values()),
-        "scheduler_output_tokens": sum(row.get("output_tokens", 0) for row in per_session.values()),
-        "scheduler_cache_read_tokens": sum(row.get("cache_read_tokens", 0) for row in per_session.values()),
-        "scheduler_cache_write_tokens": sum(row.get("cache_write_tokens", 0) for row in per_session.values()),
-        "scheduler_total_tokens": sum(row.get("total_tokens", 0) for row in per_session.values()),
+        "model_sessions": len(per_session),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": sum(
+            row.get("cache_read_tokens", 0) for row in per_session.values()
+        ),
+        "cache_write_tokens": sum(
+            row.get("cache_write_tokens", 0) for row in per_session.values()
+        ),
+        # Some providers omit totalTokens.  Input + output is the portable
+        # comparison measure and the Figure 4 artifact's exact invariant.
+        "total_tokens": input_tokens + output_tokens,
     }
+
+
+def _scheduler_token_usage(trace_path: Path) -> dict[str, int]:
+    usage = _pi_token_usage(trace_path, scheduler=True)
+    return {f"scheduler_{key}": value for key, value in usage.items()}
+
+
+def _solver_token_usage(trace_path: Path) -> dict[str, int]:
+    usage = _pi_token_usage(trace_path, scheduler=False)
+    return {f"solver_{key}": value for key, value in usage.items()}
 
 
 _FIGURE4_POLICIES = frozenset(
@@ -1428,6 +1507,9 @@ def run_experiment(
     logger = RunLogger(run_dir)
     manifest_snapshot = config.public_dict()
     manifest_snapshot["run_id"] = run_id
+    # Preserve benchmark order as an explicit comparison input.  Sorting task
+    # IDs in a summary can silently change paired allocation vectors.
+    manifest_snapshot["ordered_task_ids"] = [task.slug for task in tasks]
     manifest_snapshot["started_at"] = utc_now()
     manifest_snapshot["repo_root"] = str(config.repo_root)
     manifest_snapshot["effective_runtime_limits"] = _runtime_limit_snapshot()
@@ -3419,6 +3501,7 @@ def _run_elastic_cps(
         )
     )
     allocation_summary.update(_scheduler_token_usage(run_dir / "pi_events.jsonl"))
+    allocation_summary.update(_solver_token_usage(run_dir / "pi_events.jsonl"))
     allocation_summary["initial_pool_size"] = len(initial_assignments)
     allocation_summary["initial_assignments"] = initial_assignment_count
     allocation_summary["adaptive_assignments"] = adaptive_assignments
@@ -4682,7 +4765,15 @@ def _write_final(
         "finished_at": utc_now(),
     }
     if config.allocation.policy in _FIGURE4_POLICIES:
-        _write_figure4_summary(run_dir, config, verdicts, allocation_summary)
+        summary_path = _write_figure4_summary(
+            run_dir,
+            config,
+            verdicts,
+            all_agent_rows,
+            allocation_summary,
+        )
+        final["figure4_run_summary"] = summary_path.name
+        final["figure4_run_summary_schema"] = "contextswarm_figure4_run_summary_v1"
     (run_dir / "final.json").write_text(
         json.dumps(final, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -4693,15 +4784,15 @@ def _write_figure4_summary(
     run_dir: Path,
     config: ExperimentConfig,
     verdicts: Mapping[str, Verdict],
+    agent_results: Iterable[Mapping[str, Any]],
     allocation_summary: Mapping[str, Any] | None,
-) -> None:
+) -> Path:
     """Emit the machine-readable per-repeat Figure 4 development artifact."""
 
-    score_time = _score_time_metrics(
-        run_dir,
-        horizon_seconds=config.time_limit_seconds,
-        max_score=len(verdicts),
-    )
+    try:
+        meta = json.loads((run_dir / "run_meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meta = {}
     try:
         history = [
             json.loads(line)
@@ -4712,80 +4803,265 @@ def _write_figure4_summary(
         ]
     except (OSError, json.JSONDecodeError):
         history = []
-    accepted_history = [
-        {
-            "task_id": row.get("task_id"),
-            "score": float(row.get("score") or 0.0),
-            "horizon_elapsed_seconds": row.get("horizon_elapsed_seconds"),
-        }
-        for row in history
-        if str(row.get("source") or "") != "closeout"
-        and float(row.get("score") or 0.0) >= 1.0
-    ]
+    proof_times: dict[str, float] = {}
+    for row in history:
+        try:
+            if str(row.get("source") or "") == "closeout" or float(
+                row.get("score") or 0.0
+            ) < 1.0:
+                continue
+            task_id = str(row.get("task_id") or "")
+            elapsed = float(row.get("horizon_elapsed_seconds"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            task_id
+            and math.isfinite(elapsed)
+            and 0.0 <= elapsed <= config.time_limit_seconds
+            and (task_id not in proof_times or elapsed < proof_times[task_id])
+        ):
+            proof_times[task_id] = elapsed
+    cumulative = 0
+    accepted_history: list[dict[str, Any]] = []
+    for task_id, elapsed in sorted(proof_times.items(), key=lambda item: (item[1], item[0])):
+        cumulative += 1
+        accepted_history.append(
+            {
+                "elapsed_seconds": round(elapsed, 6),
+                "accepted_score": cumulative,
+                "task_id": task_id,
+            }
+        )
+
+    raw_extra = config.extra.get("raw", {}) if isinstance(config.extra, Mapping) else {}
+    experiment_raw = raw_extra.get("experiment", {}) if isinstance(raw_extra, Mapping) else {}
+    selection_raw = raw_extra.get("selection", {}) if isinstance(raw_extra, Mapping) else {}
+    if not isinstance(experiment_raw, Mapping):
+        experiment_raw = {}
+    if not isinstance(selection_raw, Mapping):
+        selection_raw = {}
+    raw_repeat = experiment_raw.get(
+        "paired_repeat_id", config.extra.get("paired_repeat_id", config.seed)
+    )
+    try:
+        repeat = int(raw_repeat)
+    except (TypeError, ValueError):
+        repeat = int(config.seed)
+    # Development manifests historically used "dev".  The public schema
+    # requires an integer paired identity, so bind non-numeric values to the
+    # paired seed until an explicit numeric repeat is registered.
+
     selected = getattr(config, "selection", None)
-    selector_identity = selected.public_dict() if selected is not None else {
-        "enabled": False,
-        "selector_name": "",
-        "selection_config_id": "",
+    if selected is not None and callable(getattr(selected, "public_dict", None)):
+        selector_identity = selected.public_dict()
+    else:
+        selector_identity = dict(selection_raw)
+        selector_identity.setdefault("enabled", False)
+        selector_identity.setdefault("selector_name", "development_unfrozen")
+        selector_identity.setdefault("selector_version", "development_v1")
+        selector_identity.setdefault("visibility", "project_shared")
+        selector_identity.setdefault("direct_messages", False)
+        selector_identity.setdefault("candidate_transfer", False)
+        selector_identity["selection_config_id"] = canonical_json_sha256(
+            {
+                key: value
+                for key, value in selector_identity.items()
+                if key != "selection_config_id"
+            }
+        )
+    selector_config_sha256 = str(
+        selector_identity.get("selection_config_id") or ""
+    )
+    if not re.fullmatch(r"[0-9a-f]{64}", selector_config_sha256):
+        selector_config_sha256 = canonical_json_sha256(
+            {
+                key: value
+                for key, value in selector_identity.items()
+                if key != "selection_config_id"
+            }
+        )
+        selector_identity["selection_config_id"] = selector_config_sha256
+
+    task_order_value = meta.get("ordered_task_ids", meta.get("tasks"))
+    if not isinstance(task_order_value, list) or set(task_order_value) != set(verdicts):
+        task_order_value = list(verdicts)
+    task_order = [str(task_id) for task_id in task_order_value]
+    initial_allocation = {
+        task_id: config.initial_agents_per_task for task_id in task_order
+    }
+    candidate_transfer = bool(
+        selector_identity.get("candidate_transfer", True)
+        if bool(selector_identity.get("enabled", False))
+        else True
+    )
+    inference_settings = {
+        "thinking": config.thinking,
+        "fast_mode": config.fast_mode,
+        "pi_timeout_seconds": config.pi_timeout_seconds,
+        "pi_http_idle_timeout_ms": config.pi_http_idle_timeout_ms,
+        "retry_enabled": config.pi_retry_enabled,
+        "retry_max_retries": config.pi_retry_max_retries,
+        "provider_max_retries": config.pi_provider_max_retries,
+    }
+    evaluator_contract = {
+        "judge_kind": config.judge_kind,
+        "environment_id": config.lean_env_id,
+        "verification_profile": config.lean_verification_profile,
+        "judge_mode": config.lean_judge_mode,
+        "timeout_seconds": config.lean_timeout_seconds,
+        "max_lifecycle_seconds": config.lean_max_lifecycle_seconds,
+        "max_concurrent_evaluations": config.lean_max_concurrent_evaluations,
+        "result_cache_disabled_required": config.lean_require_result_cache_disabled,
     }
     contract = {
         "dataset": config.dataset_name,
-        "ordered_task_ids": sorted(verdicts),
+        "ordered_task_ids": task_order,
+        "paired_repeat_id": repeat,
         "paired_seed": config.seed,
-        "selector": selector_identity,
+        "selector_identity": selector_identity,
+        "selector_config_sha256": selector_config_sha256,
+        "trace_visibility": str(
+            selector_identity.get("visibility") or "project_shared"
+        ),
         "model": config.model,
+        "inference_settings": inference_settings,
+        "evaluator": evaluator_contract,
+        "runtime_limits": dict(meta.get("effective_runtime_limits") or {}),
         "horizon_seconds": config.time_limit_seconds,
         "total_capacity": config.max_parallel,
-        "initial_agents_per_task": config.initial_agents_per_task,
+        "initial_allocation": initial_allocation,
         "communication": config.communication,
         "direct_messages_enabled": False,
-        "candidate_transfer": True,
+        "candidate_transfer": candidate_transfer,
         "stopping_rule": "full_score_or_horizon",
     }
-    contract_hash = hashlib.sha256(
-        json.dumps(contract, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-    ).hexdigest()
-    summary = {
-        "schema_version": "contextswarm_figure4_run_summary_v1",
-        "policy": config.allocation.policy,
-        "paired_repeat_id": str(config.extra.get("paired_repeat_id", "dev")),
-        "paired_seed": config.seed,
-        "ordered_task_ids": sorted(verdicts),
-        "horizon_seconds": config.time_limit_seconds,
-        "total_capacity": config.max_parallel,
-        "initial_allocation": {
-            task_id: config.initial_agents_per_task for task_id in sorted(verdicts)
-        },
-        "accepted_score_history": accepted_history,
-        "final_accepted_score": sum(
-            1 for verdict in verdicts.values() if float(verdict.score) >= 1.0
-        ),
-        "time_to_k_seconds": score_time.get("time_to_k_proofs_seconds", {}),
-        "nauc": score_time.get("normalized_score_time_auc", 0.0),
-        "solver_usage": {
-            "solver_agent_seconds": (allocation_summary or {}).get("solver_agent_seconds", 0.0),
-            "solver_slot_utilization": (allocation_summary or {}).get("solver_slot_utilization", 0.0),
-        },
-        "evaluator_usage": {
-            "terminal_verdict_count": len(verdicts),
-            "attempt_verdict_count": len(history),
-        },
-        "scheduler_cost": (allocation_summary or {}).get("scheduler_cost", {}),
-        "allocation_metrics": {
-            key: value
-            for key, value in (allocation_summary or {}).items()
-            if key in {"decision_count", "fallback_count", "agent_calls", "total_latency_seconds"}
-        },
-        "allocation_config": config.allocation.public_dict(),
-        "comparison_contract": contract,
-        "comparison_contract_sha256": contract_hash,
+    contract_hash = canonical_json_sha256(contract)
+
+    agents = list(agent_results)
+    solver_agents = [
+        row
+        for row in agents
+        if row.get("task_id") != "__allocation__"
+        and not str(row.get("agent_id") or "").startswith("scheduler-")
+    ]
+    scheduler_agents = [row for row in agents if row.get("task_id") == "__allocation__"]
+    allocation = dict(allocation_summary or {})
+    solver_usage = {
+        "calls": len(solver_agents),
+        "input_tokens": int(allocation.get("solver_input_tokens", 0)),
+        "output_tokens": int(allocation.get("solver_output_tokens", 0)),
+        "cache_read_tokens": int(allocation.get("solver_cache_read_tokens", 0)),
+        "cache_write_tokens": int(allocation.get("solver_cache_write_tokens", 0)),
+        "total_tokens": int(allocation.get("solver_total_tokens", 0)),
+        "slot_seconds": float(allocation.get("solver_agent_seconds", 0.0)),
+        "max_occupied_slots": int(allocation.get("max_occupied_slots", 0)),
     }
-    (run_dir / "figure4_run_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    event_rows, _ = _read_jsonl_objects(run_dir / "events.jsonl")
+    evaluation_rows = [
+        row
+        for row in event_rows
+        if row.get("event") == "evaluation_finished"
+        and str(row.get("source") or "") != "closeout"
+    ]
+    judge_rows, _ = _read_jsonl_objects(run_dir / "judge_checks.jsonl")
+    evaluator_calls = len(evaluation_rows)
+    evaluator_admissions = len(evaluation_rows)
+    evaluator_usage = {
+        "calls": evaluator_calls,
+        "admissions": evaluator_admissions,
+        "terminal_receipts": sum(
+            bool(row.get("judge_job_id"))
+            or (
+                isinstance(row.get("response"), Mapping)
+                and row["response"].get("mock") is True
+            )
+            for row in evaluation_rows
+        ),
+        "judge_check_calls": len(judge_rows),
+        "judge_check_admissions": sum(
+            row.get("accepted") is True for row in judge_rows
+        ),
+    }
+    raw_scheduler = dict(allocation.get("scheduler_cost") or {})
+    scheduler_cost = {
+        "calls": int(
+            raw_scheduler.get("calls", len(scheduler_agents) if config.allocation.policy == "llm_scheduler" else 0)
+        ),
+        "input_tokens": int(allocation.get("scheduler_input_tokens", 0)),
+        "output_tokens": int(allocation.get("scheduler_output_tokens", 0)),
+        "total_tokens": int(allocation.get("scheduler_total_tokens", 0)),
+        "latency_seconds": float(allocation.get("total_latency_seconds", 0.0)),
+        "capacity_reservations": int(
+            allocation.get("scheduler_capacity_reservations", 0)
+        ),
+        "occupied_capacity_slot_seconds": float(
+            allocation.get("scheduler_reserved_slot_seconds", 0.0)
+        ),
+        "reserved_slot_seconds": float(
+            allocation.get("scheduler_reserved_slot_seconds", 0.0)
+        ),
+        "invalid_outputs": int(allocation.get("invalid_output_count", 0)),
+        "fallback_count": int(allocation.get("fallback_count", 0)),
+        "horizon_truncations": int(
+            allocation.get("horizon_truncation_count", 0)
+        ),
+    }
+    decision_rows, _ = _read_jsonl_objects(run_dir / "allocation_decisions.jsonl")
+    allocation_metrics = {
+        "decisions": len(decision_rows),
+        "admitted_decisions": sum(
+            str(row.get("disposition") or "") == "assigned" for row in decision_rows
+        ),
+        "fallbacks": sum(row.get("fallback") is True for row in decision_rows),
+        "invalid_outputs": sum(
+            row.get("fallback") is True
+            and "scheduler output" in str(row.get("fallback_reason") or "")
+            for row in decision_rows
+        ),
+        "horizon_truncations": sum(
+            str(row.get("disposition") or "") == "not_admitted_horizon"
+            for row in decision_rows
+        ),
+        "stale_decisions": sum(
+            str(row.get("disposition") or "") == "not_admitted_stale"
+            for row in decision_rows
+        ),
+    }
+    parameters = {
+        "task_state": dict(config.allocation.task_state),
+        "trace_state": dict(config.allocation.trace_state),
+        "normalization": dict(config.allocation.normalization),
+    }
+    allocation_hash = canonical_json_sha256(parameters)
+    summary = build_figure4_run_summary(
+        run_id=str(meta.get("run_id") or run_dir.name),
+        policy=config.allocation.policy,
+        paired_seed=config.seed,
+        repeat=repeat,
+        paired_repeat_id=repeat,
+        comparison_contract_id=contract_hash,
+        comparison_contract=contract,
+        task_order=task_order,
+        horizon_seconds=config.time_limit_seconds,
+        total_capacity=config.max_parallel,
+        initial_allocation=initial_allocation,
+        accepted_score_history=accepted_history,
+        max_score=max(1, len(task_order)),
+        solver_usage=solver_usage,
+        evaluator_usage=evaluator_usage,
+        scheduler_cost=scheduler_cost,
+        allocation_metrics=allocation_metrics,
+        allocation_parameters=parameters,
+        allocation_config_sha256=allocation_hash,
     )
+    summary["comparison_contract_id"] = contract_hash
+    summary["selector_config_sha256"] = selector_config_sha256
+    summary["inference_settings"] = inference_settings
+    summary["runtime_limits"] = contract["runtime_limits"]
+    summary["evaluator_contract"] = evaluator_contract
+    path = run_dir / "figure4_run_summary.json"
+    write_figure4_run_summary(path, summary)
+    return path
 
 
 def _judge_result_cache_evidence(
