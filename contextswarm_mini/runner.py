@@ -3091,7 +3091,92 @@ def _run_elastic_cps(
                 raise RuntimeError("duplicate scheduler result decision index")
             scheduler_unfinalized_results[index] = result
 
-    def reconcile_scheduler_result(decision: Any) -> None:
+    def check_scheduler_result_lifecycle() -> RuntimeError | None:
+        """Return a stable failure when an invoked scheduler result is orphaned.
+
+        Core LLM invocation stages its process result before policy parsing.
+        Every charged decision must consume exactly that staged row (or create
+        one bounded synthetic row for a pre-invocation failure).  Keep this
+        final check independent of the artifact reader in ``_run_health`` so a
+        malformed policy response cannot leave an in-process orphan that is
+        silently discarded when the CPS helper unwinds.
+        """
+
+        with scheduler_results_lock:
+            leftovers = tuple(sorted(scheduler_unfinalized_results))
+            finalized = frozenset(scheduler_result_decisions)
+        if not leftovers:
+            if config.allocation.policy != "llm_scheduler":
+                return None
+            charged_indexes = []
+            for decision in getattr(allocator, "decisions", ()):
+                if getattr(decision, "scheduler_cost", None) is not None:
+                    index = getattr(decision, "decision_index", None)
+                    if (
+                        isinstance(index, bool)
+                        or not isinstance(index, int)
+                        or index <= 0
+                    ):
+                        return RuntimeError(
+                            "allocation scheduler charged decision has an invalid index"
+                        )
+                    charged_indexes.append(index)
+            charged = frozenset(charged_indexes)
+            if len(charged_indexes) != len(charged):
+                return RuntimeError(
+                    "allocation scheduler charged decision indexes are duplicated"
+                )
+            if finalized != charged:
+                missing = sorted(charged - finalized)
+                unexpected = sorted(finalized - charged)
+                return RuntimeError(
+                    "allocation scheduler lifecycle cardinality mismatch "
+                    f"(missing={missing[:8]}, unexpected={unexpected[:8]})"
+                )
+            return None
+        # Decision indexes are runner-generated positive integers.  They are
+        # safe to expose as bounded diagnostics and contain no provider data.
+        preview = ",".join(str(index) for index in leftovers[:8])
+        if len(leftovers) > 8:
+            preview += ",..."
+        return RuntimeError(
+            "allocation scheduler lifecycle left unfinalized result(s) "
+            f"(count={len(leftovers)}, indexes={preview})"
+        )
+
+    def _validate_core_decision_index(
+        decision: Any,
+        expected_index: int,
+    ) -> int:
+        """Require a policy result to remain bound to its input snapshot.
+
+        ``AllocationDecision`` validates the *shape* of ``decision_index`` but
+        cannot know which snapshot produced a result.  The runner owns that
+        causal binding.  In particular, do not coerce values here: accepting
+        ``True``, ``"1"`` or ``1.5`` would create lifecycle artifacts that do
+        not correspond to the scheduler reservation which was charged.
+        """
+
+        if (
+            isinstance(expected_index, bool)
+            or not isinstance(expected_index, int)
+            or expected_index <= 0
+        ):
+            raise RuntimeError("scheduler invocation snapshot has an invalid decision index")
+        index = getattr(decision, "decision_index", None)
+        if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+            raise RuntimeError("scheduler decision returned an invalid decision index")
+        if index != expected_index:
+            raise RuntimeError(
+                "scheduler decision index does not match its invocation snapshot"
+            )
+        return index
+
+    def reconcile_scheduler_result(
+        decision: Any,
+        *,
+        expected_index: int | None = None,
+    ) -> None:
         """Materialize a bounded result when the policy caught an invoker error.
 
         The pure LLM policy deliberately catches provider/adapter exceptions
@@ -3102,15 +3187,24 @@ def _run_elastic_cps(
         a result already emitted by the invoker.
         """
 
+        if expected_index is None:
+            index = getattr(decision, "decision_index", None)
+            if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
+                raise RuntimeError("scheduler decision returned an invalid decision index")
+        else:
+            index = _validate_core_decision_index(decision, expected_index)
         cost = getattr(decision, "scheduler_cost", None)
-        if cost is None:
-            return
-        index = getattr(decision, "decision_index", None)
-        if isinstance(index, bool) or not isinstance(index, int) or index <= 0:
-            raise RuntimeError(
-                "charged scheduler decision is missing a valid decision index"
-            )
         with scheduler_results_lock:
+            # A real invoker result is staged before policy output parsing.  A
+            # policy must not erase the cost record after such an invocation;
+            # doing so would otherwise silently orphan the staged result and
+            # make the scheduler appear to have made no call.
+            if cost is None:
+                if index in scheduler_unfinalized_results:
+                    raise RuntimeError(
+                        "staged scheduler result has no scheduler cost"
+                    )
+                return
             if index in scheduler_result_decisions:
                 raise RuntimeError("duplicate scheduler result decision index")
             result = scheduler_unfinalized_results.pop(index, None)
@@ -3122,6 +3216,14 @@ def _run_elastic_cps(
                     command=["<scheduler-invocation-failed>"],
                     error_tail="scheduler invocation ended before a process result was available",
                     mocked=mock_agent, decision_index=index,
+                )
+            elif (
+                isinstance(result.decision_index, bool)
+                or not isinstance(result.decision_index, int)
+                or result.decision_index != index
+            ):
+                raise RuntimeError(
+                    "staged scheduler result does not match its decision index"
                 )
             result.scheduler_call_id = str(decision.scheduler_call_id)
             result.scheduler_outcome = str(decision.scheduler_outcome)
@@ -3324,7 +3426,14 @@ def _run_elastic_cps(
                 trace_view=trace_view,
             )
             core_decision = self.core_policy.choose(core_snapshot)
-            reconcile_scheduler_result(core_decision)
+            _validate_core_decision_index(
+                core_decision,
+                core_snapshot.decision_index,
+            )
+            reconcile_scheduler_result(
+                core_decision,
+                expected_index=core_snapshot.decision_index,
+            )
             self.decisions.append(core_decision)
             core_decisions[core_decision.decision_index] = (core_snapshot, core_decision)
             return _legacy_decision_from_core(core_decision)
@@ -4683,6 +4792,13 @@ def _run_elastic_cps(
         # a bounded queue join, not a solver-slot join.
         evaluation_executor.shutdown(wait=True, cancel_futures=False)
 
+    # Do this check after all worker/evaluator futures have settled.  A worker
+    # exception may interrupt policy reconciliation, but it must not make a
+    # staged scheduler process result disappear without a terminal runner
+    # failure being recorded.
+    lifecycle_failure = check_scheduler_result_lifecycle()
+    if lifecycle_failure is not None:
+        raise lifecycle_failure
     callback_failure.raise_if_failed()
 
     seen_tasks = {verdict.task_id for _, verdict in results}
