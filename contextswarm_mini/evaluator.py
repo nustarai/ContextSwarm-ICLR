@@ -36,6 +36,13 @@ _MAX_SETTLEMENT_POLL_PATHS = 32
 _MAX_WORKER_ERROR_BYTES = 1_200
 _MAX_WORKER_STATUS_BYTES = 120
 _MAX_WORKER_IDENTIFIER_BYTES = 256
+# This header is deliberately out-of-band from the candidate/evaluator JSON.
+# Newer Judge dispatch layers may use it to route a job through an independent
+# (completed-result and singleflight bypass) path.  The legacy coding endpoint
+# does not consume this hint, so the process-level health gate remains the
+# authoritative cache-disabled contract for the current deployment.
+_DISPATCH_CACHE_MODE_HEADER = "X-ContextSwarmJudge-Dispatch-Cache-Mode"
+_CACHE_MODE_DISABLED = "disabled"
 _ENDPOINT_RE = re.compile(r"https?://[^\s\])}>\"']+", re.IGNORECASE)
 _CREDENTIAL_RE = re.compile(
     r"(?i)\b(authorization|bearer|access[_-]?token|api[_-]?key|token)\b"
@@ -2320,6 +2327,7 @@ class CodingEvaluator(LeanEvaluator):
         judge_mode: str = "coding",
         poll_interval_seconds: float = 0.25,
         cancel_grace_seconds: float = 5.0,
+        require_result_cache_disabled: bool = False,
     ):
         super().__init__(
             normalize_base_url(base_url),
@@ -2335,6 +2343,10 @@ class CodingEvaluator(LeanEvaluator):
             admission_retry_seconds=min(30.0, max(0.1, float(cancel_grace_seconds))),
             terminal_overload_retries=0,
         )
+        # Keep this policy on the adapter rather than putting it in candidate
+        # JSON.  The Judge's dispatch contract treats cache mode as an
+        # out-of-band, immutable per-job capability.
+        self.require_result_cache_disabled = bool(require_result_cache_disabled)
 
     def expected_task_contract_sha256(self, task: Task) -> str:
         digest = hashlib.sha256()
@@ -2476,6 +2488,12 @@ class CodingEvaluator(LeanEvaluator):
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
+        if (
+            self.require_result_cache_disabled
+            and method.upper() == "POST"
+            and path == "/api/judge/jobs"
+        ):
+            headers[_DISPATCH_CACHE_MODE_HEADER] = _CACHE_MODE_DISABLED
         try:
             request = Request(url, data=data, headers=headers, method=method)
             with urlopen(request, timeout=max(0.1, float(timeout_seconds))) as response:
@@ -2668,11 +2686,20 @@ class CodingEvaluator(LeanEvaluator):
             safe = safe_worker_response(nested if nested else response)
             safe["job_status"] = str(response.get("status") or response.get("job_status") or "")[:64]
             safe["judge_job_id"] = job_id
+            # Preserve Judge-side cache provenance in the worker-safe receipt.
+            # This is separate from the adapter's local probe cache flag and
+            # lets closeout/audit reject a supposedly independent run that was
+            # actually served by a completed-result or singleflight cache.
+            judge_cache_hit = bool(
+                safe.get("judge_cache_hit") is True
+                or safe.get("judge_cache_status") in {"hit", "singleflight_wait"}
+                or safe.get("cache_reused") is True
+            )
             if status == "AC":
-                return Verdict(task.slug, "PROVED", 1.0, time.monotonic() - started, safe, judge_job_id=job_id, **provenance)
+                return Verdict(task.slug, "PROVED", 1.0, time.monotonic() - started, safe, judge_job_id=job_id, cache_reused=judge_cache_hit, **provenance)
             if status in {"WA", "PE", "CE", "MLE", "TLE", "RE"}:
-                return Verdict(task.slug, status, 0.0, time.monotonic() - started, safe, judge_job_id=job_id, **provenance)
-            return Verdict(task.slug, "EVALUATOR_ERROR", 0.0, time.monotonic() - started, safe, error="coding Judge returned no terminal submission verdict", judge_job_id=job_id, **provenance)
+                return Verdict(task.slug, status, 0.0, time.monotonic() - started, safe, judge_job_id=job_id, cache_reused=judge_cache_hit, **provenance)
+            return Verdict(task.slug, "EVALUATOR_ERROR", 0.0, time.monotonic() - started, safe, error="coding Judge returned no terminal submission verdict", judge_job_id=job_id, cache_reused=judge_cache_hit, **provenance)
         except EvaluatorError as exc:
             return Verdict(task.slug, "EVALUATOR_ERROR", 0.0, time.monotonic() - started, {"evaluator_failure": exc.public_details()}, error="coding Judge transport failed", judge_job_id=job_id, **provenance)
 
@@ -3125,6 +3152,8 @@ def safe_worker_response(
         "terminal_reason",
         "mathlib_revision",
         "lean_version",
+        "judge_cache_backend",
+        "judge_cache_status",
     ):
         value = payload.get(key)
         if isinstance(value, str):
@@ -3144,6 +3173,9 @@ def safe_worker_response(
         "retryable",
         "cache_reused",
         "probe_cache_reused",
+        "judge_cache_hit",
+        "judge_cache_leader",
+        "judge_cache_singleflight_wait",
         "cancel_requested",
         "finalization_pending",
         "remote_settlement_unconfirmed",
@@ -3162,6 +3194,7 @@ def safe_worker_response(
         "execution_seconds",
         "admission_attempts",
         "evaluator_overload_resubmissions",
+        "judge_cache_wait_ms",
     ):
         number = _safe_nonnegative_number(payload.get(key))
         if number is not None:

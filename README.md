@@ -407,7 +407,7 @@ verdict 计入分数。
 
 ## 数据来源
 
-`benchmarks/catalog.json` 将六套题目统一固定到上游 `ContextSwarm` 的同一 revision；每套目录都包含 `manifest.json`、`problem_ids.json` 和上游 `benchmark_integrity.json`。Formal 题库迁移公开 `problem.md`、`metadata.json` 与 `baseline/*.lean`，ICPC 迁移公开题目入口与 C++ baseline，USACO 只迁移公开 metadata projection 和 resident test contract，不包含隐藏测试。
+`benchmarks/catalog.json` 将六套题目统一固定到上游 `ContextSwarm` 的同一 revision；每套目录都包含 `manifest.json`、`problem_ids.json` 和上游 `benchmark_integrity.json`。Formal 题库迁移公开 `problem.md`、`metadata.json` 与 `baseline/*.lean`；ICPC worker bundle 包含完整公开题面与统一的中性 C++ skeleton，绝不迁移公开 AC reference；USACO 只迁移公开 metadata projection 和 resident test contract，不包含隐藏测试。
 
 这次完整性修订使用新 task id 隔离语义变化：MathOlympiadBench 的 `imo2023_p2_v2` 取代 `imo2023_p2`，Clever 的四个修订题也使用 `_v2` id；旧结果不得与新 contract 合并。各题库的详细来源、修复分类和 hash 见对应 `PROVENANCE.md`（若有）与 `benchmark_integrity.json`。
 

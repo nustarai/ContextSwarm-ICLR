@@ -87,6 +87,7 @@ class BenchmarkBundleTests(unittest.TestCase):
                         self.assertTrue((task / "problem.md").is_file())
                         self.assertEqual(len(list((task / "baseline").glob("*.lean"))), 1)
             elif dataset == "icpc_wf_2025":
+                self.assertEqual(manifest["worker_baseline"], "neutral_cpp_skeleton_v1")
                 for problem_id in problem_ids:
                     task = root / problem_id
                     with self.subTest(dataset=dataset, problem_id=problem_id):
@@ -145,6 +146,27 @@ class BenchmarkBundleTests(unittest.TestCase):
 
     def test_production_evaluators_are_not_redistributed(self) -> None:
         self.assertEqual(list(BENCHMARK_ROOT.rglob("evaluate.py")), [])
+
+    def test_icpc_worker_bundle_has_statements_but_no_public_solution_seed(self) -> None:
+        """The worker-visible ICPC bundle must not replay public AC code."""
+
+        root = BENCHMARK_ROOT / "icpc_wf_2025"
+        problem_ids = _load_json(root / "problem_ids.json")
+        neutral_hash: str | None = None
+        for problem_id in problem_ids:
+            task = root / problem_id
+            statement = (task / "problem.md").read_text(encoding="utf-8")
+            baseline = next((task / "baseline").glob("*.cpp"))
+            baseline_text = baseline.read_text(encoding="utf-8")
+            with self.subTest(problem_id=problem_id):
+                self.assertTrue(statement.startswith("Problem "))
+                self.assertNotRegex(statement, r"(?i)https?://|public ac|submission-.*ac")
+                self.assertIn("Neutral starting skeleton", baseline_text)
+                self.assertNotIn("struct Task", baseline_text)
+                digest = hashlib.sha256(baseline.read_bytes()).hexdigest()
+                if neutral_hash is None:
+                    neutral_hash = digest
+                self.assertEqual(digest, neutral_hash)
 
 
 if __name__ == "__main__":

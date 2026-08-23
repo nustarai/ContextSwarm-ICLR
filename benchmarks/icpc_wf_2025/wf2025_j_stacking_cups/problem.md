@@ -1,22 +1,59 @@
-# J. Stacking Cups
+Problem J
+Stacking Cups
+Time limit: 2 seconds
+You have a collection of n cylindrical cups, where the ith cup is 2i − 1 cm tall. The cups have increasing
+diameters, such that cup i fits inside cup j if and only if i < j. The base of each cup is 1 cm thick (which
+makes the smallest cup rather useless as it is only 1 cm tall, but you keep it for sentimental reasons).
+After washing all the cups, you stack them in a tower. Each cup is placed upright (in other words, with
+the opening at the top) and with the centers of all the cups aligned vertically. The height of the tower is
+defined as the vertical distance from the lowest point on any of the cups to the highest. You would like
+to know in what order to place the cups such that the final height (in cm) is your favorite number. Note
+that all n cups must be used.
+For example, suppose n = 4 and your favorite number is 9. If you place the cups of heights 7, 3, 5, 1, in
+that order, the tower will have a total height of 9, as shown in Figure J.1.
 
-这是 ICPC World Finals 2025 官方题目的 ContextSwarm config 入口，不是 smoke fixture。
+9
+8
+7
+6
+5
+4
+3
+2
+1
+0
+Figure J.1: Illustration of Sample Output 1.
 
-## Problem ID
+Input
+The input consists of a single line containing two integers n and h, where n (1 ≤ n ≤ 2 · 105 ) is the
+number of cups and h (1 ≤ h ≤ 4 · 1010 ) is your favorite number.
 
-- `wf2025_j_stacking_cups`
+Output
+If it is possible to build a tower with height h, output the heights of all the cups in the order they should
+be placed to achieve this. Otherwise, output impossible. If there is more than one valid ordering of
+cups, any one will be accepted.
 
-## Provenance
+49th ICPC World Championship Problem J: Stacking Cups © ICPC Foundation
 
-- Public AC baseline: https://github.com/openai/openai-icpc-2025-public/blob/main/J-Stacking Cups/Submission-1-AC.cpp
-- Judge-side package collection: `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_j_stacking_cups`
-- Judge-side canonical status surfaces:
-  - `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_j_stacking_cups/problem.yaml`
-  - `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_j_stacking_cups/validation/report.md`
-- Judge verification status: `certified`
+19
 
-## Current Status
 
-- judge 侧官方 package 已是 `certified`。
-- owned custom checker、owned hidden tests 与 validation evidence 已齐备。
-- 当前 config 可以视为官方题的已认证入口，具体证据见 judge-side `validation/report.md`。
+Sample Input 1
+
+Sample Output 1
+
+4 9
+
+7 3 5 1
+
+Sample Input 2
+
+Sample Output 2
+
+4 100
+
+impossible
+
+49th ICPC World Championship Problem J: Stacking Cups © ICPC Foundation
+
+20

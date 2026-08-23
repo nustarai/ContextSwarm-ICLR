@@ -1,22 +1,162 @@
-# L. Walking on Sunshine
+Problem L
+Walking on Sunshine
+Time limit: 2 seconds
+I’m walking on sunshine, and it don’t feel good – my eyes hurt!
+Baku has plenty of sunshine. If you walk away from the sun, or at least perpendicular to its rays, it does
+not shine in your eyes. For this problem assume that the sun shines from the south. Walking west or
+east or in any direction between west and east with a northward component avoids looking into the sun.
+Your eyes will hurt if you walk in any direction with a southward component.
+Baku also has many rectangular areas of shade, and staying in these protects your eyes regardless of
+which direction you walk in. For example, Figure L.1 shows two shaded areas.
+Find the minimum distance you need to walk with the sun shining in your eyes to get from the contest
+location to the awards ceremony location.
+y
+N
 
-这是 ICPC World Finals 2025 官方题目的 ContextSwarm config 入口，不是 smoke fixture。
+9
+N
 
-## Problem ID
+E
 
-- `wf2025_l_walking_on_sunshine`
+N
 
-## Provenance
+W
 
-- Public AC baseline: https://github.com/openai/openai-icpc-2025-public/blob/main/L-Walking on Sunshine/Submission-1-AC.cpp
-- Judge-side package collection: `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_l_walking_on_sunshine`
-- Judge-side canonical status surfaces:
-  - `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_l_walking_on_sunshine/problem.yaml`
-  - `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_l_walking_on_sunshine/validation/report.md`
-- Judge verification status: `certified`
+•
+contest
 
-## Current Status
+5
 
-- judge 侧当前已将该官方题包提升到 `certified`，并维护非公开 validation assets。
-- 这表示 package 已不再停留在 bootstrap-only 状态，但当前 canonical 验证结论仍以 Judge-side `problem.yaml` 与 `validation/report.md` 为准。
-- 本目录不重复抄写固定结论；需要确认支持边界时，直接查看上面的 canonical status surfaces。
+SE
+
+SW
+
+6
+
+E
+
+7
+
+W
+
+8
+
+S
+
+4
+3
+2
+•
+awards ceremony
+
+1
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+7
+
+8
+
+9
+
+10 11
+
+x
+
+Figure L.1: Sample Input 1 and a path that minimizes the sun shining in your eyes.
+
+Input
+The first line of input contains five integers n, xc , yc , xa , and ya , where n (0 ≤ n ≤ 105 ) is the number of
+shaded areas, (xc , yc ) is the location of the contest, and (xa , ya ) is the location of the awards ceremony
+(−106 ≤ xc , yc , xa , ya ≤ 106 ). The sun shines in the direction (0, 1) from south towards north. You
+look into the sun if you walk in direction (x, y) for any y < 0 and any x.
+The next n lines describe the shaded areas, which are axis-aligned rectangles. Each of these lines
+contains four integers x1 , y1 , x2 , and y2 (−106 ≤ x1 < x2 ≤ 106 ; −106 ≤ y1 < y2 ≤ 106 ).
+The southwest corner of the rectangle is (x1 , y1 ) and its northeast corner is (x2 , y2 ). The rectangles
+describing the shaded areas do not touch or intersect.
+
+Output
+Output the minimum distance you have to walk with the sun shining in your eyes. Your answer must
+have an absolute or relative error of at most 10−7 .
+49th ICPC World Championship Problem L: Walking on Sunshine © ICPC Foundation
+
+23
+
+
+Sample Input 1
+
+Sample Output 1
+
+2 1 7 5 1
+3 6 5 9
+2 3 6 5
+
+3.0
+
+Explanation of Sample 1: Figure L.1 shows an optimal path from the contest location to the awards
+ceremony location with 5 segments. On the first segment you walk away from the sun. On the second
+and fourth segments you walk towards the sun but in a shaded area. On the third and fifth segments you
+walk towards the sun outside the shaded areas. The total length of these two segments is 3.
+Sample Input 2
+
+Sample Output 2
+
+2 0 10 10 0
+2 7 3 8
+4 3 8 5
+
+7.0
+
+Sample Input 3
+
+Sample Output 3
+
+2 11 -1 -1 11
+2 7 3 8
+4 3 8 5
+
+0.0
+
+Sample Input 4
+
+Sample Output 4
+
+3 1 5 9 5
+-5 6 2 9
+4 7 12 8
+1 1 7 3
+
+0.0
+
+Sample Input 5
+
+Sample Output 5
+
+3 1 7 9 3
+2 6 3 8
+4 4 5 6
+6 2 7 4
+
+0.0
+
+Sample Input 6
+
+Sample Output 6
+
+1 0 0 0 0
+-5 -5 5 5
+
+0.0
+
+49th ICPC World Championship Problem L: Walking on Sunshine © ICPC Foundation
+
+24

@@ -45,7 +45,7 @@ max_lifecycle_seconds = 3600
 max_concurrent_evaluations = 4
 verification_profile = "coding_icpc_contest"
 judge_mode = "coding"
-require_result_cache_disabled = false
+require_result_cache_disabled = true
 
 [formal_tools]
 enabled = false

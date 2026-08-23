@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from contextswarm_mini.config import load_config
+from contextswarm_mini.evaluator import CodingEvaluator
 from contextswarm_mini.models import Task
 from contextswarm_mini.preflight import PreflightError, run_preflight
 from contextswarm_mini.prompts import (
@@ -34,7 +35,9 @@ def _coding_task(slug: str = "sample") -> Task:
     )
 
 
-def _coding_health(*, usaco: bool = False, ready_workers: int = 64) -> dict[str, object]:
+def _coding_health(
+    *, usaco: bool = False, ready_workers: int = 64, cache_enabled: bool | None = None
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "ok": True,
         "service": "contextswarm-judge",
@@ -54,6 +57,12 @@ def _coding_health(*, usaco: bool = False, ready_workers: int = 64) -> dict[str,
         "busy_workers": 0,
         "queued_jobs": 0,
     }
+    if cache_enabled is not None:
+        payload["result_cache"] = {
+            "enabled": cache_enabled,
+            "backend": "memory" if cache_enabled else "disabled",
+            "stats": {"private": "must-not-escape"},
+        }
     if usaco:
         payload["legacy_usaco"] = {
             "enabled": True,
@@ -85,6 +94,29 @@ class CodingPromptTests(unittest.TestCase):
             self.assertNotIn("Lean/Mathlib", prompt)
             self.assertNotIn("local `lean`", prompt)
         self.assertIn(CODING_EXECUTION_CONTRACT, prompts[0])
+
+    def test_coding_prompts_treat_public_solution_urls_as_non_actionable(self) -> None:
+        task = _coding_task()
+        prompts = (
+            build_task_prompt(
+                task,
+                task_workspace="task",
+                agent_id="worker",
+                episode=1,
+                communication_enabled=False,
+            ),
+            build_mono_prompt([task], workspace="mono", communication_enabled=False),
+            build_finalization_prompt(task),
+        )
+        for prompt in prompts:
+            self.assertIn("public AC, provenance, repository, or other URL", prompt)
+            self.assertIn("Never open, follow, fetch, search, download, or copy", prompt)
+            self.assertIn("Internet and web access are prohibited", prompt)
+            self.assertIn("browser or", prompt)
+            self.assertIn("Solve the task independently and answer carefully", prompt)
+            self.assertIn("Rely on your own reasoning", prompt)
+        self.assertIn("neutral local", prompts[0])
+        self.assertIn("skeleton", prompts[0])
 
     def test_mono_rejects_mixed_candidate_languages(self) -> None:
         formal = replace(_coding_task(), metadata={"language": "lean"})
@@ -203,6 +235,73 @@ class CodingPreflightTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(PreflightError, "USACO dataset"):
                     run_preflight(config, Path(raw))
+
+    def test_required_disabled_cache_is_checked_and_recorded(self) -> None:
+        config = replace(self._config("icpc_wf_2025"), lean_require_result_cache_disabled=True)
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                patch("contextswarm_mini.preflight.PiAgent.binary", return_value="/bin/true"),
+                patch(
+                    "contextswarm_mini.preflight.CodingEvaluator.health",
+                    return_value=_coding_health(cache_enabled=False),
+                ),
+            ):
+                report = run_preflight(config, Path(raw))
+            self.assertEqual(
+                report["coding"]["result_cache"],
+                {
+                    "enabled": False,
+                    "backend": "disabled",
+                    "backend_ready": True,
+                    "requested_env_accepted": True,
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                patch("contextswarm_mini.preflight.PiAgent.binary", return_value="/bin/true"),
+                patch(
+                    "contextswarm_mini.preflight.CodingEvaluator.health",
+                    return_value=_coding_health(cache_enabled=True),
+                ),
+            ):
+                with self.assertRaisesRegex(PreflightError, "result cache"):
+                    run_preflight(config, Path(raw))
+
+
+class CodingCacheDispatchTests(unittest.TestCase):
+    def test_disabled_cache_mode_is_sent_out_of_band_on_submit_only(self) -> None:
+        observed: list[object] = []
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self):
+                return b'{"job_id":"coding-job-1","status":"queued"}'
+
+        def fake_urlopen(request, *, timeout):
+            del timeout
+            observed.append(request)
+            return _Response()
+
+        evaluator = CodingEvaluator(
+            "http://judge.invalid",
+            require_result_cache_disabled=True,
+        )
+        with patch("contextswarm_mini.evaluator.urlopen", side_effect=fake_urlopen):
+            evaluator._request("POST", "/api/judge/jobs", {"code": "int main(){}"})
+            evaluator._request("GET", "/api/judge/jobs/coding-job-1")
+        self.assertEqual(
+            observed[0].headers.get("X-contextswarmjudge-dispatch-cache-mode"),
+            "disabled",
+        )
+        self.assertIsNone(
+            observed[1].headers.get("X-contextswarmjudge-dispatch-cache-mode")
+        )
 
 
 if __name__ == "__main__":

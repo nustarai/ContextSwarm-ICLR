@@ -55,6 +55,15 @@ CODING_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
   authoritative C++ compilation, execution, and test verdicts. The Judge owns
   the compiler, runtime sandbox, test data, and resource limits; its terminal
   result is the only authority for success.
+- Any public AC, provenance, repository, or other URL printed in `problem.md` is
+  non-actionable metadata. Never open, follow, fetch, search, download, or copy
+  a solution from such a URL; solve only from the statement, the neutral local
+  skeleton, and feedback returned by `judge_check`.
+- Internet and web access are prohibited. Do not browse the web, use a browser or
+  search engine, DNS, an external API, or any other internet-connected tool.
+- Solve the task independently and answer carefully. Rely on your own reasoning, the
+  statement, the neutral baseline, and permitted Judge/CPS feedback; do not copy or
+  trust externally sourced solutions.
 - `CONTEXTSWARM_JUDGE_URL` is reserved for that runner-owned capability. It is
   session-scoped and is not permission to construct another client, contact an
   endpoint, or inspect Judge implementation details. Never read, print, modify,

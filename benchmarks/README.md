@@ -15,11 +15,13 @@ the upstream `benchmark_integrity.json`.
 | `clever/` | hard12 integrity v2 | 12 | definition bundle only |
 | `verina/` | functional hard12 integrity v2 | 12 | definition bundle only |
 
-Only public statements or public metadata, task metadata, and baseline skeletons
-are redistributed. Upstream production evaluators, hidden tests, oracle outputs,
-solutions, and Judge-side packages are intentionally absent. In particular, the
-USACO directory contains the public metadata projection and expected resident
-test contracts, not the hidden test corpus.
+Only public statements or public metadata, task metadata, and neutral baseline
+skeletons are redistributed. Coding workers never receive a public accepted
+implementation: those references remain only in the separate Judge-side
+package used to validate the evaluator. Upstream production evaluators, hidden
+tests, oracle outputs, solutions, and Judge-side packages are intentionally
+absent. In particular, the USACO directory contains the public metadata
+projection and expected resident test contracts, not the hidden test corpus.
 
 Maintainers can refresh the projection from a clean upstream checkout with:
 

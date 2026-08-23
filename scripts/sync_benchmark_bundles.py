@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Import the six public benchmark bundles from a clean ContextSwarm checkout."""
+"""Import the six public benchmark bundles from a clean ContextSwarm checkout.
+
+ICPC worker artifacts intentionally contain a neutral C++ skeleton rather than
+the public accepted reference that older upstream bundles called ``baseline``.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +24,23 @@ from sync_problem_work_mode import synchronized_text
 
 
 UPSTREAM_REPOSITORY = "https://github.com/shiyegao/ContextSwarm"
+
+# Coding workers must never start from a public accepted implementation.  The
+# upstream ContextSwarm coding bundles historically called that implementation
+# ``baseline.cpp``; retain the public source only in the Judge-side package and
+# emit this neutral, compiling skeleton into the worker-facing bundle.
+NEUTRAL_CPP_BASELINE = """#include <bits/stdc++.h>
+using namespace std;
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // Neutral starting skeleton. Construct the solution from the statement
+    // and controlled Judge feedback.
+    return 0;
+}
+"""
 
 
 @dataclass(frozen=True)
@@ -172,14 +193,37 @@ def _icpc_payloads(source: Path, bundle: Bundle, ids: list[str]) -> dict[Path, b
     task_root = (source / bundle.aggregate).parent
     for problem_id in ids:
         source_task = task_root / problem_id.removeprefix("wf2025_")
-        payloads[Path(problem_id) / "problem.md"] = (
-            source_task / "problem.md"
-        ).read_bytes()
+        # The upstream config entry is a provenance stub, not the contest
+        # statement.  Keep the checked-in official statement text (which is
+        # URL/reference-free) stable when refreshing the projection.
+        tracked_statement = (
+            ROOT / "benchmarks" / bundle.destination / problem_id / "problem.md"
+        )
+        if not tracked_statement.is_file():
+            raise ValueError(
+                f"missing tracked official ICPC statement: {tracked_statement}; "
+                "refusing to fall back to the upstream provenance stub"
+            )
+        statement_text = tracked_statement.read_text(encoding="utf-8")
+        if (
+            not statement_text.startswith("Problem ")
+            or "Public AC baseline" in statement_text
+            or "http://" in statement_text.lower()
+            or "https://" in statement_text.lower()
+        ):
+            raise ValueError(
+                f"ICPC worker statement is not a URL-free official statement: "
+                f"{tracked_statement}"
+            )
+        payloads[Path(problem_id) / "problem.md"] = statement_text.encode("utf-8")
         baselines = sorted((source_task / "baseline").glob("*.cpp"))
         if len(baselines) != 1:
             raise ValueError(f"{source_task} must contain exactly one C++ baseline")
-        baseline = baselines[0]
-        payloads[Path(problem_id) / "baseline" / baseline.name] = baseline.read_bytes()
+        # Validate that the source still carries a single coding baseline, but
+        # never copy its bytes into the worker-visible artifact.
+        payloads[Path(problem_id) / "baseline" / "baseline.cpp"] = (
+            NEUTRAL_CPP_BASELINE.encode("utf-8")
+        )
     return payloads
 
 
@@ -228,6 +272,8 @@ def _manifest(
     }
     if bundle.aliases:
         payload["aliases"] = list(bundle.aliases)
+    if bundle.kind == "icpc":
+        payload["worker_baseline"] = "neutral_cpp_skeleton_v1"
     if bundle.name == "matholympiadbench":
         # Retain the original mini-manifest field for external consumers. The
         # value is the immutable MOBench artifact digest, not the ContextSwarm

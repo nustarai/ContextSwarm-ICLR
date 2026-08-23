@@ -2358,6 +2358,7 @@ def run_experiment(
             max_lifecycle_seconds=config.lean_max_lifecycle_seconds,
             verification_profile=config.lean_verification_profile,
             judge_mode=config.lean_judge_mode,
+            require_result_cache_disabled=config.lean_require_result_cache_disabled,
         )
     else:
         evaluator = LeanEvaluator(
@@ -7127,7 +7128,10 @@ def _judge_result_cache_evidence(
         preflight = json.loads(
             (run_dir / "transport_preflight.json").read_text(encoding="utf-8")
         )
-        cache = preflight["lean"]["result_cache"]
+        # Formal manifests put this under ``lean`` for historical reasons;
+        # coding manifests use the explicit ``coding`` health contract.
+        section = "coding" if config.is_coding else "lean"
+        cache = preflight[section]["result_cache"]
     except (OSError, KeyError, TypeError, json.JSONDecodeError):
         return evidence
     if isinstance(cache, Mapping) and isinstance(cache.get("enabled"), bool):

@@ -96,6 +96,19 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertFalse(any(name.startswith("cps_") for name in tools))
         self.assertIn("bash", tools)
 
+    def test_coding_solver_requires_independent_careful_answers(self) -> None:
+        config = replace(
+            load_config("configs/smoke.toml", ROOT),
+            judge_kind="coding",
+            formal_tools_enabled=False,
+            aisw_enabled=False,
+        )
+        command = PiAgent(config).command()
+        system_prompt = command[command.index("--system-prompt") + 1]
+        self.assertIn("Solve the task independently and answer carefully", system_prompt)
+        self.assertIn("Rely on your own reasoning", system_prompt)
+        self.assertIn("do not copy or\ntrust externally sourced solutions", system_prompt)
+
     def test_isolated_scheduler_has_no_tools_and_a_read_only_system_prompt(self) -> None:
         command = PiAgent(load_config("configs/smoke.toml", ROOT)).command(isolated=True)
         self.assertIn("--no-tools", command)
@@ -220,6 +233,22 @@ class PiSolverContractTests(unittest.TestCase):
         pi_binary = shutil.which("pi")
         if not pi_binary:
             self.skipTest("local Pi is not installed")
+        # The host development environment may resolve ``pi`` to the managed
+        # NuRouter launcher (an ELF wrapper), not the Node-based Pi 0.84.2
+        # executable shipped in the experiment image.  Its private node.toml
+        # contract cannot be exercised with the test's isolated HOME, so this
+        # probe is intentionally Docker-only in that environment.
+        try:
+            is_elf = Path(pi_binary).resolve().read_bytes()[:4] == b"\x7fELF"
+        except OSError:
+            is_elf = False
+        if is_elf:
+            self.skipTest("pi resolves to the managed NuRouter launcher")
+        if not any(
+            Path(candidate).is_file() and os.access(candidate, os.X_OK)
+            for candidate in ("/usr/local/bin/node", "/usr/bin/node", "/bin/node")
+        ):
+            self.skipTest("controlled Node.js runtime is unavailable on this host")
         version = subprocess.run(
             [pi_binary, "--version"],
             text=True,

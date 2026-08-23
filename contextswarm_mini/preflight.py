@@ -122,6 +122,7 @@ def run_preflight(
                 max_lifecycle_seconds=config.lean_max_lifecycle_seconds,
                 verification_profile=config.lean_verification_profile,
                 judge_mode=config.lean_judge_mode,
+                require_result_cache_disabled=config.lean_require_result_cache_disabled,
             )
             health = evaluator.health()
             safe = _safe_coding_health(health, config)
@@ -414,6 +415,27 @@ def _safe_coding_health(
                     safe_compute[key] = parsed
         result["compute_executor"] = safe_compute
 
+    # Record only the bounded cache health contract here; detailed cache
+    # keys/statistics must not enter artifacts.  The process-level cache mode
+    # reported by this same-origin health response is authoritative for the
+    # current legacy coding endpoint.
+    result_cache = payload.get("result_cache")
+    if isinstance(result_cache, dict):
+        safe_cache: dict[str, Any] = {}
+        if isinstance(result_cache.get("enabled"), bool):
+            safe_cache["enabled"] = result_cache["enabled"]
+            # A successful same-origin health response is the coding Judge's
+            # cache-backend readiness signal.  Unlike the formal sidecar
+            # probe, coding health does not expose a separate deployment or
+            # environment field; keep the equivalent bounded contract facts
+            # explicit for run closeout/audit consumers.
+            safe_cache["backend_ready"] = True
+            safe_cache["requested_env_accepted"] = True
+        backend = result_cache.get("backend")
+        if isinstance(backend, str) and len(backend) <= 80:
+            safe_cache["backend"] = sanitize_worker_text(backend, 80)
+        result["result_cache"] = safe_cache
+
     inventory = payload.get("legacy_usaco")
     if isinstance(inventory, dict):
         safe_inventory: dict[str, Any] = {}
@@ -478,6 +500,10 @@ def _validate_coding_health(
         raise PreflightError("coding Judge package bundle is not configured")
     if not health.get("oj_base_url_present"):
         raise PreflightError("coding Judge OJ endpoint is not configured")
+    if config.lean_require_result_cache_disabled:
+        cache = health.get("result_cache")
+        if not isinstance(cache, dict) or cache.get("enabled") is not False:
+            raise PreflightError("coding Judge result cache is not verifiably disabled")
 
 
 def _kernel_probe(evaluator: Any, output_dir: Path) -> Verdict:

@@ -1,22 +1,113 @@
-# A. A-Skew-ed Reasoning
+Problem A
+A-Skew-ed Reasoning
+Time limit: 2 seconds
+The following is based on a true story – the names have been changed because. . . well, because you
+always change names in stories like this one.
+Professor Taylor Swift is grading a homework assignment on integer skew heaps. A skew heap is a
+binary tree with an integer stored in each node such that the value in any node is less than or equal to the
+values in any of its children. Note that the skew heap need not be a perfect binary tree; that is, the left
+and/or right subtree of any node may be empty.
+Inserting a value x into a skew heap H is done using the following recursive procedure:
+• If H is empty, make H a skew heap consisting of a single node containing x.
+• Otherwise, let y be the value in the root of H.
+– If y < x, swap the two children of the root and recursively insert x into the new left subtree.
+– If y ≥ x, create a new node with value x and make H the left subtree of this node.
+4
 
-这是 ICPC World Finals 2025 官方题目的 ContextSwarm config 入口，不是 smoke fixture。
+4
 
-## Problem ID
+9
 
-- `wf2025_a_a_skewed_reasoning`
+20
 
-## Provenance
+5
 
-- Public AC baseline: https://github.com/openai/openai-icpc-2025-public/blob/main/A-A-Skew-ed Reasoning/Submission-1-AC.cpp
-- Judge-side package collection: `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_a_a_skewed_reasoning`
-- Judge-side canonical status surfaces:
-  - `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_a_a_skewed_reasoning/problem.yaml`
-  - `ContextSwarmJudge/packages/icpc_wf_2025/wf2025_a_a_skewed_reasoning/validation/report.md`
-- Judge verification status: `certified`
+25
 
-## Current Status
+5
 
-- judge 侧当前已将该官方题包提升到 `certified`，并维护自有 validation assets。
-- canonical 验证证据与剩余限制以 Judge-side package collection 中的 `validation/report.md` 为准。
-- 本 config 入口可以作为官方题目的正式 evaluator 入口使用，不再是 bootstrap-only 占位描述。
+6
+
+11
+
+17
+
+7
+
+9
+
+6
+
+20
+
+25
+
+11
+
+17
+
+Figure A.1: Example of inserting the value 7 into a skew heap. The nodes storing 4 and 5
+(marked in blue) have their children swapped, while the node storing 11 becomes the left
+child of the newly inserted node (marked in red).
+Now, back to Professor Swift. The homework problem she has assigned asks the students to show the
+heap that results from inserting a given permutation of the numbers from 1 to n, in the given order,
+into an empty heap. Surprisingly, some of the students have wrong answers! That got Professor Swift
+wondering: For a given heap, is there an input permutation that would have produced this heap? And if
+so, what are the lexicographically minimal and maximal such input permutations?
+
+Input
+The first line of input contains an integer n (1 ≤ n ≤ 2 · 105 ), the number of nodes in the tree. These
+nodes contain the numbers from 1 to n exactly. This is followed by n lines, the ith of which contains
+two integers ℓi and ri (i < ℓi ≤ n or ℓi = 0; i < ri ≤ n or ri = 0), describing the values of the left and
+right children of the node storing i, where a value of 0 is used to indicate that the corresponding child
+does not exist. It is guaranteed that this data describes a binary tree.
+49th ICPC World Championship Problem A: A-Skew-ed Reasoning © ICPC Foundation
+
+1
+
+
+Output
+Output the lexicographically minimal input permutation that produces the given tree under the insertion
+method for skew heaps, followed by the lexicographically maximal such input permutation. These permutations may coincide, in which case you still need to output both. If no input permutation producing
+the given tree exists, output impossible.
+Sample Input 1
+
+Sample Output 1
+
+7
+2 3
+4 5
+6 7
+0 0
+0 0
+0 0
+0 0
+
+1 3 2 7 5 6 4
+7 1 5 3 2 6 4
+
+Sample Input 2
+
+Sample Output 2
+
+2
+0 2
+0 0
+
+impossible
+
+Sample Input 3
+
+Sample Output 3
+
+3
+2 0
+3 0
+0 0
+
+2 3 1
+3 2 1
+
+49th ICPC World Championship Problem A: A-Skew-ed Reasoning © ICPC Foundation
+
+2
