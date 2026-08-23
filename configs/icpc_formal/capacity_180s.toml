@@ -1,0 +1,15 @@
+# Real NuRouter/Judge capacity probe.  This is not a reported arm; it keeps
+# the formal ICPC CPS shape (24 slots and 24 in-flight leases) while using a
+# short fixed horizon before the 24-container matrix is admitted.
+extends = ["random.toml"]
+
+[experiment]
+name = "icpc-formal-capacity-probe-180s"
+output_root = "runs/icpc_formal_capacity_probe"
+time_limit_seconds = 180
+
+[pi]
+timeout_seconds = 180
+
+[allocation]
+agent_timeout_seconds = 180
