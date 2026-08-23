@@ -1,0 +1,9 @@
+extends = ["_base.toml"]
+
+[experiment]
+name = "icpc-figure4-formal-task-state"
+output_root = "runs/figure4_formal_icpc/task_state"
+
+[allocation]
+policy = "task_state"
+

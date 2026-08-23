@@ -1,0 +1,37 @@
+# Formal Issue #39 allocator substrate using the provisional selector choice
+# from the corrected three-repeat Issue #38 ICPC matrix.  The selector seed
+# below is the frozen identity seed (1729); formal Figure 4 permits future
+# paired repeats to vary only experiment.seed while retaining this selector
+# identity.  The checked-in one-repeat setup currently uses 1729 for both.
+# All four leaves below differ only in allocator policy, human-readable name,
+# and output directory.
+extends = ["../icpc_formal/_base.toml"]
+
+[experiment]
+name = "icpc-figure4-formal-base"
+output_root = "runs/figure4_formal_icpc"
+figure4_phase = "formal"
+# Keep the corrected ICPC Issue #38 comparison boundary: 12 tasks, two
+# initial agents per task, 24 CPS slots, one-hour horizon, NuRouter and the
+# coding Judge.  The provisional selector configuration below is immutable
+# across all allocator arms in this setup.
+
+[selection]
+enabled = true
+selector_name = "recency"
+selector_version = "icpc_formal_v1"
+visibility = "project_shared"
+trace_slot_limit = 8
+context_token_budget = 4096
+tokenizer = "utf8_bytes_ceil_div4_v1"
+# Frozen selector identity seed.  A future formal repeat may override only
+# [experiment].seed; ordinary Issue #38 manifests must keep the two seeds equal.
+seed = 1729
+tie_break = "trace_id_asc"
+direct_messages = false
+# Formal Figure 4 deliberately preserves task-local best-candidate handoff;
+# the runner permits this only with figure4_phase = "formal".
+candidate_transfer = true
+
+[selection.policy_params]
+primary_sort = "commit_seq_desc"

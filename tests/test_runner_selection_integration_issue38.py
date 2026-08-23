@@ -276,6 +276,24 @@ class RunnerSelectionIntegrationTests(unittest.TestCase):
         config = load_config("configs/smoke.toml", ROOT)
         self.assertEqual(_selection_capabilities(config), (False, True, True))
 
+    def test_formal_figure4_keeps_selector_isolation_and_candidate_handoff(self):
+        config = load_config("configs/figure4_formal_icpc/uniform_refill.toml", ROOT)
+        self.assertEqual(_selection_capabilities(config), (True, False, True))
+
+    def test_candidate_handoff_remains_forbidden_outside_formal_figure4(self):
+        base = load_config("configs/smoke.toml", ROOT)
+        selection = replace(_selection_config(), candidate_transfer=True)
+        config = replace(base, selection=selection)
+        with self.assertRaisesRegex(ConfigError, "outside formal Figure 4"):
+            _selection_capabilities(config)
+
+    def test_formal_figure4_still_rejects_direct_messages(self):
+        base = load_config("configs/figure4_formal_icpc/uniform_refill.toml", ROOT)
+        selection = replace(base.selection, direct_messages=True)
+        config = replace(base, selection=selection)
+        with self.assertRaisesRegex(ConfigError, "disable direct messages"):
+            _selection_capabilities(config)
+
 
 if __name__ == "__main__":
     unittest.main()

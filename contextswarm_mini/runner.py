@@ -106,9 +106,12 @@ def _candidate_path(root: Path, task: Task) -> Path:
 def _selection_capabilities(config: ExperimentConfig) -> tuple[bool, bool, bool]:
     """Return (enabled, direct-messages, candidate-transfer) capabilities.
 
-    Selection manifests are an isolation boundary: enabled arms explicitly
-    disable direct messages and cross-assignment candidate transfer.  Keep the
-    historical CPS surface unchanged for manifests without a selection table.
+    Figure 3 selection manifests are an isolation boundary: enabled arms
+    explicitly disable direct messages and cross-assignment candidate
+    transfer.  Formal Figure 4 is the one registered exception: it keeps the
+    selected Figure 3 policy fields fixed while explicitly enabling task-local
+    candidate handoff for the allocator experiment.  Keep the historical CPS
+    surface unchanged for manifests without a selection table.
     """
 
     selection = getattr(config, "selection", None)
@@ -117,12 +120,16 @@ def _selection_capabilities(config: ExperimentConfig) -> tuple[bool, bool, bool]
         return False, True, True
     direct_messages = bool(getattr(selection, "direct_messages", False))
     candidate_transfer = bool(getattr(selection, "candidate_transfer", False))
-    if direct_messages or candidate_transfer:
+    if direct_messages:
         raise ConfigError(
-            "selection-enabled runs must disable direct messages and "
-            "cross-assignment candidate transfer"
+            "selection-enabled runs must disable direct messages"
         )
-    return True, False, False
+    if candidate_transfer and getattr(config, "figure4_phase", "") != "formal":
+        raise ConfigError(
+            "selection-enabled runs must disable cross-assignment candidate "
+            "transfer outside formal Figure 4"
+        )
+    return True, False, candidate_transfer
 
 
 def _selection_comparison_contract_id(config: ExperimentConfig) -> str:

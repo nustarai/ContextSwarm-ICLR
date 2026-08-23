@@ -925,12 +925,16 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     horizon = _positive_int(experiment.get("time_limit_seconds"), "experiment.time_limit_seconds", 3600)
     seed = _nonnegative_int(experiment.get("seed"), "experiment.seed", 0)
     if selection_config.enabled and selection_config.seed != seed:
-        # The runner derives paired selector requests from experiment.seed.
-        # Reject a second, contradictory selection seed instead of recording
-        # one value in the selector identity while executing with another.
-        raise ConfigError(
-            "enabled selection requires selection.seed == experiment.seed"
-        )
+        # Ordinary Figure 3 arms use one seed for both the selector identity
+        # and paired requests.  Formal Figure 4 is different: its selector
+        # identity is frozen once, while experiment.seed is the independent
+        # paired-repeat seed passed to SelectionRuntime.  Keeping these two
+        # values separate prevents every allocator repeat from acquiring a
+        # different selector configuration hash.
+        if figure4_phase != "formal":
+            raise ConfigError(
+                "enabled non-formal selection requires selection.seed == experiment.seed"
+            )
     if mode == "mono":
         max_parallel = 1
         episodes = 1

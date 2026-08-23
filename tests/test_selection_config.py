@@ -234,6 +234,50 @@ class SelectionConfigTests(unittest.TestCase):
         self.assertEqual(config.figure4_phase, "formal")
         self.assertTrue(config.selection.identity_frozen)
 
+    def test_formal_figure4_separates_selector_and_experiment_seed(self) -> None:
+        # Figure 4 freezes the selector identity seed while a paired repeat
+        # may use a distinct experiment/stochastic seed.  Changing only the
+        # latter must not change the selector configuration hash.
+        common = (
+            _selection_table("recency")
+            .replace(
+                "[selection.policy_params]\n"
+                "sample_without_replacement = true\n"
+                "weights = { interaction = 1.25, evidence = 0.75 }\n"
+                "kinds = [\"useful\", \"not_useful\"]",
+                "[selection.policy_params]\n"
+                "primary_sort = \"commit_seq_desc\"",
+            )
+            .replace(
+                "[experiment]\nseed = 17",
+                "[experiment]\nseed = SEED_PLACEHOLDER\nfigure4_phase = \"formal\"",
+            )
+            .replace("candidate_transfer = false", "candidate_transfer = true")
+            + "\n[allocation]\npolicy = \"task_state\"\n"
+        )
+        first = self._load(common.replace("SEED_PLACEHOLDER", "1730"))
+        second = self._load(common.replace("SEED_PLACEHOLDER", "1731"))
+        self.assertEqual(first.figure4_phase, "formal")
+        self.assertEqual(first.selection.seed, 17)
+        self.assertEqual(first.seed, 1730)
+        self.assertEqual(second.seed, 1731)
+        self.assertEqual(
+            first.selection.selection_config_id,
+            second.selection.selection_config_id,
+        )
+
+    def test_nonformal_selection_still_rejects_seed_separation(self) -> None:
+        with self.assertRaisesRegex(
+            ConfigError,
+            r"enabled non-formal selection requires selection\.seed == experiment\.seed",
+        ):
+            self._load(
+                _selection_table("recency").replace(
+                    "[experiment]\nseed = 17",
+                    "[experiment]\nseed = 1730",
+                )
+            )
+
     def test_explicit_development_figure4_requires_disabled_selector(self) -> None:
         with self.assertRaisesRegex(ConfigError, "selection.enabled = false"):
             self._load(
