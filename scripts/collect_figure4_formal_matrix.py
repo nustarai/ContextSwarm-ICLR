@@ -63,7 +63,22 @@ def _latest_summary(root: Path, dataset: str, repeat: int, policy: str) -> tuple
     valid: list[tuple[Path, dict[str, Any]]] = []
     for path in candidates:
         value = _json(path)
-        if value and value.get("policy") == policy:
+        # The runner deliberately emits diagnostic closeout artifacts after a
+        # preflight failure.  They have no horizon origin and must never be
+        # mistaken for an official paired arm merely because their summary is
+        # newer than a completed run.  The strict Figure 4 audit validates the
+        # remaining contents after this eligibility filter.
+        meta = _json(path.parent / "run_meta.json")
+        final = _json(path.parent / "final.json")
+        horizon_started_at = meta.get("horizon_started_at") if meta else None
+        if (
+            value
+            and value.get("policy") == policy
+            and isinstance(horizon_started_at, str)
+            and bool(horizon_started_at.strip())
+            and final is not None
+            and final.get("status") != "PREFLIGHT_FAILED"
+        ):
             valid.append((path, value))
     if not valid:
         return None, None

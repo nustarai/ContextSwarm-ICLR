@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, asdict
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -109,6 +110,49 @@ def _cache_urls(urls: dict[str, str]) -> dict[str, str]:
     }
 
 
+def _health_ready(value: Any) -> bool:
+    """Match the runner's admission readiness checks before launching.
+
+    A router can transiently report ``ok=true`` while its advertised group
+    capacity is degraded or while a disabled group projection masks an empty
+    direct worker pool.  Launching in either state only creates a
+    ``PREFLIGHT_FAILED`` artifact and consumes a supervisor retry.  Keep this
+    bounded gate aligned with :mod:`contextswarm_mini.preflight`; the runner's
+    own preflight remains authoritative after launch.
+    """
+
+    if not isinstance(value, dict) or value.get("ok") is not True:
+        return False
+    group = value.get("group_admission")
+    group_disabled = (
+        isinstance(group, dict)
+        and group.get("enabled") is False
+        and group.get("status") == "disabled"
+        and value.get("capacity_error_kind") == "admission_disabled"
+    )
+    if group_disabled:
+        direct_ready = value.get("ready_workers", value.get("active_workers"))
+        return (
+            not isinstance(direct_ready, bool)
+            and isinstance(direct_ready, (int, float))
+            and math.isfinite(float(direct_ready))
+            and float(direct_ready) > 0
+        )
+
+    if "available_service_units" in value:
+        available = value.get("available_service_units")
+        if (
+            isinstance(available, bool)
+            or not isinstance(available, (int, float))
+            or not math.isfinite(float(available))
+            or float(available) <= 0
+        ):
+            return False
+    if "capacity_state" in value and value.get("capacity_state") != "AVAILABLE":
+        return False
+    return True
+
+
 def _health_ok(url: str) -> bool:
     # host.docker.internal is a container-only name; the supervisor probes the
     # corresponding host listener without printing the private URL.
@@ -116,7 +160,7 @@ def _health_ok(url: str) -> bool:
     try:
         with urlopen(probe, timeout=5.0) as response:
             value = json.loads(response.read(1_000_000).decode("utf-8"))
-        return value.get("ok") is True
+        return _health_ready(value)
     except (OSError, URLError, ValueError, json.JSONDecodeError):
         return False
 
