@@ -11,9 +11,15 @@ extends = ["../figure3_dev/_base.toml"]
 name = "figure3-formal-matholympiadbench-base"
 output_root = "runs/figure3_formal/matholympiadbench"
 figure3_readiness = "formal_uniform_refill_issue38"
+# The formal arm is a fixed one-hour horizon.  Full score (all 12 tasks) is
+# handled by the runner's full_score_or_horizon stopping rule.
+time_limit_seconds = 3600
 
 [allocation]
 policy = "uniform_refill"
+# Keep a live allocation decision within the arm horizon; a 300-second
+# development timeout would otherwise revoke a healthy NuRouter session early.
+agent_timeout_seconds = 3600
 
 # Unlike the development/mock matrix, a formal arm must use the mounted
 # NuRouter transport so the worker can submit candidates to the real Judge.
@@ -21,3 +27,11 @@ policy = "uniform_refill"
 # contract-identical.
 [aisw]
 enabled = true
+# One shared 24-session NuRouter ceiling per arm.  This is the registered
+# Figure 3 CPS capacity; the Judge semaphore remains four evaluations/arm.
+max_in_flight = 24
+
+[pi]
+# Match the formal arm horizon so the provider session is not cut off at the
+# development fixture's five-minute timeout.
+timeout_seconds = 3600
