@@ -385,6 +385,11 @@ class PiAgent:
         env["PYTHONPATH"] = str(self.config.repo_root)
         if self.config.aisw_enabled:
             env["AISW_HOME"] = env.get("AISW_HOME", "/run/contextswarm-aisw")
+            # NuRouter resolves its private node.toml from NUROUTER_HOME.
+            # Keep the legacy AISW_HOME compatibility variable, but bind both
+            # names to the same per-container runtime directory after the
+            # runner rebuilds the agent environment.
+            env["NUROUTER_HOME"] = env["AISW_HOME"]
             env["CONTEXTSWARM_AISW_PRIVATE_HOME_REQUIRED"] = "1"
             env["AISW_DISABLE_LOCAL_FALLBACK"] = "1"
             env["CONTEXTSWARM_REAL_PI_BINARY"] = env.get("CONTEXTSWARM_REAL_PI_BINARY", "/usr/local/bin/pi")
