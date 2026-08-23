@@ -188,6 +188,15 @@ Issue #39 的 Figure 4 路径使用四个独立的新 policy 名，旧三臂及�
 Trace-State 额外产生 `allocation_audit.jsonl`，从每个实际 dispatch 的同一个
 immutable snapshot 计算不 dispatch 的 Task-State counterfactual。
 
+正式六数据集矩阵位于 `configs/figure4_formal_6datasets/`：六个数据集、四个
+allocator、三个 paired repeats（共 72 个 commit-bound leaves）。每个 repeat wave
+同时运行 6×4=24 个 CPS arm，每个 arm 的 `max_parallel` 和
+`aisw.max_in_flight` 都是 24；wave 结束后才进入下一 repeat。selector 固定为
+远端 Figure 3 结果中的 `recency/icpc_formal_v1` identity。矩阵由
+`scripts/run_figure4_formal_matrix.py` 调度，完成后用
+`scripts/collect_figure4_formal_matrix.py` 逐数据集生成 paired artifacts 和
+allocator selection。三重复规则是小样本工程验证，不能冒充八重复的论文统计结论。
+
 每次尝试使用独立 workspace，完成后把较强 candidate 合并到
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
 pieces/messages。Mono 和 Parallel 仍保持通信关闭、固定 baseline 语义。

@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: verina, repeat 2, task_state.
+extends = ["../../_verina.toml"]
+
+[experiment]
+name = "figure4-formal-verina-r02-task_state"
+output_root = "runs/figure4_formal_6datasets/verina/repeat-02/task_state"
+paired_repeat_id = 2
+seed = 1730
+
+[allocation]
+policy = "task_state"

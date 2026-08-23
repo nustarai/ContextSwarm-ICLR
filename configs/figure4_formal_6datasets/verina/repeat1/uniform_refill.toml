@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: verina, repeat 1, uniform_refill.
+extends = ["../../_verina.toml"]
+
+[experiment]
+name = "figure4-formal-verina-r01-uniform_refill"
+output_root = "runs/figure4_formal_6datasets/verina/repeat-01/uniform_refill"
+paired_repeat_id = 1
+seed = 1729
+
+[allocation]
+policy = "uniform_refill"

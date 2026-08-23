@@ -175,7 +175,10 @@ or via a canonical contract hash, in every paired-repeat row:
 
 Only `allocation.policy` may differ.  Output names and run IDs may differ but
 are not experimental inputs.  Mono and Parallel remain communication-free.
-Formal repeats start only after the Figure 3 selector is frozen.
+Formal repeats start only after the Figure 3 selector is frozen.  The current
+operator-authorized matrix uses three paired repeats per dataset; this is an
+explicit small-sample engineering validation and must not be described as the
+eight-repeat publication protocol.
 
 Before formal repeats, the allocator-selection artifact must freeze a rule ID,
 the registered paired performance metric (normally nAUC), validation split,
