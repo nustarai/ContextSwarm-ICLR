@@ -15,3 +15,9 @@ figure3_readiness = "formal_uniform_refill_issue38"
 [allocation]
 policy = "uniform_refill"
 
+# Unlike the development/mock matrix, a formal arm must use the mounted
+# NuRouter transport so the worker can submit candidates to the real Judge.
+# Keep this override in the shared formal base so all eight arms remain
+# contract-identical.
+[aisw]
+enabled = true
