@@ -269,7 +269,7 @@ class SelectionConfigTests(unittest.TestCase):
     def test_nonformal_selection_still_rejects_seed_separation(self) -> None:
         with self.assertRaisesRegex(
             ConfigError,
-            r"enabled non-formal selection requires selection\.seed == experiment\.seed",
+            r"enabled selection requires selection\.seed == experiment\.seed",
         ):
             self._load(
                 _selection_table("recency").replace(

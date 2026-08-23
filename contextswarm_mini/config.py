@@ -933,7 +933,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         # different selector configuration hash.
         if figure4_phase != "formal":
             raise ConfigError(
-                "enabled non-formal selection requires selection.seed == experiment.seed"
+                "enabled selection requires selection.seed == experiment.seed"
             )
     if mode == "mono":
         max_parallel = 1

@@ -104,6 +104,13 @@ following registered rule, recorded as a rule ID in the run artifact:
    selector and configuration fixed for the downstream allocation and
    integrated runs.
 
+For the downstream formal Figure 4 exception, the selected selector's
+`selection.seed` is part of that frozen identity and may remain fixed while a
+paired repeat varies `[experiment].seed`.  The runner uses the experiment seed
+for paired request derivation in that phase.  Ordinary Issue #38 selection
+manifests still require the two seed fields to be equal; this separation must
+not be used to create an unmatched Figure 3 arm.
+
 This rule is a development protocol until the owner freezes its repeat count,
 split, and numeric guardrail thresholds in the formal run manifest.  It is
 intentionally explicit about the decision order so those values cannot be
