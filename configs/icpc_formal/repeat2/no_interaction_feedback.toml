@@ -1,0 +1,7 @@
+extends = ["../no_interaction_feedback.toml"]
+[experiment]
+name = "icpc-formal-r02-no-interaction-feedback"
+output_root = "runs/icpc_formal/r02/no_interaction_feedback"
+seed = 1730
+[selection]
+seed = 1730

@@ -1,0 +1,7 @@
+extends = ["../bm25_mmr.toml"]
+[experiment]
+name = "icpc-formal-r03-bm25-mmr"
+output_root = "runs/icpc_formal/r03/bm25_mmr"
+seed = 1731
+[selection]
+seed = 1731

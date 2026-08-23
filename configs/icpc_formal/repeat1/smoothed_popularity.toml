@@ -1,0 +1,7 @@
+extends = ["../smoothed_popularity.toml"]
+[experiment]
+name = "icpc-formal-r01-smoothed-popularity"
+output_root = "runs/icpc_formal/r01/smoothed_popularity"
+seed = 1729
+[selection]
+seed = 1729

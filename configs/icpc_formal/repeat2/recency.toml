@@ -1,0 +1,7 @@
+extends = ["../recency.toml"]
+[experiment]
+name = "icpc-formal-r02-recency"
+output_root = "runs/icpc_formal/r02/recency"
+seed = 1730
+[selection]
+seed = 1730

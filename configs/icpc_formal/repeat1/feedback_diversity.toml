@@ -1,0 +1,7 @@
+extends = ["../feedback_diversity.toml"]
+[experiment]
+name = "icpc-formal-r01-feedback-diversity"
+output_root = "runs/icpc_formal/r01/feedback_diversity"
+seed = 1729
+[selection]
+seed = 1729

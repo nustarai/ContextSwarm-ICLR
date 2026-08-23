@@ -1,0 +1,11 @@
+extends = ["_base.toml"]
+
+[experiment]
+name = "icpc-formal-recency"
+output_root = "runs/icpc_formal/recency"
+
+[selection]
+selector_name = "recency"
+
+[selection.policy_params]
+primary_sort = "commit_seq_desc"

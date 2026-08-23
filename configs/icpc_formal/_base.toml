@@ -1,0 +1,61 @@
+# Independent ICPC formal selector matrix.
+#
+# This is intentionally separate from the registered Issue #38 MathOlympiadBench
+# matrix.  The eight leaf manifests differ only in selector identity/policy and
+# output naming; all task, model, CPS, Judge, and runtime limits are shared here.
+extends = ["../figure3_dev/_base.toml"]
+
+[experiment]
+name = "icpc-formal-base"
+dataset = "icpc_wf_2025"
+dataset_root = "benchmarks/icpc_wf_2025"
+problem_ids = "benchmarks/icpc_wf_2025/problem_ids.json"
+output_root = "runs/icpc_formal"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 24
+initial_agents_per_task = 2
+max_attempts_per_task = 0
+cancel_on_proved = true
+assignment_policy = "least_active"
+episodes_per_task = 2
+max_tasks = 12
+time_limit_seconds = 3600
+seed = 1729
+figure3_readiness = "icpc_formal_nurouter_coding_judge_v1"
+
+[allocation]
+policy = "uniform_refill"
+piece_limit_per_task = 3
+piece_body_chars = 1200
+agent_timeout_seconds = 3600
+
+[pi]
+timeout_seconds = 3600
+
+[aisw]
+enabled = true
+max_in_flight = 24
+
+[judge]
+kind = "coding"
+env_id = ""
+timeout_seconds = 300
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 4
+verification_profile = "coding_icpc_contest"
+judge_mode = "coding"
+require_result_cache_disabled = false
+
+[formal_tools]
+enabled = false
+require_decl_index = false
+
+[docker]
+image = "contextswarm-iclr:icpc-formal"
+memory_mb = 16384
+internet = "online"
+network = "host"
+
+[selection]
+selector_version = "icpc_formal_v1"

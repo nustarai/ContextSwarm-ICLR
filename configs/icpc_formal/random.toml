@@ -1,0 +1,11 @@
+extends = ["_base.toml"]
+
+[experiment]
+name = "icpc-formal-random"
+output_root = "runs/icpc_formal/random"
+
+[selection]
+selector_name = "random"
+
+[selection.policy_params]
+sample_without_replacement = true

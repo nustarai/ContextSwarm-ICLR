@@ -1,0 +1,7 @@
+extends = ["../random.toml"]
+[experiment]
+name = "icpc-formal-r02-random"
+output_root = "runs/icpc_formal/r02/random"
+seed = 1730
+[selection]
+seed = 1730
