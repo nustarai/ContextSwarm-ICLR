@@ -71,6 +71,11 @@ fi
 if [[ -x "${INPUT_BINARY}" ]]; then
   install -d -m 0700 "${RUNTIME_ROOT}/bin" "${RUNTIME_ROOT}/aisw"
   install -m 0755 "${INPUT_BINARY}" "${RUNTIME_ROOT}/bin/pi"
+  # The managed Pi launcher verifies that the executable it was invoked from
+  # has an adjacent NuRouter binary with the same bytes.  The host launcher is
+  # mounted as a single input file, so materialize the private sibling inside
+  # the container rather than relying on a host-side directory layout.
+  install -m 0755 "${INPUT_BINARY}" "${RUNTIME_ROOT}/bin/nurouter"
 
   metadata=""
   for candidate in \
@@ -105,6 +110,7 @@ PY
 
   export MINI_SWARM_PI_BIN="${RUNTIME_ROOT}/bin/pi"
   export AISW_HOME="${RUNTIME_ROOT}/aisw"
+  export NUROUTER_HOME="${RUNTIME_ROOT}/aisw"
   export CONTEXTSWARM_REAL_PI_BINARY="${CONTEXTSWARM_REAL_PI_BINARY:-/usr/local/bin/pi}"
   export CONTEXTSWARM_AISW_PRIVATE_HOME_REQUIRED=1
   export AISW_DISABLE_LOCAL_FALLBACK=1
