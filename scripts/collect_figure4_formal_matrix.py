@@ -19,6 +19,12 @@ from pathlib import Path
 import sys
 from typing import Any
 
+# ``python scripts/collect_figure4_formal_matrix.py`` sets ``sys.path[0]`` to
+# the scripts directory rather than the repository root.  Keep the documented
+# direct CLI form working without requiring an operator-specific PYTHONPATH.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from contextswarm_mini.allocation_audit import build_figure4_paired_repeat
 from contextswarm_mini.allocator_selection import (
     AllocatorSelectionError,
