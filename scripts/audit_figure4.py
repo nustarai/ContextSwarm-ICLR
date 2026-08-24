@@ -140,9 +140,16 @@ def _admitted_decision(row: Mapping[str, Any]) -> bool:
         raise ValueError("decision disposition must be a non-empty string")
     normalized = disposition.strip().lower().replace("-", "_")
     admitted = normalized in {"admitted", "executed", "assigned", "dispatched"}
+    # The runner records the reason for a non-admission using the stable
+    # ``not_admitted_<reason>`` form (for example ``not_admitted_stale`` when
+    # an LLM decision loses its revalidation race).  Keep the audit's
+    # disposition vocabulary aligned with the runtime while still rejecting
+    # arbitrary strings: only the documented prefix and legacy exact aliases
+    # are accepted.
     rejected = normalized in {
-        "not_admitted", "rejected", "stale", "horizon_reached", "no_capacity",
-        "cancelled", "invalid", "skipped",
+        "not_admitted", "not_admitted_horizon", "not_admitted_ineligible",
+        "not_admitted_stale", "rejected", "stale", "horizon_reached",
+        "no_capacity", "cancelled", "invalid", "skipped",
     }
     if not admitted and not rejected:
         raise ValueError(f"unsupported decision disposition {disposition!r}")
