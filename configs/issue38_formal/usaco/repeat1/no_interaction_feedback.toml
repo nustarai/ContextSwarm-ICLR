@@ -1,0 +1,10 @@
+extends = ["../no_interaction_feedback.toml"]
+
+[experiment]
+name = "issue38-formal-usaco-r01-no_interaction_feedback"
+output_root = "runs/issue38_formal/usaco/repeat1/no_interaction_feedback"
+seed = 1729
+
+[selection]
+seed = 1729
+

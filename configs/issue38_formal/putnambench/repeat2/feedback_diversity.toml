@@ -1,0 +1,10 @@
+extends = ["../feedback_diversity.toml"]
+
+[experiment]
+name = "issue38-formal-putnambench-r02-feedback_diversity"
+output_root = "runs/issue38_formal/putnambench/repeat2/feedback_diversity"
+seed = 1730
+
+[selection]
+seed = 1730
+

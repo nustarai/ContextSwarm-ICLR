@@ -1,0 +1,10 @@
+extends = ["../feedback_diversity.toml"]
+
+[experiment]
+name = "issue38-formal-usaco-r03-feedback_diversity"
+output_root = "runs/issue38_formal/usaco/repeat3/feedback_diversity"
+seed = 1731
+
+[selection]
+seed = 1731
+
