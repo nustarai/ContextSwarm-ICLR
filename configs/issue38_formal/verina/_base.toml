@@ -48,7 +48,8 @@ enabled = true
 max_restarts = 1
 base_delay_ms = 1000
 
-[aisw]
+[nurouter]
+# Historical AISW_* environment names below are launcher compatibility only.
 enabled = true
 binary = "~/.local/share/contextswarm/aisw-linux-aarch64"
 node_config = "~/.nurouter/node.toml"
@@ -91,5 +92,4 @@ seed = 1729
 tie_break = "trace_id_asc"
 direct_messages = false
 candidate_transfer = false
-
 
