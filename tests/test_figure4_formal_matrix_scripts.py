@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 
+from contextswarm_mini.formal_matrix_artifacts import REQUIRED_LIFECYCLE_EVENTS, artifact_eligibility
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -71,7 +72,7 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             failed.mkdir()
             errored.mkdir()
             for directory, run_id, horizon, status in (
-                (completed, "valid-run", "2026-08-23T00:00:00+00:00", "DEGRADED"),
+                (completed, "valid-run", "2026-08-23T00:00:00+00:00", "COMPLETED"),
                 (failed, "preflight-run", None, "PREFLIGHT_FAILED"),
                 (errored, "error-run", "2026-08-23T00:00:00+00:00", "ERROR"),
             ):
@@ -84,9 +85,41 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 (directory / "final.json").write_text(
-                    json.dumps({"status": status}),
+                    json.dumps(
+                        {
+                            "status": status,
+                            "health": {"ok": status == "COMPLETED", "issues": []},
+                        }
+                    ),
                     encoding="utf-8",
                 )
+                if status == "COMPLETED":
+                    (directory / "judge_broker_closeout.json").write_text(
+                        json.dumps(
+                            {
+                                "drained": True,
+                                "active_handlers": 0,
+                                "fifo_depth": 0,
+                                "remote_unsettled_jobs": 0,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    (directory / "transport_preflight.json").write_text(
+                        json.dumps({"status": "ok", "aisw": {"nurouter_version": "test"}}),
+                        encoding="utf-8",
+                    )
+                    (directory / "events.jsonl").write_text(
+                        "".join(json.dumps({"event": event}) + "\n" for event in REQUIRED_LIFECYCLE_EVENTS),
+                        encoding="utf-8",
+                    )
+                    meta = json.loads((directory / "run_meta.json").read_text(encoding="utf-8"))
+                    meta["runtime_provenance"] = {
+                        "image_id": "image",
+                        "manifest_sha256": "manifest",
+                        "source_commit": "commit",
+                    }
+                    (directory / "run_meta.json").write_text(json.dumps(meta), encoding="utf-8")
             # Candidate ordering is mtime-based; make the invalid diagnostic
             # summary newest to exercise the observed formal-run failure mode.
             failed_summary = failed / "figure4_run_summary.json"
@@ -97,6 +130,17 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             )
             self.assertEqual(path, completed / "figure4_run_summary.json")
             self.assertEqual(run_id, "valid-run")
+
+    def test_degraded_terminal_artifact_is_not_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run = Path(raw)
+            (run / "final.json").write_text(
+                json.dumps({"status": "DEGRADED", "health": {"ok": False}}),
+                encoding="utf-8",
+            )
+            eligible, reasons = artifact_eligibility(run)
+            self.assertFalse(eligible)
+            self.assertIn("final_status:DEGRADED", reasons)
 
 
 if __name__ == "__main__":

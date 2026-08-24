@@ -33,6 +33,8 @@ from contextswarm_mini.allocator_selection import (
     select_allocator,
     write_selection_result,
 )
+from contextswarm_mini.formal_matrix_artifacts import artifact_eligibility
+from scripts.audit_figure4 import audit_figure4
 
 
 DATASETS = ("clever", "icpc_wf_2025", "matholympiadbench", "putnambench", "usaco", "verina")
@@ -69,17 +71,16 @@ def _latest_summary(root: Path, dataset: str, repeat: int, policy: str) -> tuple
         # newer than a completed run.  The strict Figure 4 audit validates the
         # remaining contents after this eligibility filter.
         meta = _json(path.parent / "run_meta.json")
-        final = _json(path.parent / "final.json")
         horizon_started_at = meta.get("horizon_started_at") if meta else None
         if (
             value
             and value.get("policy") == policy
             and isinstance(horizon_started_at, str)
             and bool(horizon_started_at.strip())
-            and final is not None
-            and final.get("status") in {"COMPLETED", "DEGRADED"}
         ):
-            valid.append((path, value))
+            eligible, _reasons = artifact_eligibility(path.parent, policy=policy)
+            if eligible:
+                valid.append((path, value))
     if not valid:
         return None, None
     path, value = valid[-1]
@@ -87,6 +88,10 @@ def _latest_summary(root: Path, dataset: str, repeat: int, policy: str) -> tuple
 
 
 def _pair_for_repeat(summary_paths: dict[str, Path], *, dataset: str, repeat: int) -> dict[str, Any]:
+    audit = audit_figure4({policy: path.parent for policy, path in summary_paths.items()})
+    if not audit.get("ok"):
+        details = audit.get("errors") or []
+        raise ValueError(f"{dataset} repeat {repeat}: strict arm audit failed: {details}")
     summaries = {policy: _json(path) for policy, path in summary_paths.items()}
     if any(value is None for value in summaries.values()):
         raise ValueError(f"{dataset} repeat {repeat}: malformed summary")

@@ -28,6 +28,8 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
 
+from contextswarm_mini.formal_matrix_artifacts import artifact_eligibility
+
 
 DATASETS = ("clever", "icpc_wf_2025", "matholympiadbench", "putnambench", "usaco", "verina")
 POLICIES = ("uniform_refill", "task_state", "trace_state", "llm_scheduler")
@@ -50,6 +52,8 @@ class Slot:
     next_launch_at: float = 0.0
     horizon_run_id: str = ""
     latest_run_id: str = ""
+    infrastructure_failures: int = 0
+    last_artifact_reasons: list[str] | None = None
 
     @property
     def output_root(self) -> str:
@@ -230,6 +234,7 @@ def _latest_run(root: Path, slot: Slot) -> tuple[Path | None, dict[str, Any] | N
 
 
 def _refresh(slot: Slot, root: Path) -> None:
+    slot.last_artifact_reasons = None
     run_dir, meta = _latest_run(root, slot)
     if run_dir is None or meta is None:
         return
@@ -240,7 +245,13 @@ def _refresh(slot: Slot, root: Path) -> None:
         slot.horizon_run_id = run_id
         final = _json(run_dir / "final.json")
         if final is not None:
-            slot.status = "finished"
+            eligible, reasons = artifact_eligibility(run_dir, policy=slot.policy)
+            slot.last_artifact_reasons = reasons or None
+            if eligible:
+                slot.status = "finished"
+            elif slot.pid is None:
+                slot.status = "pending"
+                slot.last_reason = "invalid_terminal_artifact"
         elif slot.pid is None:
             slot.status = "closeout_pending"
         else:
@@ -284,7 +295,16 @@ def _slots_for_wave(repeat: int) -> list[Slot]:
     return [Slot(dataset=dataset, repeat=repeat, policy=policy) for dataset in DATASETS for policy in POLICIES]
 
 
-def run(repo: Path, *, state_path: Path, log_root: Path, root: Path, max_attempts: int, retry_seconds: float) -> int:
+def run(
+    repo: Path,
+    *,
+    state_path: Path,
+    log_root: Path,
+    root: Path,
+    max_attempts: int,
+    retry_seconds: float,
+    max_infrastructure_failures: int,
+) -> int:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     stopping = False
 
@@ -317,8 +337,22 @@ def run(repo: Path, *, state_path: Path, log_root: Path, root: Path, max_attempt
                         slot.pid = None
                         _refresh(slot, root)
                         if slot.status != "finished":
+                            if slot.last_artifact_reasons:
+                                slot.infrastructure_failures += 1
+                                slot.last_reason = "invalid_terminal_artifact"
+                                if slot.infrastructure_failures >= max_infrastructure_failures:
+                                    slot.status = "blocked_infrastructure"
+                                    _write_state(
+                                        state_path,
+                                        all_slots,
+                                        event="infrastructure_failure_threshold",
+                                        root=root,
+                                        pid=os.getpid(),
+                                    )
+                                    return 3
                             slot.status = "pending"
-                            slot.last_reason = "startup_or_preflight_failure"
+                            if not slot.last_artifact_reasons:
+                                slot.last_reason = "startup_or_preflight_failure"
                             slot.next_launch_at = now + min(retry_seconds * max(1, slot.attempts), 300.0)
                 if slot.status == "finished":
                     continue
@@ -364,6 +398,12 @@ def main() -> int:
     parser.add_argument("--logs", type=Path, default=Path("tmp/figure4_formal_6datasets/logs"))
     parser.add_argument("--max-attempts", type=int, default=20)
     parser.add_argument("--retry-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--max-infrastructure-failures",
+        type=int,
+        default=3,
+        help="stop instead of endlessly relaunching after this many invalid terminal artifacts",
+    )
     args = parser.parse_args()
     return run(
         args.repo.resolve(),
@@ -372,6 +412,7 @@ def main() -> int:
         root=args.root.resolve(),
         max_attempts=max(1, args.max_attempts),
         retry_seconds=max(1.0, args.retry_seconds),
+        max_infrastructure_failures=max(1, args.max_infrastructure_failures),
     )
 
 
