@@ -876,7 +876,13 @@ def _safe_health(payload: dict[str, Any], requested_env: str) -> dict[str, Any]:
         group_admission.get("enabled"), bool
     ):
         result["group_admission_enabled"] = bool(group_admission["enabled"])
+    # Routers advertise the routed environment set as ``accepted_*`` while a
+    # direct, dataset-pinned Lean backend uses the older
+    # ``supported_lean_env_ids`` spelling.  Both are explicit admission
+    # contracts; normalize them to one bounded field before validation.
     accepted = payload.get("accepted_lean_env_ids")
+    if not isinstance(accepted, list):
+        accepted = payload.get("supported_lean_env_ids")
     if isinstance(accepted, list):
         safe_accepted = [value for value in accepted if isinstance(value, str)]
         result["accepted_lean_env_ids"] = safe_accepted

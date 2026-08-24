@@ -366,6 +366,28 @@ class PreflightResultCacheTests(unittest.TestCase):
         self.assertNotIn("available_service_units", report["lean"])
         self.assertNotIn("capacity_state", report["lean"])
 
+        # A dataset-pinned direct backend advertises the same admission
+        # contract under ``supported_lean_env_ids`` rather than the router's
+        # ``accepted_lean_env_ids`` spelling.
+        direct_health = {
+            "ok": True,
+            "workspace_ready": True,
+            "supported_lean_env_ids": [config.lean_env_id],
+        }
+        with tempfile.TemporaryDirectory() as raw:
+            with (
+                patch(
+                    "contextswarm_mini.preflight.PiAgent.binary",
+                    return_value="/bin/true",
+                ),
+                patch(
+                    "contextswarm_mini.preflight.LeanEvaluator.health",
+                    return_value=direct_health,
+                ),
+            ):
+                direct_report = run_preflight(config, Path(raw))
+        self.assertTrue(direct_report["lean"]["requested_env_accepted"])
+
         failures = (
             ("missing_ok", {key: value for key, value in healthy.items() if key != "ok"}),
             ("false_ok", {**healthy, "ok": False}),
@@ -379,7 +401,6 @@ class PreflightResultCacheTests(unittest.TestCase):
                 {
                     "ok": True,
                     "workspace_ready": True,
-                    "supported_lean_env_ids": [config.lean_env_id],
                 },
             ),
             (
