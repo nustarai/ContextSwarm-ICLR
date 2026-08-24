@@ -66,11 +66,14 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             base = root / "clever" / "repeat-01" / "uniform_refill"
             completed = base / "completed"
             failed = base / "failed"
+            errored = base / "errored"
             completed.mkdir(parents=True)
             failed.mkdir()
+            errored.mkdir()
             for directory, run_id, horizon, status in (
                 (completed, "valid-run", "2026-08-23T00:00:00+00:00", "DEGRADED"),
                 (failed, "preflight-run", None, "PREFLIGHT_FAILED"),
+                (errored, "error-run", "2026-08-23T00:00:00+00:00", "ERROR"),
             ):
                 (directory / "figure4_run_summary.json").write_text(
                     json.dumps({"policy": "uniform_refill", "run_id": run_id}),
@@ -88,6 +91,7 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             # summary newest to exercise the observed formal-run failure mode.
             failed_summary = failed / "figure4_run_summary.json"
             failed_summary.touch()
+            (errored / "figure4_run_summary.json").touch()
             path, run_id = COLLECTOR._latest_summary(
                 root, "clever", 1, "uniform_refill"
             )

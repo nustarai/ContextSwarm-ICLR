@@ -77,7 +77,7 @@ def _latest_summary(root: Path, dataset: str, repeat: int, policy: str) -> tuple
             and isinstance(horizon_started_at, str)
             and bool(horizon_started_at.strip())
             and final is not None
-            and final.get("status") != "PREFLIGHT_FAILED"
+            and final.get("status") in {"COMPLETED", "DEGRADED"}
         ):
             valid.append((path, value))
     if not valid:
