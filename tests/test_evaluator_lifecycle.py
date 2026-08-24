@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from contextswarm_mini.evaluator import (
+    CodingEvaluator,
     EvaluatorError,
     LeanEvaluator,
     _safe_response,
@@ -955,6 +956,61 @@ class EvaluatorLifecycleTests(unittest.TestCase):
                 "job-1",
                 response=response,
                 cancellation_reason="broker_revoked",
+            )
+
+        watcher.assert_called_once()
+        self.assertTrue(summary["deferred"])
+        self.assertFalse(summary["unconfirmed"])
+        self.assertEqual(summary["failure_category"], "cancel_settlement_deferred")
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+
+    def test_full_score_cancel_defers_with_legacy_coding_receipt(self) -> None:
+        """A bound runner stop is recoverable without a retryable marker."""
+
+        evaluator = CodingEvaluator(
+            "https://judge.invalid",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        response = {
+            "job_id": "job-1",
+            "status": "running",
+            "status_endpoint": "/api/judge/jobs/job-1",
+            "cancel_endpoint": "/api/judge/jobs/job-1",
+        }
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            if method == "DELETE":
+                return {
+                    "job_id": "job-1",
+                    "status": "cancel_requested",
+                    "status_endpoint": "/api/judge/jobs/job-1",
+                    "cancel_endpoint": "/api/judge/jobs/job-1",
+                }
+            return {
+                "job_id": "job-1",
+                "status": "cancel_requested",
+                "status_endpoint": "/api/judge/jobs/job-1",
+                "cancel_endpoint": "/api/judge/jobs/job-1",
+            }
+
+        with (
+            patch.object(evaluator, "_request", side_effect=request),
+            patch.object(
+                evaluator,
+                "_start_settlement_watcher",
+                return_value=True,
+            ) as watcher,
+        ):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response=response,
+                cancellation_reason="full_score",
             )
 
         watcher.assert_called_once()
