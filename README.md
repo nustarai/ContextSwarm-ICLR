@@ -205,6 +205,10 @@ Pi transport 设置由共享 `[pi]` / `[pi.retry]` manifest 明确控制，三�
 不会隐式继承宿主机 `~/.pi`。默认 provider idle timeout 为 600 秒；一次
 `agent_end` 只代表底层调用结束，runner 会继续等待 Pi 自动 retry/compaction，
 直到收到 `agent_settled` 才结束该 agent。外层 experiment horizon 仍是硬截止。
+`agent_finished` 同时记录 `settled`、最终 assistant outcome、
+`transport_diagnostic` 和 `transport_recovered`；因此 WebSocket/SSE 等中间
+诊断会保留供审计，但只有未恢复的终态错误才会触发 experiment-level
+provider circuit breaker 或使 formal artifact 失格。
 
 如果整个 Pi RPC/session 进程在收到 `agent_settled` 前异常退出，`[pi.recovery]`
 提供 runner 级的有界恢复：默认在原 horizon 内重启一次，沿用同一个逻辑

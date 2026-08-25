@@ -7,7 +7,11 @@ import sys
 import tempfile
 import unittest
 
-from contextswarm_mini.formal_matrix_artifacts import REQUIRED_LIFECYCLE_EVENTS, artifact_eligibility
+from contextswarm_mini.formal_matrix_artifacts import (
+    REQUIRED_LIFECYCLE_EVENTS,
+    artifact_eligibility,
+    is_recovered_transport_event,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -141,6 +145,88 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             eligible, reasons = artifact_eligibility(run)
             self.assertFalse(eligible)
             self.assertIn("final_status:DEGRADED", reasons)
+
+    def test_recovered_transport_diagnostic_is_not_an_experiment_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            run = Path(raw)
+            (run / "final.json").write_text(
+                json.dumps({"status": "COMPLETED", "health": {"ok": True, "issues": []}}),
+                encoding="utf-8",
+            )
+            (run / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "recovered-run",
+                        "horizon_started_at": "2026-08-23T00:00:00+00:00",
+                        "runtime_provenance": {
+                            "image_id": "image",
+                            "manifest_sha256": "manifest",
+                            "source_commit": "commit",
+                        },
+                        "allocation": {"policy": "uniform_refill"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run / "figure4_run_summary.json").write_text(
+                json.dumps({"policy": "uniform_refill"}), encoding="utf-8"
+            )
+            (run / "judge_broker_closeout.json").write_text(
+                json.dumps(
+                    {
+                        "drained": True,
+                        "active_handlers": 0,
+                        "fifo_depth": 0,
+                        "remote_unsettled_jobs": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run / "transport_preflight.json").write_text(
+                json.dumps({"status": "ok", "aisw": {"nurouter_version": "test"}}),
+                encoding="utf-8",
+            )
+            recovered = {
+                "event": "agent_finished",
+                "returncode": 0,
+                "settled": True,
+                "assistant_success": True,
+                "timed_out": False,
+                "cancelled": False,
+                "transport_diagnostic": True,
+                "transport_recovered": True,
+                "error_tail": "message_end: upstream request failed",
+            }
+            self.assertTrue(is_recovered_transport_event(recovered))
+            (run / "events.jsonl").write_text(
+                "".join(
+                    json.dumps({"event": event}) + "\n"
+                    for event in REQUIRED_LIFECYCLE_EVENTS
+                )
+                + json.dumps(recovered)
+                + "\n",
+                encoding="utf-8",
+            )
+            eligible, reasons = artifact_eligibility(run, policy="uniform_refill")
+            self.assertTrue(eligible, reasons)
+
+            # The same diagnostic is a real artifact error when settlement or
+            # the final assistant outcome is absent/failed.
+            unrecovered = dict(recovered)
+            unrecovered["transport_recovered"] = False
+            unrecovered["assistant_success"] = False
+            (run / "events.jsonl").write_text(
+                "".join(
+                    json.dumps({"event": event}) + "\n"
+                    for event in REQUIRED_LIFECYCLE_EVENTS
+                )
+                + json.dumps(unrecovered)
+                + "\n",
+                encoding="utf-8",
+            )
+            eligible, reasons = artifact_eligibility(run, policy="uniform_refill")
+            self.assertFalse(eligible)
+            self.assertTrue(any(reason.startswith("event_error:error_tail:") for reason in reasons))
 
 
 if __name__ == "__main__":

@@ -52,6 +52,34 @@ _ERROR_MARKERS = (
 )
 
 
+def is_recovered_transport_event(value: Mapping[str, Any]) -> bool:
+    """Return whether one ``agent_finished`` row proves transport recovery.
+
+    Pi preserves intermediate provider diagnostics in ``error_tail`` for
+    forensic visibility.  Those strings are not an experiment failure when
+    the same logical agent has a successful assistant outcome and an
+    authoritative settlement.  Require all public lifecycle bits rather than
+    trusting a status label alone so an incomplete/ambiguous row remains
+    fail-closed.
+    """
+
+    if value.get("event") != "agent_finished":
+        return False
+    if value.get("returncode") != 0:
+        return False
+    if value.get("settled") is not True or value.get("assistant_success") is not True:
+        return False
+    if value.get("timed_out") is True or value.get("cancelled") is True:
+        return False
+    if value.get("transport_diagnostic") is not True:
+        return False
+    if "transport_recovered" in value:
+        return value.get("transport_recovered") is True
+    # Permit artifacts produced by the first structured-outcome rollout, which
+    # emitted the constituent fields before adding the convenience bit.
+    return True
+
+
 def _read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -81,10 +109,16 @@ def _read_events(path: Path) -> tuple[set[str], list[str]]:
             event = value.get("event")
             if isinstance(event, str) and event:
                 events.add(event)
+            recovered_transport = is_recovered_transport_event(value)
             # Error tails are emitted by the runner as structured strings.  A
             # marker elsewhere in a normal event is not sufficient; only
             # inspect fields that conventionally carry an error/diagnostic.
+            # A recovered agent intentionally retains its intermediate
+            # transport tail, so do not turn that forensic field into a
+            # terminal artifact error.
             for key in ("error", "error_tail", "reason", "message", "exception"):
+                if recovered_transport and key == "error_tail":
+                    continue
                 item = value.get(key)
                 if isinstance(item, str):
                     lowered = item.lower()
@@ -194,4 +228,8 @@ def artifact_eligibility(run_dir: str | Path, *, policy: str | None = None) -> t
     return not unique, unique
 
 
-__all__ = ["REQUIRED_LIFECYCLE_EVENTS", "artifact_eligibility"]
+__all__ = [
+    "REQUIRED_LIFECYCLE_EVENTS",
+    "artifact_eligibility",
+    "is_recovered_transport_event",
+]
