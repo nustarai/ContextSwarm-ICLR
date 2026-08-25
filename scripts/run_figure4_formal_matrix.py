@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from dataclasses import dataclass, asdict
+import datetime as dt
 import json
 import math
 import os
@@ -178,6 +179,49 @@ def _proc_cwd(pid: Any) -> Path | None:
         return None
 
 
+def _proc_start_epoch(pid: Any) -> float:
+    """Return a best-effort wall-clock start time for *pid*.
+
+    Linux exposes process start ticks in ``/proc/<pid>/stat``.  The value is
+    only used to choose between several identity-checked children and run
+    directories during recovery; failure to read it must never make a child
+    unsafe to inspect or force a duplicate launch.
+    """
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return 0.0
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        # The comm field is parenthesized and can contain spaces.  Split only
+        # after its final closing parenthesis; starttime is field 22, i.e.
+        # index 19 in the remaining tail.
+        fields = stat_text[stat_text.rfind(")") + 2 :].split()
+        start_ticks = int(fields[19])
+        hz = int(os.sysconf("SC_CLK_TCK"))
+        boot_text = Path("/proc/stat").read_text(encoding="ascii")
+        boot = float(boot_text.split("btime ", 1)[1].splitlines()[0])
+        return boot + start_ticks / hz
+    except (OSError, UnicodeError, ValueError, IndexError, TypeError, ZeroDivisionError):
+        return 0.0
+
+
+def _parse_epoch(value: Any) -> float | None:
+    """Parse a runner ISO timestamp without exposing it in diagnostics."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _trusted_child_pid(pid: Any, slot: Slot, repo: Path) -> bool:
     """Validate a persisted child identity before supervisor adoption.
 
@@ -218,6 +262,98 @@ def _adopt_process(pid: Any, slot: Slot, repo: Path) -> _AdoptedProcess | None:
     if not _trusted_child_pid(pid, slot, repo):
         return None
     return _AdoptedProcess(int(pid))
+
+
+def _trusted_children(slot: Slot, repo: Path) -> list[tuple[int, float]]:
+    """Find identity-checked launcher processes for one matrix slot.
+
+    State files are intentionally small and may lag a child by one heartbeat.
+    Scanning procfs is therefore a recovery fallback, not the primary source
+    of truth.  Every candidate still has to pass the exact checkout, manifest,
+    and output-root checks in :func:`_trusted_child_pid`.
+    """
+
+    children: list[tuple[int, float]] = []
+    try:
+        entries = Path("/proc").glob("[0-9]*")
+    except OSError:
+        return children
+    for entry in entries:
+        try:
+            pid = int(entry.name)
+        except (TypeError, ValueError):
+            continue
+        if _trusted_child_pid(pid, slot, repo):
+            children.append((pid, _proc_start_epoch(pid)))
+    return children
+
+
+def _live_horizon_for_slot(
+    root: Path,
+    slot: Slot,
+    repo: Path,
+) -> tuple[int, str] | None:
+    """Discover an admitted child when state persistence lagged its horizon.
+
+    A supervisor can die after the child writes ``run_meta.json`` but before
+    the next atomic state heartbeat.  In that window ``state.json`` has no
+    ``horizon_run_id`` even though killing/relaunching the child would discard
+    its candidate and CPS state.  Match only exact launcher identities and
+    choose the run whose recorded start is nearest to the child start time.
+    """
+
+    children = _trusted_children(slot, repo)
+    if not children:
+        return None
+    live_runs: list[tuple[Path, dict[str, Any], float]] = []
+    for directory, meta in _run_records(root, slot):
+        if not str(meta.get("horizon_started_at") or "").strip():
+            continue
+        eligible, _reasons = artifact_eligibility(directory, policy=slot.policy)
+        if eligible:
+            continue
+        started = _parse_epoch(meta.get("started_at"))
+        if started is None:
+            started = _parse_epoch(meta.get("horizon_started_at"))
+        if started is None:
+            try:
+                started = directory.stat().st_mtime
+            except OSError:
+                started = 0.0
+        live_runs.append((directory, meta, float(started or 0.0)))
+    if not live_runs:
+        return None
+
+    best_key: tuple[float, float, int, str] | None = None
+    chosen: tuple[int, str] | None = None
+    for pid, process_started in children:
+        for directory, meta, run_started in live_runs:
+            distance = (
+                abs(process_started - run_started)
+                if process_started and run_started
+                else 0.0
+            )
+            run_id = str(meta.get("run_id") or directory.name)
+            key = (distance, -run_started, pid, run_id)
+            if best_key is None or key < best_key:
+                best_key = key
+                chosen = (pid, run_id)
+    return chosen
+
+
+def _quarantine_trusted_children(
+    slot: Slot,
+    repo: Path,
+    extra_pid: Any = None,
+) -> int:
+    """Terminate exact-slot children that have no admitted horizon binding."""
+
+    pids = {pid for pid, _started in _trusted_children(slot, repo)}
+    if isinstance(extra_pid, int) and _trusted_child_pid(extra_pid, slot, repo):
+        pids.add(extra_pid)
+    for pid in sorted(pids):
+        _terminate_process(_AdoptedProcess(pid))
+    return len(pids)
 
 
 def _run_records(root: Path, slot: Slot) -> list[tuple[Path, dict[str, Any]]]:
@@ -329,10 +465,11 @@ def _resume_slot(
     if completed is not None:
         # A duplicate supervisor may have left a newer child alive after an
         # earlier attempt already produced a valid artifact.  The artifact is
-        # authoritative; stop only an identity-checked child bound to this
-        # exact slot so it cannot keep consuming provider capacity.
-        if _trusted_child_pid(old_pid, slot, repo):
-            _terminate_process(_AdoptedProcess(int(old_pid)))
+        # authoritative; stop only identity-checked children bound to this
+        # exact slot so they cannot keep consuming provider capacity.  Scan
+        # procfs as well as the persisted PID because a supervisor may have
+        # crashed before its final heartbeat.
+        _quarantine_trusted_children(slot, repo, old_pid)
         directory, meta = completed
         run_id = str(meta.get("run_id") or directory.name)
         slot.horizon_run_id = run_id
@@ -345,6 +482,7 @@ def _resume_slot(
         persisted_horizon = str(row.get("horizon_run_id") or "").strip()
     else:
         persisted_horizon = ""
+
     # Prefer the exact persisted horizon over the newest directory.  A
     # pre-admission retry can have been created by an operator just before a
     # supervisor restart; adopting the older live horizon is still safer than
@@ -356,6 +494,14 @@ def _resume_slot(
     if latest is None and records:
         latest = records[-1]
     if latest is None:
+        # A pre-admission launcher may not have created ``run_meta.json`` yet.
+        # Quarantine that exact child before the caller refills the slot;
+        # otherwise a state-file race can start two launchers for one arm.
+        if _quarantine_trusted_children(slot, repo, old_pid):
+            slot.last_reason = "pre_admission_process_terminated"
+        else:
+            slot.last_reason = "pre_admission_retry"
+        slot.attempts = max(slot.attempts, len(records))
         return
     directory, meta = latest
     run_id = str(meta.get("run_id") or directory.name)
@@ -373,18 +519,37 @@ def _resume_slot(
             processes[process.pid] = process
             return
 
+    # The state heartbeat can lag the child by one write: the child may have
+    # created a horizon-bound run directory just before the supervisor was
+    # killed.  Discover that exact live process before considering a relaunch.
+    # This fallback is deliberately after the eligible-artifact check and the
+    # exact persisted-PID adoption, so a completed result or known owner wins
+    # and any duplicate child is not selected in their place.
+    discovered = _live_horizon_for_slot(root, slot, repo)
+    if discovered is not None:
+        pid, discovered_run_id = discovered
+        process = _adopt_process(pid, slot, repo)
+        if process is not None:
+            slot.horizon_run_id = discovered_run_id
+            slot.latest_run_id = discovered_run_id
+            slot.pid = process.pid
+            slot.status = "running"
+            processes[process.pid] = process
+            return
+
     # No safe live owner remains.  A previous supervisor may have died while
     # a pre-admission launcher was still alive; terminate that exact, trusted
     # process before allowing a replacement, otherwise two launchers can race
     # the same slot and recreate the provider overload.  Never do this for an
     # admitted horizon whose state binding is ambiguous: candidate/CPS state
     # must remain untouched until the operator can reconcile it.
-    if not horizon and _trusted_child_pid(old_pid, slot, repo):
-        orphan = _AdoptedProcess(int(old_pid))
-        _terminate_process(orphan)
-        slot.last_reason = "pre_admission_process_terminated"
+    if not horizon:
+        if _quarantine_trusted_children(slot, repo, old_pid):
+            slot.last_reason = "pre_admission_process_terminated"
+        else:
+            slot.last_reason = "pre_admission_retry"
     else:
-        slot.last_reason = "incomplete_horizon" if horizon else "pre_admission_retry"
+        slot.last_reason = "incomplete_horizon"
     slot.attempts = max(slot.attempts, len(records))
 
 
@@ -435,6 +600,19 @@ def _health_ready(value: Any) -> bool:
 
     if not isinstance(value, dict) or value.get("ok") is not True:
         return False
+    # Some router versions expose a top-level ``ok`` bit before the selected
+    # formal workspace/backend is usable.  An explicit false on any of these
+    # contract probes is a candidate-independent admission failure; wait for
+    # recovery instead of creating a doomed PREFLIGHT_FAILED arm.  Missing
+    # keys remain compatible with the coding Judge health schema.
+    for key in (
+        "workspace_ready",
+        "safeverify_ready",
+        "formal_strict_safeverify_ready",
+        "router_formal_contract_valid",
+    ):
+        if value.get(key) is False:
+            return False
     group = value.get("group_admission")
     group_disabled = (
         isinstance(group, dict)
@@ -581,14 +759,19 @@ def _provider_infra_burst(
         if not base.is_dir():
             continue
         for events_path in base.glob("*/events.jsonl"):
+            # Run IDs are generated by each arm and are not required to be
+            # globally unique.  Use the full path as the append cursor key so
+            # two slots named ``run-1`` cannot hide one another's provider
+            # evidence during a 24-arm wave.
+            cursor_key = str(events_path.resolve())
             run_id = events_path.parent.name
             try:
                 size = events_path.stat().st_size
-                offset = min(max(0, int(seen_offsets.get(run_id, 0))), size)
+                offset = min(max(0, int(seen_offsets.get(cursor_key, 0))), size)
                 with events_path.open("rb") as handle:
                     handle.seek(offset)
                     chunk = handle.read()
-                seen_offsets[run_id] = size
+                seen_offsets[cursor_key] = size
             except OSError:
                 continue
             for raw in chunk.splitlines():
@@ -753,7 +936,7 @@ def run(
             base = root / slot.dataset / f"repeat-{slot.repeat:02d}" / slot.policy
             for events_path in base.glob("*/events.jsonl") if base.is_dir() else ():
                 try:
-                    seen_provider_offsets[events_path.parent.name] = events_path.stat().st_size
+                    seen_provider_offsets[str(events_path.resolve())] = events_path.stat().st_size
                 except OSError:
                     pass
         while not stopping:

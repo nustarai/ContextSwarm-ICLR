@@ -199,7 +199,10 @@ allocator selection。三重复规则是小样本工程验证，不能冒充八�
 
 矩阵 supervisor 的 state 文件是原子写入的；默认重启会先复用已通过严格 closeout
 检查的 artifact，再对仍在固定 horizon 内且 PID、工作目录、manifest 和 output root
-均匹配的 child 做安全 adoption。provider 的 candidate-independent burst 只会停止
+均匹配的 child 做安全 adoption；若 child 已写入 horizon 但 state heartbeat 尚未
+落盘，重启还会用同样的身份约束从 procfs 发现并接管它。没有 horizon 的可信
+pre-admission child 会先被定向 quarantine，避免恢复时产生重复 arm。provider 的
+candidate-independent burst 只会停止
 尚未进入 horizon 的 slot；重启后只补这些 slot 或已经死亡/无法 reconcile 的单个
 slot，不会重启其余已进入 horizon 的 arm。若确实要忽略旧 supervisor state，可显式
 传入 `--no-resume`；这不会把已有合格 artifact 当成新的结果。

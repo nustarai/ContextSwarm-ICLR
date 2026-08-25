@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from collections import deque
+import datetime as dt
 import os
 from pathlib import Path
 import signal
@@ -67,6 +68,7 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
                 cwd=ROOT,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
             try:
                 trusted = False
@@ -92,6 +94,134 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
                     os.kill(process.pid, signal.SIGTERM)
                 except OSError:
                     pass
+                process.wait(timeout=5)
+
+    def test_resume_discovers_live_horizon_when_state_heartbeat_lagged(self) -> None:
+        """A child admitted just before supervisor loss is adopted by scan.
+
+        The state writer and the child write different files.  A crash between
+        those writes leaves ``run_meta.json`` with a horizon but no
+        ``horizon_run_id`` in ``state.json``.  Re-launching here would create a
+        duplicate arm, so exercise the real procfs fallback with a launcher-
+        shaped child.
+        """
+
+        slot = RUNNER.Slot(dataset="clever", repeat=1, policy="uniform_refill")
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw) / "runs" / slot.dataset / "repeat-01" / slot.policy
+            run = base / "lagged-horizon"
+            run.mkdir(parents=True)
+            started = dt.datetime.now(dt.timezone.utc).isoformat()
+            (run / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "lagged-horizon",
+                        "dataset": slot.dataset,
+                        "started_at": started,
+                        "horizon_started_at": started,
+                        "allocation": {"policy": slot.policy},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            helper = Path(raw) / "long_lived_child.py"
+            helper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(helper),
+                    "docker",
+                    "run",
+                    "scripts/run_docker.sh",
+                    "--config",
+                    slot.manifest,
+                    "--output",
+                    slot.output_root,
+                ],
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            adopted: dict[int, object] = {}
+            try:
+                for _ in range(100):
+                    if RUNNER._trusted_child_pid(process.pid, slot, ROOT):
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("launcher-shaped child never became discoverable")
+                RUNNER._resume_slot(
+                    slot,
+                    {"pid": process.pid, "attempts": 1, "horizon_run_id": ""},
+                    root=Path(raw) / "runs",
+                    repo=ROOT,
+                    processes=adopted,
+                )
+                self.assertEqual(slot.status, "running")
+                self.assertEqual(slot.pid, process.pid)
+                self.assertEqual(slot.horizon_run_id, "lagged-horizon")
+                self.assertIn(process.pid, adopted)
+            finally:
+                try:
+                    os.kill(process.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                process.wait(timeout=5)
+
+    def test_resume_quarantines_pre_admission_child_without_run_metadata(self) -> None:
+        """A launcher race before ``run_meta`` cannot create a duplicate slot."""
+
+        slot = RUNNER.Slot(dataset="clever", repeat=1, policy="uniform_refill")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "runs"
+            helper = Path(raw) / "long_lived_child.py"
+            helper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(helper),
+                    "docker",
+                    "run",
+                    "scripts/run_docker.sh",
+                    "--config",
+                    slot.manifest,
+                    "--output",
+                    slot.output_root,
+                ],
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            try:
+                for _ in range(100):
+                    if RUNNER._trusted_child_pid(process.pid, slot, ROOT):
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("launcher-shaped child never became discoverable")
+                slot_processes: dict[int, object] = {}
+                RUNNER._resume_slot(
+                    slot,
+                    {"pid": process.pid, "attempts": 1, "horizon_run_id": ""},
+                    root=root,
+                    repo=ROOT,
+                    processes=slot_processes,
+                )
+                self.assertEqual(slot.status, "pending")
+                self.assertEqual(slot.last_reason, "pre_admission_process_terminated")
+                self.assertIsNotNone(process.poll())
+                for _ in range(100):
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(process.poll())
+            finally:
+                if process.poll() is None:
+                    try:
+                        os.kill(process.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
                 process.wait(timeout=5)
 
     def test_formal_wave_stops_after_bounded_provider_burst(self) -> None:
@@ -696,6 +826,38 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             assert repeated is not None
             self.assertEqual(repeated[2], RUNNER.INFRA_ERROR_LIMIT)
 
+    def test_provider_offsets_are_namespaced_by_full_run_path(self) -> None:
+        """Two arms may independently use the same local run-directory name."""
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            slots = [
+                RUNNER.Slot(dataset="clever", repeat=1, policy="uniform_refill"),
+                RUNNER.Slot(dataset="usaco", repeat=1, policy="uniform_refill"),
+            ]
+            overload = {
+                "event": "agent_finished",
+                "returncode": 1,
+                "settled": True,
+                "assistant_success": False,
+                "timed_out": False,
+                "cancelled": False,
+                "error_tail": "Codex error: Our servers are currently overloaded",
+            }
+            for slot in slots:
+                run = root / slot.dataset / "repeat-01" / slot.policy / "run-1"
+                run.mkdir(parents=True)
+                (run / "events.jsonl").write_text(
+                    "".join(json.dumps(overload) + "\n" for _ in range(10)),
+                    encoding="utf-8",
+                )
+            offsets: dict[str, int] = {}
+            recent: deque[tuple[float, str, str]] = deque()
+            burst = RUNNER._provider_infra_burst(root, slots, offsets, recent, now=100.0)
+            self.assertIsNotNone(burst)
+            assert burst is not None
+            self.assertEqual(burst[2], RUNNER.INFRA_ERROR_LIMIT)
+
     def test_cancelled_overload_is_still_candidate_independent_evidence(self) -> None:
         row = {
             "event": "agent_finished",
@@ -738,6 +900,7 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
         }
         self.assertFalse(RUNNER._health_ready(base | {"ready_workers": 0, "active_workers": 9}))
         self.assertTrue(RUNNER._health_ready(base | {"ready_workers": 2, "active_workers": 9}))
+        self.assertFalse(RUNNER._health_ready(base | {"ready_workers": 2, "workspace_ready": False}))
 
     def test_collector_ignores_newer_preflight_only_summary(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
