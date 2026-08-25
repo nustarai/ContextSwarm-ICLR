@@ -444,6 +444,14 @@ def run(
                     pass
         while not stopping:
             now = _now()
+            # Bind any run that crossed the fixed horizon before inspecting
+            # provider diagnostics.  A child can append a burst of terminal
+            # rows in the same polling interval in which it writes
+            # ``horizon_started_at``; checking the breaker first would then
+            # mistake an admitted arm for a pre-admission child and kill the
+            # very CPS state a replacement supervisor is meant to adopt.
+            for slot in slots:
+                _refresh(slot, root)
             burst = _provider_infra_burst(
                 root,
                 slots,
@@ -482,7 +490,6 @@ def run(
                 )
                 return 4
             for slot in slots:
-                _refresh(slot, root)
                 if slot.pid is not None:
                     process = processes.get(slot.pid)
                     if process is not None:

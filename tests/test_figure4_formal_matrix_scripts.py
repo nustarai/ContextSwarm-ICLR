@@ -69,6 +69,17 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
                 )
                 run.mkdir(parents=True)
                 if index == 0:
+                    # This child crosses the fixed horizon before the burst
+                    # is observed.  The supervisor must preserve it for
+                    # adoption while stopping only pre-admission children.
+                    (run / "run_meta.json").write_text(
+                        json.dumps({
+                            "run_id": f"horizon-{index:02d}",
+                            "dataset": slot.dataset,
+                            "horizon_started_at": "2026-08-25T00:00:00+00:00",
+                        }),
+                        encoding="utf-8",
+                    )
                     row = {
                         "event": "agent_finished",
                         "returncode": 0,
@@ -130,13 +141,17 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
                 )
 
             # 6 datasets × 4 policies are admitted once, then the provider
-            # breaker stops the wave.  No slot gets a second launch.
+            # breaker stops the wave.  The first child has a persisted horizon
+            # and remains alive for supervisor adoption; no slot gets a second
+            # launch.
             self.assertEqual(returncode, 4)
             self.assertEqual(len(launches), 24)
-            self.assertEqual(len(stopped), 24)
+            self.assertEqual(len(stopped), 23)
             self.assertEqual(len({process.pid for _slot, process in launches}), 24)
+            self.assertNotIn(launches[0][1], stopped)
             payload = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(payload["event"], "stopped_for_provider_diagnosis")
+            self.assertTrue(payload["slots"][0]["horizon_run_id"])
             self.assertTrue(
                 all(
                     row["last_reason"] == "provider_infrastructure_burst"
