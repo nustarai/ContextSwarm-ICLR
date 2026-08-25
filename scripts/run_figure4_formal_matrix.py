@@ -310,6 +310,7 @@ def _resume_slot(
     pre-admission child is left pending so only that slot is relaunched.
     """
 
+    old_pid = (row or {}).get("pid") if isinstance(row, dict) else None
     slot.pid = None
     slot.status = "pending"
     slot.horizon_run_id = ""
@@ -326,6 +327,12 @@ def _resume_slot(
 
     completed = _completed_run(root, slot)
     if completed is not None:
+        # A duplicate supervisor may have left a newer child alive after an
+        # earlier attempt already produced a valid artifact.  The artifact is
+        # authoritative; stop only an identity-checked child bound to this
+        # exact slot so it cannot keep consuming provider capacity.
+        if _trusted_child_pid(old_pid, slot, repo):
+            _terminate_process(_AdoptedProcess(int(old_pid)))
         directory, meta = completed
         run_id = str(meta.get("run_id") or directory.name)
         slot.horizon_run_id = run_id
@@ -355,8 +362,6 @@ def _resume_slot(
     slot.latest_run_id = run_id
     horizon = str(meta.get("horizon_started_at") or "").strip()
     old_horizon = persisted_horizon
-    old_pid = (row or {}).get("pid")
-
     # Adopt only the exact run recorded by the previous supervisor.  This
     # prevents a stale PID from being attached to a newer retry directory.
     if horizon and old_horizon == run_id:
