@@ -23,10 +23,17 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 from typing import Any
 from urllib.error import URLError
 from urllib.request import urlopen
+
+# ``python scripts/run_figure4_formal_matrix.py`` sets ``sys.path[0]`` to
+# ``scripts`` rather than the checkout root.  Keep the direct operator entry
+# point usable without requiring an operator-specific ``PYTHONPATH``.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from contextswarm_mini.formal_matrix_artifacts import artifact_eligibility
 
