@@ -3,9 +3,13 @@ from __future__ import annotations
 import importlib.util
 import json
 from collections import deque
+import os
 from pathlib import Path
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -34,6 +38,62 @@ COLLECTOR = _load_script("collect_figure4_formal_matrix")
 
 
 class Figure4FormalMatrixScriptTests(unittest.TestCase):
+    def test_adoption_identity_accepts_real_launcher_shape_without_repo_argv(self) -> None:
+        """The persisted Popen PID is checked like an actual run_docker child.
+
+        ``Popen(..., cwd=repo)`` does not put the checkout path in argv.  The
+        launcher eventually execs ``docker run`` and retains only the manifest
+        and output arguments.  Exercise that exact procfs shape with a real
+        child process so adoption cannot regress to an argv-only repository
+        check that rejects every live arm.
+        """
+
+        slot = RUNNER.Slot(dataset="clever", repeat=1, policy="uniform_refill")
+        with tempfile.TemporaryDirectory() as raw:
+            helper = Path(raw) / "long_lived_child.py"
+            helper.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(helper),
+                    "docker",
+                    "run",
+                    "scripts/run_docker.sh",
+                    "--config",
+                    slot.manifest,
+                    "--output",
+                    slot.output_root,
+                ],
+                cwd=ROOT,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                trusted = False
+                for _ in range(100):
+                    trusted = RUNNER._trusted_child_pid(process.pid, slot, ROOT)
+                    if trusted:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(trusted)
+                adopted = RUNNER._adopt_process(process.pid, slot, ROOT)
+                self.assertIsNotNone(adopted)
+                assert adopted is not None
+                self.assertIsNone(adopted.poll())
+                self.assertFalse(
+                    RUNNER._trusted_child_pid(
+                        process.pid,
+                        slot,
+                        ROOT.parent / "a-different-checkout",
+                    )
+                )
+            finally:
+                try:
+                    os.kill(process.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                process.wait(timeout=5)
+
     def test_formal_wave_stops_after_bounded_provider_burst(self) -> None:
         """A formal-sized wave must stop, not endlessly refill, on overload."""
 
@@ -77,6 +137,7 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
                             "run_id": f"horizon-{index:02d}",
                             "dataset": slot.dataset,
                             "horizon_started_at": "2026-08-25T00:00:00+00:00",
+                            "allocation": {"policy": slot.policy},
                         }),
                         encoding="utf-8",
                     )
@@ -314,6 +375,255 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             payload = json.loads(state.read_text(encoding="utf-8"))
             self.assertEqual(payload["event"], "all_repeats_finished")
             self.assertTrue(all(row["status"] == "finished" for row in payload["slots"]))
+
+    def test_formal_wave_continues_unfinished_arms_after_supervisor_restart(self) -> None:
+        """A replacement supervisor adopts 23 live arms and refills one slot.
+
+        This is the experiment-level failure mode seen in the interrupted
+        Figure 4 wave: the provider emits a candidate-independent burst while
+        one child is still pre-admission, the supervisor exits, and the other
+        children have already persisted their fixed horizon.  A second
+        invocation must not launch duplicate arms or discard their state.  It
+        adopts the 23 identity-checked children and launches exactly one
+        replacement for the affected slot.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "runs"
+            state = Path(raw) / "state.json"
+            logs = Path(raw) / "logs"
+            phase = {"value": 1}
+            launches: list[dict[str, object]] = []
+            stopped: list[object] = []
+            adopted: list[object] = []
+            processes: dict[int, object] = {}
+            original_slots_for_wave = RUNNER._slots_for_wave
+
+            def write_artifact(run: Path, slot, run_id: str, *, terminal: bool) -> None:  # type: ignore[no-untyped-def]
+                run.mkdir(parents=True, exist_ok=True)
+                (run / "run_meta.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "dataset": slot.dataset,
+                            "horizon_started_at": "2026-08-25T00:00:00+00:00",
+                            "runtime_provenance": {
+                                "image_id": "image",
+                                "manifest_sha256": "manifest",
+                                "source_commit": "commit",
+                            },
+                            "allocation": {"policy": slot.policy},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                lifecycle = sorted(REQUIRED_LIFECYCLE_EVENTS)
+                rows = [{"event": event} for event in lifecycle]
+                rows.append(
+                    {
+                        "event": "agent_finished",
+                        "returncode": 0,
+                        "settled": True,
+                        "assistant_success": True,
+                        "timed_out": False,
+                        "cancelled": False,
+                        "transport_diagnostic": True,
+                        "transport_recovered": True,
+                        "error_tail": "Codex error: Our servers are currently overloaded",
+                    }
+                )
+                (run / "events.jsonl").write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+                )
+                if not terminal:
+                    return
+                (run / "final.json").write_text(
+                    json.dumps({"status": "COMPLETED", "health": {"ok": True, "issues": []}}),
+                    encoding="utf-8",
+                )
+                (run / "figure4_run_summary.json").write_text(
+                    json.dumps({"policy": slot.policy}), encoding="utf-8"
+                )
+                (run / "judge_broker_closeout.json").write_text(
+                    json.dumps(
+                        {
+                            "drained": True,
+                            "active_handlers": 0,
+                            "fifo_depth": 0,
+                            "remote_unsettled_jobs": 0,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (run / "transport_preflight.json").write_text(
+                    json.dumps({"status": "ok", "aisw": {"nurouter_version": "test"}}),
+                    encoding="utf-8",
+                )
+
+            class FakeProcess:
+                def __init__(self, pid: int, run: Path, slot) -> None:  # type: ignore[no-untyped-def]
+                    self.pid = pid
+                    self.run = run
+                    self.slot = slot
+                    self.returncode: int | None = None
+                    self.adopted = False
+                    self.finished = False
+
+                def poll(self) -> int | None:
+                    if self.returncode is not None:
+                        return self.returncode
+                    if phase["value"] >= 2 and self.adopted and not self.finished:
+                        write_artifact(self.run, self.slot, f"complete-{self.pid}", terminal=True)
+                        self.finished = True
+                        self.returncode = 0
+                    return self.returncode
+
+                def wait(self, timeout: float | None = None) -> int:
+                    del timeout
+                    if self.returncode is None:
+                        self.returncode = -15
+                    return self.returncode
+
+            failed_key: tuple[str, int, str] | None = None
+
+            def fake_launch(slot, *, repo, root, urls, caches, log_root):  # type: ignore[no-untyped-def]
+                del repo, urls, caches, log_root
+                index = len(launches)
+                key = (slot.dataset, int(slot.repeat), slot.policy)
+                run = (
+                    root
+                    / slot.dataset
+                    / f"repeat-{slot.repeat:02d}"
+                    / slot.policy
+                    / f"attempt-{index:02d}"
+                )
+                if phase["value"] == 1 and index == 0:
+                    # No horizon means this is the one pre-admission child
+                    # that the burst breaker may stop and later refill.
+                    run.mkdir(parents=True)
+                    overload = {
+                        "event": "agent_finished",
+                        "returncode": 1,
+                        "settled": True,
+                        "assistant_success": False,
+                        "error_tail": (
+                            "Codex error: Our servers are currently overloaded. "
+                            "Please try again later."
+                        ),
+                    }
+                    (run / "events.jsonl").write_text(
+                        "".join(json.dumps(overload) + "\n" for _ in range(RUNNER.INFRA_ERROR_LIMIT)),
+                        encoding="utf-8",
+                    )
+                    nonlocal_failed[0] = key
+                else:
+                    write_artifact(
+                        run,
+                        slot,
+                        f"live-{index:02d}",
+                        terminal=phase["value"] >= 2,
+                    )
+                process = FakeProcess(50_000 + index, run, slot)
+                if phase["value"] >= 2:
+                    # The replacement arm has already produced a complete
+                    # terminal artifact; let the supervisor observe its
+                    # normal child exit on the next poll.
+                    process.finished = True
+                    process.returncode = 0
+                process_by_pid[process.pid] = process
+                slot.pid = process.pid
+                slot.status = "starting"
+                launches.append(
+                    {
+                        "phase": phase["value"],
+                        "key": key,
+                        "pid": process.pid,
+                    }
+                )
+                return process
+
+            # Keep the mutable key in a list so the nested launcher remains
+            # compatible with Python's assignment rules.
+            nonlocal_failed: list[tuple[str, int, str] | None] = [None]
+            process_by_pid = processes
+
+            def fake_adopt(pid, slot, repo):  # type: ignore[no-untyped-def]
+                del repo
+                process = process_by_pid.get(pid)
+                if process is None or getattr(process, "returncode", None) is not None:
+                    return None
+                process.adopted = True
+                adopted.append(process)
+                return process
+
+            def fake_stop(process) -> None:  # type: ignore[no-untyped-def]
+                stopped.append(process)
+                process.returncode = -15
+
+            def slots_for_wave(repeat: int):  # type: ignore[no-untyped-def]
+                return original_slots_for_wave(repeat) if repeat == 1 else []
+
+            common = {
+                "state_path": state,
+                "log_root": logs,
+                "root": root,
+                "max_attempts": 3,
+                "retry_seconds": 0.0,
+                "max_infrastructure_failures": 3,
+                "resume": True,
+            }
+            with (
+                patch.object(
+                    RUNNER,
+                    "_discover_capabilities",
+                    return_value=({"formal": "formal", "coding": "coding"}, {}),
+                ),
+                patch.object(RUNNER, "_health_ok", return_value=True),
+                patch.object(RUNNER, "_slots_for_wave", side_effect=slots_for_wave),
+                patch.object(RUNNER, "_launch", side_effect=fake_launch),
+                patch.object(RUNNER, "_adopt_process", side_effect=fake_adopt),
+                patch.object(RUNNER, "_terminate_process", side_effect=fake_stop),
+                patch.object(RUNNER.time, "sleep", side_effect=lambda _seconds: None),
+            ):
+                first_code = RUNNER.run(Path(raw), **common)
+
+            self.assertEqual(first_code, 4)
+            failed_key = nonlocal_failed[0]
+            self.assertIsNotNone(failed_key)
+            self.assertEqual(len(launches), 24)
+            self.assertEqual(len(stopped), 1)
+            self.assertEqual(len(adopted), 0)
+            first_state = json.loads(state.read_text(encoding="utf-8"))
+            first_rows = first_state["slots"]
+            self.assertEqual(sum(bool(row["horizon_run_id"]) for row in first_rows), 23)
+            self.assertEqual(sum(row["pid"] is None for row in first_rows), 1)
+
+            phase["value"] = 2
+            with (
+                patch.object(
+                    RUNNER,
+                    "_discover_capabilities",
+                    return_value=({"formal": "formal", "coding": "coding"}, {}),
+                ),
+                patch.object(RUNNER, "_health_ok", return_value=True),
+                patch.object(RUNNER, "_slots_for_wave", side_effect=slots_for_wave),
+                patch.object(RUNNER, "_launch", side_effect=fake_launch),
+                patch.object(RUNNER, "_adopt_process", side_effect=fake_adopt),
+                patch.object(RUNNER, "_terminate_process", side_effect=fake_stop),
+                patch.object(RUNNER.time, "sleep", side_effect=lambda _seconds: None),
+            ):
+                second_code = RUNNER.run(Path(raw), **common)
+
+            self.assertEqual(second_code, 0)
+            self.assertEqual(len(adopted), 23)
+            self.assertEqual(len(launches), 25)
+            self.assertEqual(
+                [row["key"] for row in launches if row["phase"] == 2],
+                [failed_key],
+            )
+            final_state = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(final_state["event"], "all_repeats_finished")
+            self.assertTrue(all(row["status"] == "finished" for row in final_state["slots"]))
 
     def test_provider_overload_classifier_is_contextual(self) -> None:
         self.assertEqual(

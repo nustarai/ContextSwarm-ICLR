@@ -83,6 +83,40 @@ class Slot:
         return f"configs/figure4_formal_6datasets/{self.dataset}/repeat{self.repeat}/{self.policy}.toml"
 
 
+class _AdoptedProcess:
+    """Small ``Popen``-compatible view over a child owned by an old supervisor.
+
+    A replacement supervisor cannot manufacture a ``subprocess.Popen`` object
+    for a process it did not spawn.  It only needs the bounded ``poll``/``wait``
+    surface used by this module, so keep that surface deliberately tiny.  The
+    process identity is checked before this wrapper is created; a dead or
+    mismatched PID is never adopted.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = int(pid)
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is not None:
+            return self.returncode
+        if _pid_alive(self.pid):
+            return None
+        # We cannot recover the original wait status after a supervisor loss.
+        # The artifact lifecycle is authoritative; a missing/incomplete
+        # artifact is handled as a bounded slot retry by the caller.
+        self.returncode = 0
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("adopted process", timeout)
+            time.sleep(0.05)
+        return int(self.returncode or 0)
+
+
 def _now() -> float:
     return time.monotonic()
 
@@ -97,6 +131,256 @@ def _json(path: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _pid_alive(pid: Any) -> bool:
+    """Return whether *pid* currently names a process."""
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    # ``kill(pid, 0)`` also succeeds for a zombie.  A replacement supervisor
+    # cannot wait on a child it did not create, so treat a zombie as already
+    # settled and let artifact reconciliation decide whether the slot needs a
+    # bounded retry.
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        tail = stat_text[stat_text.rfind(")") + 2 :].split()
+        if tail and tail[0] == "Z":
+            return False
+    except (OSError, UnicodeError):
+        pass
+    return True
+
+
+def _proc_cmdline(pid: Any) -> str:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return ""
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(
+            "utf-8", "replace"
+        )
+    except OSError:
+        return ""
+
+
+def _proc_cwd(pid: Any) -> Path | None:
+    """Return a process' working directory when procfs exposes it."""
+
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    try:
+        return Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _trusted_child_pid(pid: Any, slot: Slot, repo: Path) -> bool:
+    """Validate a persisted child identity before supervisor adoption.
+
+    A PID alone is never enough: after a process exits the kernel may reuse it
+    for an unrelated command.  The launcher command must still identify this
+    exact manifest and output root, while procfs must bind it to this
+    checkout.  The check is intentionally conservative; a false negative
+    causes a bounded relaunch, while a false positive could duplicate a
+    formal arm.
+    """
+
+    if not _pid_alive(pid):
+        return False
+    command = _proc_cmdline(pid)
+    if not command:
+        return False
+    if "run_docker.sh" not in command and "docker run" not in command:
+        return False
+    # ``subprocess.Popen`` starts the launcher with a relative command from
+    # ``cwd=repo``.  That path is not present in argv after ``run_docker.sh``
+    # execs ``docker run``; inspect procfs cwd instead of requiring a path in
+    # the command line (which would reject every real child).
+    process_cwd = _proc_cwd(pid)
+    try:
+        expected_cwd = repo.resolve()
+    except OSError:
+        return False
+    if process_cwd != expected_cwd:
+        return False
+    if slot.manifest not in command and Path(slot.manifest).name not in command:
+        return False
+    return slot.output_root in command
+
+
+def _adopt_process(pid: Any, slot: Slot, repo: Path) -> _AdoptedProcess | None:
+    """Return an identity-checked process view, or ``None`` if unsafe."""
+
+    if not _trusted_child_pid(pid, slot, repo):
+        return None
+    return _AdoptedProcess(int(pid))
+
+
+def _run_records(root: Path, slot: Slot) -> list[tuple[Path, dict[str, Any]]]:
+    base = root / slot.dataset / f"repeat-{slot.repeat:02d}" / slot.policy
+    if not base.is_dir():
+        return []
+    records: list[tuple[Path, dict[str, Any]]] = []
+    for meta_path in base.glob("*/run_meta.json"):
+        meta = _json(meta_path)
+        if not isinstance(meta, dict):
+            continue
+        # A run directory is forensic input, not an authority by itself.
+        # Require the runner's explicit dataset/policy binding before it can
+        # influence adoption or suppress a replacement launch.  In
+        # particular, do not let a malformed/legacy metadata file with a
+        # missing field masquerade as this slot merely because it lives below
+        # the expected output directory.
+        if meta.get("dataset") != slot.dataset:
+            continue
+        allocation = meta.get("allocation")
+        if not isinstance(allocation, dict) or allocation.get("policy") != slot.policy:
+            continue
+        records.append((meta_path.parent, meta))
+    records.sort(key=lambda item: item[0].stat().st_mtime)
+    return records
+
+
+def _completed_run(root: Path, slot: Slot) -> tuple[Path, dict[str, Any]] | None:
+    """Find the newest eligible result, even if a later attempt is partial."""
+
+    for directory, meta in reversed(_run_records(root, slot)):
+        eligible, _reasons = artifact_eligibility(directory, policy=slot.policy)
+        if eligible:
+            return directory, meta
+    return None
+
+
+def _state_rows(path: Path, root: Path) -> dict[tuple[str, int, str], dict[str, Any]]:
+    """Load only state rows bound to this result root and matrix contract."""
+
+    payload = _json(path)
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema_version") != "contextswarm_figure4_matrix_supervisor_v1":
+        return {}
+    recorded_root = payload.get("root")
+    if not isinstance(recorded_root, str) or not recorded_root.strip():
+        return {}
+    try:
+        if Path(recorded_root).resolve() != root.resolve():
+            return {}
+    except OSError:
+        return {}
+    if payload.get("wave_capacity") != 24 or payload.get("repeat_count") != 3:
+        return {}
+    if tuple(payload.get("datasets") or ()) != DATASETS:
+        return {}
+    if tuple(payload.get("policies") or ()) != POLICIES:
+        return {}
+    rows = payload.get("slots")
+    if not isinstance(rows, list):
+        return {}
+    result: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        dataset = str(row.get("dataset") or "")
+        policy = str(row.get("policy") or "")
+        repeat = row.get("repeat")
+        if dataset not in DATASETS or policy not in POLICIES:
+            continue
+        if isinstance(repeat, bool) or not isinstance(repeat, int) or repeat not in (1, 2, 3):
+            continue
+        result[(dataset, repeat, policy)] = row
+    return result
+
+
+def _resume_slot(
+    slot: Slot,
+    row: dict[str, Any] | None,
+    *,
+    root: Path,
+    repo: Path,
+    processes: dict[int, Any],
+) -> None:
+    """Restore one slot without duplicating an admitted arm.
+
+    Completed artifacts win over stale state.  A live, identity-checked child
+    with a persisted horizon is adopted.  A dead/incomplete horizon or a
+    pre-admission child is left pending so only that slot is relaunched.
+    """
+
+    slot.pid = None
+    slot.status = "pending"
+    slot.horizon_run_id = ""
+    slot.latest_run_id = ""
+    slot.last_artifact_reasons = None
+    slot.next_launch_at = 0.0
+    if isinstance(row, dict):
+        attempts = row.get("attempts")
+        if isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0:
+            slot.attempts = attempts
+        reason = row.get("last_reason")
+        if isinstance(reason, str):
+            slot.last_reason = reason[:240]
+
+    completed = _completed_run(root, slot)
+    if completed is not None:
+        directory, meta = completed
+        run_id = str(meta.get("run_id") or directory.name)
+        slot.horizon_run_id = run_id
+        slot.latest_run_id = run_id
+        slot.status = "finished"
+        return
+
+    records = _run_records(root, slot)
+    if isinstance(row, dict):
+        persisted_horizon = str(row.get("horizon_run_id") or "").strip()
+    else:
+        persisted_horizon = ""
+    # Prefer the exact persisted horizon over the newest directory.  A
+    # pre-admission retry can have been created by an operator just before a
+    # supervisor restart; adopting the older live horizon is still safer than
+    # launching a duplicate for it.
+    latest = next(
+        ((directory, meta) for directory, meta in records if str(meta.get("run_id") or directory.name) == persisted_horizon),
+        None,
+    )
+    if latest is None and records:
+        latest = records[-1]
+    if latest is None:
+        return
+    directory, meta = latest
+    run_id = str(meta.get("run_id") or directory.name)
+    slot.latest_run_id = run_id
+    horizon = str(meta.get("horizon_started_at") or "").strip()
+    old_horizon = persisted_horizon
+    old_pid = (row or {}).get("pid")
+
+    # Adopt only the exact run recorded by the previous supervisor.  This
+    # prevents a stale PID from being attached to a newer retry directory.
+    if horizon and old_horizon == run_id:
+        process = _adopt_process(old_pid, slot, repo)
+        if process is not None:
+            slot.horizon_run_id = run_id
+            slot.pid = process.pid
+            slot.status = "running"
+            processes[process.pid] = process
+            return
+
+    # No safe live owner remains.  A previous supervisor may have died while
+    # a pre-admission launcher was still alive; terminate that exact, trusted
+    # process before allowing a replacement, otherwise two launchers can race
+    # the same slot and recreate the provider overload.  Never do this for an
+    # admitted horizon whose state binding is ambiguous: candidate/CPS state
+    # must remain untouched until the operator can reconcile it.
+    if not horizon and _trusted_child_pid(old_pid, slot, repo):
+        orphan = _AdoptedProcess(int(old_pid))
+        _terminate_process(orphan)
+        slot.last_reason = "pre_admission_process_terminated"
+    else:
+        slot.last_reason = "incomplete_horizon" if horizon else "pre_admission_retry"
+    slot.attempts = max(slot.attempts, len(records))
 
 
 def _write_state(path: Path, slots: list[Slot], *, event: str, root: Path, pid: int | None = None) -> None:
@@ -326,6 +610,19 @@ def _provider_infra_burst(
 
 def _refresh(slot: Slot, root: Path) -> None:
     slot.last_artifact_reasons = None
+    # A later forensic retry must not hide an earlier valid result.  This is
+    # especially important after supervisor recovery: the old child may have
+    # written a partial directory just before the replacement supervisor
+    # starts, while the preceding arm already satisfied the formal closeout
+    # contract.
+    completed = _completed_run(root, slot)
+    if completed is not None:
+        directory, meta = completed
+        run_id = str(meta.get("run_id") or directory.name)
+        slot.latest_run_id = run_id
+        slot.horizon_run_id = run_id
+        slot.status = "finished"
+        return
     run_dir, meta = _latest_run(root, slot)
     if run_dir is None or meta is None:
         return
@@ -413,6 +710,7 @@ def run(
     max_attempts: int,
     retry_seconds: float,
     max_infrastructure_failures: int,
+    resume: bool = True,
 ) -> int:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     stopping = False
@@ -424,11 +722,22 @@ def run(
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     all_slots: list[Slot] = []
-    processes: dict[int, subprocess.Popen[bytes]] = {}
+    # Values are either children launched by this invocation or the bounded
+    # ``_AdoptedProcess`` view of a child owned by a prior supervisor.
+    processes: dict[int, Any] = {}
     urls, caches = _discover_capabilities()
+    prior_rows = _state_rows(state_path, root) if resume else {}
 
     for repeat in (1, 2, 3):
         slots = _slots_for_wave(repeat)
+        for slot in slots:
+            _resume_slot(
+                slot,
+                prior_rows.get((slot.dataset, slot.repeat, slot.policy)),
+                root=root,
+                repo=repo,
+                processes=processes,
+            )
         all_slots.extend(slots)
         _write_state(state_path, all_slots, event=f"wave_{repeat}_starting", root=root, pid=os.getpid())
         seen_provider_offsets: dict[str, int] = {}
@@ -568,6 +877,11 @@ def main() -> int:
         default=3,
         help="stop instead of endlessly relaunching after this many invalid terminal artifacts",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="ignore persisted supervisor state and start missing matrix arms afresh",
+    )
     args = parser.parse_args()
     return run(
         args.repo.resolve(),
@@ -577,6 +891,7 @@ def main() -> int:
         max_attempts=max(1, args.max_attempts),
         retry_seconds=max(1.0, args.retry_seconds),
         max_infrastructure_failures=max(1, args.max_infrastructure_failures),
+        resume=not args.no_resume,
     )
 
 

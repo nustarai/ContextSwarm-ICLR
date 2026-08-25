@@ -197,6 +197,13 @@ allocator、三个 paired repeats（共 72 个 commit-bound leaves）。每个 r
 `scripts/collect_figure4_formal_matrix.py` 逐数据集生成 paired artifacts 和
 allocator selection。三重复规则是小样本工程验证，不能冒充八重复的论文统计结论。
 
+矩阵 supervisor 的 state 文件是原子写入的；默认重启会先复用已通过严格 closeout
+检查的 artifact，再对仍在固定 horizon 内且 PID、工作目录、manifest 和 output root
+均匹配的 child 做安全 adoption。provider 的 candidate-independent burst 只会停止
+尚未进入 horizon 的 slot；重启后只补这些 slot 或已经死亡/无法 reconcile 的单个
+slot，不会重启其余已进入 horizon 的 arm。若确实要忽略旧 supervisor state，可显式
+传入 `--no-resume`；这不会把已有合格 artifact 当成新的结果。
+
 每次尝试使用独立 workspace，完成后把较强 candidate 合并到
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
 pieces/messages。Mono 和 Parallel 仍保持通信关闭、固定 baseline 语义。
