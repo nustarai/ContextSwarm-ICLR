@@ -22,6 +22,7 @@ import uuid
 
 from .config import ExperimentConfig
 from .models import AgentResult
+from .provider_diagnostics import is_provider_diagnostic
 
 
 _STDERR_LINE_LIMIT_BYTES = 256 * 1024
@@ -1082,7 +1083,7 @@ def _is_transport_diagnostic(value: str) -> bool:
     """
 
     lowered = str(value or "").lower()
-    return any(
+    return is_provider_diagnostic(value) or any(
         marker in lowered
         for marker in (
             "upstream request failed",

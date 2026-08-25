@@ -45,6 +45,14 @@ _INFRASTRUCTURE_COUNTER_PARTS = (
 )
 _ERROR_MARKERS = (
     "upstream request failed",
+    "our servers are currently overloaded",
+    "servers are currently overloaded",
+    "server is currently overloaded",
+    "servers are overloaded",
+    "server is overloaded",
+    "service unavailable",
+    "temporarily unavailable",
+    "error occurred while processing your request",
     "account is unavailable",
     "oauth",
     "provider transport",

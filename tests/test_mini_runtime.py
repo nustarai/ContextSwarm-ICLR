@@ -42,6 +42,7 @@ from contextswarm_mini.pi_agent import (
     PiAgent,
     _event_text,
     _event_trace_fields,
+    _is_transport_diagnostic,
     _redact_sensitive_text,
     _usage_fields,
 )
@@ -2419,6 +2420,20 @@ class MiniRuntimeTests(unittest.TestCase):
             # Keep the diagnostic for forensics while exposing the structured
             # recovered bit to experiment-level circuit breakers.
             self.assertIn("upstream request failed", result.error_tail)
+
+    def test_pi_rpc_classifies_provider_overload_as_transport_diagnostic(self) -> None:
+        self.assertTrue(
+            _is_transport_diagnostic(
+                "Codex error: Our servers are currently overloaded. Please try again later."
+            )
+        )
+        self.assertTrue(
+            _is_transport_diagnostic("An error occurred while processing your request...")
+        )
+        # A normal terminal candidate result must remain outside this
+        # provider classifier; the experiment-level breaker only consumes
+        # candidate-independent evidence.
+        self.assertFalse(_is_transport_diagnostic("Judge candidate failed: VERIFY_FAIL"))
 
     def test_pi_rpc_fails_closed_without_agent_settled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

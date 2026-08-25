@@ -16,6 +16,7 @@ environments but are never written to the state file or printed.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from dataclasses import dataclass, asdict
 import json
 import math
@@ -35,7 +36,11 @@ from urllib.request import urlopen
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from contextswarm_mini.formal_matrix_artifacts import artifact_eligibility
+from contextswarm_mini.formal_matrix_artifacts import (
+    artifact_eligibility,
+    is_recovered_transport_event,
+)
+from contextswarm_mini.provider_diagnostics import provider_diagnostic_class
 
 
 DATASETS = ("clever", "icpc_wf_2025", "matholympiadbench", "putnambench", "usaco", "verina")
@@ -44,6 +49,13 @@ FORMAL_DATASETS = {"clever", "matholympiadbench", "putnambench", "verina"}
 CODING_DATASETS = {"icpc_wf_2025", "usaco"}
 DEFAULT_FORMAL_URL = "http://host.docker.internal:38100"
 DEFAULT_CODING_URL = "http://host.docker.internal:38081"
+
+# A short, candidate-independent provider burst is handled as a bounded
+# supervisor stop.  Isolated errors remain recoverable agent noise; this
+# threshold prevents a broken account/router from causing endless slot
+# refills while preserving the fixed arm horizon for already-admitted runs.
+INFRA_ERROR_WINDOW_SECONDS = 60.0
+INFRA_ERROR_LIMIT = 20
 
 
 @dataclass
@@ -240,6 +252,78 @@ def _latest_run(root: Path, slot: Slot) -> tuple[Path | None, dict[str, Any] | N
     return candidates[-1] if candidates else (None, None)
 
 
+def _provider_infra_class(error_tail: Any) -> str | None:
+    """Classify explicit provider failures, never ordinary candidate errors."""
+
+    if not isinstance(error_tail, str):
+        return None
+    classified = provider_diagnostic_class(error_tail)
+    if classified is not None:
+        return classified
+    low = error_tail.casefold()
+    if "not found" in low or "404" in low:
+        return "provider_not_found"
+    if "coordinator run request failed" in low or "coordinator response failed" in low:
+        return "coordinator_request"
+    if "account auth refresh" in low:
+        return "provider_auth"
+    return None
+
+
+def _provider_infra_burst(
+    root: Path,
+    slots: list[Slot],
+    seen_offsets: dict[str, int],
+    recent: deque[tuple[float, str, str]],
+    *,
+    now: float | None = None,
+) -> tuple[str, str, int] | None:
+    """Read appended terminal rows and detect a bounded provider-error burst.
+
+    ``seen_offsets`` is caller-owned so a replacement supervisor can start at
+    the current tail and avoid retriggering on old forensic evidence.  A
+    recovered transport row is intentionally ignored; its settlement and
+    assistant-success bits prove that the logical agent continued.
+    """
+
+    sample_time = time.monotonic() if now is None else float(now)
+    for slot in slots:
+        base = root / slot.dataset / f"repeat-{slot.repeat:02d}" / slot.policy
+        if not base.is_dir():
+            continue
+        for events_path in base.glob("*/events.jsonl"):
+            run_id = events_path.parent.name
+            try:
+                size = events_path.stat().st_size
+                offset = min(max(0, int(seen_offsets.get(run_id, 0))), size)
+                with events_path.open("rb") as handle:
+                    handle.seek(offset)
+                    chunk = handle.read()
+                seen_offsets[run_id] = size
+            except OSError:
+                continue
+            for raw in chunk.splitlines():
+                try:
+                    row = json.loads(raw.decode("utf-8", "replace"))
+                except (TypeError, ValueError, UnicodeError):
+                    continue
+                if not isinstance(row, dict) or row.get("event") != "agent_finished":
+                    continue
+                if is_recovered_transport_event(row):
+                    continue
+                kind = _provider_infra_class(row.get("error_tail"))
+                if kind is not None:
+                    recent.append((sample_time, run_id, kind))
+
+    cutoff = sample_time - INFRA_ERROR_WINDOW_SECONDS
+    while recent and recent[0][0] < cutoff:
+        recent.popleft()
+    if len(recent) >= INFRA_ERROR_LIMIT:
+        _at, run_id, kind = recent[-1]
+        return run_id, kind, len(recent)
+    return None
+
+
 def _refresh(slot: Slot, root: Path) -> None:
     slot.last_artifact_reasons = None
     run_dir, meta = _latest_run(root, slot)
@@ -298,6 +382,24 @@ def _launch(slot: Slot, *, repo: Path, root: Path, urls: dict[str, str], caches:
     return process
 
 
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    """Stop one pre-admission child without touching unrelated processes."""
+
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except OSError:
+        return
+    try:
+        process.wait(timeout=15.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def _slots_for_wave(repeat: int) -> list[Slot]:
     return [Slot(dataset=dataset, repeat=repeat, policy=policy) for dataset in DATASETS for policy in POLICIES]
 
@@ -329,8 +431,56 @@ def run(
         slots = _slots_for_wave(repeat)
         all_slots.extend(slots)
         _write_state(state_path, all_slots, event=f"wave_{repeat}_starting", root=root, pid=os.getpid())
+        seen_provider_offsets: dict[str, int] = {}
+        recent_provider_errors: deque[tuple[float, str, str]] = deque()
+        # Do not turn old forensic rows into a fresh breaker trip when a
+        # supervisor is intentionally started against an existing result root.
+        for slot in slots:
+            base = root / slot.dataset / f"repeat-{slot.repeat:02d}" / slot.policy
+            for events_path in base.glob("*/events.jsonl") if base.is_dir() else ():
+                try:
+                    seen_provider_offsets[events_path.parent.name] = events_path.stat().st_size
+                except OSError:
+                    pass
         while not stopping:
             now = _now()
+            burst = _provider_infra_burst(
+                root,
+                slots,
+                seen_provider_offsets,
+                recent_provider_errors,
+            )
+            if burst is not None:
+                run_id, kind, count = burst
+                for slot in slots:
+                    if slot.status != "finished":
+                        slot.last_reason = "provider_infrastructure_burst"
+                _write_state(
+                    state_path,
+                    all_slots,
+                    event="provider_infrastructure_burst",
+                    root=root,
+                    pid=os.getpid(),
+                )
+                # A pre-admission child has no persisted horizon and is safe
+                # to stop.  An admitted arm is left alive with its candidate
+                # and CPS state so a replacement supervisor can adopt it.
+                for slot in slots:
+                    if slot.horizon_run_id or slot.pid is None:
+                        continue
+                    process = processes.get(slot.pid)
+                    if process is not None:
+                        _terminate_process(process)
+                        processes.pop(slot.pid, None)
+                        slot.pid = None
+                _write_state(
+                    state_path,
+                    all_slots,
+                    event="stopped_for_provider_diagnosis",
+                    root=root,
+                    pid=os.getpid(),
+                )
+                return 4
             for slot in slots:
                 _refresh(slot, root)
                 if slot.pid is not None:
