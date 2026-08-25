@@ -707,16 +707,11 @@ def _index_capability(dataset: str, child_env: dict[str, str]) -> None:
 
 
 def _latest_run(root: Path, slot: Slot) -> tuple[Path | None, dict[str, Any] | None]:
-    base = root / slot.dataset / f"repeat-{slot.repeat:02d}" / slot.policy
-    if not base.exists():
-        return None, None
-    candidates: list[tuple[Path, dict[str, Any]]] = []
-    for meta_path in base.glob("*/run_meta.json"):
-        meta = _json(meta_path)
-        if meta is not None:
-            candidates.append((meta_path.parent, meta))
-    candidates.sort(key=lambda item: item[0].stat().st_mtime)
-    return candidates[-1] if candidates else (None, None)
+    # Keep active refresh bound to the same dataset/policy contract used by
+    # resume and closeout.  A malformed or cross-policy forensic directory
+    # must not make a slot look admitted and suppress its replacement.
+    records = _run_records(root, slot)
+    return records[-1] if records else (None, None)
 
 
 def _provider_infra_class(error_tail: Any) -> str | None:

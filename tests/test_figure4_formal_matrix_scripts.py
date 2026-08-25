@@ -972,6 +972,27 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             self.assertEqual(path, completed / "figure4_run_summary.json")
             self.assertEqual(run_id, "valid-run")
 
+    def test_runner_refresh_ignores_cross_bound_run_metadata(self) -> None:
+        """A forensic directory cannot bind a different dataset/policy slot."""
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            slot = RUNNER.Slot(dataset="clever", repeat=1, policy="uniform_refill")
+            directory = root / "clever" / "repeat-01" / "uniform_refill" / "wrong"
+            directory.mkdir(parents=True)
+            (directory / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "wrong-binding",
+                        "dataset": "usaco",
+                        "horizon_started_at": "2026-08-25T00:00:00+00:00",
+                        "allocation": {"policy": "task_state"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(RUNNER._latest_run(root, slot), (None, None))
+
     def test_degraded_terminal_artifact_is_not_eligible(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             run = Path(raw)
