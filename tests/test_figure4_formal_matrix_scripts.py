@@ -1004,6 +1004,99 @@ class Figure4FormalMatrixScriptTests(unittest.TestCase):
             self.assertFalse(eligible)
             self.assertIn("final_status:DEGRADED", reasons)
 
+    def test_scheduler_fallback_and_full_score_cancellation_remain_eligible(self) -> None:
+        """Charged LLM fallback outcomes do not invalidate a complete arm.
+
+        The runner records a scheduler provider failure (including a Pi RPC
+        cancelled by ``solver_completed``) as a deterministic fallback.  It
+        must remain visible in the cost ledger without turning the whole arm
+        into infrastructure failure.
+        """
+
+        with tempfile.TemporaryDirectory() as raw:
+            run = Path(raw)
+            (run / "final.json").write_text(
+                json.dumps(
+                    {
+                        "status": "COMPLETED",
+                        "health": {
+                            "ok": True,
+                            "issues": [],
+                            "allocation_scheduler_nonzero_return_count": 1,
+                            "allocation_scheduler_provider_error_count": 1,
+                            "allocation_scheduler_summary_cost_provider_errors": 1,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "scheduler-fallback",
+                        "dataset": "usaco",
+                        "horizon_started_at": "2026-08-23T00:00:00+00:00",
+                        "runtime_provenance": {
+                            "image_id": "image",
+                            "manifest_sha256": "manifest",
+                            "source_commit": "commit",
+                        },
+                        "allocation": {"policy": "llm_scheduler"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run / "figure4_run_summary.json").write_text(
+                json.dumps({"policy": "llm_scheduler"}), encoding="utf-8"
+            )
+            (run / "judge_broker_closeout.json").write_text(
+                json.dumps(
+                    {
+                        "drained": True,
+                        "active_handlers": 0,
+                        "fifo_depth": 0,
+                        "remote_unsettled_jobs": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run / "transport_preflight.json").write_text(
+                json.dumps({"status": "ok", "aisw": {"nurouter_version": "test"}}),
+                encoding="utf-8",
+            )
+            scheduler_event = {
+                "event": "allocation_scheduler_finished",
+                "task_id": "__allocation__",
+                "returncode": -15,
+                "cancelled": True,
+                "recoverable_invocation_error": True,
+                "scheduler_outcome": "provider_error",
+                "error_tail": "Pi RPC was cancelled before agent_settled",
+            }
+            (run / "events.jsonl").write_text(
+                "".join(
+                    json.dumps({"event": event}) + "\n"
+                    for event in REQUIRED_LIFECYCLE_EVENTS
+                )
+                + json.dumps(scheduler_event)
+                + "\n",
+                encoding="utf-8",
+            )
+            eligible, reasons = artifact_eligibility(run, policy="llm_scheduler")
+            self.assertTrue(eligible, reasons)
+
+            # Structural scheduler joins remain fail-closed even though
+            # ordinary provider/fallback counters are benign outcomes.
+            final = json.loads((run / "final.json").read_text(encoding="utf-8"))
+            final["health"]["allocation_scheduler_call_id_error_count"] = 1
+            (run / "final.json").write_text(json.dumps(final), encoding="utf-8")
+            eligible, reasons = artifact_eligibility(run, policy="llm_scheduler")
+            self.assertFalse(eligible)
+            self.assertIn(
+                "health_counter:allocation_scheduler_call_id_error_count",
+                reasons,
+            )
+
     def test_recovered_transport_diagnostic_is_not_an_experiment_failure(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             run = Path(raw)

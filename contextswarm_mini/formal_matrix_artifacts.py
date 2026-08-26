@@ -43,6 +43,21 @@ _INFRASTRUCTURE_COUNTER_PARTS = (
     "policy_timeout",
     "reservation_leak",
 )
+
+# An LLM scheduler invocation is itself one charged policy decision.  A
+# provider/adapter failure is converted by the allocation core into the
+# deterministic Task-State fallback and is therefore an observed policy
+# outcome, not an experiment-level infrastructure failure.  The same is true
+# of a scheduler RPC cancelled while the arm is closing after full score.  Do
+# not let these counters make an otherwise complete arm ineligible; the
+# allocator-selection cost guardrails still consume the recorded values.
+_BENIGN_SCHEDULER_COUNTERS = frozenset(
+    {
+        "allocation_scheduler_nonzero_return_count",
+        "allocation_scheduler_provider_error_count",
+        "allocation_scheduler_summary_cost_provider_errors",
+    }
+)
 _ERROR_MARKERS = (
     "upstream request failed",
     "our servers are currently overloaded",
@@ -71,7 +86,7 @@ def is_recovered_transport_event(value: Mapping[str, Any]) -> bool:
     fail-closed.
     """
 
-    if value.get("event") != "agent_finished":
+    if value.get("event") not in {"agent_finished", "allocation_scheduler_finished"}:
         return False
     if value.get("returncode") != 0:
         return False
@@ -86,6 +101,26 @@ def is_recovered_transport_event(value: Mapping[str, Any]) -> bool:
     # Permit artifacts produced by the first structured-outcome rollout, which
     # emitted the constituent fields before adding the convenience bit.
     return True
+
+
+def _is_scheduler_policy_outcome(value: Mapping[str, Any]) -> bool:
+    """Whether an event is a charged, recoverable scheduler fallback.
+
+    ``allocation_scheduler_finished`` is emitted after the policy has joined
+    the Pi result to its charged decision.  Its provider error and policy
+    timeout statuses are intentionally ordinary allocator outcomes.  Keeping
+    this predicate narrow prevents an unrelated solver/runner error from
+    being hidden merely because the run also used the LLM scheduler.
+    """
+
+    if value.get("event") != "allocation_scheduler_finished":
+        return False
+    if value.get("task_id") != "__allocation__":
+        return False
+    outcome = str(value.get("scheduler_outcome") or "")
+    if outcome == "provider_error":
+        return value.get("recoverable_invocation_error") is True
+    return outcome in {"invalid_output", "policy_timeout"}
 
 
 def _read_json(path: Path) -> Any:
@@ -118,6 +153,7 @@ def _read_events(path: Path) -> tuple[set[str], list[str]]:
             if isinstance(event, str) and event:
                 events.add(event)
             recovered_transport = is_recovered_transport_event(value)
+            scheduler_policy_outcome = _is_scheduler_policy_outcome(value)
             # Error tails are emitted by the runner as structured strings.  A
             # marker elsewhere in a normal event is not sufficient; only
             # inspect fields that conventionally carry an error/diagnostic.
@@ -125,7 +161,7 @@ def _read_events(path: Path) -> tuple[set[str], list[str]]:
             # transport tail, so do not turn that forensic field into a
             # terminal artifact error.
             for key in ("error", "error_tail", "reason", "message", "exception"):
-                if recovered_transport and key == "error_tail":
+                if (recovered_transport or scheduler_policy_outcome) and key == "error_tail":
                     continue
                 item = value.get(key)
                 if isinstance(item, str):
@@ -173,6 +209,8 @@ def artifact_eligibility(run_dir: str | Path, *, policy: str | None = None) -> t
         if issues not in ([], None):
             reasons.append("health_has_issues")
         for key, value in health.items():
+            if str(key) in _BENIGN_SCHEDULER_COUNTERS:
+                continue
             if any(part in str(key).lower() for part in _INFRASTRUCTURE_COUNTER_PARTS):
                 if _positive_counter(value):
                     reasons.append(f"health_counter:{key}")
