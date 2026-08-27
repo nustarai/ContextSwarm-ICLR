@@ -38,7 +38,15 @@ from .selection_store import CANONICAL_FEEDBACK_KINDS, SelectionStore
 
 
 _MAX_REQUEST_BYTES = 32 * 1024
-_MAX_PROBE_CALLS_PER_SESSION = 32
+# Keep a per-session guard, but leave enough room for a bounded CPS solver to
+# work through a hard task.  The old value (32) was routinely reached by
+# normal formal agents before the one-hour horizon, turning an otherwise
+# valid candidate-attempt stream into a fail-closed infrastructure error.
+# 128 remains finite and, together with the one-second admission interval and
+# the fixed horizon, bounds one session to a small, auditable share of Judge
+# capacity.  This is a broker-wide runtime guard and is identical for every
+# allocation arm; it is not a policy-specific tuning knob.
+_MAX_PROBE_CALLS_PER_SESSION = 128
 _MIN_PROBE_INTERVAL_SECONDS = 1.0
 _PROBE_ADMISSION_TIMEOUT_SECONDS: float | None = None
 # Closeout is outside the solver horizon.  A five-second drain was sufficient
