@@ -673,6 +673,10 @@ def main(argv: list[str] | None = None) -> int:
     report = audit_figure4(paths)
     rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     if args.output:
+        # The closeout operator writes one report below a nested dataset/repeat
+        # directory.  Make the CLI safe for fresh output roots while keeping
+        # the audit itself read-only with respect to the run artifacts.
+        args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(rendered, encoding="utf-8")
     else:
         print(rendered, end="")
