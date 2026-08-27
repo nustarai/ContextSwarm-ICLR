@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: clever, repeat 1, uniform_refill.
+extends = ["../../_clever.toml"]
+
+[experiment]
+name = "figure4-formal-clever-r01-uniform_refill"
+output_root = "runs/figure4_formal_6datasets/clever/repeat-01/uniform_refill"
+paired_repeat_id = 1
+seed = 1729
+
+[allocation]
+policy = "uniform_refill"

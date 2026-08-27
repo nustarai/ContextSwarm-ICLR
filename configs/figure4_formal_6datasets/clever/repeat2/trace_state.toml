@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: clever, repeat 2, trace_state.
+extends = ["../../_clever.toml"]
+
+[experiment]
+name = "figure4-formal-clever-r02-trace_state"
+output_root = "runs/figure4_formal_6datasets/clever/repeat-02/trace_state"
+paired_repeat_id = 2
+seed = 1730
+
+[allocation]
+policy = "trace_state"

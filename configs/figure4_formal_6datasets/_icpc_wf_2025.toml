@@ -1,0 +1,17 @@
+# Dataset overlay for icpc_wf_2025; no arm-specific policy belongs here.
+extends = ["_base.toml"]
+
+[experiment]
+dataset = "icpc_wf_2025"
+dataset_root = "benchmarks/icpc_wf_2025"
+problem_ids = "benchmarks/icpc_wf_2025/problem_ids.json"
+
+[judge]
+kind = "coding"
+env_id = ""
+verification_profile = "coding_icpc_contest"
+judge_mode = "coding"
+
+[formal_tools]
+enabled = false
+require_decl_index = false

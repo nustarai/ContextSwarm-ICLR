@@ -17,6 +17,7 @@ from contextswarm_mini.allocator_selection import (
     _integer,
     canonical_sha256,
     development_rule,
+    formal_rule,
     load_rule,
     select_allocator,
     write_selection_result,
@@ -210,6 +211,27 @@ class AllocatorSelectionTests(unittest.TestCase):
         self.assertEqual(rule["minimum_validation_repeats"], 8)
         self.assertEqual(rule["bootstrap"]["draws"], 10_000)
         self.assertTrue(rule["guardrails"]["require_per_block"])
+
+    def test_checked_in_formal_three_repeat_rule_is_frozen_and_parseable(self) -> None:
+        rule = load_rule(
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "allocator_selection_rule_formal_3repeat.json"
+        )
+        self.assertEqual(rule["phase"], "formal_validation")
+        self.assertEqual(rule["minimum_validation_repeats"], 3)
+        self.assertEqual(rule["validation_split"]["paired_repeat_ids"], [
+            "repeat-01",
+            "repeat-02",
+            "repeat-03",
+        ])
+
+    def test_formal_rule_helper_requires_exactly_three_ids(self) -> None:
+        rule = formal_rule(validation_repeat_ids=("a", "b", "c"))
+        self.assertEqual(rule["phase"], "formal_validation")
+        self.assertEqual(rule["minimum_validation_repeats"], 3)
+        with self.assertRaisesRegex(ValueError, "exactly 3"):
+            formal_rule(validation_repeat_ids=("a", "b"))
 
     def test_rule_rejects_history_bypass_and_contradictory_aliases(self) -> None:
         rule = _validation_rule()

@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: usaco, repeat 2, task_state.
+extends = ["../../_usaco.toml"]
+
+[experiment]
+name = "figure4-formal-usaco-r02-task_state"
+output_root = "runs/figure4_formal_6datasets/usaco/repeat-02/task_state"
+paired_repeat_id = 2
+seed = 1730
+
+[allocation]
+policy = "task_state"

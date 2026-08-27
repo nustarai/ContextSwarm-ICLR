@@ -1,0 +1,17 @@
+# Dataset overlay for usaco; no arm-specific policy belongs here.
+extends = ["_base.toml"]
+
+[experiment]
+dataset = "usaco"
+dataset_root = "benchmarks/usaco"
+problem_ids = "benchmarks/usaco/problem_ids.json"
+
+[judge]
+kind = "coding"
+env_id = ""
+verification_profile = "coding_usaco_contest"
+judge_mode = "coding"
+
+[formal_tools]
+enabled = false
+require_decl_index = false

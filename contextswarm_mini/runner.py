@@ -6940,10 +6940,32 @@ def _write_figure4_summary(
         )
         selector_identity["selection_config_id"] = selector_config_sha256
 
+    # The manifest/run metadata is the registered task boundary.  During
+    # closeout a few workers can still be settling when ``verdicts`` is
+    # snapshotted, while their already-authoritative positive Judge receipts
+    # are present in ``scoreboard_history.jsonl``.  Deriving ``max_score``
+    # from the transient verdict map in that window makes a valid trajectory
+    # appear out of bounds (for example, 12 accepted points with 11 final
+    # verdict rows) and used to abort summary generation altogether.  Prefer
+    # the validated ordered task list whenever it is available; fall back to
+    # the verdict keys only for legacy/diagnostic runs with no usable task
+    # metadata.
     task_order_value = meta.get("ordered_task_ids", meta.get("tasks"))
-    if not isinstance(task_order_value, list) or set(task_order_value) != set(verdicts):
-        task_order_value = list(verdicts)
-    task_order = [str(task_id) for task_id in task_order_value]
+    if (
+        isinstance(task_order_value, list)
+        and task_order_value
+        and all(isinstance(task_id, str) and task_id for task_id in task_order_value)
+        and len(set(task_order_value)) == len(task_order_value)
+    ):
+        task_order = list(task_order_value)
+    else:
+        task_order = [str(task_id) for task_id in verdicts if str(task_id)]
+    registered_tasks = set(task_order)
+    proof_times = {
+        task_id: elapsed
+        for task_id, elapsed in proof_times.items()
+        if task_id in registered_tasks
+    }
     initial_allocation = {
         task_id: config.initial_agents_per_task for task_id in task_order
     }

@@ -188,6 +188,25 @@ Issue #39 的 Figure 4 路径使用四个独立的新 policy 名，旧三臂及�
 Trace-State 额外产生 `allocation_audit.jsonl`，从每个实际 dispatch 的同一个
 immutable snapshot 计算不 dispatch 的 Task-State counterfactual。
 
+正式六数据集矩阵位于 `configs/figure4_formal_6datasets/`：六个数据集、四个
+allocator、三个 paired repeats（共 72 个 commit-bound leaves）。每个 repeat wave
+同时运行 6×4=24 个 CPS arm，每个 arm 的 `max_parallel` 和
+`aisw.max_in_flight` 都是 24；wave 结束后才进入下一 repeat。selector 固定为
+远端 Figure 3 结果中的 `recency/icpc_formal_v1` identity。矩阵由
+`scripts/run_figure4_formal_matrix.py` 调度，完成后用
+`scripts/collect_figure4_formal_matrix.py` 逐数据集生成 paired artifacts 和
+allocator selection。三重复规则是小样本工程验证，不能冒充八重复的论文统计结论。
+
+矩阵 supervisor 的 state 文件是原子写入的；默认重启会先复用已通过严格 closeout
+检查的 artifact，再对仍在固定 horizon 内且 PID、工作目录、manifest 和 output root
+均匹配的 child 做安全 adoption；若 child 已写入 horizon 但 state heartbeat 尚未
+落盘，重启还会用同样的身份约束从 procfs 发现并接管它。没有 horizon 的可信
+pre-admission child 会先被定向 quarantine，避免恢复时产生重复 arm。provider 的
+candidate-independent burst 只会停止
+尚未进入 horizon 的 slot；重启后只补这些 slot 或已经死亡/无法 reconcile 的单个
+slot，不会重启其余已进入 horizon 的 arm。若确实要忽略旧 supervisor state，可显式
+传入 `--no-resume`；这不会把已有合格 artifact 当成新的结果。
+
 每次尝试使用独立 workspace，完成后把较强 candidate 合并到
 `workers/<task>/best/result.lean`；后续 agent 会先读取该文件和该题的 CPS
 pieces/messages。Mono 和 Parallel 仍保持通信关闭、固定 baseline 语义。
@@ -196,6 +215,10 @@ Pi transport 设置由共享 `[pi]` / `[pi.retry]` manifest 明确控制，三�
 不会隐式继承宿主机 `~/.pi`。默认 provider idle timeout 为 600 秒；一次
 `agent_end` 只代表底层调用结束，runner 会继续等待 Pi 自动 retry/compaction，
 直到收到 `agent_settled` 才结束该 agent。外层 experiment horizon 仍是硬截止。
+`agent_finished` 同时记录 `settled`、最终 assistant outcome、
+`transport_diagnostic` 和 `transport_recovered`；因此 WebSocket/SSE 等中间
+诊断会保留供审计，但只有未恢复的终态错误才会触发 experiment-level
+provider circuit breaker 或使 formal artifact 失格。
 
 如果整个 Pi RPC/session 进程在收到 `agent_settled` 前异常退出，`[pi.recovery]`
 提供 runner 级的有界恢复：默认在原 horizon 内重启一次，沿用同一个逻辑
