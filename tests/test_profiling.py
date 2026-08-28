@@ -15,14 +15,14 @@ from urllib.request import Request, urlopen
 from contextswarm_mini.config import load_config
 from contextswarm_mini.evaluator import candidate_sha256, task_contract_sha256
 from contextswarm_mini.judge_broker import JudgeBroker
-from contextswarm_mini.models import Task, Verdict
+from contextswarm_mini.models import AgentResult, Task, Verdict
 from contextswarm_mini.pi_agent import PiAgent
 from contextswarm_mini.profiling import (
     PROFILE_FILENAME,
     PROFILE_SCHEMA_VERSION,
     RunProfiler,
 )
-from contextswarm_mini.runner import RunLogger
+from contextswarm_mini.runner import RunLogger, _run_solver_with_recovery
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -146,6 +146,7 @@ class ProfilingTests(unittest.TestCase):
                 "selection.rank",
                 task_id="task-1",
                 actor_id="agent-1",
+                episode=0,
                 candidate_count=2,
             ):
                 profiler.emit(
@@ -180,6 +181,9 @@ class ProfilingTests(unittest.TestCase):
             self.assertIn("selection.rank.end", events)
             self.assertIn("resource.sample", events)
             span_end = next(row for row in rows if row["event"] == "selection.rank.end")
+            self.assertEqual(span_end["task_id"], "task-1")
+            self.assertEqual(span_end["actor_id"], "agent-1")
+            self.assertEqual(span_end["episode"], 0)
             self.assertIn("wall_seconds", span_end)
             self.assertIn("cpu_user_seconds", span_end)
             self.assertIn("cpu_system_seconds", span_end)
@@ -310,6 +314,47 @@ class ProfilingTests(unittest.TestCase):
                     for row in rows
                 )
             )
+
+    def test_attempt_wrapper_span_keeps_task_and_actor_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix=".contextswarm-profile-", dir=str(ROOT)) as temporary:
+            root = Path(temporary)
+            profiler = RunProfiler(root, enabled=True, heartbeat_interval_seconds=60, run_id="run-4")
+            logger = RunLogger(root, profiler=profiler, run_id="run-4")
+            config = load_config("configs/smoke.toml", ROOT)
+
+            def invoke(_recovery_attempt: int) -> AgentResult:
+                return AgentResult(
+                    agent_id="agent-4",
+                    task_id="task-4",
+                    episode=2,
+                    returncode=0,
+                    started_at="start",
+                    finished_at="finish",
+                    events=3,
+                )
+
+            result = _run_solver_with_recovery(
+                config,
+                logger,
+                invoke,
+                task_id="task-4",
+                actor_id="agent-4",
+                episode=2,
+                deadline=time.monotonic() + 5,
+                cancel_event=threading.Event(),
+            )
+            logger.close()
+
+            self.assertEqual(result.returncode, 0)
+            rows = self._rows(root / PROFILE_FILENAME)
+            start = next(row for row in rows if row["event"] == "attempt.lifecycle.start")
+            end = next(row for row in rows if row["event"] == "attempt.lifecycle.end")
+            outcome = next(row for row in rows if row["event"] == "attempt.result")
+            for row in (start, end, outcome):
+                self.assertEqual(row["task_id"], "task-4")
+                self.assertEqual(row["actor_id"], "agent-4")
+                self.assertEqual(row["episode"], 2)
+            self.assertEqual(outcome["events"], 3)
 
     def test_judge_receipt_profile_covers_success_and_failure(self) -> None:
         for status in ("PROVED", "VERIFY_FAIL"):

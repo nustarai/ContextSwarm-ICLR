@@ -720,17 +720,44 @@ def _run_solver_with_recovery(
     """Apply the common persisted-session recovery contract to a solver."""
 
     max_restarts, delay_seconds = recovery_settings(config)
-    return run_with_recovery(
-        invoke,
+    # This is the per-attempt wrapper boundary: it includes recovery/session
+    # supervision and runner bookkeeping around the Pi call, while the
+    # profiler's registered solver root reports the child process tree itself.
+    # Keeping both rows lets a report distinguish wrapper wall/CPU from solver
+    # residency without subtracting overlapping concurrent wall times.
+    with logger.profile_span(
+        "attempt.lifecycle",
         task_id=task_id,
         actor_id=actor_id,
         episode=episode,
-        deadline_monotonic=deadline,
-        cancel_event=cancel_event,
+        operation="solver_with_recovery",
         max_restarts=max_restarts,
-        base_delay_seconds=delay_seconds,
-        on_event=lambda event, payload: logger.event(event, **payload),
+    ):
+        result = run_with_recovery(
+            invoke,
+            task_id=task_id,
+            actor_id=actor_id,
+            episode=episode,
+            deadline_monotonic=deadline,
+            cancel_event=cancel_event,
+            max_restarts=max_restarts,
+            base_delay_seconds=delay_seconds,
+            on_event=lambda event, payload: logger.event(event, **payload),
+        )
+    logger.profile_event(
+        "attempt.result",
+        task_id=task_id,
+        actor_id=actor_id,
+        episode=episode,
+        returncode=result.returncode,
+        events=result.events,
+        timed_out=result.timed_out,
+        cancelled=result.cancelled,
+        settled=result.returncode == 0,
+        agent_run_horizon_reached=result.run_horizon_reached,
+        recoverable_invocation_error=result.recoverable_invocation_error,
     )
+    return result
 
 
 def _agent_result_can_refill(

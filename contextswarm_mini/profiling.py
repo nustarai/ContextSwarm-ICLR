@@ -125,6 +125,7 @@ _SCALAR_FIELDS = frozenset(
         "elapsed_seconds",
         "episode",
         "error_count",
+        "events",
         "fd_count",
         "gate_wait_seconds",
         "fifo_depth",
@@ -135,6 +136,7 @@ _SCALAR_FIELDS = frozenset(
         "items",
         "lock_wait_seconds",
         "max_concurrent",
+        "max_restarts",
         "max_parallel",
         "max_workers",
         "memory_bytes",
@@ -159,6 +161,7 @@ _SCALAR_FIELDS = frozenset(
         "ranked_count",
         "receipt_count",
         "records",
+        "recoverable_invocation_error",
         "returncode",
         "retryable",
         "rows",
@@ -377,16 +380,33 @@ class _Span:
         self,
         profiler: "RunProfiler",
         name: str,
+        *,
+        task_id: Any = None,
+        actor_id: Any = None,
         fields: Mapping[str, Any],
     ) -> None:
         self.profiler = profiler
         self.name = name
+        self.task_id = task_id
+        self.actor_id = actor_id
         self.fields = dict(fields)
         self.started = time.monotonic()
         self.cpu_user_started, self.cpu_system_started = _cpu_times()
 
+    def _emit(self, event: str, **fields: Any) -> None:
+        # Keep correlation identities on the dedicated ``emit`` parameters so
+        # they pass identifier sanitisation rather than being treated as
+        # arbitrary payload fields.  This is what lets a selection/Judge span
+        # be joined back to one task/agent without admitting prompt content.
+        self.profiler.emit(
+            event,
+            task_id=self.task_id,
+            actor_id=self.actor_id,
+            **fields,
+        )
+
     def __enter__(self) -> "_Span":
-        self.profiler.emit(self.name + ".start", **self.fields)
+        self._emit(self.name + ".start", **self.fields)
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, _tb: Any) -> None:
@@ -403,7 +423,7 @@ class _Span:
         )
         if exc_type is not None:
             payload["error_kind"] = getattr(exc_type, "__name__", "error")
-        self.profiler.emit(self.name + ".end", **payload)
+        self._emit(self.name + ".end", **payload)
 
 
 class RunProfiler:
@@ -1006,8 +1026,14 @@ class RunProfiler:
         if not _EVENT_RE.fullmatch(normalized):
             yield _NullSpan()
             return
-        identity = {"task_id": task_id, "actor_id": actor_id, "episode": episode, **fields}
-        with _Span(self, normalized, identity) as span:
+        span_fields = {"episode": episode, **fields}
+        with _Span(
+            self,
+            normalized,
+            task_id=task_id,
+            actor_id=actor_id,
+            fields=span_fields,
+        ) as span:
             yield span
 
     def close(self) -> None:

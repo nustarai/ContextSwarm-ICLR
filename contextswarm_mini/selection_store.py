@@ -255,23 +255,24 @@ class SelectionStore:
         lock_wait = 0.0
         committed = False
         error_kind: str | None = None
+        commit_seconds = 0.0
         self._profile_event("selection.persist.start", operation=operation)
         with self._db() as db:
             lock_started = time.monotonic()
             try:
-                db.execute("BEGIN IMMEDIATE")
-                lock_wait = max(0.0, time.monotonic() - lock_started)
-            except Exception as exc:
-                error_kind = type(exc).__name__
-                raise
-            try:
+                try:
+                    db.execute("BEGIN IMMEDIATE")
+                    lock_wait = max(0.0, time.monotonic() - lock_started)
+                except Exception as exc:
+                    error_kind = type(exc).__name__
+                    raise
                 yield db
                 commit_started = time.monotonic()
                 db.execute("COMMIT")
                 committed = True
                 commit_seconds = max(0.0, time.monotonic() - commit_started)
-            except Exception:
-                error_kind = error_kind or "transaction_error"
+            except Exception as exc:
+                error_kind = error_kind or type(exc).__name__ or "transaction_error"
                 if db.in_transaction:
                     db.execute("ROLLBACK")
                 raise
@@ -281,7 +282,7 @@ class SelectionStore:
                     operation=operation,
                     lock_wait_seconds=lock_wait,
                     transaction_seconds=max(0.0, time.monotonic() - lock_started),
-                    commit_seconds=locals().get("commit_seconds", 0.0),
+                    commit_seconds=commit_seconds,
                     wall_seconds=max(0.0, time.monotonic() - started),
                     status="ok" if committed else "error",
                     error_kind=error_kind,
