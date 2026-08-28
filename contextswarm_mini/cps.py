@@ -43,11 +43,47 @@ def _json(value: Any) -> str:
 class CPSStore:
     """Thread/process-safe store; each operation uses a short SQLite txn."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, profiler: Any | None = None):
         self.path = Path(path)
+        self.profiler = profiler
+        try:
+            self._profiling_enabled = bool(
+                profiler is not None and getattr(profiler, "enabled", False)
+            )
+        except Exception:
+            self._profiling_enabled = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._init_schema()
+
+    def _profile_event(self, event: str, **fields: Any) -> None:
+        if not self._profiling_enabled:
+            return
+        profiler = self.profiler
+        try:
+            profiler.emit(event, **fields)
+        except Exception:
+            return
+
+    @contextmanager
+    def _profile_span(self, name: str, **fields: Any):
+        if not self._profiling_enabled:
+            yield
+            return
+        profiler = self.profiler
+        span = getattr(profiler, "span", None) if profiler is not None else None
+        if not callable(span):
+            yield
+            return
+        try:
+            context = span(name, **fields)
+        except Exception:
+            context = None
+        if context is None:
+            yield
+            return
+        with context:
+            yield
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -439,7 +475,7 @@ class CPSStore:
         messages = self.inbox(task_id=task_id, recipient=actor_id, limit=limit)
         return {"pieces": pieces, "messages": messages}
 
-    def progress_snapshot(
+    def _progress_snapshot_impl(
         self,
         task_ids: Iterable[str],
         *,
@@ -509,6 +545,35 @@ class CPSStore:
             result[task_id]["duplicate_piece_count"] = sum(
                 max(0, count - 1) for count in counts.values()
             )
+        return result
+
+    def progress_snapshot(
+        self,
+        task_ids: Iterable[str],
+        *,
+        recent_limit: int = 3,
+        body_chars: int = 1_200,
+    ) -> dict[str, dict[str, Any]]:
+        """Profile the bounded CPS progress projection."""
+
+        if not self._profiling_enabled:
+            return self._progress_snapshot_impl(
+                task_ids,
+                recent_limit=recent_limit,
+                body_chars=body_chars,
+            )
+        with self._profile_span("cps.progress", operation="progress_snapshot"):
+            result = self._progress_snapshot_impl(
+                task_ids,
+                recent_limit=recent_limit,
+                body_chars=body_chars,
+            )
+        self._profile_event(
+            "cps.progress.summary",
+            operation="progress_snapshot",
+            task_count=len(result),
+            rows_scanned=sum(int(item.get("piece_count", 0) or 0) for item in result.values()),
+        )
         return result
 
     def summary(self) -> dict[str, Any]:

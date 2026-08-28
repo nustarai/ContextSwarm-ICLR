@@ -12,6 +12,7 @@ snapshot.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -145,6 +146,7 @@ class SelectionRuntime:
         run_id: str = "",
         paired_seed: int = 0,
         comparison_contract_id: str = "",
+        profiler: Any | None = None,
     ) -> None:
         if cps_store is None or selection_store is None:
             raise ValueError("selection runtime requires both CPS and selection stores")
@@ -154,6 +156,14 @@ class SelectionRuntime:
         self.run_id = str(run_id)
         self.paired_seed = int(paired_seed)
         self.comparison_contract_id = str(comparison_contract_id)
+        self.profiler = profiler if profiler is not None else getattr(selection_store, "profiler", None)
+        try:
+            self._profiling_enabled = bool(
+                self.profiler is not None
+                and getattr(self.profiler, "enabled", False)
+            )
+        except Exception:
+            self._profiling_enabled = False
         self.selector_name = str(getattr(selection_config, "selector_name", "") or "")
         if not self.selector_name:
             raise ValueError("selection_config.selector_name is required")
@@ -186,6 +196,35 @@ class SelectionRuntime:
         self.selector_config_id = str(
             self.selector_config_record.get("selector_config_id") or ""
         )
+
+    def _profile_event(self, event: str, **fields: Any) -> None:
+        if not self._profiling_enabled:
+            return
+        profiler = self.profiler
+        try:
+            profiler.emit(event, **fields)
+        except Exception:
+            return
+
+    @contextmanager
+    def _profile_span(self, name: str, **fields: Any):
+        if not self._profiling_enabled:
+            yield
+            return
+        profiler = self.profiler
+        span = getattr(profiler, "span", None) if profiler is not None else None
+        if not callable(span):
+            yield
+            return
+        try:
+            context = span(name, **fields)
+        except Exception:
+            context = None
+        if context is None:
+            yield
+            return
+        with context:
+            yield
 
     def _config_identity(self) -> dict[str, Any]:
         if hasattr(self.config, "public_dict") and callable(self.config.public_dict):
@@ -259,7 +298,7 @@ class SelectionRuntime:
             self._ordinals[key] = value + 1
             return value
 
-    def _trace_stats(
+    def _trace_stats_impl(
         self, trace_ids: Iterable[str]
     ) -> tuple[Mapping[str, FeedbackStats], Mapping[str, Mapping[str, Any]]]:
         """Aggregate feedback, evidence, maintenance, and relations in one read txn."""
@@ -348,7 +387,22 @@ class SelectionRuntime:
             )
         return result, projections
 
-    def _eligible(self, *, query: str = "", task_family: str = "") -> tuple[TraceCandidate, ...]:
+    def _trace_stats(
+        self, trace_ids: Iterable[str]
+    ) -> tuple[Mapping[str, FeedbackStats], Mapping[str, Mapping[str, Any]]]:
+        if not self._profiling_enabled:
+            return self._trace_stats_impl(trace_ids)
+        ordered = tuple(trace_ids)
+        with self._profile_span("trace.project", records=len(ordered)):
+            result = self._trace_stats_impl(ordered)
+        self._profile_event(
+            "trace.project.summary",
+            records=len(ordered),
+            task_count=len({str(item) for item in ordered}),
+        )
+        return result
+
+    def _eligible_impl(self, *, query: str = "", task_family: str = "") -> tuple[TraceCandidate, ...]:
         """Read a project-wide committed-piece snapshot without control rows."""
 
         with self.cps_store._db() as db:  # short, read-only CPS snapshot
@@ -437,6 +491,23 @@ class SelectionRuntime:
                 )
             )
         return tuple(candidates)
+
+    def _eligible(self, *, query: str = "", task_family: str = "") -> tuple[TraceCandidate, ...]:
+        if not self._profiling_enabled:
+            return self._eligible_impl(query=query, task_family=task_family)
+        with self._profile_span(
+            "selection.eligible",
+            operation="read_candidates",
+            task_count=1,
+        ):
+            candidates = self._eligible_impl(query=query, task_family=task_family)
+        self._profile_event(
+            "selection.eligible.summary",
+            operation="read_candidates",
+            candidate_count=len(candidates),
+            selection_candidate_count=len(candidates),
+        )
+        return candidates
 
     def _piece_metadata(self, trace_ids: Iterable[str]) -> Mapping[str, Mapping[str, Any]]:
         """Read bounded rendered fields for a prior committed search chain."""
@@ -581,7 +652,7 @@ class SelectionRuntime:
             "idempotent": True,
         }
 
-    def search(
+    def _search_impl(
         self,
         task_id: str,
         actor_id: str,
@@ -669,12 +740,35 @@ class SelectionRuntime:
         )
         candidates = self._eligible(query=str(query or ""), task_family=str(task_family or ""))
         snapshot = make_snapshot(request, candidates, snapshot_event_seq=max((c.commit_seq for c in candidates), default=0))
-        ranked = self.selector.rank(snapshot)
-        packed = pack_ranked_by_token_budget(
-            ranked,
-            max_items=max_items,
-            context_token_budget=token_budget,
-        )
+        if self._profiling_enabled:
+            with self._profile_span(
+                "selection.rank",
+                task_id=task_id,
+                actor_id=actor_id,
+                episode=episode,
+                selector=self.selector_name,
+                candidate_count=len(candidates),
+            ):
+                ranked = self.selector.rank(snapshot)
+            with self._profile_span(
+                "selection.pack",
+                task_id=task_id,
+                actor_id=actor_id,
+                episode=episode,
+                candidate_count=len(ranked),
+            ):
+                packed = pack_ranked_by_token_budget(
+                    ranked,
+                    max_items=max_items,
+                    context_token_budget=token_budget,
+                )
+        else:
+            ranked = self.selector.rank(snapshot)
+            packed = pack_ranked_by_token_budget(
+                ranked,
+                max_items=max_items,
+                context_token_budget=token_budget,
+            )
         ranking_rows = []
         for row in packed:
             ranking_rows.append({
@@ -821,6 +915,63 @@ class SelectionRuntime:
             "delivered_tokens": sum(int(row["payload"]["token_count"]) for row in selected_rows),
             "latency_seconds": round(time.monotonic() - started, 6),
         }
+
+    def search(
+        self,
+        task_id: str,
+        actor_id: str,
+        query: str = "",
+        *,
+        limit: int | None = None,
+        request_key: str | None = None,
+        episode: int = 0,
+        search_ordinal: int | None = None,
+        paired_seed: int | None = None,
+        task_family: str = "",
+    ) -> dict[str, Any]:
+        """Run one selection search with an observational lifecycle span."""
+
+        if not self._profiling_enabled:
+            return self._search_impl(
+                task_id=task_id,
+                actor_id=actor_id,
+                query=query,
+                limit=limit,
+                request_key=request_key,
+                episode=episode,
+                search_ordinal=search_ordinal,
+                paired_seed=paired_seed,
+                task_family=task_family,
+            )
+        with self._profile_span(
+            "selection.search",
+            task_id=task_id,
+            actor_id=actor_id,
+            episode=episode,
+            operation="search",
+        ):
+            result = self._search_impl(
+                task_id=task_id,
+                actor_id=actor_id,
+                query=query,
+                limit=limit,
+                request_key=request_key,
+                episode=episode,
+                search_ordinal=search_ordinal,
+                paired_seed=paired_seed,
+                task_family=task_family,
+            )
+        self._profile_event(
+            "selection.search.summary",
+            task_id=task_id,
+            actor_id=actor_id,
+            episode=episode,
+            candidate_count=int(result.get("eligible_candidate_count", 0) or 0),
+            selected_count=len(result.get("items", [])),
+            ranked_count=len(result.get("ranked", [])),
+            delivered_tokens=int(result.get("delivered_tokens", 0) or 0),
+        )
+        return result
 
     def digest(
         self,

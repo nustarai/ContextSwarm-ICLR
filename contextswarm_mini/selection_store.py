@@ -22,6 +22,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
+import time
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -171,10 +172,51 @@ class SelectionStore:
     processes while keeping lock-holding transactions short.
     """
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, profiler: Any | None = None):
         self.path = Path(path)
+        self.profiler = profiler
+        try:
+            self._profiling_enabled = bool(
+                profiler is not None and getattr(profiler, "enabled", False)
+            )
+        except Exception:
+            self._profiling_enabled = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+
+    def _profile_event(self, event: str, **fields: Any) -> None:
+        if not self._profiling_enabled:
+            return
+        profiler = self.profiler
+        try:
+            profiler.emit(event, **fields)
+        except Exception:
+            # Profiling must never turn a SQLite diagnostic into a runtime
+            # failure or alter attribution semantics.
+            return
+
+    @contextmanager
+    def _profile_span(self, name: str, **fields: Any):
+        if not self._profiling_enabled:
+            yield
+            return
+        profiler = self.profiler
+        span = getattr(profiler, "span", None) if profiler is not None else None
+        if callable(span):
+            try:
+                context = span(name, **fields)
+            except Exception:
+                context = None
+            if context is not None:
+                try:
+                    with context:
+                        yield
+                    return
+                except Exception:
+                    # Exceptions from the wrapped operation belong to the
+                    # caller and must retain their original semantics.
+                    raise
+        yield
 
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
@@ -194,30 +236,106 @@ class SelectionStore:
             db.close()
 
     @contextmanager
-    def _write(self):
+    def _write(self, operation: str = "write"):
+        if not self._profiling_enabled:
+            # Preserve the original transaction path exactly when profiling is
+            # disabled: no profiling clocks, file stats, or event dictionaries.
+            with self._db() as db:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    yield db
+                    db.execute("COMMIT")
+                except Exception:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
+            return
+        started = time.monotonic()
+        lock_started = started
+        lock_wait = 0.0
+        committed = False
+        error_kind: str | None = None
+        self._profile_event("selection.persist.start", operation=operation)
         with self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
+            lock_started = time.monotonic()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                lock_wait = max(0.0, time.monotonic() - lock_started)
+            except Exception as exc:
+                error_kind = type(exc).__name__
+                raise
             try:
                 yield db
+                commit_started = time.monotonic()
                 db.execute("COMMIT")
+                committed = True
+                commit_seconds = max(0.0, time.monotonic() - commit_started)
             except Exception:
+                error_kind = error_kind or "transaction_error"
                 if db.in_transaction:
                     db.execute("ROLLBACK")
                 raise
+            finally:
+                self._profile_event(
+                    "selection.persist.end",
+                    operation=operation,
+                    lock_wait_seconds=lock_wait,
+                    transaction_seconds=max(0.0, time.monotonic() - lock_started),
+                    commit_seconds=locals().get("commit_seconds", 0.0),
+                    wall_seconds=max(0.0, time.monotonic() - started),
+                    status="ok" if committed else "error",
+                    error_kind=error_kind,
+                    db_bytes=self._file_size(self.path),
+                    wal_bytes=self._file_size(Path(str(self.path) + "-wal")),
+                )
 
     @contextmanager
-    def _read_snapshot(self):
+    def _read_snapshot(self, operation: str = "read"):
         """Yield one consistent read snapshot without blocking WAL writers."""
 
+        if not self._profiling_enabled:
+            with self._db() as db:
+                db.execute("BEGIN")
+                try:
+                    yield db
+                    db.execute("COMMIT")
+                except Exception:
+                    if db.in_transaction:
+                        db.execute("ROLLBACK")
+                    raise
+            return
+        started = time.monotonic()
+        committed = False
+        error_kind: str | None = None
+        self._profile_event("selection.read.start", operation=operation)
         with self._db() as db:
             db.execute("BEGIN")
             try:
                 yield db
                 db.execute("COMMIT")
+                committed = True
             except Exception:
+                error_kind = "transaction_error"
                 if db.in_transaction:
                     db.execute("ROLLBACK")
                 raise
+            finally:
+                self._profile_event(
+                    "selection.read.end",
+                    operation=operation,
+                    wall_seconds=max(0.0, time.monotonic() - started),
+                    status="ok" if committed else "error",
+                    error_kind=error_kind,
+                    db_bytes=self._file_size(self.path),
+                    wal_bytes=self._file_size(Path(str(self.path) + "-wal")),
+                )
+
+    @staticmethod
+    def _file_size(path: Path) -> int:
+        try:
+            return max(0, int(path.stat().st_size))
+        except OSError:
+            return 0
 
     def _init_schema(self) -> None:
         with self._db() as db:
@@ -454,7 +572,7 @@ class SelectionStore:
         config_sha256 = hashlib.sha256(config_json.encode("utf-8")).hexdigest()
         selector_config_id = _hash("selector_config", selector_name, config_sha256)
         created_at = _now()
-        with self._write() as db:
+        with self._write(operation="register_selector_config") as db:
             db.execute(
                 """INSERT OR IGNORE INTO selector_configs(
                        selector_config_id, selector_name, config_sha256, config_json, created_at
@@ -468,7 +586,7 @@ class SelectionStore:
         assert row is not None
         return _decode_row(row) or {}
 
-    def record_search(
+    def _record_search_impl(
         self,
         *,
         request_key: str,
@@ -547,7 +665,7 @@ class SelectionStore:
         watermarks_json = _json(prepared_watermarks)
         created_at = _now()
 
-        with self._write() as db:
+        with self._write(operation="record_search") as db:
             prior = db.execute(
                 "SELECT * FROM search_events WHERE request_key = ?", (request_key,)
             ).fetchone()
@@ -670,6 +788,64 @@ class SelectionStore:
             result = self._search_chain(db, search_event_id)
             result["idempotent"] = False
             return result
+
+    def record_search(
+        self,
+        *,
+        request_key: str,
+        task_id: str,
+        actor_id: str,
+        selector_config_id: str,
+        query: Any,
+        comparison_identity: Any,
+        snapshot_identity: Any,
+        pool_identity: Any | None,
+        rankings: Sequence[Mapping[str, Any]],
+        search_identity: Any | None = None,
+        eligible_candidates: Sequence[Mapping[str, Any]] | None = None,
+        snapshot_watermarks: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Profile a search persistence call without changing its contract."""
+
+        if not self._profiling_enabled:
+            return self._record_search_impl(
+                request_key=request_key,
+                task_id=task_id,
+                actor_id=actor_id,
+                selector_config_id=selector_config_id,
+                query=query,
+                comparison_identity=comparison_identity,
+                snapshot_identity=snapshot_identity,
+                pool_identity=pool_identity,
+                rankings=rankings,
+                search_identity=search_identity,
+                eligible_candidates=eligible_candidates,
+                snapshot_watermarks=snapshot_watermarks,
+            )
+        candidate_count = len(eligible_candidates) if eligible_candidates is not None else 0
+        ranked_count = len(rankings)
+        with self._profile_span(
+            "selection.persist",
+            task_id=task_id,
+            actor_id=actor_id,
+            operation="record_search",
+            candidate_count=candidate_count,
+            ranked_count=ranked_count,
+        ):
+            return self._record_search_impl(
+                request_key=request_key,
+                task_id=task_id,
+                actor_id=actor_id,
+                selector_config_id=selector_config_id,
+                query=query,
+                comparison_identity=comparison_identity,
+                snapshot_identity=snapshot_identity,
+                pool_identity=pool_identity,
+                rankings=rankings,
+                search_identity=search_identity,
+                eligible_candidates=eligible_candidates,
+                snapshot_watermarks=snapshot_watermarks,
+            )
 
     @staticmethod
     def _assert_search_retry_matches(
@@ -906,7 +1082,7 @@ class SelectionStore:
         payload_json = _json(dict(payload or {}))
         feedback_event_id = _hash("feedback_event", request_key)
 
-        with self._write() as db:
+        with self._write(operation="record_feedback") as db:
             prior = db.execute(
                 "SELECT * FROM feedback_events WHERE request_key = ?", (request_key,)
             ).fetchone()
@@ -1105,7 +1281,7 @@ class SelectionStore:
         values: Mapping[str, Any],
     ) -> dict[str, Any]:
         # Table and column are private constants supplied only by methods above.
-        with self._write() as db:
+        with self._write(operation=f"insert_{table}") as db:
             prior = db.execute(
                 f"SELECT * FROM {table} WHERE request_key = ?", (values["request_key"],)
             ).fetchone()
@@ -1381,7 +1557,7 @@ class SelectionStore:
     def summary(self) -> dict[str, Any]:
         """Return counts and selector/comparison identities from one snapshot."""
 
-        with self._read_snapshot() as db:
+        with self._read_snapshot(operation="summary") as db:
             return self._summary_from_db(db, db_name=self.path.name)
 
     def export_jsonl(self, destination: Path | str) -> dict[str, Any]:
@@ -1411,7 +1587,7 @@ class SelectionStore:
         record_type_counts: dict[str, int] = {}
         try:
             with handle:
-                with self._read_snapshot() as db:
+                with self._read_snapshot(operation="export_jsonl") as db:
                     summary = self._summary_from_db(db, db_name=self.path.name)
                     for record_type, table, id_column in self._export_tables_for_db(db):
                         type_count = 0

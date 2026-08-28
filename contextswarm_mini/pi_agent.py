@@ -22,6 +22,7 @@ import uuid
 
 from .config import ExperimentConfig
 from .models import AgentResult
+from .profiling import RunProfiler
 
 
 _STDERR_LINE_LIMIT_BYTES = 256 * 1024
@@ -170,6 +171,7 @@ def now_iso() -> str:
 class PiAgent:
     config: ExperimentConfig
     trace_path: Path | None = None
+    profiler: RunProfiler | None = None
     _trace_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def binary(self) -> str:
@@ -465,6 +467,17 @@ class PiAgent:
         selection_enabled: bool = False,
     ) -> AgentResult:
         started = now_iso()
+        profiler = self.profiler
+        try:
+            profiling_enabled = bool(
+                profiler is not None and getattr(profiler, "enabled", False)
+            )
+        except Exception:
+            profiling_enabled = False
+        # Profiling is opt-in and immutable for one invocation.  Avoid taking
+        # profiling-only clocks or consulting the sink on every poll when it
+        # is disabled (the ordinary RPC deadline clocks remain unchanged).
+        started_monotonic = time.monotonic() if profiling_enabled else 0.0
         command = self.command(
             isolated=isolated,
             communication_enabled=communication_enabled,
@@ -478,6 +491,7 @@ class PiAgent:
         cancelled = False
         returncode = 1
         process: subprocess.Popen[bytes] | None = None
+        profile_process_tracked = False
         trace_handle = None
         selector: selectors.BaseSelector | None = None
         settled_seen = False
@@ -494,6 +508,48 @@ class PiAgent:
         stderr_buffer = bytearray()
         stderr_overflow = False
         index_path: Path | None = None
+        heartbeat_seq = 0
+        last_heartbeat = started_monotonic
+
+        def profile_heartbeat(*, force: bool = False) -> None:
+            """Emit a bounded liveness sample without touching RPC payloads."""
+
+            nonlocal heartbeat_seq, last_heartbeat
+            if not profiling_enabled or profiler is None:
+                return
+            now = time.monotonic()
+            if not force and now - last_heartbeat < profiler.heartbeat_interval_seconds:
+                return
+            last_heartbeat = now
+            heartbeat_seq += 1
+            profiler.heartbeat(
+                task_id=task_id,
+                actor_id=actor_id,
+                episode=episode,
+                heartbeat_seq=heartbeat_seq,
+                elapsed_seconds=now - started_monotonic,
+                process_alive=process is not None and process.poll() is None,
+                pid=process.pid if process is not None else None,
+                events=events,
+                stdout_buffer_bytes=len(stdout_buffer),
+                stderr_buffer_bytes=len(stderr_buffer),
+            )
+
+        if profiling_enabled:
+            profiler.emit(
+                "agent.start",
+                task_id=task_id,
+                actor_id=actor_id,
+                episode=episode,
+                mode=self.config.mode,
+                isolated=isolated,
+                communication_enabled=(
+                    self.config.uses_cps
+                    if communication_enabled is None
+                    else communication_enabled
+                ),
+                selection_enabled=selection_enabled,
+            )
 
         def consume_stdout_line(line: str) -> None:
             nonlocal events
@@ -512,6 +568,20 @@ class PiAgent:
                 return
             events += 1
             event_type = str(payload.get("type") or payload.get("event") or "unknown")
+
+            if profiling_enabled:
+                # Restrict model lifecycle rows to assistant turns.  Tool
+                # event rows carry only the event type and bounded usage
+                # counters; the RPC payload itself is never forwarded.
+                role = _message_role(payload)
+                if event_type not in {"message_start", "message_end"} or role == "assistant":
+                    profiler.observe_pi_event(
+                        event_type,
+                        task_id=task_id,
+                        actor_id=actor_id,
+                        episode=episode,
+                        **_usage_fields(payload),
+                    )
 
             if event_type == "message_start" and _message_role(payload) == "assistant":
                 assistant_streamed = False
@@ -666,6 +736,31 @@ class PiAgent:
                 bufsize=0,
                 start_new_session=True,
             )
+            if profiling_enabled:
+                # Register the concrete Pi process only after spawn so the
+                # sampler can attribute its complete descendant tree to this
+                # task/actor attempt.  Mark the attempt before calling the
+                # sink: even a sink-side failure must still get a best-effort
+                # unregister in the unconditional cleanup path below.
+                register_process = getattr(profiler, "register_process", None)
+                if callable(register_process):
+                    profile_process_tracked = True
+                    try:
+                        register_process(
+                            process.pid,
+                            task_id=task_id,
+                            actor_id=actor_id,
+                            role="solver",
+                        )
+                    except Exception:
+                        pass
+                profiler.emit(
+                    "agent.process_started",
+                    task_id=task_id,
+                    actor_id=actor_id,
+                    episode=episode,
+                    pid=process.pid,
+                )
             assert process.stdin is not None
             process.stdin.write(
                 json.dumps({"id": request_id, "type": "prompt", "message": prompt}, ensure_ascii=False)
@@ -682,6 +777,7 @@ class PiAgent:
                 timeout_seconds = min(timeout_seconds, max(0.1, deadline_monotonic - time.monotonic()))
             deadline = time.monotonic() + timeout_seconds
             while True:
+                profile_heartbeat()
                 if time.monotonic() >= deadline:
                     timed_out = True
                     break
@@ -703,6 +799,7 @@ class PiAgent:
                         consume_stderr_bytes(chunk)
                         continue
                     consume_stdout_bytes(chunk)
+                profile_heartbeat()
                 if settled_seen or prompt_rejected:
                     break
             selector.close()
@@ -760,6 +857,49 @@ class PiAgent:
                             index_handle.write(json.dumps(index_row, ensure_ascii=False, sort_keys=True) + "\n")
                 except OSError as exc:
                     errors.append(f"Unable to write Pi session index: {_redact_sensitive_text(str(exc))}")
+            if profiling_enabled and profiler is not None:
+                # Take the final attempt sample while the process is still
+                # registered, so a short-lived solver that exits before the
+                # next periodic tick still contributes an attributable row.
+                # Every call is best-effort: an injected diagnostic adapter
+                # must not be able to change the AgentResult contract.
+                try:
+                    profile_heartbeat(force=True)
+                except Exception:
+                    pass
+                try:
+                    profiler.emit(
+                        "agent.end",
+                        task_id=task_id,
+                        actor_id=actor_id,
+                        episode=episode,
+                        pid=process.pid if process is not None else None,
+                        returncode=returncode,
+                        timed_out=timed_out,
+                        cancelled=cancelled,
+                        settled=settled_seen,
+                        process_alive=process is not None and process.poll() is None,
+                        events=events,
+                        elapsed_seconds=time.monotonic() - started_monotonic,
+                    )
+                except Exception:
+                    pass
+            if profile_process_tracked and process is not None and profiler is not None:
+                # Unregister even when the RPC path failed before normal drain
+                # completion.  The profiler is observational; any sink error
+                # is swallowed and cannot affect the AgentResult contract.
+                try:
+                    unregister_process = getattr(profiler, "unregister_process", None)
+                    if callable(unregister_process):
+                        status = "exited" if process.poll() is not None else "alive"
+                        try:
+                            unregister_process(process.pid, status=status)
+                        except TypeError:
+                            # Keep compatibility with narrow test/adaptor
+                            # sinks that expose only ``unregister_process(pid)``.
+                            unregister_process(process.pid)
+                except Exception:
+                    pass
 
         if timed_out:
             errors.append("Pi RPC deadline elapsed before agent_settled")

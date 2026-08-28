@@ -275,6 +275,7 @@ class JudgeBroker:
         selection_store: SelectionStore | None = None,
         selection_enabled: bool = False,
         selection_search: Callable[[Any, str, int], Mapping[str, Any]] | None = None,
+        profiler: Any | None = None,
     ):
         self.evaluator = evaluator
         self.evaluator_gate = evaluator_gate
@@ -311,6 +312,16 @@ class JudgeBroker:
         if selection_search is not None and not callable(selection_search):
             raise ValueError("selection_search must be callable or None")
         self.selection_search = selection_search
+        # Optional diagnostic sink.  It is deliberately duck-typed so the
+        # broker remains usable by narrow test/evaluator adapters without
+        # importing or depending on the profiling implementation.
+        self.profiler = profiler
+        try:
+            self._profiling_enabled = bool(
+                profiler is not None and getattr(profiler, "enabled", False)
+            )
+        except Exception:
+            self._profiling_enabled = False
         self.formal_audit_path = Path(
             formal_audit_path
             if formal_audit_path is not None
@@ -331,6 +342,30 @@ class JudgeBroker:
         self._remote_unsettled_jobs = 0
         self._server: _BrokerHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def _profile_event(
+        self,
+        event: str,
+        *,
+        claim: _SessionClaim | None = None,
+        task_id: str | None = None,
+        **fields: Any,
+    ) -> None:
+        if not self._profiling_enabled:
+            return
+        profiler = self.profiler
+        actor_id = claim.actor_id if claim is not None else None
+        try:
+            profiler.emit(
+                event,
+                task_id=task_id,
+                actor_id=actor_id,
+                **fields,
+            )
+        except Exception:
+            # A diagnostic sink must never change broker admission, settlement,
+            # or cancellation behavior.
+            return
 
     def start(self) -> "JudgeBroker":
         if self._server is not None:
@@ -368,6 +403,7 @@ class JudgeBroker:
             daemon=True,
         )
         self._thread.start()
+        self._profile_event("judge.broker.start")
         return self
 
     def close(self, *, timeout_seconds: float | None = None) -> dict[str, Any]:
@@ -380,6 +416,12 @@ class JudgeBroker:
         )
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("broker close timeout must be finite and positive")
+        self._profile_event(
+            "drain.start",
+            timeout_seconds=timeout,
+            active_handlers=self.active_handlers,
+            fifo_depth=self.fifo_depth,
+        )
         deadline = time.monotonic() + timeout
         server = self._server
         thread = self._thread
@@ -400,13 +442,16 @@ class JudgeBroker:
         if thread is not None:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if not state["drained"]:
+            self._profile_event("drain.timeout", **state)
             raise JudgeBrokerDrainError(state)
         # A successful close is stronger than a point-in-time observation:
         # serve_forever is stopped, claims are revoked, and no handler or FIFO
         # waiter remains that could re-populate either count.
         final_state = self.drain_state()
         if any(final_state.values()):
+            self._profile_event("drain.timeout", **final_state)
             raise JudgeBrokerDrainError(final_state)
+        self._profile_event("drain.end", **final_state, drained=True)
         return {"drained": True, **final_state}
 
     def drain_state(self) -> dict[str, int]:
@@ -716,6 +761,13 @@ class JudgeBroker:
         )
         with self._claims_lock:
             self._claims[token] = claim
+        self._profile_event(
+            "judge.session.start",
+            claim=claim,
+            candidate_count=len(bindings),
+            communication=normalized_communication,
+            selection_enabled=effective_selection_enabled,
+        )
         host, port = self._server.server_address[:2]
         try:
             yield {
@@ -723,6 +775,12 @@ class JudgeBroker:
                 "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": str(deadline_epoch_ms),
             }
         finally:
+            self._profile_event(
+                "judge.session.end",
+                claim=claim,
+                candidate_count=len(bindings),
+                probe_calls=claim.probe_calls,
+            )
             claim.revoked_event.set()
             with self._claims_lock:
                 self._claims.pop(token, None)
@@ -924,6 +982,13 @@ class JudgeBroker:
                     gate_wait_started=gate_wait_started,
                 )
 
+            self._profile_event(
+                "judge.submitted",
+                claim=claim,
+                task_id=task_id,
+                candidate_sha256=snapshot.sha256,
+            )
+
             admission_deadline = claim.deadline_monotonic
             capped_admission = False
             if self.probe_admission_timeout_seconds is not None:
@@ -936,6 +1001,7 @@ class JudgeBroker:
                 acquired = self._acquire_evaluator_gate(
                     admission_deadline,
                     claim=claim,
+                    task_id=task_id,
                 )
             except Exception:
                 result = _control_result(
@@ -1046,11 +1112,27 @@ class JudgeBroker:
                 if _accepts_cancel_event(evaluator_call):
                     evaluator_kwargs["cancel_event"] = _ClaimCancelEvent(claim)
                 evaluator_call_started = True
-                verdict: Verdict = evaluator_call(
-                    binding.task,
-                    candidate_argument,
-                    **evaluator_kwargs,
+                evaluator_started_at = time.monotonic()
+                self._profile_event(
+                    "judge.execute.start",
+                    claim=claim,
+                    task_id=task_id,
+                    call_index=call_index,
                 )
+                try:
+                    verdict: Verdict = evaluator_call(
+                        binding.task,
+                        candidate_argument,
+                        **evaluator_kwargs,
+                    )
+                finally:
+                    self._profile_event(
+                        "judge.execute.end",
+                        claim=claim,
+                        task_id=task_id,
+                        call_index=call_index,
+                        elapsed_seconds=time.monotonic() - evaluator_started_at,
+                    )
                 raw_judge_job_id = verdict.judge_job_id
                 verdict_status = _safe_verdict_status(verdict.status)
                 safe_job_id = sanitize_worker_identifier(verdict.judge_job_id)
@@ -1259,20 +1341,43 @@ class JudgeBroker:
                     "retryable": False,
                 }
 
+        audit_gate_wait_seconds = (
+            time.monotonic() - gate_wait_started
+            if not acquired
+            else gate_wait
+        )
+        audit_elapsed_seconds = time.monotonic() - started
         self._audit(
             claim,
             task_id,
             result,
             accepted=accepted,
             call_index=call_index,
-            gate_wait_seconds=time.monotonic() - gate_wait_started
-            if not acquired
-            else gate_wait,
-            elapsed_seconds=time.monotonic() - started,
+            gate_wait_seconds=audit_gate_wait_seconds,
+            elapsed_seconds=audit_elapsed_seconds,
             candidate_sha256=snapshot.sha256 if snapshot is not None else None,
             task_contract_sha256=result.get("task_contract_sha256"),
             judge_job_id=result.get("judge_job_id"),
             cache_reused=result.get("cache_reused") is True,
+        )
+        # The normal evaluator path reaches this point after the durable audit;
+        # expose the same bounded receipt profile as pre-admission failures.
+        # ``result`` is already sanitized above, and no response/error payload
+        # is forwarded to the profiling sink.
+        self._profile_event(
+            "judge.receipt",
+            claim=claim,
+            task_id=task_id,
+            accepted=accepted,
+            status=result.get("status"),
+            proved=result.get("proved") is True,
+            judge_job_id=result.get("judge_job_id"),
+            score=result.get("score"),
+            retryable=result.get("retryable") is True,
+            gate_wait_seconds=audit_gate_wait_seconds,
+            elapsed_seconds=audit_elapsed_seconds,
+            cache_reused=result.get("cache_reused") is True,
+            candidate_sha256=snapshot.sha256 if snapshot is not None else None,
         )
         if _valid_judge_checkpoint(
             result,
@@ -1288,13 +1393,21 @@ class JudgeBroker:
         deadline_monotonic: float,
         *,
         claim: _SessionClaim,
+        task_id: str | None = None,
     ) -> bool:
         """Acquire the shared evaluator gate FIFO among broker callers."""
 
         waiter = object()
         acquired = False
+        queued_at = time.monotonic()
         with self._admission_condition:
             self._admission_queue.append(waiter)
+            self._profile_event(
+                "judge.queued",
+                claim=claim,
+                task_id=task_id,
+                queue_depth=len(self._admission_queue),
+            )
         try:
             while True:
                 if self._remote_settlement_unconfirmed():
@@ -1321,6 +1434,13 @@ class JudgeBroker:
                         self._release_evaluator_gate()
                         acquired = False
                         return False
+                    self._profile_event(
+                        "judge.running",
+                        claim=claim,
+                        task_id=task_id,
+                        queue_depth=len(self._admission_queue),
+                        wait_seconds=time.monotonic() - queued_at,
+                    )
                     return True
         finally:
             with self._admission_condition:
@@ -1360,6 +1480,22 @@ class JudgeBroker:
             task_id,
             normalized,
             accepted=accepted,
+            gate_wait_seconds=(
+                time.monotonic() - gate_wait_started
+                if gate_wait_seconds is None
+                else gate_wait_seconds
+            ),
+            elapsed_seconds=time.monotonic() - started,
+            candidate_sha256=candidate_sha256,
+        )
+        self._profile_event(
+            "judge.receipt",
+            claim=claim,
+            task_id=task_id,
+            accepted=accepted,
+            status=normalized.get("status"),
+            proved=normalized.get("proved") is True,
+            judge_job_id=normalized.get("judge_job_id"),
             gate_wait_seconds=(
                 time.monotonic() - gate_wait_started
                 if gate_wait_seconds is None
@@ -1507,6 +1643,7 @@ class JudgeBroker:
             acquired = self._acquire_evaluator_gate(
                 claim.deadline_monotonic,
                 claim=claim,
+                task_id=task_id,
             )
             if not acquired:
                 self._formal_release(task_id, "evaluate_backend_jobs", backend_number)
@@ -1984,7 +2121,11 @@ class JudgeBroker:
         evaluator_unsettled_before = 0
         verdict: Verdict | None = None
         try:
-            acquired = self._acquire_evaluator_gate(deadline, claim=claim)
+            acquired = self._acquire_evaluator_gate(
+                deadline,
+                claim=claim,
+                task_id=binding.task.slug,
+            )
             if not acquired:
                 self._formal_release(
                     binding.task.slug,

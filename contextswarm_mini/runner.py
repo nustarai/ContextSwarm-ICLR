@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import datetime as dt
 import hashlib
@@ -85,6 +86,7 @@ from .models import AgentResult, Task, Verdict
 from .pi_agent import PiAgent
 from .preflight import PreflightError, run_preflight
 from .prompts import build_mono_prompt, build_task_prompt
+from .profiling import RunProfiler
 from .selection_runtime import SelectionRuntime
 from .selection_store import EXPORT_SCHEMA_VERSION, SelectionStore
 
@@ -227,7 +229,10 @@ def _initialize_selection_runtime(
             "the shared selection runtime requires a CPS store"
         )
     selection = config.selection
-    store = SelectionStore(run_dir / "selection.sqlite3")
+    store = SelectionStore(
+        run_dir / "selection.sqlite3",
+        profiler=getattr(logger, "profiler", None),
+    )
     runtime = SelectionRuntime(
         cps_store,
         store,
@@ -235,6 +240,7 @@ def _initialize_selection_runtime(
         run_id=run_id or run_dir.name,
         paired_seed=config.seed,
         comparison_contract_id=_selection_comparison_contract_id(config),
+        profiler=getattr(logger, "profiler", None),
     )
     metadata = {
         "schema_version": "contextswarm_runner_selection_v1",
@@ -443,11 +449,36 @@ def _exception_artifact_fields(
 class RunLogger:
     output_dir: Path
     lock: threading.Lock
+    run_id: str | None = None
+    profiler: RunProfiler = field(init=False, repr=False)
 
-    def __init__(self, output_dir: Path):
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        profiler: RunProfiler | None = None,
+        run_id: str | None = None,
+    ):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
+        self.run_id = run_id
+        self.profiler = profiler or RunProfiler.from_environment(
+            self.output_dir,
+            run_id=run_id,
+        )
+        try:
+            self._profiling_enabled = bool(getattr(self.profiler, "enabled", False))
+        except Exception:
+            self._profiling_enabled = False
+        # ``RunProfiler`` is intentionally duck-typed at this boundary so
+        # narrow test sinks and downstream adapters remain compatible.
+        try:
+            start = getattr(self.profiler, "start", None)
+            if callable(start):
+                start(run_id=run_id, root_pid=os.getpid())
+        except Exception:
+            pass
         self._horizon_started_monotonic: float | None = None
 
     def start_horizon(self, started_monotonic: float | None = None) -> float:
@@ -462,9 +493,37 @@ class RunLogger:
 
     def event(self, event_type: str, **payload: Any) -> None:
         row = {"at": utc_now(), "event": event_type, **payload}
+        profiling_enabled = self._profiling_enabled
+        # The ordinary event log is part of the runner contract.  When the
+        # optional profiler is off, keep this path to one serialization/write
+        # and avoid profiling-only clock and UTF-8 byte-count work.
+        started = time.monotonic() if profiling_enabled else 0.0
+        encoded_bytes = 0
         with self.lock:
             with (self.output_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                encoded = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                if profiling_enabled:
+                    encoded_bytes = len(encoded.encode("utf-8"))
+                handle.write(encoded)
+        if not profiling_enabled:
+            return
+        try:
+            self.profiler.emit(
+                "artifact.write",
+                event_type="runner_event",
+                source="events.jsonl",
+                bytes=encoded_bytes,
+                flush_seconds=time.monotonic() - started,
+            )
+        except Exception:
+            pass
+        # Profiling is observational and must never be allowed to alter the
+        # runner's event/audit contract.  RunProfiler itself is defensive, but
+        # keep this boundary fail-open in case a future sink is injected.
+        try:
+            self.profiler.observe_logger_event(event_type, payload)
+        except Exception:
+            pass
 
     def scoreboard(
         self,
@@ -492,6 +551,58 @@ class RunLogger:
         with self.lock:
             with (self.output_dir / "scoreboard_history.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        if self._profiling_enabled:
+            try:
+                self.profiler.emit(
+                    "scoreboard.record",
+                    task_id=verdict.task_id,
+                    actor_id=agent_id,
+                    episode=episode,
+                    source=source,
+                    status=verdict.status,
+                    score=verdict.score,
+                    elapsed_seconds=verdict.elapsed_seconds,
+                    candidate_sha256=verdict.candidate_sha256,
+                    cache_reused=verdict.cache_reused,
+                )
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """Close the optional profile sink without affecting run artifacts."""
+
+        try:
+            self.profiler.close()
+        except Exception:
+            pass
+
+    @contextmanager
+    def profile_span(self, name: str, **fields: Any):
+        """Yield an optional profiler span without coupling runner semantics."""
+
+        profiler = self.profiler
+        span = getattr(profiler, "span", None)
+        if not self._profiling_enabled or not callable(span):
+            yield
+            return
+        try:
+            context = span(name, **fields)
+        except Exception:
+            context = None
+        if context is None:
+            yield
+            return
+        with context:
+            yield
+
+    def profile_event(self, event: str, **fields: Any) -> None:
+        """Emit a bounded diagnostic event through the fail-open sink."""
+
+        try:
+            if self._profiling_enabled:
+                self.profiler.emit(event, **fields)
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)
@@ -2231,7 +2342,7 @@ def run_experiment(
     output_root = output_override or config.resolved_output_root
     run_dir = Path(output_root).resolve() / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
-    logger = RunLogger(run_dir)
+    logger = RunLogger(run_dir, run_id=run_id)
     manifest_snapshot = config.public_dict()
     manifest_snapshot["run_id"] = run_id
     # Preserve benchmark order as an explicit comparison input.  Sorting task
@@ -2288,6 +2399,7 @@ def run_experiment(
                 status="PREFLIGHT_FAILED",
                 cps_summary=None,
             )
+            logger.close()
             raise error from exc
     else:
         declaration_index = DeclarationIndex(None)
@@ -2314,6 +2426,7 @@ def run_experiment(
                 **_exception_artifact_fields(exc, config),
             )
             _write_final(run_dir, config, {}, [], status="PREFLIGHT_FAILED", cps_summary=None)
+            logger.close()
             raise
 
     # Preflight is an admission check, not experiment compute.  Bind both the
@@ -2331,7 +2444,11 @@ def run_experiment(
     )
     run_deadline = horizon_started_monotonic + config.time_limit_seconds
 
-    store = CPSStore(run_dir / "cps.sqlite3") if config.uses_cps else None
+    store = (
+        CPSStore(run_dir / "cps.sqlite3", profiler=getattr(logger, "profiler", None))
+        if config.uses_cps
+        else None
+    )
     selection_runtime = _initialize_selection_runtime(
         config,
         run_dir,
@@ -2412,6 +2529,7 @@ def run_experiment(
         selection_store=selection_store,
         selection_enabled=_selection_capabilities(config)[0],
         selection_search=selection_search,
+        profiler=logger.profiler,
     ).start()
     (run_dir / "judge_broker_policy.json").write_text(
         json.dumps(judge_broker.public_policy(), ensure_ascii=False, indent=2, sort_keys=True)
@@ -2439,7 +2557,11 @@ def run_experiment(
         + "\n",
         encoding="utf-8",
     )
-    pi_agent = PiAgent(config, trace_path=run_dir / "pi_events.jsonl")
+    pi_agent = PiAgent(
+        config,
+        trace_path=run_dir / "pi_events.jsonl",
+        profiler=logger.profiler,
+    )
     agent_results: list[AgentResult] = []
     attempt_verdicts: list[Verdict] = []
     verdicts: dict[str, Verdict] = {}

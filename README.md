@@ -51,6 +51,20 @@ workers/mono/tasks/<task>/result.lean # mono
 
 `--mock-agent` 只验证编排和产物，不代表论文分数。
 
+## 可选资源 profiling（默认关闭）
+
+设置 `CONTEXTSWARM_PROFILE=1` 才会在 run 目录生成受权限保护的
+`profiling.jsonl`；默认路径不会创建 profiling 文件、sampler 线程或额外的
+profiling 写入。事件只保留低基数身份、计数器和资源标量，不写 prompt、candidate、
+secret、provider response 或主机路径。采样周期有界，artifact/JSONL 统计以低频快照
+和单行追加写入控制观测自身的开销。
+
+`resource.sample` 是包含 runner/shared 进程树的 run-level aggregate；注册的
+`resource.process` 行则按 solver/attempt 的 task 与 actor 归属，并可包含该根进程的
+descendants。两者的进程集合可能重叠，不能把 runner aggregate 与 solver rows 直接
+相加；aggregate 用于整体峰值，solver rows 用于归属分析，无法安全分摊的部分单列。
+在 cgroup v2 下优先读取当前进程 `0::` scope，只有 scope 不可用时才回退到层级根。
+
 ## Docker + NuRouter/AISW Pi
 
 先构建镜像：
