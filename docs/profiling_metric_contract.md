@@ -1,4 +1,4 @@
-# ContextSwarm profiling 指标合同（六目标能力审计）
+# ContextSwarm profiling 指标合同（六主目标 + 独立 record_search_lock 诊断）
 
 本文档是 `contextswarm_profile_event_v1` 的运行时观测合同。它回答的是：在不改
 算法决策和任务合同的前提下，`ContextSwarm` 本地 runner、wrapper、Selection/CPS、
@@ -14,6 +14,12 @@ SQLite、Trace bridge、Judge broker 和 Pi 进程分别花了多少时间、CPU
 4. Trace projection 的重复读取、materialize 和 snapshot identity；
 5. `max_parallel` 增长时的进程树、CPU 和内存放大；
 6. CPS progress/SQLite 的全量扫描、连接、WAL 及读写锁开销。
+
+审计器在这六个主目标之外，单独输出第七个 `record_search_lock` target。它只筛选
+`operation == record_search` 的 writer transaction，用于确认 `persist.start → persist.lock
+→ persist.end`、SQLite wait/hold 和终态；这是 Selection 的诊断子目标，不是新的算法目标或
+allocation arm。因而文档继续使用“六目标”描述研究问题，而 audit report 出现七行 coverage
+是有意设计，不能用普通 Selection summary/SQLite connect 事件代替锁诊断。
 
 Judge 调用和关闭阶段 drain 是跨目标的必要辅助观测：没有它们，Agent 的“无输出”无法
 与 evaluator 等待或远端 settlement 等待区分。
@@ -32,6 +38,10 @@ python3 -m contextswarm_mini.cli --config <manifest> run
 仓库。输出目录中的 `profiling.jsonl` 由 runner 创建为 owner-only（目录 `0700`、文件
 `0600`）。构建和长证据必须放在磁盘文件系统；不要把 profile、数据库或构建树写到
 `/tmp`/`/dev/shm` 等 tmpfs。
+
+profiling-on 真实 run 的最小 provenance、workload、分支、资源边界和审计回填字段见
+[`docs/profiling_one_run_checklist.md`](profiling_one_run_checklist.md)；没有这些记录时，
+profile 只能作为插桩 smoke，不能作为可比较的 baseline candidate。
 
 关闭 profiling 时，不创建 profile 文件、不启动 sampler，也不执行 profiling 专用的
 时钟、`/proc`/cgroup 读取或文件大小统计。所有观测调用均 fail-open：sink 出错不能
@@ -317,7 +327,7 @@ python3 scripts/audit_profiling.py <profiling.jsonl-or-run-dir> --format text
 # 需要机器可读结果时：--format json
 ```
 
-审计报告包含 `coverage`（六目标简表）、`coverage_detail`（required/observed/missing
+审计报告包含 `coverage`（六个 primary goal 加独立 `record_search_lock` 诊断 target）、`coverage_detail`（required/observed/missing
 族）、`realness`、`issues`、序列/span/终止状态和有限 numeric percentiles。覆盖状态的
 精确定义如下：
 
@@ -326,7 +336,7 @@ python3 scripts/audit_profiling.py <profiling.jsonl-or-run-dir> --format text
 | `present` | 该目标的 required conjunction 全部出现 | 是（其他质量检查也通过时） |
 | `partial` | 至少一个 required 族出现，但 conjunction 不完整 | 否 |
 | `missing` | 应适用且没有观察到 required 族 | 否 |
-| `conditional_missing` | 代码明确知道该目标/子族只在条件分支执行，本次分支未执行；例如 trace policy 跳过 CPS progress | 否；它说明本 profile 不是“六目标全覆盖” |
+| `conditional_missing` | 代码明确知道该目标/子族只在条件分支执行，本次分支未执行；例如 trace policy 跳过 CPS progress | 否；它说明本 profile 不是“六个主目标（及适用诊断）全覆盖” |
 | `not_applicable` | 由可信配置证明分支被关闭，例如 selection disabled、dry-run Judge 或 `max_parallel<=1` | 不因该目标失败 |
 | `invalid` | 配置未知/冲突、schema/序列/span/互斥 invariant 违反或无法安全判断 | 否 |
 

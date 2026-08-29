@@ -65,10 +65,12 @@ descendants。两者的进程集合可能重叠，不能把 runner aggregate 与
 相加；aggregate 用于整体峰值，solver rows 用于归属分析，无法安全分摊的部分单列。
 在 cgroup v2 下优先读取当前进程 `0::` scope，只有 scope 不可用时才回退到层级根。
 
-六目标事件覆盖矩阵、Agent/wrapper 分界、SQLite 锁/WAL 解读、互斥分支和一次运行的限制见
+六个主目标及独立 `record_search_lock` 诊断的事件覆盖矩阵、Agent/wrapper 分界、SQLite
+锁/WAL 解读、互斥分支和一次运行的限制见
 [`docs/profiling_metric_contract.md`](docs/profiling_metric_contract.md)；profile 结束后用
 只读的 [`scripts/audit_profiling.py`](scripts/audit_profiling.py) 检查 coverage、真实性
-等级和退出码。实际运行前的参数/证据交接约束见
+等级和退出码。一次 profiling-on 真实 run 的字段清单见
+[`docs/profiling_one_run_checklist.md`](docs/profiling_one_run_checklist.md)；实际运行前的参数/证据交接约束见
 [`docs/profiling_dispatch_checklist.md`](docs/profiling_dispatch_checklist.md)。
 
 外部 formal Judge/Lean backend、router 和 worker 的宿主进程不属于 runner 的进程树，
@@ -82,10 +84,10 @@ PID/线程和 cgroup counters；不会读取命令行/环境、发送请求或�
 先构建镜像：
 
 ```bash
-CONTEXTSWARM_MINI_PI_VERSION=0.84.3 scripts/build_image.sh
+CONTEXTSWARM_MINI_PI_VERSION=0.84.2 scripts/build_image.sh
 ```
 
-镜像同时固定 Codex compatibility binary（当前默认 `0.150.1`，可用
+镜像同时固定 Codex compatibility binary（当前默认 `0.148.0`，可用
 `CONTEXTSWARM_MINI_CODEX_VERSION` 覆盖）。
 正式构建只接受 clean worktree，并使用 `git archive HEAD` 作为 Docker context；
 镜像 label 绑定完整 source commit。启动器会校验实际 image ID 与 revision label，

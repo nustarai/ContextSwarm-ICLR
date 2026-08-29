@@ -226,6 +226,16 @@ class ProfilingAuditTests(unittest.TestCase):
         self.assertFalse(detail["goal_complete"])
         self.assertEqual(detail["plumbing_presence"]["families"]["selection.persist.start"], False)
         self.assertEqual(detail["correlation"]["state"], "not_observed")
+        # The shared persist lifecycle is also excluded from the generic
+        # correlation diagnostics for the dedicated target; otherwise a
+        # startup/config write could look like lock evidence in the top-level
+        # report even though coverage correctly rejects it.
+        self.assertFalse(
+            any(key.endswith(":record_search_lock") for key in report["correlation"]["missing_dimensions"])
+        )
+        self.assertFalse(
+            any(key.startswith("record_search_lock:") for key in report["correlation"]["unattributed_stage_rows"])
+        )
 
         # Mixing one non-record marker into an otherwise complete transaction
         # must still fail: the operation predicate is applied per event, not
@@ -518,6 +528,31 @@ class ProfilingAuditTests(unittest.TestCase):
         self.assertGreater(report["sensitive_fields"]["total"], 0)
         self.assertIn("prompt", report["sensitive_fields"]["categories"])
         self.assertEqual(report["exit_code"], 1)
+
+    def test_bounded_candidate_row_metric_is_not_sensitive(self) -> None:
+        """Numeric preparation counters must not trip candidate-content checks."""
+
+        rows = _clean_rows()
+        rows.insert(
+            3,
+            _row(
+                4,
+                "selection.persist.end",
+                operation="register_selector_config",
+                status="ok",
+                prepare_candidate_rows=0,
+                prepare_ranking_rows=0,
+                prepare_rows=0,
+            ),
+        )
+        for index, row in enumerate(rows, 1):
+            row["sequence"] = index
+        with tempfile.TemporaryDirectory(prefix="audit-profile-", dir=ROOT) as temporary:
+            profile = _write_profile(Path(temporary), rows)
+            report = audit_profiling(profile)
+
+        self.assertEqual(report["sensitive_fields"]["total"], 0)
+        self.assertNotIn("sensitive_field", {item["code"] for item in report["issues"]})
 
     def test_unknown_event_label_is_collapsed_without_echoing_label(self) -> None:
         rows = _clean_rows()

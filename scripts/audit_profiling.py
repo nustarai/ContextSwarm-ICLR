@@ -155,6 +155,9 @@ _SENSITIVE_KEY_EXEMPTIONS = {
     "selection_config_id",
     "candidate_count",
     "selection_candidate_count",
+    # Bounded numeric preparation counters describe row cardinality; they do
+    # not contain candidate payloads despite the field-name component.
+    "prepare_candidate_rows",
     "candidates",
     "candidate_transfer",
     "input_tokens",
@@ -1166,6 +1169,18 @@ def _record_correlation(row: Mapping[str, Any], event: str, state: _AuditState) 
                     state.correlation_run_span_ends[key] = state.correlation_run_span_ends.get(key, 0) + 1
 
     target_names = _correlation_stage_targets(stage) if stage is not None else ()
+    if not is_record_search and "record_search_lock" in target_names:
+        # ``selection.persist.*`` is a shared lifecycle family.  A
+        # register_selector_config/feedback write may therefore have the
+        # same stage label as record_search, but it must not even enter the
+        # dedicated target's generic attribution counters.  The
+        # operation-filtered maps below already enforce this for coverage;
+        # filter the broad target list too so the top-level correlation report
+        # cannot suggest that an unrelated write was observed for the lock
+        # question.
+        target_names = tuple(
+            target for target in target_names if target != "record_search_lock"
+        )
     for dimension in missing:
         if dimension != "run_id" and target_names:
             state.correlation_missing[f"{dimension}:{target_names[0]}"] += 1
@@ -2111,6 +2126,7 @@ def _coverage(state: _AuditState, config: Mapping[str, Any]) -> tuple[dict[str, 
             required=record_search_required,
             observed=record_search_observed,
             note="selection disabled",
+            extra={"operation_filter": "operation == record_search"},
         )
     elif selection_enabled is True:
         # No writer invocation is a conditional branch rather than evidence
@@ -2133,6 +2149,7 @@ def _coverage(state: _AuditState, config: Mapping[str, Any]) -> tuple[dict[str, 
             event_counts=record_search_events,
             correlation=record_search_correlation,
             note="record_search writer transaction; exact start/lock/end markers",
+            extra={"operation_filter": "operation == record_search"},
         )
     else:
         # Unknown selection configuration must not be interpreted as a
@@ -2146,6 +2163,7 @@ def _coverage(state: _AuditState, config: Mapping[str, Any]) -> tuple[dict[str, 
             event_counts=record_search_events,
             correlation=record_search_correlation,
             note="selection applicability unknown",
+            extra={"operation_filter": "operation == record_search"},
         )
 
     # The mutually-exclusive branch is an invariant, not merely a coverage
