@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
 import datetime as dt
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -75,6 +76,91 @@ _NON_CACHEABLE_PROBE_STATUSES = {
     "CANCELLED",
     "TASK_CANCELLED",
 }
+# Values copied into the optional profile stream are deliberately bounded.  A
+# Judge may expose implementation-specific status strings, but those strings
+# are not useful dimensions for a resource report and can have unbounded
+# cardinality.  Keep only the stable lifecycle labels and collapse the rest.
+_PROFILE_STATUS_VALUES = frozenset(
+    {
+        "ok",
+        "queued",
+        "running",
+        "accepted",
+        "submitted",
+        "cancel_requested",
+        "cancelling",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "ac",
+        "wa",
+        "pe",
+        "ce",
+        "mle",
+        "tle",
+        "re",
+        "verify_fail",
+        "proved",
+        "local_rejected",
+        "evaluator_error",
+        "evaluator_timeout",
+        "network_error",
+        "out_of_horizon",
+        "timeout",
+        "overloaded",
+        "malformed",
+        "invalid_request",
+        "http_error",
+        "unsettled",
+        "other",
+    }
+)
+
+_PROFILE_STATUS_ALIASES = {
+    "complete": "succeeded",
+    "completed": "succeeded",
+    "pass": "proved",
+    "passed": "proved",
+    "cancelled_by_client": "cancelled",
+    "canceled": "cancelled",
+    "cancel_requested": "cancel_requested",
+    "request_cancelled": "cancelled",
+    "request_deadline_elapsed": "timeout",
+    "judge_overloaded": "overloaded",
+    "judge_overloaded_deadline": "overloaded",
+    "malformed_response": "malformed",
+    "invalid_request_configuration": "invalid_request",
+    "http_error": "http_error",
+    "remote_settlement_unconfirmed": "unsettled",
+    "cancel_settlement_unconfirmed": "unsettled",
+    "timeouterror": "timeout",
+    "timeout_error": "timeout",
+    "connectionerror": "network_error",
+    "urlerror": "network_error",
+    "httpexception": "network_error",
+    "oserror": "network_error",
+}
+
+
+def _profile_status(value: Any) -> str:
+    text = str(value or "").strip().casefold().replace("-", "_")
+    text = _PROFILE_STATUS_ALIASES.get(text, text)
+    return text if text in _PROFILE_STATUS_VALUES else "other"
+
+
+def _profile_clock() -> float:
+    """Read a diagnostic clock without allowing a broken clock to escape."""
+
+    try:
+        return time.monotonic()
+    except BaseException:
+        return 0.0
+
+
+def _profile_elapsed(started: float) -> float:
+    if not started:
+        return 0.0
+    return max(0.0, _profile_clock() - started)
 
 
 class EvaluatorError(RuntimeError):
@@ -437,6 +523,7 @@ class LeanEvaluator:
         admission_retry_seconds: float = 30.0,
         max_lifecycle_seconds: float | None = None,
         terminal_overload_retries: int = 1,
+        profiler: Any | None = None,
     ):
         self.base_url = normalize_base_url(base_url)
         self.lean_env_id = lean_env_id
@@ -470,7 +557,134 @@ class LeanEvaluator:
         # fail-closed process latch above.
         self._deferred_settlement_lock = threading.RLock()
         self._deferred_settlements: dict[str, dict[str, Any]] = {}
+        self._settlement_poll_count = 0
+        self._settlement_poll_seconds = 0.0
+        self._settlement_receipt_count = 0
+        self._settlement_cancel_count = 0
         self.deferred_settlement_timeout_seconds = 300.0
+        # Profiling is an observational side channel.  Keep the sink optional
+        # and duck-typed so preflight/test adapters do not need to know about
+        # it, and make every call fail-open at this boundary.
+        self.profiler = profiler
+        try:
+            self._profiling_enabled = bool(
+                profiler is not None and getattr(profiler, "enabled", False)
+            )
+        except BaseException:
+            self._profiling_enabled = False
+
+    def _profile_event(
+        self,
+        event: str,
+        *,
+        task: Task | None = None,
+        **fields: Any,
+    ) -> None:
+        if not self._profiling_enabled:
+            return
+        try:
+            self.profiler.emit(
+                event,
+                task_id=task.slug if task is not None else None,
+                **fields,
+            )
+        except BaseException:
+            # A diagnostic sink must never affect Judge lifecycle semantics.
+            return
+
+    @contextmanager
+    def _profile_span(self, name: str, *, task: Task | None = None, **fields: Any):
+        """Use an injected span without allowing it to mask evaluator errors."""
+
+        if not self._profiling_enabled:
+            yield
+            return
+        try:
+            context = self.profiler.span(
+                name,
+                task_id=task.slug if task is not None else None,
+                **fields,
+            )
+        except BaseException:
+            context = None
+        if context is None:
+            yield
+            return
+        try:
+            context.__enter__()
+        except BaseException:
+            yield
+            return
+        try:
+            yield
+        except BaseException:
+            try:
+                context.__exit__(*__import__("sys").exc_info())
+            except BaseException:
+                pass
+            raise
+        else:
+            try:
+                context.__exit__(None, None, None)
+            except BaseException:
+                pass
+
+    def _observed_request(
+        self,
+        operation: str,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        task: Task | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Call the concrete transport and emit one bounded stage timing row."""
+
+        if not self._profiling_enabled:
+            if payload is None:
+                return self._request(method, path, **kwargs)
+            return self._request(method, path, payload, **kwargs)
+        started = _profile_clock()
+        status = "ok"
+        attempts = 1
+        self._profile_event(
+            "judge.http.start",
+            task=task,
+            operation=operation,
+            phase=operation,
+            method=str(method).upper(),
+        )
+        try:
+            if payload is None:
+                response = self._request(method, path, **kwargs)
+            else:
+                response = self._request(method, path, payload, **kwargs)
+            if isinstance(response, Mapping):
+                raw_status = response.get("status") or response.get("job_status")
+                if isinstance(raw_status, str) and raw_status:
+                    # Keep only a low-cardinality lifecycle label; never copy a
+                    # response body or endpoint into the profile stream.
+                    status = _profile_status(raw_status)
+            return response
+        except EvaluatorError as exc:
+            status = _profile_status(exc.category or "error")
+            attempts = max(1, int(getattr(exc, "attempts", 1) or 1))
+            raise
+        except BaseException as exc:
+            status = _profile_status(type(exc).__name__)
+            raise
+        finally:
+            self._profile_event(
+                "judge.http.end",
+                task=task,
+                operation=operation,
+                phase=operation,
+                method=str(method).upper(),
+                status=status,
+                attempt_count=attempts,
+                elapsed_seconds=_profile_elapsed(started),
+            )
 
     @property
     def remote_unsettled_jobs(self) -> int:
@@ -496,6 +710,60 @@ class LeanEvaluator:
 
         with self._deferred_settlement_lock:
             return len(self._deferred_settlements)
+
+    def settlement_snapshot(self) -> dict[str, int | float]:
+        """Return bounded watcher counters for broker closeout profiling.
+
+        Job IDs, URLs, response bodies, and paths intentionally stay inside the
+        evaluator.  The broker only needs queue depth, age, and monotonic poll
+        counters to explain a long drain interval.
+        """
+
+        # This method is a diagnostics-only surface.  Keep the bounded counts
+        # available to callers even when profiling is disabled, but do not take
+        # an instrumentation clock (or derive watcher ages) on the hot/off
+        # path.
+        now = _profile_clock() if self._profiling_enabled else 0.0
+        with self._deferred_settlement_lock:
+            ages: list[float] = []
+            if self._profiling_enabled:
+                for record in self._deferred_settlements.values():
+                    try:
+                        started_at = float(record.get("started_at", now))
+                    except (TypeError, ValueError, OverflowError):
+                        started_at = now
+                    ages.append(max(0.0, now - started_at))
+            pending = len(ages)
+            if not self._profiling_enabled:
+                pending = len(self._deferred_settlements)
+            poll_count = self._settlement_poll_count
+            poll_seconds = self._settlement_poll_seconds
+            receipt_count = self._settlement_receipt_count
+            cancel_count = self._settlement_cancel_count
+        return {
+            "pending_settlement_watchers": pending,
+            "oldest_watcher_age_seconds": max(ages, default=0.0),
+            "poll_count": max(0, int(poll_count)),
+            "settlement_poll_seconds": max(0.0, float(poll_seconds)),
+            "settled_job_count": max(0, int(receipt_count)),
+            "cancel_job_count": max(0, int(cancel_count)),
+        }
+
+    def _profile_settlement_transition(
+        self,
+        state: str,
+        *,
+        elapsed_seconds: float | None = None,
+    ) -> None:
+        """Publish one value-free watcher transition and its aggregate state."""
+
+        if not self._profiling_enabled:
+            return
+        fields: dict[str, Any] = dict(self.settlement_snapshot())
+        fields["watcher_state"] = state
+        if elapsed_seconds is not None:
+            fields["elapsed_seconds"] = max(0.0, float(elapsed_seconds))
+        self._profile_event("judge.settlement.watcher", **fields)
 
     def _start_settlement_watcher(
         self,
@@ -537,9 +805,12 @@ class LeanEvaluator:
                 "cancel_endpoint": cancel_endpoint,
                 "paths": tuple(paths),
                 "callbacks": [callback] if callback is not None else [],
-                "started_at": time.monotonic(),
+                "started_at": _profile_clock() if self._profiling_enabled else 0.0,
             }
             self._deferred_settlements[normalized] = record
+            if self._profiling_enabled:
+                self._settlement_cancel_count += 1
+        self._profile_settlement_transition("started")
         thread = threading.Thread(
             target=self._settlement_watcher_loop,
             args=(record,),
@@ -551,6 +822,28 @@ class LeanEvaluator:
         return True
 
     def _settlement_watcher_loop(self, record: Mapping[str, Any]) -> None:
+        """Run a watcher with a terminal fail-closed boundary.
+
+        Polling is deliberately best-effort, but an unexpected adapter/sink
+        exception must not leave the watcher entry (and its evaluator permit)
+        permanently invisible to broker drain.  Convert such failures into the
+        same run-global unsettled latch used by a timeout.
+        """
+
+        try:
+            self._settlement_watcher_loop_impl(record)
+        except BaseException:
+            try:
+                job_id = str(record.get("job_id") or "")
+            except BaseException:
+                job_id = ""
+            self._mark_remote_unsettled()
+            if job_id:
+                with self._deferred_settlement_lock:
+                    self._deferred_settlements.pop(job_id, None)
+            self._profile_settlement_transition("error")
+
+    def _settlement_watcher_loop_impl(self, record: Mapping[str, Any]) -> None:
         job_id = str(record["job_id"])
         paths = list(record.get("paths") or ())
         path_index = 0
@@ -559,6 +852,7 @@ class LeanEvaluator:
         deadline = time.monotonic() + max(
             0.1, float(self.deferred_settlement_timeout_seconds)
         )
+        watcher_started = _profile_clock() if self._profiling_enabled else 0.0
         settled = False
         while paths and time.monotonic() < deadline:
             active_paths = [path for path in paths if path not in tainted_paths]
@@ -569,12 +863,24 @@ class LeanEvaluator:
             path = active_paths[path_index % len(active_paths)]
             separator = "&" if "?" in path else "?"
             try:
-                current = self._request(
-                    "GET",
-                    f"{path}{separator}wait_ms={wait_ms}",
-                    timeout_seconds=max(0.1, min(2.0, remaining)),
-                )
-            except EvaluatorError:
+                poll_started = _profile_clock() if self._profiling_enabled else 0.0
+                if self._profiling_enabled:
+                    with self._deferred_settlement_lock:
+                        self._settlement_poll_count += 1
+                try:
+                    current = self._observed_request(
+                        "settlement_poll",
+                        "GET",
+                        f"{path}{separator}wait_ms={wait_ms}",
+                        timeout_seconds=max(0.1, min(2.0, remaining)),
+                    )
+                finally:
+                    if self._profiling_enabled:
+                        with self._deferred_settlement_lock:
+                            self._settlement_poll_seconds += _profile_elapsed(
+                                poll_started
+                            )
+            except BaseException:
                 current = None
             if isinstance(current, Mapping):
                 identity = self._watcher_receipt_identity(current, job_id)
@@ -614,6 +920,9 @@ class LeanEvaluator:
                 if bound is not None and self._authoritative_terminal_receipt(
                     bound, job_id
                 ):
+                    if self._profiling_enabled:
+                        with self._deferred_settlement_lock:
+                            self._settlement_receipt_count += 1
                     settled = True
                     break
             path_index += 1
@@ -631,6 +940,10 @@ class LeanEvaluator:
             # unknown/transport-ambiguous submission.
             with self._deferred_settlement_lock:
                 current_record = self._deferred_settlements.pop(job_id, None)
+            self._profile_settlement_transition(
+                "timed_out",
+                elapsed_seconds=_profile_elapsed(watcher_started),
+            )
             return
 
         # Keep the record visible while callbacks run.  A broker closeout may
@@ -652,7 +965,7 @@ class LeanEvaluator:
             for callback in callbacks:
                 try:
                     callback()
-                except Exception:
+                except BaseException:
                     # A permit-release callback is orchestration bookkeeping;
                     # if it fails, retain the fail-closed latch so a leaked
                     # permit cannot be mistaken for a drained run.
@@ -664,6 +977,10 @@ class LeanEvaluator:
             current_record = self._deferred_settlements.get(job_id)
             if current_record is record:
                 self._deferred_settlements.pop(job_id, None)
+        self._profile_settlement_transition(
+            "settled" if not callback_failed else "callback_failed",
+            elapsed_seconds=_profile_elapsed(watcher_started),
+        )
 
     @staticmethod
     def _bind_watcher_receipt(
@@ -1424,10 +1741,12 @@ class LeanEvaluator:
                 if cancel_event is not None:
                     request_options["cancel_event"] = cancel_event
                 try:
-                    submitted = self._request(
+                    submitted = self._observed_request(
+                        "submit",
                         "POST",
                         "/api/lean/jobs",
                         payload,
+                        task=task,
                         **request_options,
                     )
                     if not _confirmed_pre_admission_rejection(submitted):
@@ -1545,9 +1864,11 @@ class LeanEvaluator:
                     if cancel_event is not None:
                         request_options["cancel_event"] = cancel_event
                     try:
-                        response = self._request(
+                        response = self._observed_request(
+                            "poll",
                             "GET",
                             f"/api/lean/jobs/{quote(job_id, safe='')}?wait_ms={wait_ms}",
+                            task=task,
                             **request_options,
                         )
                     except EvaluatorError as exc:
@@ -2041,7 +2362,8 @@ class LeanEvaluator:
             attempted = remaining > 0
             try:
                 if attempted:
-                    current = self._request(
+                    current = self._observed_request(
+                        "cancel",
                         "DELETE",
                         cancel_path,
                         timeout_seconds=min(
@@ -2076,7 +2398,8 @@ class LeanEvaluator:
             poll_path = poll_paths[poll_index % len(poll_paths)]
             separator = "&" if "?" in poll_path else "?"
             try:
-                current = self._request(
+                current = self._observed_request(
+                    "reconcile_poll",
                     "GET",
                     f"{poll_path}{separator}wait_ms={wait_ms}",
                     timeout_seconds=remaining,
@@ -2328,6 +2651,7 @@ class CodingEvaluator(LeanEvaluator):
         poll_interval_seconds: float = 0.25,
         cancel_grace_seconds: float = 5.0,
         require_result_cache_disabled: bool = False,
+        profiler: Any | None = None,
     ):
         super().__init__(
             normalize_base_url(base_url),
@@ -2342,6 +2666,7 @@ class CodingEvaluator(LeanEvaluator):
             # handles retry/refill at the candidate-attempt level.
             admission_retry_seconds=min(30.0, max(0.1, float(cancel_grace_seconds))),
             terminal_overload_retries=0,
+            profiler=profiler,
         )
         # Keep this policy on the adapter rather than putting it in candidate
         # JSON.  The Judge's dispatch contract treats cache mode as an
@@ -2587,7 +2912,8 @@ class CodingEvaluator(LeanEvaluator):
             return current, error, attempted
 
         try:
-            submitted = self._request(
+            submitted = self._observed_request(
+                "submit",
                 "POST",
                 "/api/judge/jobs",
                 {
@@ -2596,6 +2922,7 @@ class CodingEvaluator(LeanEvaluator):
                     "code": source,
                     "submission_id": f"contextswarm-{uuid.uuid4().hex}",
                 },
+                task=task,
                 timeout_seconds=min(30.0, max(1.0, (deadline_monotonic - time.monotonic()) if deadline_monotonic else 30.0)),
             )
             raw_job_id = submitted.get("job_id") or submitted.get("id")
@@ -2678,7 +3005,13 @@ class CodingEvaluator(LeanEvaluator):
                         )
                     break
                 wait_ms = min(1000, max(1, int(min(remaining, 1.0) * 1000)))
-                response = self._request("GET", f"/api/judge/jobs/{quote(job_id, safe='')}?wait_ms={wait_ms}", timeout_seconds=max(1.0, min(30.0, remaining)))
+                response = self._observed_request(
+                    "poll",
+                    "GET",
+                    f"/api/judge/jobs/{quote(job_id, safe='')}?wait_ms={wait_ms}",
+                    task=task,
+                    timeout_seconds=max(1.0, min(30.0, remaining)),
+                )
                 if response.get("cancel_endpoint") or response.get("status_endpoint"):
                     cancel_endpoint = response.get("cancel_endpoint") or response.get("status_endpoint")
             status = self._response_status(response)
