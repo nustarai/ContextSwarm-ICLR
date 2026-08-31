@@ -2393,12 +2393,18 @@ class JudgeBroker:
                         task_id=task_id,
                         recipient=claim.actor_id,
                         limit=limit,
+                        include_global=claim.communication == "hybrid",
                     )
                 ],
             }
         if operation == "cps_ack":
             message_id = _required_string(payload.get("message_id"), "message_id", 64)
-            visible = store.inbox(task_id=task_id, recipient=claim.actor_id, limit=50)
+            visible = store.inbox(
+                task_id=task_id,
+                recipient=claim.actor_id,
+                limit=50,
+                include_global=claim.communication == "hybrid",
+            )
             if not any(str(item.get("id")) == message_id for item in visible):
                 return {"ok": False, "status": "MESSAGE_NOT_VISIBLE", "acked": False}
             return {
