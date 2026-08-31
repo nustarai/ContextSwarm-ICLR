@@ -389,6 +389,14 @@ class PiAgent:
         # direct-message CPS surface for existing runner call sites.
         env["CONTEXTSWARM_CPS_DIRECT_MESSAGES"] = "1" if direct_messages else "0"
         env["CONTEXTSWARM_CPS_SELECTION_ENABLED"] = "1" if selection_enabled else "0"
+        # Global scope is a capability of legacy hybrid communication only.
+        # Ordinary blackboard workers do not need to see or request it, while
+        # selector-enabled workers use their separate project-shared path.
+        env["CONTEXTSWARM_CPS_GLOBAL_SCOPE"] = (
+            "1"
+            if self.config.communication == "hybrid" and not selection_enabled
+            else "0"
+        )
         # Do not append an operator-supplied PYTHONPATH.  The runner package is
         # the only import root required by the controlled helper/client path.
         env["PYTHONPATH"] = str(self.config.repo_root)
