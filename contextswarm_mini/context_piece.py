@@ -45,6 +45,13 @@ def _actors() -> list[dict[str, object]]:
     return payload if isinstance(payload, list) else []
 
 
+def _global_scope_enabled() -> bool:
+    """Return whether this worker was explicitly granted hybrid global scope."""
+
+    raw = os.environ.get("CONTEXTSWARM_CPS_GLOBAL_SCOPE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _require_open_horizon() -> int | None:
     raw = os.environ.get("CONTEXTSWARM_HORIZON_EPOCH_MS", "").strip()
     if not raw:
@@ -64,20 +71,23 @@ def _parser() -> argparse.ArgumentParser:
     search = sub.add_parser("search", help="search shared context pieces")
     search.add_argument("--query", default="")
     search.add_argument("--limit", type=int, default=8)
-    search.add_argument("--global", action="store_true", dest="include_global")
+    if _global_scope_enabled():
+        search.add_argument("--global", action="store_true", dest="include_global")
     create = sub.add_parser("create", help="publish a typed context piece")
     create.add_argument("--kind", default="handoff")
     create.add_argument("--title", required=True)
     create.add_argument("--body")
     create.add_argument("--body-file")
     create.add_argument("--tag", action="append", default=[])
-    create.add_argument("--global", action="store_true", dest="is_global")
+    if _global_scope_enabled():
+        create.add_argument("--global", action="store_true", dest="is_global")
     message = sub.add_parser("message", help="send/read/ack direct messages")
     message_sub = message.add_subparsers(dest="message_command", required=True)
     send = message_sub.add_parser("send")
     send.add_argument("--to", default=None)
     send.add_argument("--body", required=True)
-    send.add_argument("--global", action="store_true", dest="is_global")
+    if _global_scope_enabled():
+        send.add_argument("--global", action="store_true", dest="is_global")
     inbox = message_sub.add_parser("inbox")
     inbox.add_argument("--limit", type=int, default=8)
     ack = message_sub.add_parser("ack")
@@ -106,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
                 task_id=task,
                 query=args.query,
                 limit=args.limit,
-                include_global=args.include_global,
+                include_global=getattr(args, "include_global", False),
             )
         elif args.command == "create":
             body = args.body
@@ -115,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             if not body:
                 raise ValueError("create requires --body or --body-file")
             result = store.create_piece(
-                task_id="__global__" if args.is_global else task,
+                task_id="__global__" if getattr(args, "is_global", False) else task,
                 author=actor,
                 kind=args.kind,
                 title=args.title,
@@ -126,14 +136,19 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "message":
             if args.message_command == "send":
                 result = store.send_message(
-                    task_id="__global__" if args.is_global else task,
+                    task_id="__global__" if getattr(args, "is_global", False) else task,
                     sender=actor,
                     recipient=args.to,
                     body=args.body,
                     deadline_epoch_ms=deadline_epoch_ms,
                 )
             elif args.message_command == "inbox":
-                result = store.inbox(task_id=task, recipient=actor, limit=args.limit)
+                result = store.inbox(
+                    task_id=task,
+                    recipient=actor,
+                    limit=args.limit,
+                    include_global=_global_scope_enabled(),
+                )
             else:
                 result = {
                     "acked": store.ack_message(

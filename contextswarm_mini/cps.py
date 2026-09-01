@@ -375,16 +375,32 @@ class CPSStore:
                 raise
         return message
 
-    def inbox(self, *, task_id: str, recipient: str, limit: int = 8) -> list[dict[str, Any]]:
+    def inbox(
+        self,
+        *,
+        task_id: str,
+        recipient: str,
+        limit: int = 8,
+        include_global: bool = False,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 50))
         with self._db() as db:
-            rows = db.execute(
-                """SELECT * FROM messages
-                   WHERE task_id IN (?, '__global__') AND acked_at IS NULL
-                     AND (recipient IS NULL OR recipient=? OR recipient='*')
-                   ORDER BY created_at DESC LIMIT ?""",
-                (task_id, recipient, limit),
-            ).fetchall()
+            if include_global:
+                rows = db.execute(
+                    """SELECT * FROM messages
+                       WHERE task_id IN (?, '__global__') AND acked_at IS NULL
+                         AND (recipient IS NULL OR recipient=? OR recipient='*')
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (task_id, recipient, limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """SELECT * FROM messages
+                       WHERE task_id=? AND acked_at IS NULL
+                         AND (recipient IS NULL OR recipient=? OR recipient='*')
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (task_id, recipient, limit),
+                ).fetchall()
         return [dict(row) for row in rows]
 
     def ack_message(
@@ -436,7 +452,12 @@ class CPSStore:
         include_global: bool = False,
     ) -> dict[str, Any]:
         pieces = self.search(task_id=task_id, query=query, limit=limit, include_global=include_global)
-        messages = self.inbox(task_id=task_id, recipient=actor_id, limit=limit)
+        messages = self.inbox(
+            task_id=task_id,
+            recipient=actor_id,
+            limit=limit,
+            include_global=include_global,
+        )
         return {"pieces": pieces, "messages": messages}
 
     def progress_snapshot(

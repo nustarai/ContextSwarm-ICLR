@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from contextswarm_mini.context_piece import _parser
 from contextswarm_mini.cps import CPSStore
 
 
@@ -19,6 +20,42 @@ def _count_rows(store: CPSStore, table: str) -> int:
 
 
 class CPSCommitCapabilityTests(unittest.TestCase):
+    def test_inbox_is_task_local_unless_global_scope_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CPSStore(Path(temporary) / "cps.sqlite3")
+            global_message = store.send_message(
+                task_id="__global__",
+                sender="global-agent",
+                recipient=None,
+                body="global broadcast",
+            )
+            self.assertEqual(
+                store.inbox(task_id="task-a", recipient="worker", limit=8),
+                [],
+            )
+            visible = store.inbox(
+                task_id="task-a",
+                recipient="worker",
+                limit=8,
+                include_global=True,
+            )
+            self.assertEqual([row["id"] for row in visible], [global_message["id"]])
+
+    def test_context_piece_hides_global_flags_without_hybrid_capability(self) -> None:
+        for enabled, expected in (("0", False), ("1", True)):
+            with self.subTest(enabled=enabled), patch.dict(
+                "os.environ", {"CONTEXTSWARM_CPS_GLOBAL_SCOPE": enabled}, clear=False
+            ):
+                choices = _parser()._subparsers._group_actions[0].choices
+                for command in ("search", "create"):
+                    self.assertEqual(
+                        any(
+                            "--global" in action.option_strings
+                            for action in choices[command]._actions
+                        ),
+                        expected,
+                    )
+
     def test_every_write_rolls_back_when_revoked_before_commit(self) -> None:
         for operation in ("record_event", "create_piece", "send_message", "ack_message"):
             with self.subTest(operation=operation), tempfile.TemporaryDirectory() as temporary:
