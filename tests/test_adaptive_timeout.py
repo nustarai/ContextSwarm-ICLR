@@ -585,6 +585,34 @@ process.stdout.write(JSON.stringify({
         self.assertTrue(verdict.response["timeout_budget_exhausted"])
         self.assertEqual(verdict.response["timeout_budget_remaining_seconds"], 0.0)
 
+    def test_run_horizon_floor_does_not_consume_remaining_agent_budget(self) -> None:
+        """A near-horizon no-attempt closeout is not an Agent timeout."""
+
+        class FakeClock:
+            value = 4_000.0
+
+            def monotonic(self) -> float:
+                return self.value
+
+        clock = FakeClock()
+        evaluator = LeanEvaluator("http://unused", lean_env_id="test")
+        task = _task(ROOT)
+        with patch("contextswarm_mini.evaluator.time.monotonic", clock.monotonic):
+            verdict = evaluator.probe_source(
+                task,
+                task.baseline_code,
+                deadline_monotonic=4_003.0,
+                timeout_seconds=60,
+            )
+
+        self.assertEqual(verdict.status, "OUT_OF_HORIZON")
+        self.assertEqual(verdict.response["timeout_budget_stop_reason"], "run_horizon")
+        self.assertFalse(verdict.response["timeout_budget_exhausted"])
+        self.assertEqual(verdict.response["judge_attempt_count"], 0)
+        self.assertAlmostEqual(
+            verdict.response["timeout_budget_remaining_seconds"], 60.0
+        )
+
     def test_formal_backend_quota_blocks_a_fresh_retry_without_losing_attempt_count(self) -> None:
         """Each fresh evaluate retry consumes a task-global backend-job unit."""
 

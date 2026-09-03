@@ -2063,18 +2063,44 @@ class LeanEvaluator:
         timeout: AgentTimeout,
         run_horizon: float | None,
     ) -> Verdict:
-        run_horizon_elapsed = (
-            run_horizon is not None and time.monotonic() >= float(run_horizon)
+        now = time.monotonic()
+        run_horizon_value: float | None = None
+        if run_horizon is not None:
+            try:
+                candidate_horizon = float(run_horizon)
+            except (TypeError, ValueError, OverflowError):
+                candidate_horizon = float("nan")
+            if math.isfinite(candidate_horizon):
+                run_horizon_value = candidate_horizon
+
+        # ``logical_deadline`` is the earlier of the Agent budget and the
+        # outer run horizon.  Reaching the five-second minimum before that
+        # logical deadline is not the same as exhausting the Agent budget:
+        # near the fixed run horizon there may still be 45/60 seconds in the
+        # Agent budget, but no safe time left to start another backend job.
+        # Classify that case as OUT_OF_HORIZON and keep the independent Agent
+        # budget remaining/exhausted fields truthful.
+        horizon_limited = (
+            run_horizon_value is not None
+            and run_horizon_value <= float(budget_deadline)
+            and float(logical_deadline) <= run_horizon_value
         )
-        status = "OUT_OF_HORIZON" if run_horizon_elapsed else "EVALUATOR_TIMEOUT"
+        run_horizon_elapsed = (
+            run_horizon_value is not None and now >= run_horizon_value
+        )
+        budget_expired = now >= float(budget_deadline)
+        horizon_stop = horizon_limited or run_horizon_elapsed
+        status = "OUT_OF_HORIZON" if horizon_stop else "EVALUATOR_TIMEOUT"
         verdict = Verdict(
             task_id=task.slug,
             status=status,
             score=0.0,
-            elapsed_seconds=max(0.0, time.monotonic() - started),
+            elapsed_seconds=max(0.0, now - started),
             response={
                 "reason": (
-                    "run_horizon_elapsed_before_retry"
+                    "run_horizon_before_retry"
+                    if horizon_limited and not run_horizon_elapsed
+                    else "run_horizon_elapsed_before_retry"
                     if run_horizon_elapsed
                     else "agent_total_timeout_exhausted_before_retry"
                 ),
@@ -2096,8 +2122,8 @@ class LeanEvaluator:
             attempt_timeouts=attempt_timeouts,
             attempt_elapsed=attempt_elapsed,
             retry_reasons=retry_reasons,
-            exhausted=True,
-            stop_reason=("run_horizon" if run_horizon_elapsed else "budget_exhausted"),
+            exhausted=budget_expired,
+            stop_reason=("run_horizon" if horizon_stop else "budget_exhausted"),
             timeout=timeout,
         )
 
