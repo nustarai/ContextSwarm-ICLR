@@ -326,6 +326,9 @@ def _run(output: Path) -> dict[str, Any]:
                 and row.get("status") == "blocked"
                 for row in blocked_view
             ),
+            "blocked_update_accepted": blocked.get("ok") is True,
+            "blocked_update_acquired_false": blocked.get("acquired") is False,
+            "blocked_update_claimed_false": blocked.get("claimed") is False,
             "explicit_release_status": released.get("claim", {}).get("status"),
             "explicit_release_absent_from_active_view": not any(
                 row.get("claim_id") == mutable_claim_id for row in released_view
@@ -387,6 +390,63 @@ def _run(output: Path) -> dict[str, Any]:
         },
         "event_counts": dict(sorted(event_types.items())),
     }
+    checks = {
+        "admission_only_roster": (
+            result["roster"]["after_first_admission_actor_ids"] == ["actor-a"]
+            and result["roster"]["future_actor_visible_before_admission"] is False
+        ),
+        "one_atomic_primary": (
+            result["primary_race"]["attempts"] == 3
+            and result["primary_race"]["primary_acquired"] == 1
+            and result["primary_race"]["conflicts"] == 2
+            and result["primary_race"]["all_claim_results_accounted"] is True
+        ),
+        "independent_verification": (
+            result["independent_verification"]["ok"] is True
+            and result["independent_verification"]["acquired"] is True
+            and result["independent_verification"]["is_primary"] is False
+            and result["independent_verification"]["accepted_reason"] is True
+        ),
+        "finish_releases_claims": (
+            result["lifecycle"]["active_routes_after_primary_finish"] == 1
+            and result["lifecycle"]["active_routes_after_all_finish"] == 0
+        ),
+        "ttl_releases_and_reclaims": (
+            result["lifecycle"]["ttl_expired_from_active_view"] is True
+            and result["lifecycle"]["ttl_reclaim_acquired"] is True
+            and result["lifecycle"]["ttl_reclaim_primary"] is True
+        ),
+        "blocked_is_visible_but_not_writable": (
+            result["lifecycle"]["blocked_update_visible"] is True
+            and result["lifecycle"]["blocked_update_accepted"] is True
+            and result["lifecycle"]["blocked_update_acquired_false"] is True
+            and result["lifecycle"]["blocked_update_claimed_false"] is True
+        ),
+        "explicit_release": (
+            result["lifecycle"]["explicit_release_status"] == "released"
+            and result["lifecycle"]["explicit_release_absent_from_active_view"]
+            is True
+        ),
+        "pre_judge_surface": (
+            result["pre_judge_gate"]["active_routes_ok"] is True
+            and result["pre_judge_gate"]["search_blocked_before_judge"] is True
+        ),
+        "profiled_transactions_ok": (
+            result["profiling"]["non_ok_write_commits"] == 0
+            and set(result["profiling"]["write_commit_counts"])
+            == {
+                "actor.finish",
+                "actor.list_active",
+                "actor.register",
+                "route.claim",
+                "route.list_active",
+                "route.release",
+                "route.update",
+            }
+        ),
+    }
+    result["checks"] = checks
+    result["ok"] = all(checks.values())
     output.write_text(
         json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -401,7 +461,7 @@ def main() -> int:
     args = parser.parse_args()
     result = _run(args.output)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 0 if result.get("ok") is True else 1
 
 
 if __name__ == "__main__":
