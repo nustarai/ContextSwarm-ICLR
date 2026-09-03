@@ -24,6 +24,7 @@ from .models import Task, Verdict
 from .timeout_policy import (
     AGENT_TIMEOUT_MIN_SECONDS,
     AgentTimeout,
+    agent_timeout_bounds,
     normalize_agent_timeout,
 )
 
@@ -39,6 +40,7 @@ _JUDGE_CANCEL_TIMEOUT_SECONDS = 2.0
 _CANCEL_AWARE_LONG_POLL_MS = 250
 _CANCEL_AWARE_HTTP_TIMEOUT_SECONDS = 1.0
 _MAX_SETTLEMENT_POLL_PATHS = 32
+_AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS = 0.01
 _MAX_WORKER_ERROR_BYTES = 1_200
 _MAX_WORKER_STATUS_BYTES = 120
 _MAX_WORKER_IDENTIFIER_BYTES = 256
@@ -1817,10 +1819,16 @@ class LeanEvaluator:
         while True:
             now = time.monotonic()
             remaining = logical_deadline - now
-            # The public Agent contract has a five-second floor.  Do not issue
-            # a final sub-floor attempt merely because integer rounding left a
-            # few seconds; report the exhausted logical budget instead.
-            if remaining < AGENT_TIMEOUT_MIN_SECONDS:
+            # The default public Agent contract has a five-second floor.  A
+            # manifest may deliberately choose a smaller positive cap, in
+            # which case that cap is also the smallest executable attempt.
+            minimum_attempt_seconds = min(
+                AGENT_TIMEOUT_MIN_SECONDS, budget_seconds
+            )
+            if (
+                remaining
+                < minimum_attempt_seconds - _AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS
+            ):
                 if last_verdict is None:
                     return self._total_budget_exhausted_verdict(
                         task,
@@ -1860,7 +1868,7 @@ class LeanEvaluator:
             # A broker-owned formal quota may count each fresh backend job,
             # not merely the logical helper call.  Reserve the next slot only
             # after the remaining-budget check, so a retry that cannot honor
-            # the five-second floor does not consume quota speculatively.
+            # the configured minimum floor does not consume quota speculatively.
             if attempt_index > 0 and retry_admission_callback is not None:
                 try:
                     retry_admitted = bool(retry_admission_callback())
@@ -1925,7 +1933,7 @@ class LeanEvaluator:
             # The retry reason becomes observable only when the fresh attempt
             # is actually admitted.  This keeps ``judge_retry_count`` from
             # claiming a retry that was blocked by quota or fell below the
-            # five-second floor while waiting for the next loop turn.
+            # configured minimum floor while waiting for the next loop turn.
             if pending_retry_reason is not None:
                 retry_reasons.append(pending_retry_reason)
                 pending_retry_reason = None
@@ -1936,7 +1944,7 @@ class LeanEvaluator:
             # hard boundary, so the rounding cannot create another full
             # timeout tail.
             attempt_timeout = max(
-                AGENT_TIMEOUT_MIN_SECONDS,
+                minimum_attempt_seconds,
                 min(budget_seconds, int(math.ceil(remaining))),
             )
             attempt_index += 1
@@ -2074,8 +2082,9 @@ class LeanEvaluator:
                 run_horizon_value = candidate_horizon
 
         # ``logical_deadline`` is the earlier of the Agent budget and the
-        # outer run horizon.  Reaching the five-second minimum before that
-        # logical deadline is not the same as exhausting the Agent budget:
+        # outer run horizon.  Reaching the configured minimum remaining-attempt
+        # floor before that logical deadline is not the same as exhausting the
+        # Agent budget:
         # near the fixed run horizon there may still be 45/60 seconds in the
         # Agent budget, but no safe time left to start another backend job.
         # Classify that case as OUT_OF_HORIZON and keep the independent Agent
@@ -2357,7 +2366,8 @@ class LeanEvaluator:
                         and time.monotonic() >= deadline_monotonic
                     )
                     rejection_response = _safe_response(
-                        last_admission_rejection or {}
+                        last_admission_rejection or {},
+                        timeout_max_seconds=self.timeout_seconds,
                     )
                     rejection_response.update(
                         {
@@ -2447,9 +2457,13 @@ class LeanEvaluator:
             if not job_id:
                 self._mark_remote_unsettled()
                 safe_response = (
-                    _safe_nonterminal_response(response)
+                    _safe_nonterminal_response(
+                        response, timeout_max_seconds=self.timeout_seconds
+                    )
                     if not _terminal(response)
-                    else _safe_response(response)
+                    else _safe_response(
+                        response, timeout_max_seconds=self.timeout_seconds
+                    )
                 )
                 safe_response.update(
                     {
@@ -2654,7 +2668,9 @@ class LeanEvaluator:
                     )
                 if cancel_error:
                     last_poll_error = cancel_error
-                    safe_response = _safe_nonterminal_response(response)
+                    safe_response = _safe_nonterminal_response(
+                        response, timeout_max_seconds=self.timeout_seconds
+                    )
                     safe_response.update(
                         {
                             "reason": "remote_settlement_unconfirmed",
@@ -2696,7 +2712,9 @@ class LeanEvaluator:
                         status="EVALUATOR_ERROR",
                         score=0.0,
                         elapsed_seconds=time.monotonic() - started,
-                        response=_safe_nonterminal_response(response),
+                        response=_safe_nonterminal_response(
+                            response, timeout_max_seconds=self.timeout_seconds
+                        ),
                         error=outcome_error,
                         judge_job_id=normalized_job_id,
                         **provenance,
@@ -2710,11 +2728,15 @@ class LeanEvaluator:
                         status="PROVED" if proved else abandoned_status,
                         score=1.0 if proved else 0.0,
                         elapsed_seconds=time.monotonic() - started,
-                        response=_safe_response(response),
+                        response=_safe_response(
+                            response, timeout_max_seconds=self.timeout_seconds
+                        ),
                         judge_job_id=normalized_job_id,
                         **provenance,
                     )
-                safe_response = _safe_response(response)
+                safe_response = _safe_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                )
                 safe_response["reason"] = (
                     "run_horizon_elapsed_during_evaluation"
                     if deadline_monotonic is not None
@@ -2740,7 +2762,9 @@ class LeanEvaluator:
                 )
             if not _terminal(response):
                 horizon_elapsed = deadline_monotonic is not None and time.monotonic() >= deadline_monotonic
-                safe_response = _safe_nonterminal_response(response)
+                safe_response = _safe_nonterminal_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                )
                 safe_response["reason"] = (
                     "run_horizon_elapsed_during_evaluation"
                     if horizon_elapsed
@@ -2765,7 +2789,9 @@ class LeanEvaluator:
                     status="EVALUATOR_ERROR",
                     score=0.0,
                     elapsed_seconds=time.monotonic() - started,
-                    response=_safe_nonterminal_response(response),
+                    response=_safe_nonterminal_response(
+                        response, timeout_max_seconds=self.timeout_seconds
+                    ),
                     error=outcome_error,
                     judge_job_id=normalized_job_id,
                     **provenance,
@@ -2775,7 +2801,9 @@ class LeanEvaluator:
                 status="PROVED" if proved else status,
                 score=1.0 if proved else 0.0,
                 elapsed_seconds=time.monotonic() - started,
-                response=_safe_response(response),
+                response=_safe_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                ),
                 judge_job_id=normalized_job_id,
                 **provenance,
             )
@@ -2865,7 +2893,9 @@ class LeanEvaluator:
                         status="PROVED" if proved else reconciled_status,
                         score=1.0 if proved else 0.0,
                         elapsed_seconds=time.monotonic() - started,
-                        response=_safe_response(response),
+                        response=_safe_response(
+                            response, timeout_max_seconds=self.timeout_seconds
+                        ),
                         judge_job_id=sanitize_worker_identifier(job_id),
                         **provenance,
                     )
@@ -2877,10 +2907,14 @@ class LeanEvaluator:
             ):
                 response = dict(exc.submission_response)
             safe_error_response = (
-                _safe_nonterminal_response(response)
+                _safe_nonterminal_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                )
                 if _verdict_status(response) in _NONTERMINAL_STATUSES
                 or not _terminal(response)
-                else _safe_response(response)
+                else _safe_response(
+                    response, timeout_max_seconds=self.timeout_seconds
+                )
             )
             if isinstance(exc, EvaluatorError):
                 safe_error_response["evaluator_failure"] = exc.public_details()
@@ -3777,7 +3811,10 @@ class CodingEvaluator(LeanEvaluator):
                     cancel_endpoint = response.get("cancel_endpoint") or response.get("status_endpoint")
             status = self._response_status(response)
             nested = response.get("response") if isinstance(response.get("response"), Mapping) else {}
-            safe = safe_worker_response(nested if nested else response)
+            safe = safe_worker_response(
+                nested if nested else response,
+                timeout_max_seconds=self.timeout_seconds,
+            )
             safe["job_status"] = str(response.get("status") or response.get("job_status") or "")[:64]
             safe["judge_job_id"] = job_id
             # Preserve Judge-side cache provenance in the worker-safe receipt.
@@ -4315,7 +4352,11 @@ def _custom_retry_class(
     attempt, when any, is reserved for an independently evidenced failure.
     """
 
-    if remaining_budget_seconds < float(AGENT_TIMEOUT_MIN_SECONDS):
+    minimum_attempt_seconds = min(AGENT_TIMEOUT_MIN_SECONDS, budget_seconds)
+    if (
+        remaining_budget_seconds
+        < minimum_attempt_seconds - _AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS
+    ):
         return None
     status = str(verdict.status or "").strip().upper()
     if status in _CUSTOM_DETERMINISTIC_STATUSES:
@@ -4444,11 +4485,16 @@ def safe_worker_response(
     payload: Mapping[str, Any] | Any,
     *,
     _depth: int = 0,
+    timeout_max_seconds: int | float | None = None,
 ) -> dict[str, Any]:
     """Keep bounded verdict metadata while removing secrets and host details."""
 
     if not isinstance(payload, Mapping) or _depth > 2:
         return {}
+    try:
+        timeout_cap = agent_timeout_bounds(timeout_max_seconds).max_seconds
+    except ValueError:
+        timeout_cap = agent_timeout_bounds().max_seconds
     result: dict[str, Any] = {}
     for key in ("job_id", "id"):
         identifier = sanitize_worker_identifier(payload.get(key))
@@ -4524,7 +4570,7 @@ def safe_worker_response(
     attempt_timeouts = payload.get("judge_attempt_timeouts_seconds")
     if isinstance(attempt_timeouts, (list, tuple)):
         result["judge_attempt_timeouts_seconds"] = [
-            max(0, min(int(item), 300))
+            max(0, min(int(item), timeout_cap))
             for item in attempt_timeouts[:16]
             if isinstance(item, int) and not isinstance(item, bool)
         ]
@@ -4564,7 +4610,9 @@ def safe_worker_response(
         ]
     if isinstance(payload.get("response"), Mapping):
         result["response"] = safe_worker_response(
-            payload["response"], _depth=_depth + 1
+            payload["response"],
+            _depth=_depth + 1,
+            timeout_max_seconds=timeout_max_seconds,
         )
     if "probe_diagnostics" in payload:
         result["probe_diagnostics"] = _safe_probe_diagnostics(
@@ -4629,10 +4677,14 @@ def safe_worker_response(
     return result
 
 
-def _safe_response(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _safe_response(
+    payload: Mapping[str, Any],
+    *,
+    timeout_max_seconds: int | float | None = None,
+) -> dict[str, Any]:
     """Backward-compatible internal alias for the response sanitizer."""
 
-    return safe_worker_response(payload)
+    return safe_worker_response(payload, timeout_max_seconds=timeout_max_seconds)
 
 
 def _safe_probe_diagnostics(value: Any) -> dict[str, Any]:
@@ -4721,10 +4773,14 @@ def _safe_nonnegative_number(value: Any) -> float | int | None:
     return value
 
 
-def _safe_nonterminal_response(payload: Mapping[str, Any]) -> dict[str, Any]:
+def _safe_nonterminal_response(
+    payload: Mapping[str, Any],
+    *,
+    timeout_max_seconds: int | float | None = None,
+) -> dict[str, Any]:
     """Retain diagnostics without serializing a pending state as a verdict."""
 
-    result = _safe_response(payload)
+    result = _safe_response(payload, timeout_max_seconds=timeout_max_seconds)
     observations: list[str] = []
 
     def scrub(node: dict[str, Any]) -> None:

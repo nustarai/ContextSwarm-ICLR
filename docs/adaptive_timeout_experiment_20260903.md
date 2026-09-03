@@ -89,9 +89,15 @@ matched control。
   保持历史表面；旧 run 不会因为新增字段而改变分母。
 - `judge_check` 请求字段：可选整数 `timeout_seconds`。
 - `evaluate_local`：可选 `python3 evaluate.py --timeout N`，由同一 broker 字段承载。
-- 广告范围为 **5–300 秒**。broker 在 capability 边界校验类型并记录原值；超出范围
-  进行裁剪，malformed 值拒绝。evaluator 再按自身配置的 timeout ceiling 做第二次
-  防御性裁剪。
+- 默认广告范围为 **5–300 秒**；实际范围由 `[judge].timeout_seconds`（未填写时回退到
+  `[lean].timeout_seconds`）驱动，始终显示为 `min(5, configured)`–`configured`。因此较小
+  或较大的 manifest 会同步改变 prompt、工具说明、formal helper 文档和 broker receipt；
+  300 秒只是默认值，不是写死的全局上限。broker 在 capability 边界校验类型并记录原值；
+  超出实际配置范围进行裁剪，malformed 值拒绝。evaluator 再按同一配置做第二次防御性裁剪。
+- 当 Agent timeout capability 和 formal helper 同时启用时，配置加载器会把
+  `formal_tools.command_timeout_seconds` 至少提升到 `configured + 120` 秒；这是 Pi Bash
+  外层的 handoff margin，不改变 Judge/evaluator cap。这样即使把 cap 配成 600 或更大，
+  `evaluate.py --timeout N` 也不会先被 shell guard 截断；默认 cap=300 仍保持历史 420 秒。
 - receipt、audit 和 profiling 记录 `requested_timeout_seconds`、
   `effective_timeout_seconds`、`timeout_clamped`、`timeout_source`。这四个字段只记录
   有界策略元数据，不记录 prompt、候选源码、token 或原始 Judge response。
@@ -126,12 +132,15 @@ closeout evaluation 和 remote settlement 语义不变。每个 receipt/audit �
 
 ### 3.3 Prompt 引导（实验 treatment）
 
-启用能力的动态 prompt 和工具描述建议 Agent：
+启用能力的动态 prompt 和工具描述建议 Agent（下列比例按 manifest 的实际 cap 计算；默认
+cap=300 时约等于括号中的历史档位）：
 
-- routine incremental check 约 30–60 s；
-- 有重 import/elaboration/resource 风险、但候选很有希望时 120–180 s；
-- 只有已接近完整且已知偏慢时才用 300 s；
-- 5–15 s 只适合明显小改动后的廉价 sanity check，不适合首个 checkpoint 或刚改大定义。
+- routine incremental check 约为 cap 的 10–20%（默认 30–60 s）；
+- 有重 import/elaboration/resource 风险、但候选很有希望时约为 cap 的 40–60%（默认
+  120–180 s）；
+- 只有已接近完整且已知偏慢时才用完整 cap（默认 300 s）；
+- 约 cap 的 5% 或更低只适合明显小改动后的廉价 sanity check（默认 5–15 s），不适合
+  首个 checkpoint 或刚改大定义。
 
 Prompt 明确说明：值会被 runner clamp，生效值会在 receipt 返回；超时不是错误证明；超时
 后应检查反馈并做实质修改或保留最佳候选，再决定是否重试。为了让 treatment 有可测的
@@ -474,6 +483,31 @@ recovery 语义和随机候选共同作用。当前最可信的方案收益仍�
 综合判断：**方案对“长尾验证耗时”有效且值得继续，但对最终解题质量的提升尚未构成因果
 结论。** r1 的 4 分落在原始三轮的 4–5 分区间内，更像随机/混杂波动；r2/r3 的 6 分和
 三轮 treatment 平均值的上升是积极信号，但不能归因给累计 retry，因为 retry 实际没有发生。
+
+### 6.1 交付决策（2026-09-04）
+
+针对最初的长尾问题，本轮证据已经足够支持提交实现 PR：原始 Judge 工具的两次 300 秒
+backend attempt 会把少数请求拖到约 600 秒；显式 Agent budget 现在由 fresh backend
+attempt、单次逻辑总预算和底层硬上限共同约束，timeout-specific retry 不会再复制一个
+完整的长尾。
+三轮累计 treatment 的 pooled 最大 fresh elapsed 为 180.865 秒，`>300 s`、`>600 s` 均为
+零，`>120 s` 耗时占比由 50.952% 降至 3.889%。
+
+这不是把所有异常 retry 都删除：对于有明确 candidate-independent transport/runtime 证据的
+情况，当前 evaluator 仍可在同一个 broker handler/evaluator gate 内使用剩余总预算做安全
+fresh retry；三轮正式 workload 的 `judge_retry_count` 恰好均为 0，因此这个分支没有被自然
+流量触发。对本次目标而言，关键保证是超时本身不自动再开一轮完整 300 秒，而不是依赖降低
+retry 次数来掩盖总预算问题。
+
+实现上的配置修正也一并纳入 PR：`[judge].timeout_seconds`（或 `[lean]` fallback）现在是
+Agent timeout cap 的单一来源，默认仍为 300；prompt、Pi tool description/schema 的说明、
+formal helper `PUBLIC_FILES.md`、runner summary、broker policy 和审计字段都读取同一实际
+cap。工具 schema 保留“无 maximum 字段”的软控制设计，让超 cap 请求可以到达 broker，记录
+requested 值并由底层裁剪；因此既保留可观测性，也保留硬性兜底。
+
+最终质量结论仍保持保守：baseline 三轮 score=`5,4,5`，treatment 三轮为 `6,6,5`，这是
+积极但非因果、非稳定的方向性信号；本 PR 的明确结论是长尾治理有效，不宣称数学解题质量
+已经被证明提升。
 
 ### 下一步决策
 

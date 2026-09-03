@@ -322,7 +322,12 @@ paper-facing manifest 统一将 `[lean].max_concurrent_evaluations` 设为 4；�
 内存容量一起调整。`[lean].timeout_seconds`（默认 300 秒）是省略 Agent 提议时
 Judge 单个后端命令的执行预算，不是提交到终态的总 wall time：合法 job lifecycle 还可能包含
 queue、冷 REPL header/body 以及 formal finalization。它也不是 solver horizon 或
-整个 closeout 的总预算。`[lean].max_lifecycle_seconds`（paper manifest 为 3600）
+整个 closeout 的总预算。启用 Agent timeout capability 时，`timeout_seconds` 的默认
+广告范围是 5–300 秒，但 300 只是默认值；实际 Agent 上限跟随 `[judge].timeout_seconds`
+（或 `[lean].timeout_seconds` fallback），prompt、tool description 和 broker 会使用同一
+配置值。启用该能力且开启 formal helper 时，`formal_tools.command_timeout_seconds` 会至少
+保留该 cap 外加 120 秒的 helper handoff margin，避免 Pi 的 Bash guard 先于 Judge budget
+结束；默认 300 秒对应历史 420 秒。`[lean].max_lifecycle_seconds`（paper manifest 为 3600）
 是客户端防御畸形 receipt 的显式安全上界，不会缩短 Judge 正常公布的预算。
 
 如果 AISW binary 或 node config 不在默认路径：

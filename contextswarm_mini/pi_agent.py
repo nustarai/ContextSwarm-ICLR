@@ -24,6 +24,7 @@ import uuid
 from .config import ExperimentConfig
 from .models import AgentResult
 from .profiling import RunProfiler
+from .timeout_policy import agent_timeout_bounds
 
 
 _STDERR_LINE_LIMIT_BYTES = 256 * 1024
@@ -360,6 +361,7 @@ class PiAgent:
         for directory in (private_home, private_tmp):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(directory, 0o700)
+        agent_timeout = agent_timeout_bounds(self.config.lean_timeout_seconds)
         env.update(
             {
                 "HOME": str(private_home),
@@ -379,6 +381,15 @@ class PiAgent:
                     "1"
                     if getattr(self.config, "judge_agent_timeout_enabled", False)
                     else "0"
+                ),
+                # Keep the trusted Pi extension's schema and guidance aligned
+                # with the evaluator cap selected by the manifest.  These are
+                # public capability metadata, not credentials.
+                "CONTEXTSWARM_AGENT_TIMEOUT_MIN_SECONDS": str(
+                    agent_timeout.min_seconds
+                ),
+                "CONTEXTSWARM_AGENT_TIMEOUT_MAX_SECONDS": str(
+                    agent_timeout.max_seconds
                 ),
                 "EXPERIMENT_CONFIG_AISW_MAX_IN_FLIGHT": str(
                     self.config.aisw_max_in_flight

@@ -90,7 +90,7 @@ from .prompts import build_mono_prompt, build_task_prompt
 from .profiling import RunProfiler
 from .selection_runtime import SelectionRuntime
 from .selection_store import EXPORT_SCHEMA_VERSION, SelectionStore
-from .timeout_policy import AGENT_TIMEOUT_MAX_SECONDS, AGENT_TIMEOUT_MIN_SECONDS
+from .timeout_policy import agent_timeout_bounds
 
 
 def _candidate_name(task: Task) -> str:
@@ -2665,6 +2665,7 @@ def run_experiment(
         selection_search=selection_search,
         profiler=logger.profiler,
         agent_timeout_enabled=config.judge_agent_timeout_enabled,
+        agent_timeout_cap_seconds=config.lean_timeout_seconds,
     ).start()
     (run_dir / "judge_broker_policy.json").write_text(
         json.dumps(judge_broker.public_policy(), ensure_ascii=False, indent=2, sort_keys=True)
@@ -3093,6 +3094,7 @@ def _run_mono(
             communication_enabled=False,
             formal_tools_enabled=config.formal_tools_enabled,
             agent_timeout_enabled=config.judge_agent_timeout_enabled,
+            agent_timeout_cap_seconds=config.lean_timeout_seconds,
         )
     early_lock = threading.RLock()
     early_proofs: dict[str, _EarlyProofCredit] = {}
@@ -5087,6 +5089,7 @@ def _run_elastic_cps(
                 communication_enabled=policy.enabled,
                 formal_tools_enabled=config.formal_tools_enabled,
                 agent_timeout_enabled=config.judge_agent_timeout_enabled,
+                agent_timeout_cap_seconds=config.lean_timeout_seconds,
                 direct_messages=direct_messages,
                 selection_enabled=selection_enabled,
                 digest=digest,
@@ -5864,6 +5867,7 @@ def _run_task_workers(
                     communication_enabled=policy.enabled,
                     formal_tools_enabled=config.formal_tools_enabled,
                     agent_timeout_enabled=config.judge_agent_timeout_enabled,
+                    agent_timeout_cap_seconds=config.lean_timeout_seconds,
                     direct_messages=direct_messages,
                     selection_enabled=selection_enabled,
                     digest=digest,
@@ -6143,6 +6147,8 @@ def _stage_task(
                 surface_version=config.formal_tools_version,
             ),
             baseline_names=[baseline_source.name],
+            agent_timeout_enabled=config.judge_agent_timeout_enabled,
+            agent_timeout_cap_seconds=config.lean_timeout_seconds,
         )
 
 
@@ -7677,10 +7683,11 @@ def _write_figure4_summary(
         "judge_mode": config.lean_judge_mode,
         "timeout_seconds": config.lean_timeout_seconds,
         "agent_timeout_enabled": config.judge_agent_timeout_enabled,
-        "agent_timeout_bounds_seconds": {
-            "min": AGENT_TIMEOUT_MIN_SECONDS,
-            "max": AGENT_TIMEOUT_MAX_SECONDS,
-        },
+        "agent_timeout_bounds_seconds": agent_timeout_bounds(
+            config.lean_timeout_seconds
+            if config.judge_agent_timeout_enabled
+            else None
+        ).public_dict(),
         "agent_timeout_semantics": (
             "cumulative_total_across_safe_retries_with_legacy_per_job_when_omitted"
         ),

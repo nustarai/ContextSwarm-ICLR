@@ -18,6 +18,12 @@ class ConfigError(ValueError):
     """Raised when a manifest is incomplete or internally inconsistent."""
 
 
+# The staged ``evaluate.py`` helper is launched through Pi's Bash capability.
+# Leave a bounded handoff margin after the Agent budget so that the shell
+# wrapper cannot kill a legal helper request before the broker/evaluator does.
+_AGENT_TIMEOUT_HELPER_GRACE_SECONDS = 120
+
+
 def _deep_merge(base: dict[str, Any], update: Mapping[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(base)
     for key, value in update.items():
@@ -1063,6 +1069,21 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     )
     if judge_kind == "coding" and formal_tools_enabled:
         raise ConfigError("coding judge manifests cannot enable formal_tools")
+    formal_tools_command_timeout_seconds = _positive_int(
+        formal_tools.get("command_timeout_seconds"),
+        "formal_tools.command_timeout_seconds",
+        max(420, lean_timeout + _AGENT_TIMEOUT_HELPER_GRACE_SECONDS),
+    )
+    if judge_agent_timeout_enabled and formal_tools_enabled:
+        # ``evaluate.py`` runs through the Pi Bash capability.  Keep that
+        # outer process timeout at least one bounded handoff margin beyond the
+        # Agent/Judge budget; otherwise a larger manifest cap would be
+        # advertised but the shell could terminate the helper first.  The
+        # default 300-second cap retains the historical 420-second value.
+        formal_tools_command_timeout_seconds = max(
+            formal_tools_command_timeout_seconds,
+            lean_timeout + _AGENT_TIMEOUT_HELPER_GRACE_SECONDS,
+        )
     formal_tools_version = _text(
         formal_tools.get("surface_version"),
         "contextswarm_mini_formal_tools_v1",
@@ -1166,11 +1187,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
             "formal_tools.max_candidate_bytes",
             2 * 1024 * 1024,
         ),
-        formal_tools_command_timeout_seconds=_positive_int(
-            formal_tools.get("command_timeout_seconds"),
-            "formal_tools.command_timeout_seconds",
-            max(420, lean_timeout + 120),
-        ),
+        formal_tools_command_timeout_seconds=formal_tools_command_timeout_seconds,
         formal_tools_decl_index=_text(formal_tools.get("decl_index")),
         formal_tools_decl_index_sha256=formal_tools_decl_index_sha256,
         formal_tools_mathlib_revision=formal_tools_mathlib_revision,

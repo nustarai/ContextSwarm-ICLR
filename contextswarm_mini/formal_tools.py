@@ -16,6 +16,7 @@ import threading
 from typing import Any, Iterable, Mapping
 
 from .artifacts import atomic_write_json, atomic_write_text
+from .timeout_policy import agent_timeout_bounds
 
 
 TOOL_CAPABILITY_FILENAME = ".contextswarm_tool_capability.json"
@@ -469,6 +470,8 @@ def stage_worker_tools(
     *,
     capability: ToolCapability,
     baseline_names: Iterable[str],
+    agent_timeout_enabled: bool = False,
+    agent_timeout_cap_seconds: int | float | None = None,
 ) -> None:
     """Stage identical manifest-selected shims for Mono, Parallel, and CPS."""
 
@@ -489,6 +492,8 @@ def stage_worker_tools(
         destination / PUBLIC_FILES_FILENAME,
         public_files_manifest(
             baseline_names=baseline_names,
+            agent_timeout_enabled=agent_timeout_enabled,
+            agent_timeout_cap_seconds=agent_timeout_cap_seconds,
         ),
         mode=0o444,
     )
@@ -497,6 +502,8 @@ def stage_worker_tools(
 def public_files_manifest(
     *,
     baseline_names: Iterable[str],
+    agent_timeout_enabled: bool = False,
+    agent_timeout_cap_seconds: int | float | None = None,
 ) -> str:
     files = [
         "problem.md",
@@ -508,6 +515,19 @@ def public_files_manifest(
         EVALUATE_FILENAME,
         FORMAL_QUERY_FILENAME,
     ]
+    timeout_bounds = agent_timeout_bounds(agent_timeout_cap_seconds)
+    timeout_note = (
+        (
+            f"When enabled, add `--timeout N` with N in the configured "
+            f"{timeout_bounds.min_seconds}–{timeout_bounds.max_seconds} second "
+            "range; the value is the cumulative logical validation budget "
+            "across safe evaluator retries."
+        )
+        if agent_timeout_enabled
+        else "When the run advertises Agent timeout control, add `--timeout N`; "
+        "the value is the cumulative logical validation budget across safe "
+        "evaluator retries."
+    )
     lines = [
         "# Public Formal Worker Files",
         "",
@@ -519,7 +539,9 @@ def public_files_manifest(
         "",
         "## Formal capabilities",
         "",
-        "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. When the run advertises Agent timeout control, add `--timeout N` (5-300 seconds); the value is the cumulative logical validation budget across safe evaluator retries and remains advisory, never the official score.",
+        "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. "
+        + timeout_note
+        + " It remains advisory, never the official score.",
         "- `./formal_query --help` describes bounded `search`, `decl`, `check`, `type`, `axioms`, and `deps` queries. `search` scans only `problem.md`, `result.lean`, `baseline/*.lean`, and the revision-bound declaration index.",
         "- `deps` returns index-related candidate premises, not a dependency graph. Verify names with `check`.",
         "- The final score comes only from the feedback-free outer evaluation of an immutable candidate snapshot.",

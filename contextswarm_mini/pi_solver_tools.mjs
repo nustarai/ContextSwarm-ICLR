@@ -114,6 +114,24 @@ function enabledCapability(name, defaultValue = false) {
   return ["1", "true", "yes", "on"].includes(raw);
 }
 
+function agentTimeoutBounds() {
+  const rawMaximum = Number(process.env.CONTEXTSWARM_AGENT_TIMEOUT_MAX_SECONDS ?? "");
+  const maximum = Number.isSafeInteger(rawMaximum) && rawMaximum > 0 ? rawMaximum : 300;
+  const minimum = Math.min(5, maximum);
+  return { minimum, maximum };
+}
+
+function scaledAgentTimeout(maximum, minimum, ratio) {
+  return Math.max(minimum, Math.min(maximum, Math.round(maximum * ratio)));
+}
+
+function timeoutTier(low, high, ratioLabel) {
+  const rendered = `${low}-${high}s`;
+  return low === high
+    ? `${rendered} (rounded for this configured cap)`
+    : `${rendered} (${ratioLabel} of the cap)`;
+}
+
 function normalizeExistingPath(rawPath, cwd) {
   if (typeof rawPath !== "string" || !rawPath.trim()) return null;
   const lexical = isAbsolute(rawPath) ? resolve(rawPath) : resolve(cwd, rawPath);
@@ -378,7 +396,11 @@ function installPathGuard(pi) {
         process.env.CONTEXTSWARM_FORMAL_COMMAND_TIMEOUT_SECONDS ?? "420",
       );
       input.timeout = Number.isFinite(configuredTimeout)
-        ? Math.max(1, Math.min(3_600, Math.trunc(configuredTimeout)))
+        // Keep the shell guard finite while allowing a manifest-selected
+        // Agent/Judge cap above the historical one-hour default.  The outer
+        // experiment horizon and broker deadline remain independent hard
+        // boundaries.
+        ? Math.max(1, Math.min(2_147_000_000, Math.trunc(configuredTimeout)))
         : 420;
     }
   });
@@ -395,15 +417,31 @@ export default function registerContextSwarmSolverTools(pi) {
   const directMessages = enabledCapability("CONTEXTSWARM_CPS_DIRECT_MESSAGES", true);
   const selectionEnabled = enabledCapability("CONTEXTSWARM_CPS_SELECTION_ENABLED");
   const agentTimeoutEnabled = enabledCapability("CONTEXTSWARM_AGENT_TIMEOUT_ENABLED");
+  const agentTimeout = agentTimeoutBounds();
+  const routineTimeout = [
+    scaledAgentTimeout(agentTimeout.maximum, agentTimeout.minimum, 0.10),
+    scaledAgentTimeout(agentTimeout.maximum, agentTimeout.minimum, 0.20),
+  ];
+  const heavyTimeout = [
+    scaledAgentTimeout(agentTimeout.maximum, agentTimeout.minimum, 0.40),
+    scaledAgentTimeout(agentTimeout.maximum, agentTimeout.minimum, 0.60),
+  ];
+  const sanityTimeout = [
+    agentTimeout.minimum,
+    scaledAgentTimeout(agentTimeout.maximum, agentTimeout.minimum, 0.05),
+  ];
+  const routineGuidance = timeoutTier(routineTimeout[0], routineTimeout[1], "10-20%");
+  const heavyGuidance = timeoutTier(heavyTimeout[0], heavyTimeout[1], "40-60%");
+  const sanityGuidance = timeoutTier(sanityTimeout[0], sanityTimeout[1], "about 5% or less");
 
   const judgeProperties = {
     task_id: stringSchema("Mono task slug; omit in a single-task worker", 256),
   };
   if (agentTimeoutEnabled) {
     judgeProperties.timeout_seconds = integerSchema(
-      "Optional cumulative validation budget in seconds across evaluator retries; runner clamps to 5-300",
+      `Optional cumulative validation budget in seconds across evaluator retries; runner clamps to ${agentTimeout.minimum}-${agentTimeout.maximum}`,
       null,
-      5,
+      agentTimeout.minimum,
     );
   }
 
@@ -411,14 +449,14 @@ export default function registerContextSwarmSolverTools(pi) {
     name: "judge_check",
     label: "Controlled Judge Check",
     description:
-      `Submit the runner-bound ${candidate} to the controlled external ${language} Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.${agentTimeoutEnabled ? " You may optionally provide integer timeout_seconds (5-300) as the total budget for this logical validation, including safe retries; the runner clamps it and reports the effective budget." : ""}`,
+      `Submit the runner-bound ${candidate} to the controlled external ${language} Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.${agentTimeoutEnabled ? ` You may optionally provide integer timeout_seconds (${agentTimeout.minimum}-${agentTimeout.maximum}) as the total budget for this logical validation, including safe retries; the runner clamps it and reports the effective budget.` : ""}`,
     promptSnippet: `Check the current ${candidate} through the controlled external Judge`,
     promptGuidelines: [
       "Use judge_check one candidate at a time; never attempt local compilation or raw Judge access.",
       "A retryable busy result is not permission to use a local fallback.",
       ...(agentTimeoutEnabled
         ? [
-            "Choose timeout_seconds as a cumulative logical validation budget: 30-60s for routine checks, 120-180s for promising heavy candidates, and 300s only for likely but known-slow checks; any safe retry receives only the remaining time.",
+            `Choose timeout_seconds as a cumulative logical validation budget: about ${routineGuidance} for routine checks, ${heavyGuidance} for promising heavy candidates, and ${agentTimeout.maximum}s only for likely but known-slow checks; use about ${sanityGuidance} for cheap sanity feedback. Any safe retry receives only the remaining time.`,
             "An execution timeout is inconclusive feedback; do not relabel it as VERIFY_FAIL or use a local checker.",
           ]
         : []),

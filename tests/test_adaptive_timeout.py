@@ -19,7 +19,7 @@ from contextswarm_mini.judge_broker import JudgeBroker
 from contextswarm_mini.models import Task, Verdict
 from contextswarm_mini.prompts import build_task_prompt
 from contextswarm_mini.profiling import RunProfiler
-from contextswarm_mini.timeout_policy import normalize_agent_timeout
+from contextswarm_mini.timeout_policy import agent_timeout_bounds, normalize_agent_timeout
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +122,38 @@ class AdaptiveTimeoutTests(unittest.TestCase):
         self.assertIn("EXECUTION_TIMEOUT", enabled)
         self.assertNotIn("Agent-proposed validation budget", disabled)
 
+    def test_prompt_uses_configured_timeout_cap_for_guidance(self) -> None:
+        task = _task(ROOT)
+        prompt = build_task_prompt(
+            task,
+            task_workspace="tasks/task",
+            agent_id="worker-task-e1",
+            episode=1,
+            communication_enabled=False,
+            formal_tools_enabled=True,
+            agent_timeout_enabled=True,
+            agent_timeout_cap_seconds=600,
+        )
+        self.assertIn("range 5–600", prompt)
+        self.assertIn('"timeout_seconds": 120', prompt)
+        self.assertIn("reserve the full 600 seconds", prompt)
+        self.assertNotIn("reserve the full 300 seconds", prompt)
+
+    def test_prompt_does_not_claim_unrounded_percentages_for_tiny_cap(self) -> None:
+        task = _task(ROOT)
+        prompt = build_task_prompt(
+            task,
+            task_workspace="tasks/task",
+            agent_id="worker-task-e1",
+            episode=1,
+            communication_enabled=False,
+            formal_tools_enabled=True,
+            agent_timeout_enabled=True,
+            agent_timeout_cap_seconds=3,
+        )
+        self.assertIn("range 3–3 seconds", prompt)
+        self.assertIn("rounded for this configured cap", prompt)
+
     def test_solver_schema_and_formal_guard_follow_capability_bit(self) -> None:
         node = shutil.which("node")
         if not node:
@@ -166,7 +198,11 @@ process.stdout.write(JSON.stringify({
                     str(workdir),
                 ],
                 cwd=workdir,
-                env=base_env | {"CONTEXTSWARM_AGENT_TIMEOUT_ENABLED": "1"},
+                env=base_env
+                | {
+                    "CONTEXTSWARM_AGENT_TIMEOUT_ENABLED": "1",
+                    "CONTEXTSWARM_AGENT_TIMEOUT_MAX_SECONDS": "120",
+                },
                 capture_output=True,
                 text=True,
                 check=False,
@@ -191,7 +227,10 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(enabled.returncode, 0, enabled.stderr)
         enabled_value = json.loads(enabled.stdout)
         self.assertEqual(enabled_value["schema"]["minimum"], 5)
+        # Leave the upper bound out of the client-side JSON schema so values
+        # above it reach the broker and are auditable as soft-control clamps.
         self.assertNotIn("maximum", enabled_value["schema"])
+        self.assertIn("5-120", enabled_value["schema"]["description"])
         self.assertFalse(enabled_value["enabled_command_blocked"])
         self.assertTrue(enabled_value["malformed_command_blocked"])
         self.assertEqual(disabled.returncode, 0, disabled.stderr)
@@ -208,8 +247,79 @@ process.stdout.write(JSON.stringify({
             normalize_agent_timeout(300, configured_timeout_seconds=30).effective_seconds,
             30,
         )
+        self.assertEqual(
+            normalize_agent_timeout(999, configured_timeout_seconds=600).effective_seconds,
+            600,
+        )
+        self.assertEqual(
+            normalize_agent_timeout(999, configured_timeout_seconds=3).effective_seconds,
+            3,
+        )
+        self.assertEqual(agent_timeout_bounds(3).min_seconds, 3)
+        self.assertEqual(agent_timeout_bounds(600).max_seconds, 600)
         with self.assertRaises(ValueError):
             normalize_agent_timeout(True)
+
+    def test_broker_policy_uses_a_larger_manifest_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = _task(root)
+            workdir = root / "worker"
+            workdir.mkdir()
+            (workdir / "result.lean").write_text(task.baseline_code, encoding="utf-8")
+
+            class ConflictingCapEvaluator(_TimeoutEvaluator):
+                # The runner's manifest value must be authoritative even for
+                # a narrow/mock adapter that exposes a stale or missing
+                # evaluator timeout attribute.
+                timeout_seconds = 300
+
+            evaluator = ConflictingCapEvaluator()
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=root / "judge_checks.jsonl",
+                formal_policy=_policy(),
+                agent_timeout_enabled=True,
+                agent_timeout_cap_seconds=600,
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=1,
+            ).start()
+            try:
+                self.assertEqual(
+                    broker.public_policy()["agent_timeout"]["max_seconds"], 600
+                )
+                with broker.session(
+                    actor_id="worker",
+                    workdir=workdir,
+                    candidates={task.slug: (task, workdir / "result.lean")},
+                    deadline_monotonic=10**9,
+                ) as env:
+                    result = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"],
+                        "judge_check",
+                        {"timeout_seconds": 999},
+                    )
+                self.assertEqual(result["requested_timeout_seconds"], 999)
+                self.assertEqual(result["effective_timeout_seconds"], 600)
+                self.assertEqual(evaluator.timeouts, [600])
+            finally:
+                broker.close()
+
+    def test_loaded_manifest_derives_helper_guard_for_a_larger_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "larger-cap.toml"
+            path.write_text(
+                f'extends = ["{ROOT / "configs" / "smoke.toml"}"]\n'
+                "\n[judge]\nagent_timeout_enabled = true\ntimeout_seconds = 600\n"
+                "\n[formal_tools]\ncommand_timeout_seconds = 420\n",
+                encoding="utf-8",
+            )
+            config = load_config(path, ROOT)
+        self.assertEqual(config.lean_timeout_seconds, 600)
+        # The Pi Bash guard gets a 120-second handoff margin, so the helper
+        # cannot be killed before the configured Agent/Judge budget expires.
+        self.assertEqual(config.formal_tools_command_timeout_seconds, 720)
 
     def test_treatment_config_advertises_capability_and_baseline_does_not(self) -> None:
         baseline = load_config("configs/formal_1h_cps32_profiled_clean.toml", ROOT)

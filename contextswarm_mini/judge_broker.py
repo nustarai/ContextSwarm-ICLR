@@ -36,9 +36,9 @@ from .models import Task, Verdict
 from .secure_io import DEFAULT_MAX_CANDIDATE_BYTES, read_regular_bytes
 from .selection_store import CANONICAL_FEEDBACK_KINDS, SelectionStore
 from .timeout_policy import (
-    AGENT_TIMEOUT_MAX_SECONDS,
     AGENT_TIMEOUT_MIN_SECONDS,
     AgentTimeout,
+    agent_timeout_bounds,
     normalize_agent_timeout,
     timeout_fields,
 )
@@ -48,6 +48,7 @@ _MAX_REQUEST_BYTES = 32 * 1024
 _MAX_PROBE_CALLS_PER_SESSION = 32
 _MIN_PROBE_INTERVAL_SECONDS = 1.0
 _PROBE_ADMISSION_TIMEOUT_SECONDS: float | None = None
+_AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS = 0.01
 # Closeout is outside the solver horizon.  A five-second drain was sufficient
 # for a single canary, but it races legitimate Judge handlers when several
 # formal arms revoke their sessions together: queued cancellation/receipt
@@ -323,6 +324,7 @@ class JudgeBroker:
         selection_search: Callable[[Any, str, int], Mapping[str, Any]] | None = None,
         profiler: Any | None = None,
         agent_timeout_enabled: bool = False,
+        agent_timeout_cap_seconds: int | float | None = None,
     ):
         self.evaluator = evaluator
         self.evaluator_gate = evaluator_gate
@@ -366,16 +368,23 @@ class JudgeBroker:
         if not isinstance(agent_timeout_enabled, bool):
             raise ValueError("agent_timeout_enabled must be a boolean")
         self.agent_timeout_enabled = agent_timeout_enabled
-        try:
-            configured_timeout = float(getattr(evaluator, "timeout_seconds", AGENT_TIMEOUT_MAX_SECONDS))
-        except (TypeError, ValueError, OverflowError):
-            configured_timeout = float(AGENT_TIMEOUT_MAX_SECONDS)
-        self.agent_timeout_cap_seconds = min(
-            AGENT_TIMEOUT_MAX_SECONDS,
-            max(1, int(configured_timeout))
-            if math.isfinite(configured_timeout) and configured_timeout > 0
-            else AGENT_TIMEOUT_MAX_SECONDS,
+        configured_agent_timeout = (
+            agent_timeout_cap_seconds
+            if agent_timeout_cap_seconds is not None
+            else getattr(evaluator, "timeout_seconds", None)
         )
+        try:
+            self.agent_timeout_bounds = agent_timeout_bounds(
+                configured_agent_timeout if agent_timeout_enabled else None
+            )
+        except ValueError:
+            if agent_timeout_cap_seconds is not None:
+                raise
+            # A narrow test/evaluator adapter may not expose a usable timeout;
+            # retain the historical default rather than making broker startup
+            # depend on an optional attribute.
+            self.agent_timeout_bounds = agent_timeout_bounds()
+        self.agent_timeout_cap_seconds = self.agent_timeout_bounds.max_seconds
         try:
             self._profiling_enabled = bool(
                 profiler is not None and getattr(profiler, "enabled", False)
@@ -705,8 +714,8 @@ class JudgeBroker:
             "agent_timeout": {
                 "enabled": self.agent_timeout_enabled,
                 "field": "timeout_seconds",
-                "min_seconds": AGENT_TIMEOUT_MIN_SECONDS,
-                "max_seconds": AGENT_TIMEOUT_MAX_SECONDS,
+                "min_seconds": self.agent_timeout_bounds.min_seconds,
+                "max_seconds": self.agent_timeout_bounds.max_seconds,
                 "configured_evaluator_cap_seconds": self.agent_timeout_cap_seconds,
                 "semantics": "cumulative_total_validation_budget_across_retries",
                 "retry_scope": "same_broker_handler_and_evaluator_gate",
@@ -798,10 +807,16 @@ class JudgeBroker:
         # never reached an evaluator still get the requested budget and a
         # zero-attempt marker below.
         response = normalized.get("response")
-        response_fields = _safe_timeout_budget_fields(response)
+        response_fields = _safe_timeout_budget_fields(
+            response, max_timeout_seconds=self.agent_timeout_cap_seconds
+        )
         normalized.update(response_fields)
         normalized.update(_safe_formal_quota_fields(response))
-        normalized.update(_safe_timeout_budget_fields(normalized))
+        normalized.update(
+            _safe_timeout_budget_fields(
+                normalized, max_timeout_seconds=self.agent_timeout_cap_seconds
+            )
+        )
         normalized.update(_safe_formal_quota_fields(normalized))
         if timeout is not None:
             normalized.setdefault("timeout_budget_mode", "cumulative_total")
@@ -1543,7 +1558,10 @@ class JudgeBroker:
                 raw_judge_job_id = verdict.judge_job_id
                 verdict_status = _safe_verdict_status(verdict.status)
                 safe_job_id = sanitize_worker_identifier(verdict.judge_job_id)
-                safe_response = safe_worker_response(verdict.response)
+                safe_response = safe_worker_response(
+                    verdict.response,
+                    timeout_max_seconds=self.agent_timeout_cap_seconds,
+                )
                 evaluator_unsettled_after = _nonnegative_count(
                     getattr(self.evaluator, "remote_unsettled_jobs", 0)
                 )
@@ -1831,7 +1849,9 @@ class JudgeBroker:
         # expose the same bounded receipt profile as pre-admission failures.
         # ``result`` is already sanitized above, and no response/error payload
         # is forwarded to the profiling sink.
-        budget_profile_fields = _timeout_profile_fields(result)
+        budget_profile_fields = _timeout_profile_fields(
+            result, max_timeout_seconds=self.agent_timeout_cap_seconds
+        )
         self._profile_event(
             "judge.receipt",
             claim=claim,
@@ -1980,7 +2000,9 @@ class JudgeBroker:
             else gate_wait_seconds
         )
         audit_started = time.monotonic()
-        budget_profile_fields = _timeout_profile_fields(normalized)
+        budget_profile_fields = _timeout_profile_fields(
+            normalized, max_timeout_seconds=self.agent_timeout_cap_seconds
+        )
         try:
             self._audit(
                 claim,
@@ -2350,7 +2372,10 @@ class JudgeBroker:
                                 retryable=False,
                             )
                         else:
-                            result = _formal_worker_verdict(verdict)
+                            result = _formal_worker_verdict(
+                                verdict,
+                                max_timeout_seconds=self.agent_timeout_cap_seconds,
+                            )
         except Exception:
             evaluator_unsettled_after = _nonnegative_count(
                 getattr(self.evaluator, "remote_unsettled_jobs", 0)
@@ -2870,7 +2895,10 @@ class JudgeBroker:
                     "cache_hit": False,
                 }
             else:
-                result = _formal_probe_result(verdict)
+                result = _formal_probe_result(
+                    verdict,
+                    max_timeout_seconds=self.agent_timeout_cap_seconds,
+                )
         except Exception:
             evaluator_unsettled_after = _nonnegative_count(
                 getattr(self.evaluator, "remote_unsettled_jobs", 0)
@@ -3026,7 +3054,11 @@ class JudgeBroker:
             "advisory_only": True,
             "official_score_eligible": False,
         }
-        row.update(_safe_timeout_budget_fields(result))
+        row.update(
+            _safe_timeout_budget_fields(
+                result, max_timeout_seconds=self.agent_timeout_cap_seconds
+            )
+        )
         row.update(_safe_formal_quota_fields(result))
         with self._audit_lock:
             with self.formal_audit_path.open("a", encoding="utf-8") as handle:
@@ -3341,7 +3373,11 @@ class JudgeBroker:
             "response_profile": LEAN_PROBE_RESPONSE_PROFILE,
             **failure_fields,
         }
-        row.update(_safe_timeout_budget_fields(result))
+        row.update(
+            _safe_timeout_budget_fields(
+                result, max_timeout_seconds=self.agent_timeout_cap_seconds
+            )
+        )
         with self._audit_lock:
             with self.audit_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
@@ -3544,23 +3580,33 @@ def _remaining_agent_attempt_seconds(
     The absolute deadline is authoritative for built-in evaluators.  Narrow
     adapters may only understand ``timeout_seconds``; passing the remaining
     integer budget to them still prevents queue/snapshot time from silently
-    granting a second full attempt.  ``None`` means that the advertised
-    five-second floor can no longer be honored.
+    granting a second full attempt.  ``None`` means that the configured
+    minimum attempt floor can no longer be honored.
     """
 
     if timeout is None:
         return None
+    minimum_attempt_seconds = min(
+        AGENT_TIMEOUT_MIN_SECONDS, int(timeout.effective_seconds)
+    )
     if deadline_monotonic is None:
         return int(timeout.effective_seconds)
     try:
         remaining = float(deadline_monotonic) - time.monotonic()
     except (TypeError, ValueError, OverflowError):
         return None
-    if not math.isfinite(remaining) or remaining < AGENT_TIMEOUT_MIN_SECONDS:
+    remaining_ceiling = (
+        int(math.ceil(max(0.0, remaining))) if math.isfinite(remaining) else 0
+    )
+    if (
+        not math.isfinite(remaining)
+        or remaining
+        < minimum_attempt_seconds - _AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS
+    ):
         return None
     return max(
-        AGENT_TIMEOUT_MIN_SECONDS,
-        min(int(timeout.effective_seconds), int(math.ceil(remaining))),
+        minimum_attempt_seconds,
+        min(int(timeout.effective_seconds), remaining_ceiling),
     )
 
 
@@ -3677,7 +3723,11 @@ def _control_result(
     return result
 
 
-def _safe_timeout_budget_fields(value: Any) -> dict[str, Any]:
+def _safe_timeout_budget_fields(
+    value: Any,
+    *,
+    max_timeout_seconds: int | float | None = None,
+) -> dict[str, Any]:
     """Extract bounded cumulative-budget metadata from a result/response.
 
     This helper is deliberately stricter than the generic JSON sanitizer.  A
@@ -3689,6 +3739,10 @@ def _safe_timeout_budget_fields(value: Any) -> dict[str, Any]:
 
     if not isinstance(value, Mapping):
         return {}
+    try:
+        timeout_cap = agent_timeout_bounds(max_timeout_seconds).max_seconds
+    except ValueError:
+        timeout_cap = agent_timeout_bounds().max_seconds
     result: dict[str, Any] = {}
     for key in _TIMEOUT_BUDGET_TEXT_FIELDS:
         raw = value.get(key)
@@ -3714,7 +3768,7 @@ def _safe_timeout_budget_fields(value: Any) -> dict[str, Any]:
     raw_timeouts = value.get("judge_attempt_timeouts_seconds")
     if isinstance(raw_timeouts, (list, tuple)):
         result["judge_attempt_timeouts_seconds"] = [
-            max(0, min(int(item), AGENT_TIMEOUT_MAX_SECONDS))
+            max(0, min(int(item), timeout_cap))
             for item in raw_timeouts[:16]
             if isinstance(item, int) and not isinstance(item, bool)
         ]
@@ -3793,12 +3847,18 @@ def _safe_backend_job_count(value: Any) -> int | None:
     return None
 
 
-def _timeout_profile_fields(value: Any) -> dict[str, Any]:
+def _timeout_profile_fields(
+    value: Any,
+    *,
+    max_timeout_seconds: int | float | None = None,
+) -> dict[str, Any]:
     """Return only scalar/text timeout fields accepted by RunProfiler."""
 
     return {
         key: item
-        for key, item in _safe_timeout_budget_fields(value).items()
+        for key, item in _safe_timeout_budget_fields(
+            value, max_timeout_seconds=max_timeout_seconds
+        ).items()
         if key not in _TIMEOUT_BUDGET_ARRAY_FIELDS
     }
 
@@ -4093,8 +4153,14 @@ def _formal_diagnostics(response: Mapping[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
-def _formal_worker_verdict(verdict: Verdict) -> dict[str, Any]:
-    response = safe_worker_response(verdict.response)
+def _formal_worker_verdict(
+    verdict: Verdict,
+    *,
+    max_timeout_seconds: int | float | None = None,
+) -> dict[str, Any]:
+    response = safe_worker_response(
+        verdict.response, timeout_max_seconds=max_timeout_seconds
+    )
     errors: list[str] = []
     nested_error = _recursive_value(response, "error_message")
     if isinstance(nested_error, str) and nested_error.strip():
@@ -4115,7 +4181,11 @@ def _formal_worker_verdict(verdict: Verdict) -> dict[str, Any]:
     }
     # Preserve the cumulative timeout accounting even though formal helper
     # responses intentionally expose only a small diagnostics projection.
-    result.update(_safe_timeout_budget_fields(response))
+    result.update(
+        _safe_timeout_budget_fields(
+            response, max_timeout_seconds=max_timeout_seconds
+        )
+    )
     # A retry can be denied by the task-global backend-job quota after the
     # first attempt has already produced feedback.  Keep that bounded reason
     # visible to the Agent instead of silently returning the earlier transient
@@ -4124,8 +4194,14 @@ def _formal_worker_verdict(verdict: Verdict) -> dict[str, Any]:
     return result
 
 
-def _formal_probe_result(verdict: Verdict) -> dict[str, Any]:
-    response = safe_worker_response(verdict.response)
+def _formal_probe_result(
+    verdict: Verdict,
+    *,
+    max_timeout_seconds: int | float | None = None,
+) -> dict[str, Any]:
+    response = safe_worker_response(
+        verdict.response, timeout_max_seconds=max_timeout_seconds
+    )
     normalized = _safe_verdict_status(verdict.status)
     if normalized in {"PROVED", "COMPILES_WITH_SORRY", "ELABORATED"}:
         status = "elaborated"
@@ -4166,6 +4242,11 @@ def _formal_probe_result(verdict: Verdict) -> dict[str, Any]:
                 safe_environment[key] = sanitize_public_text(value, limit=256)
         if safe_environment:
             result["lean_environment"] = safe_environment
+    result.update(
+        _safe_timeout_budget_fields(
+            response, max_timeout_seconds=max_timeout_seconds
+        )
+    )
     return result
 
 

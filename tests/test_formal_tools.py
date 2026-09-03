@@ -20,6 +20,7 @@ from contextswarm_mini.formal_tools import (
     FormalToolPolicy,
     ToolCapability,
     prepare_declaration_index,
+    public_files_manifest,
     stage_worker_tools,
 )
 from contextswarm_mini.judge_broker import JudgeBroker, JudgeBrokerDrainError
@@ -412,6 +413,26 @@ class PiEnvironmentTests(unittest.TestCase):
         self.assertEqual(env["PATH"], "/usr/local/bin:/usr/bin:/bin")
         self.assertEqual(env["PYTHONPATH"], str(ROOT))
         self.assertNotIn("LEAN_AUTH_TOKEN", env)
+
+    def test_worker_environment_and_public_helper_follow_configured_timeout_cap(self) -> None:
+        config = load_config("configs/smoke.toml", ROOT)
+        config = replace(
+            config,
+            lean_timeout_seconds=600,
+            formal_tools_command_timeout_seconds=720,
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            env = PiAgent(config).environment(
+                task_id="task", actor_id="actor", workdir=Path(raw)
+            )
+        self.assertEqual(env["CONTEXTSWARM_AGENT_TIMEOUT_MAX_SECONDS"], "600")
+        public = public_files_manifest(
+            baseline_names=["task.lean"],
+            agent_timeout_enabled=True,
+            agent_timeout_cap_seconds=600,
+        )
+        self.assertIn("5–600 second range", public)
+        self.assertNotIn("5-300", public)
 
 
 if __name__ == "__main__":
