@@ -3887,6 +3887,12 @@ class JudgeBroker:
                         # the same rule at its local gate.
                         claim.route_claim_ids.discard(claim_id)
                         claim.route_claim_satisfied = bool(claim.route_claim_ids)
+                        # The update itself was accepted, but its result must
+                        # not tell the solver it still holds write authority.
+                        # Preserve ``ok``/``accepted`` as mutation outcome and
+                        # normalize only the lease-authorization bits.
+                        result["acquired"] = False
+                        result["claimed"] = False
             return result
         if operation == "cps_release_route":
             admission_failure = self._route_actor_admission(

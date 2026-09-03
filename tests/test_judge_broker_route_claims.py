@@ -307,7 +307,12 @@ class _BlockedUpdateStore(_RouteStore):
                 # Deliberately echo the stale active bit. The broker must
                 # still retire its local write-gate lease for blocked state.
                 row["active"] = True
-                return {"ok": True, "claim": dict(row)}
+                return {
+                    "ok": True,
+                    "acquired": True,
+                    "claimed": True,
+                    "claim": dict(row),
+                }
         return {"ok": False, "status": "not_found"}
 
 
@@ -1052,6 +1057,9 @@ class JudgeBrokerRouteClaimTests(unittest.TestCase):
                         {"claim_id": claim_id, "status": "blocked"},
                     )
                     self.assertTrue(updated["ok"])
+                    self.assertTrue(updated["accepted"])
+                    self.assertFalse(updated["acquired"])
+                    self.assertFalse(updated["claimed"])
                     token = url.rstrip("/").rsplit("/", 1)[-1]
                     self.assertFalse(broker._claims[token].route_claim_satisfied)
                     self.assertNotIn(claim_id, broker._claims[token].route_claim_ids)

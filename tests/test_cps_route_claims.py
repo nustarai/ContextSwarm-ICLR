@@ -154,7 +154,10 @@ class CPSRouteClaimTests(unittest.TestCase):
                 now=101,
             )
             self.assertTrue(updated["ok"])
+            self.assertFalse(updated["acquired"])
+            self.assertFalse(updated["claimed"])
             self.assertEqual(updated["claim"]["status"], "blocked")
+            self.assertTrue(updated["claim"]["active"])
             self.assertTrue(store.heartbeat_actor("task", "a", status="running", now=102)["ok"])
             released = store.release_route_claim(
                 claim_id,

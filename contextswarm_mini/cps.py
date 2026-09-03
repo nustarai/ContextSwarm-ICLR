@@ -2803,7 +2803,14 @@ class CPSStore:
         result = self._result_with_claim(
             after,
             ok=True,
-            acquired=bool(after.get("active")),
+            # ``blocked`` remains visible in the active-route projection so
+            # peers know this direction is occupied/stalled, but it is not a
+            # writable lease.  Keep successful mutation (`ok`) distinct from
+            # write authorization (`acquired`/`claimed`).
+            acquired=(
+                bool(after.get("active"))
+                and str(after.get("status") or "").strip().lower() == "active"
+            ),
             idempotent=bool(current_status == next_status and status is None),
         )
         result["found"] = True
