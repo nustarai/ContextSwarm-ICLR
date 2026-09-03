@@ -247,6 +247,11 @@ adoption，prompt 默认要求正常验证调用显式给值；只有刻意测�
 - manifest：`configs/formal_1h_cps32_profiled_adaptive_timeout.toml`，SHA-256
   `33f0506df80db26d946236e59e070b4b065431eea892957e469494e5f3a07289`
 
+运行完成后，`b0b716b` 又加入了一个不改变 built-in evaluator 语义的 fail-closed 竞态保护：
+若窄适配器在已获准 admission 后、真正调用前已经低于 5 秒预算，则释放 gate 并返回审计过的
+`EVALUATOR_TIMEOUT`，不补发一轮完整 timeout；该边界由新增的确定性测试覆盖，r2 数值仍以
+上面的 run-bound source commit 为准。
+
 | 指标 | 主历史参考 | treatment-r1（旧语义） | treatment-r2（累计预算） |
 |---|---:|---:|---:|
 | final status / score | `DEGRADED` / 5 | `DEGRADED` / 4 | `DEGRADED` / 6 |
