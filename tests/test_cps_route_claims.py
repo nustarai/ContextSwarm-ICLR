@@ -180,6 +180,39 @@ class CPSRouteClaimTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_idempotent_retry_of_blocked_claim_is_not_a_write_lease(self) -> None:
+        temporary, store = self.make_store()
+        try:
+            store.register_actor("task", "a", 1, now=100)
+            claim = store.claim_route("task", "a", 1, "route", "initial", now=100)
+            claim_id = str(claim["claim_id"])
+            blocked = store.update_route_claim(
+                claim_id=claim_id,
+                actor_id="a",
+                status="blocked",
+                now=101,
+            )
+            self.assertTrue(blocked["ok"])
+            self.assertFalse(blocked["acquired"])
+            self.assertFalse(blocked["claimed"])
+
+            retry = store.claim_route(
+                "task",
+                "a",
+                1,
+                "route",
+                "retry while blocked",
+                now=102,
+            )
+            self.assertTrue(retry["ok"])
+            self.assertTrue(retry["idempotent"])
+            self.assertFalse(retry["acquired"])
+            self.assertFalse(retry["claimed"])
+            self.assertEqual(retry["claim"]["status"], "blocked")
+            self.assertTrue(retry["claim"]["active"])
+        finally:
+            temporary.cleanup()
+
     def test_update_and_release_can_be_bound_to_task_and_episode(self) -> None:
         temporary, store = self.make_store()
         try:

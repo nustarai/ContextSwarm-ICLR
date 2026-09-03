@@ -2467,10 +2467,16 @@ class CPSStore:
                             "route_key": route,
                         },
                     )
+                    # A blocked row remains visible to peers, but it is not a
+                    # write lease.  Keep retries idempotent while preserving
+                    # the authorization distinction used by broker/MJS gates.
                     return self._result_with_claim(
                         own_item,
                         ok=True,
-                        acquired=True,
+                        acquired=(
+                            str(own_item.get("status") or "").strip().lower()
+                            == "active"
+                        ),
                         idempotent=True,
                         actor_registered=actor_registered,
                     )
