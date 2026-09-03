@@ -182,10 +182,16 @@ def _agent_timeout_instructions(enabled: bool, *, formal: bool) -> str:
   choose the legacy timeout/retry behavior. For example, a Judge call can use
   `{{"timeout_seconds": 60}}` and the formal helper can use
   `python3 evaluate.py --timeout 60`.
-- This budget applies to one backend verification attempt. It is not the outer
-  experiment horizon, Judge-admission wait, provider/Pi timeout, or a guarantee
-  that the whole HTTP call returns within that many seconds. Omitting it keeps
-  the configured legacy timeout and retry policy.
+- This is one cumulative logical validation budget across all evaluator retries.
+  The runner owns one absolute deadline: a first attempt that fails abnormally
+  after about 30 seconds under a 300-second choice leaves about 270 seconds for
+  a safe retry; an attempt that consumes the deadline leaves no retry budget.
+  Retry count is therefore independent of the chosen seconds, and retries do
+  not multiply the requested timeout. The budget includes broker admission and
+  evaluator work, but it is not the outer experiment horizon or provider/Pi
+  timeout. A short, bounded remote-settlement cleanup grace may make the final
+  HTTP receipt arrive slightly after the deadline; it is recorded separately.
+  Omitting the field keeps the configured legacy timeout/retry policy.
 - As a starting heuristic, use about 30–60 seconds for routine incremental
   checks; 120–180 seconds for a promising candidate with heavy imports,
   elaboration, or resource-sensitive code; and reserve 300 seconds for a
@@ -195,7 +201,10 @@ def _agent_timeout_instructions(enabled: bool, *, formal: bool) -> str:
 - `EXECUTION_TIMEOUT` is inconclusive candidate feedback, not `VERIFY_FAIL`,
   proof of correctness, or permission to run a local checker. After a timeout,
   inspect the feedback and make a material edit (or leave the best candidate)
-  before trying again. Keep calls serial and respect the session budget."""
+  before trying again. Candidate-independent transport/runtime failures may be
+  retried automatically while the same cumulative budget remains; deterministic
+  verdicts and timeout/cancellation results are not automatically replayed.
+  Keep calls serial and respect the session budget."""
 
 
 def _is_coding_task(task: Task) -> bool:

@@ -1,9 +1,11 @@
-"""Shared policy for optional Agent-proposed Judge execution budgets.
+"""Shared policy for optional Agent-proposed Judge validation budgets.
 
 The timeout exposed to a worker is intentionally a small, integer-only
-capability.  It is not a transport deadline or a run-horizon override.  The
-broker owns validation and the evaluator applies the final defence-in-depth
-clamp before constructing a Judge job.
+capability.  When supplied, it is the cumulative logical budget for one
+validation call, including safe evaluator retries; it is not a transport
+deadline or a run-horizon override.  The broker owns validation and the
+evaluator applies the final defence-in-depth clamp before constructing Judge
+jobs.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ AGENT_TIMEOUT_MAX_SECONDS = 300
 
 @dataclass(frozen=True)
 class AgentTimeout:
-    """The requested value and the bounded value sent to the evaluator."""
+    """The requested value and bounded total budget for one logical call."""
 
     requested_seconds: int
     effective_seconds: int

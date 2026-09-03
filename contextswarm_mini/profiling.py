@@ -110,6 +110,8 @@ _TEXT_FIELDS = frozenset(
         "cpu_denominator_source",
         "cgroup_cpu_denominator_source",
         "timeout_source",
+        "timeout_budget_mode",
+        "timeout_budget_stop_reason",
     }
 )
 
@@ -196,6 +198,12 @@ _SCALAR_FIELDS = frozenset(
         "requested_timeout_seconds",
         "effective_timeout_seconds",
         "timeout_clamped",
+        "timeout_budget_seconds",
+        "timeout_budget_elapsed_seconds",
+        "timeout_budget_remaining_seconds",
+        "timeout_budget_exhausted",
+        "judge_attempt_count",
+        "judge_retry_count",
         "max_concurrent_evaluations",
         "evaluator_seconds",
         "audit_seconds",
@@ -512,6 +520,14 @@ _LOGGER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "accepted",
             "proved",
             "invalid_output",
+            "timeout_budget_mode",
+            "timeout_budget_stop_reason",
+            "timeout_budget_seconds",
+            "timeout_budget_elapsed_seconds",
+            "timeout_budget_remaining_seconds",
+            "timeout_budget_exhausted",
+            "judge_attempt_count",
+            "judge_retry_count",
         }
     ),
     "closeout_started": frozenset(
@@ -545,6 +561,14 @@ _LOGGER_EVENT_FIELDS: dict[str, frozenset[str]] = {
             "accepted",
             "proved",
             "invalid_output",
+            "timeout_budget_mode",
+            "timeout_budget_stop_reason",
+            "timeout_budget_seconds",
+            "timeout_budget_elapsed_seconds",
+            "timeout_budget_remaining_seconds",
+            "timeout_budget_exhausted",
+            "judge_attempt_count",
+            "judge_retry_count",
             "error_kind",
         }
     ),

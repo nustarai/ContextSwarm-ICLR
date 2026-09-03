@@ -519,7 +519,7 @@ def public_files_manifest(
         "",
         "## Formal capabilities",
         "",
-        "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. When the run advertises Agent timeout control, add `--timeout N` (5-300 seconds); the value is a per-backend-attempt suggestion and remains advisory, never the official score.",
+        "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. When the run advertises Agent timeout control, add `--timeout N` (5-300 seconds); the value is the cumulative logical validation budget across safe evaluator retries and remains advisory, never the official score.",
         "- `./formal_query --help` describes bounded `search`, `decl`, `check`, `type`, `axioms`, and `deps` queries. `search` scans only `problem.md`, `result.lean`, `baseline/*.lean`, and the revision-bound declaration index.",
         "- `deps` returns index-related candidate premises, not a dependency graph. Verify names with `check`.",
         "- The final score comes only from the feedback-free outer evaluation of an immutable candidate snapshot.",
@@ -603,7 +603,7 @@ def parser() -> argparse.ArgumentParser:
         "--timeout",
         type=int,
         default=None,
-        help="optional Agent-proposed backend-attempt budget in seconds (runner clamps it)",
+        help="optional Agent-proposed cumulative validation budget in seconds (runner clamps it)",
     )
     return result
 

@@ -319,8 +319,8 @@ agent。这样，各模式在 horizon 收口时选中并冻结的候选，不会
 
 paper-facing manifest 统一将 `[lean].max_concurrent_evaluations` 设为 4；建议同时给
 独立 Goedel-Prover Judge 配置至少 4 个 worker。该值应当始终和 Judge worker/
-内存容量一起调整。`[lean].timeout_seconds`（默认 300 秒）是 Judge 单个后端
-命令的执行预算，不是提交到终态的总 wall time：合法 job lifecycle 还可能包含
+内存容量一起调整。`[lean].timeout_seconds`（默认 300 秒）是省略 Agent 提议时
+Judge 单个后端命令的执行预算，不是提交到终态的总 wall time：合法 job lifecycle 还可能包含
 queue、冷 REPL header/body 以及 formal finalization。它也不是 solver horizon 或
 整个 closeout 的总预算。`[lean].max_lifecycle_seconds`（paper manifest 为 3600）
 是客户端防御畸形 receipt 的显式安全上界，不会缩短 Judge 正常公布的预算。
@@ -432,7 +432,13 @@ lifecycle receipt 会 fail closed，不会造成无限轮询。客户端主动�
 `REMOTE_SETTLEMENT_UNCONFIRMED` 并停止后续 admission。Judge 明确返回的
 pre-admission overload 会在 30 秒
 admission budget 内有界重试；已经排队后才返回的 terminal、retryable
-`rejected_overloaded` 至多重交一次 whole job。结果不明的 socket/proxy 失败不会
+`rejected_overloaded` 至多重交一次 whole job。启用 Agent timeout capability 时，
+`judge_check`/`evaluate_local` 的 `timeout_seconds` 是一次逻辑调用的累计总预算；
+安全 retry 仍可发生，但每个 fresh backend job 只拿到绝对 deadline 的剩余时间，
+因此 retry 不会把名义预算乘倍。这个 retry 留在同一个 broker handler/evaluator
+gate 内，不回到 allocator，也不新建 Agent session。`evaluate_local` 的每个 fresh
+retry 还要重新占用该 task 的 `evaluate_backend_jobs_per_task` 单位；配额不足时
+retry 会 fail closed，并在反馈中标注 `retry_blocked_reason`。结果不明的 socket/proxy 失败不会
 盲目重交，以免复制仍在运行的 job。Judge 的 `error_kind`、
 `terminal_reason`、queue/execution timing 会保留在安全摘要中，以区分证明错误、
 执行超时、资源限制、过载和基础设施故障。只有 canonical `PROVED` / `AC`

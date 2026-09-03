@@ -7682,8 +7682,19 @@ def _write_figure4_summary(
             "max": AGENT_TIMEOUT_MAX_SECONDS,
         },
         "agent_timeout_semantics": (
-            "per_backend_attempt_with_legacy_retry_when_omitted"
+            "cumulative_total_across_safe_retries_with_legacy_per_job_when_omitted"
         ),
+        # Explicit values use an evaluator-owned logical retry loop.  Each
+        # fresh backend attempt receives max_retries=0 and only the remaining
+        # absolute budget; omitted values retain the configured per-job
+        # backend retry contract.
+        "agent_timeout_retry_scope": "same_broker_handler_and_evaluator_gate",
+        # The built-in Lean/Coding adapters use one execution retry and one
+        # terminal-overload retry for explicit-budget logical calls.  Keep the
+        # Figure 4 artifact self-contained; the live broker policy is also
+        # recorded in ``judge_policy.json``.
+        "agent_timeout_backend_max_retries": 1,
+        "agent_timeout_terminal_overload_retries": 1,
         "max_lifecycle_seconds": config.lean_max_lifecycle_seconds,
         "max_concurrent_evaluations": config.lean_max_concurrent_evaluations,
         "result_cache_disabled_required": config.lean_require_result_cache_disabled,

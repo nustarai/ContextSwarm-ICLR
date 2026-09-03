@@ -93,17 +93,33 @@ matched control。
   `effective_timeout_seconds`、`timeout_clamped`、`timeout_source`。这四个字段只记录
   有界策略元数据，不记录 prompt、候选源码、token 或原始 Judge response。
 
-### 3.2 时钟和 retry 语义
+### 3.2 时钟和 retry 语义（修订）
 
-`timeout_seconds` 是一次 backend verification attempt 的执行预算，不是 Judge admission
-等待、HTTP transport、Pi/provider timeout，也不是一小时 horizon 的改写。Agent 明确给出
-预算时，本次 formal submission 使用 `max_retries=0`，避免一个名义 60 s 的建议再次隐式
-扩张为约 120 s 的 backend retry 尾部；省略字段则保留历史 evaluator timeout 和
-`max_retries=1`，便于审计“Agent 选择了 legacy 行为”的比例。
+`timeout_seconds` 现在表示一次逻辑验证调用的**累计总预算**，而不是每个 backend
+attempt 的独立预算。broker 在 capability 调用开始时建立一个绝对 deadline；它覆盖候选
+快照、evaluator admission 和实际 Judge work（外层 run horizon 仍是更早的硬边界）。例如
+Agent 选择 300 s，第一次因 candidate-independent runtime/transport 异常在 30 s 结束，
+安全 retry 只能获得约 270 s；若第一次已经耗尽 300 s，则不再发起 retry。retry 次数由
+既有 evaluator/overload policy 独立决定，不会因为选择较短 timeout 而被人为改成零，也不会
+把每次 retry 的 timeout 相加成新的长尾。
+
+Judge API 仍然只提供 per-job `timeout` 与 `max_retries` 字段，因此显式预算由 evaluator
+外层逻辑循环拆成多个 fresh job，每个 job 使用 `max_retries=0`，并把剩余的绝对时间传给
+下一次尝试。这个 retry 保持在同一个 broker handler、同一个 evaluator gate 和同一个
+solver capability 调用中；不会退回 CPS allocator，也不会创建新的 Agent/Pi session。
+已知的 remote cancellation/settlement 可能需要一个有界 cleanup grace，`elapsed_seconds`
+会如实包含它，而 `timeout_budget_*` 字段只统计验证预算本身。
+
+`evaluate_local` 还受 task-global `evaluate_backend_jobs_per_task` 约束。每次准备发起
+fresh retry 前先占用一个 backend-job unit；配额不足不会偷偷绕过限制，而是保留前一
+次反馈并返回 `formal_backend_budget_exhausted=true`、`retry_blocked_reason`。这项配额是
+防止重试放大 formal helper 后端工作量的独立护栏，不改变 `judge_check` 的逻辑预算。
 
 超时结果仍然是 `EXECUTION_TIMEOUT`/不确定反馈，不改写为 `VERIFY_FAIL`，也不开放本地
 checker 或 raw Judge access。固定的 run horizon、candidate budget、session probe quota、
-closeout evaluation 和 remote settlement 语义不变。
+closeout evaluation 和 remote settlement 语义不变。每个 receipt/audit 额外记录
+`timeout_budget_mode=cumulative_total`、预算消耗/剩余、attempt/retry 数和有界 attempt
+明细，便于验证“总预算”而不是只看单次 payload。
 
 ### 3.3 Prompt 引导（实验 treatment）
 
@@ -148,6 +164,12 @@ adoption，prompt 默认要求正常验证调用显式给值；只有刻意测�
   或 profiling audit error 都会把“只降低前台等待”的解释标为不成立。
 
 ## 5. 本轮结果（treatment-r1）
+
+> **语义更正说明**：下表的 `treatment-r1` 运行发生在本次累计预算修订之前。它采用
+> “显式 timeout 时 `max_retries=0`”的保守 treatment，因而可以说明旧方案确实压低了
+> 前台长尾，但**不能**证明“异常失败后用剩余预算 retry”的新语义。后续 rerun 必须读取
+> `timeout_budget_mode`、`judge_attempt_count` 和 `timeout_budget_remaining_seconds`，并
+> 单独报告同一逻辑调用的 attempts；本文不把旧结果冒充新实现的验证。
 
 本轮自然运行和 closeout 已完成。Judge elapsed 的分位数使用与历史表相同的线性插值；
 `fresh` 仍定义为 accepted 且没有 completed/probe/remote cache reuse。运行身份为：
@@ -230,10 +252,12 @@ adoption，prompt 默认要求正常验证调用显式给值；只有刻意测�
   不同，无法做 matched comparison；
 - run 以 `DEGRADED`、未结算 job、worker process failure 或 missing profiling 结束。
 
-本轮结果支持一个有限结论：**Agent 提议 + broker/evaluator 硬裁剪 + custom call 不重试**
-确实压掉了历史约 300–600 s 的 Judge-facing 长尾；在更多 fresh 请求下，>60 s 和 >120 s
-累计耗时也明显下降。它还没有证明最终数学得分提升，甚至本轮 score 比历史少 1，且
-`formal_query` 仍走 legacy、run/profile health 仍为 degraded。
+在旧 treatment 语义下，本轮结果支持一个有限结论：**Agent 提议 + broker/evaluator 硬裁剪
++ custom call 不重试**确实压掉了历史约 300–600 s 的 Judge-facing 长尾；在更多 fresh
+请求下，>60 s 和 >120 s 累计耗时也明显下降。它还没有证明最终数学得分提升，甚至本轮
+score 比历史少 1，且 `formal_query` 仍走 legacy、run/profile health 仍为 degraded。
+这段结论只适用于旧 treatment；累计预算 retry 修订需要新的 matched run 才能判断是否在
+不牺牲 proof 率的前提下保留该收益。
 
 下一步应先按相同 source、image、模型、Judge runtime、cache policy、seed 和 horizon 补一轮
 **matched fixed-timeout control**（flag 关闭但其余合同完全相同），再决定是否跑 2–3 轮

@@ -401,7 +401,7 @@ export default function registerContextSwarmSolverTools(pi) {
   };
   if (agentTimeoutEnabled) {
     judgeProperties.timeout_seconds = integerSchema(
-      "Optional per-backend verification budget in seconds; runner clamps to 5-300",
+      "Optional cumulative validation budget in seconds across evaluator retries; runner clamps to 5-300",
       null,
       5,
     );
@@ -411,14 +411,14 @@ export default function registerContextSwarmSolverTools(pi) {
     name: "judge_check",
     label: "Controlled Judge Check",
     description:
-      `Submit the runner-bound ${candidate} to the controlled external ${language} Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.${agentTimeoutEnabled ? " You may optionally provide integer timeout_seconds (5-300); the runner clamps it and reports the effective budget." : ""}`,
+      `Submit the runner-bound ${candidate} to the controlled external ${language} Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.${agentTimeoutEnabled ? " You may optionally provide integer timeout_seconds (5-300) as the total budget for this logical validation, including safe retries; the runner clamps it and reports the effective budget." : ""}`,
     promptSnippet: `Check the current ${candidate} through the controlled external Judge`,
     promptGuidelines: [
       "Use judge_check one candidate at a time; never attempt local compilation or raw Judge access.",
       "A retryable busy result is not permission to use a local fallback.",
       ...(agentTimeoutEnabled
         ? [
-            "Choose timeout_seconds as a per-backend-attempt budget: 30-60s for routine checks, 120-180s for promising heavy candidates, and 300s only for likely but known-slow checks.",
+            "Choose timeout_seconds as a cumulative logical validation budget: 30-60s for routine checks, 120-180s for promising heavy candidates, and 300s only for likely but known-slow checks; any safe retry receives only the remaining time.",
             "An execution timeout is inconclusive feedback; do not relabel it as VERIFY_FAIL or use a local checker.",
           ]
         : []),

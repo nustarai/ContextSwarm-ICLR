@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 from contextswarm_mini.config import load_config
@@ -313,6 +314,49 @@ process.stdout.write(JSON.stringify({
             finally:
                 broker.close()
 
+    def test_evaluate_local_custom_budget_bypasses_legacy_cache(self) -> None:
+        """A custom call must not return a cached legacy diagnostic."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = _task(root)
+            workdir = root / "worker"
+            workdir.mkdir()
+            (workdir / "result.lean").write_text(task.baseline_code, encoding="utf-8")
+            evaluator = _TimeoutEvaluator()
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=root / "judge_checks.jsonl",
+                formal_audit_path=root / "formal_tool_calls.jsonl",
+                formal_policy=_policy(),
+                agent_timeout_enabled=True,
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=1,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="worker",
+                    workdir=workdir,
+                    candidates={task.slug: (task, workdir / "result.lean")},
+                    deadline_monotonic=10**9,
+                ) as env:
+                    legacy = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"], "evaluate_local", {}
+                    )
+                    custom = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"],
+                        "evaluate_local",
+                        {"timeout_seconds": 60},
+                    )
+                self.assertFalse(legacy["cache_hit"])
+                self.assertFalse(custom["cache_hit"])
+                self.assertEqual(evaluator.timeouts, [None, 60])
+                self.assertEqual(custom["timeout_budget_mode"], "cumulative_total")
+                self.assertEqual(custom["judge_attempt_count"], 1)
+            finally:
+                broker.close()
+
     def test_profiling_allowlist_keeps_timeout_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -323,6 +367,13 @@ process.stdout.write(JSON.stringify({
                 effective_timeout_seconds=300,
                 timeout_clamped=True,
                 timeout_source="agent_requested",
+                timeout_budget_mode="cumulative_total",
+                timeout_budget_seconds=300,
+                timeout_budget_elapsed_seconds=30.0,
+                timeout_budget_remaining_seconds=270.0,
+                timeout_budget_exhausted=False,
+                judge_attempt_count=2,
+                judge_retry_count=1,
             )
             profiler.close()
             row = json.loads((root / "profiling.jsonl").read_text().splitlines()[0])
@@ -330,6 +381,11 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(row["effective_timeout_seconds"], 300)
         self.assertTrue(row["timeout_clamped"])
         self.assertEqual(row["timeout_source"], "agent_requested")
+        self.assertEqual(row["timeout_budget_mode"], "cumulative_total")
+        self.assertEqual(row["timeout_budget_seconds"], 300)
+        self.assertEqual(row["timeout_budget_remaining_seconds"], 270.0)
+        self.assertEqual(row["judge_attempt_count"], 2)
+        self.assertEqual(row["judge_retry_count"], 1)
         self.assertNotIn("dropped_fields", row)
 
     def test_disabled_broker_rejects_timeout_field(self) -> None:
@@ -390,6 +446,419 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(evaluator.payloads[1]["max_retries"], 0)
         self.assertEqual(evaluator.payloads[2]["timeout"], 300)
         self.assertEqual(evaluator.payloads[2]["max_retries"], 1)
+
+    def test_custom_budget_is_shared_by_independent_retries(self) -> None:
+        """A 300-second choice leaves 270 seconds after a 30-second failure."""
+
+        class FakeClock:
+            def __init__(self) -> None:
+                self.value = 1_000.0
+
+            def monotonic(self) -> float:
+                return self.value
+
+        class RetryingLean(LeanEvaluator):
+            def __init__(self, clock: FakeClock) -> None:
+                super().__init__(
+                    "http://unused",
+                    lean_env_id="test",
+                    backend_max_retries=1,
+                    terminal_overload_retries=0,
+                )
+                self.clock = clock
+                self.timeouts: list[int] = []
+
+            def _evaluate_once(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                del args
+                self.timeouts.append(int(kwargs["timeout_seconds"]))
+                if len(self.timeouts) == 1:
+                    self.clock.value += 30.0
+                    return Verdict(
+                        "task",
+                        "EVALUATOR_ERROR",
+                        0.0,
+                        30.0,
+                        {"evaluator_failure": {"category": "runtime_exception"}},
+                        error="transient evaluator failure",
+                        judge_job_id="job-1",
+                    )
+                return Verdict(
+                    "task",
+                    "PROVED",
+                    1.0,
+                    0.0,
+                    {},
+                    judge_job_id="job-2",
+                )
+
+        clock = FakeClock()
+        evaluator = RetryingLean(clock)
+        task = _task(ROOT)
+        with patch("contextswarm_mini.evaluator.time.monotonic", clock.monotonic):
+            verdict = evaluator.probe_source(task, task.baseline_code, timeout_seconds=300)
+
+        self.assertEqual(verdict.status, "PROVED")
+        self.assertEqual(evaluator.timeouts, [300, 270])
+        self.assertEqual(verdict.response["timeout_budget_mode"], "cumulative_total")
+        self.assertEqual(verdict.response["timeout_budget_seconds"], 300)
+        self.assertEqual(verdict.response["timeout_budget_elapsed_seconds"], 30.0)
+        self.assertEqual(verdict.response["timeout_budget_remaining_seconds"], 270.0)
+        self.assertFalse(verdict.response["timeout_budget_exhausted"])
+        self.assertEqual(verdict.response["judge_attempt_count"], 2)
+        self.assertEqual(verdict.response["judge_retry_count"], 1)
+        self.assertEqual(verdict.response["judge_attempt_timeouts_seconds"], [300, 270])
+        self.assertEqual(verdict.response["judge_retry_reasons"], ["execution"])
+
+    def test_timeout_consuming_first_attempt_does_not_retry(self) -> None:
+        class FakeClock:
+            value = 2_000.0
+
+            def monotonic(self) -> float:
+                return self.value
+
+        class TimedOutLean(LeanEvaluator):
+            def __init__(self, clock: FakeClock) -> None:
+                super().__init__(
+                    "http://unused", lean_env_id="test", backend_max_retries=1
+                )
+                self.clock = clock
+                self.calls = 0
+
+            def _evaluate_once(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                del args
+                self.calls += 1
+                self.clock.value += 300.0
+                return Verdict(
+                    "task",
+                    "EXECUTION_TIMEOUT",
+                    0.0,
+                    300.0,
+                    {"terminal_reason": "execution_timeout"},
+                    judge_job_id="job-timeout",
+                )
+
+        clock = FakeClock()
+        evaluator = TimedOutLean(clock)
+        task = _task(ROOT)
+        with patch("contextswarm_mini.evaluator.time.monotonic", clock.monotonic):
+            verdict = evaluator.probe_source(task, task.baseline_code, timeout_seconds=300)
+
+        self.assertEqual(evaluator.calls, 1)
+        self.assertEqual(verdict.status, "EXECUTION_TIMEOUT")
+        self.assertTrue(verdict.response["timeout_budget_exhausted"])
+        self.assertEqual(verdict.response["judge_attempt_count"], 1)
+        self.assertEqual(verdict.response["judge_retry_count"], 0)
+        self.assertEqual(verdict.response["timeout_budget_stop_reason"], "budget_exhausted")
+
+    def test_late_terminal_result_is_not_success_after_evaluator_budget(self) -> None:
+        """The evaluator itself must reject a proof observed during cleanup grace."""
+
+        class FakeClock:
+            value = 3_000.0
+
+            def monotonic(self) -> float:
+                return self.value
+
+        class LateProofLean(LeanEvaluator):
+            def __init__(self, clock: FakeClock) -> None:
+                super().__init__(
+                    "http://unused",
+                    lean_env_id="test",
+                    backend_max_retries=1,
+                    terminal_overload_retries=0,
+                )
+                self.clock = clock
+
+            def _evaluate_once(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                self.clock.value += 6.0
+                return Verdict("task", "PROVED", 1.0, 6.0, {}, judge_job_id="late")
+
+        clock = FakeClock()
+        evaluator = LateProofLean(clock)
+        task = _task(ROOT)
+        with patch("contextswarm_mini.evaluator.time.monotonic", clock.monotonic):
+            verdict = evaluator.probe_source(task, task.baseline_code, timeout_seconds=5)
+
+        self.assertEqual(verdict.status, "EVALUATOR_TIMEOUT")
+        self.assertEqual(verdict.score, 0.0)
+        self.assertTrue(verdict.response["timeout_budget_exhausted"])
+        self.assertEqual(verdict.response["timeout_budget_remaining_seconds"], 0.0)
+
+    def test_formal_backend_quota_blocks_a_fresh_retry_without_losing_attempt_count(self) -> None:
+        """Each fresh evaluate retry consumes a task-global backend-job unit."""
+
+        class RetryingLean(LeanEvaluator):
+            def __init__(self) -> None:
+                super().__init__(
+                    "http://unused",
+                    lean_env_id="test",
+                    backend_max_retries=1,
+                    terminal_overload_retries=0,
+                )
+                self.calls = 0
+
+            def _evaluate_once(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                del args
+                self.calls += 1
+                if self.calls == 1:
+                    return Verdict(
+                        "task",
+                        "EVALUATOR_ERROR",
+                        0.0,
+                        0.0,
+                        {"evaluator_failure": {"category": "runtime_exception"}},
+                        judge_job_id="job-1",
+                    )
+                return Verdict("task", "PROVED", 1.0, 0.0, {}, judge_job_id="job-2")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = _task(root)
+            workdir = root / "worker"
+            workdir.mkdir()
+            (workdir / "result.lean").write_text(task.baseline_code, encoding="utf-8")
+            policy = FormalToolPolicy(
+                enabled=True,
+                surface_version="adaptive-timeout-quota-v1",
+                evaluate_calls_per_task=8,
+                evaluate_backend_jobs_per_task=1,
+                query_calls_per_task=8,
+                query_backend_probes_per_task=8,
+                max_candidate_bytes=1024 * 1024,
+                command_timeout_seconds=30,
+                declaration_index=DeclarationIndex(None),
+            )
+            evaluator = RetryingLean()
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=root / "judge_checks.jsonl",
+                formal_audit_path=root / "formal_tool_calls.jsonl",
+                formal_policy=policy,
+                agent_timeout_enabled=True,
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=1,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="worker",
+                    workdir=workdir,
+                    candidates={task.slug: (task, workdir / "result.lean")},
+                    deadline_monotonic=10**9,
+                ) as env:
+                    result = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"],
+                        "evaluate_local",
+                        {"timeout_seconds": 60},
+                    )
+                self.assertEqual(evaluator.calls, 1)
+                self.assertEqual(result["status"], "EVALUATOR_ERROR")
+                self.assertTrue(result["formal_backend_budget_exhausted"])
+                self.assertEqual(result["retry_blocked_reason"], "formal_backend_job_quota")
+                self.assertEqual(result["judge_attempt_count"], 1)
+                self.assertEqual(result["judge_retry_count"], 0)
+                self.assertEqual(result["backend_job_count"], 1)
+                self.assertEqual(
+                    broker.formal_summary()["tasks"][task.slug]["evaluate_backend_jobs"],
+                    1,
+                )
+            finally:
+                broker.close()
+
+    def test_formal_backend_quota_admits_and_records_a_fresh_retry(self) -> None:
+        class RetryingLean(LeanEvaluator):
+            def __init__(self) -> None:
+                super().__init__(
+                    "http://unused",
+                    lean_env_id="test",
+                    backend_max_retries=1,
+                    terminal_overload_retries=0,
+                )
+                self.calls = 0
+
+            def _evaluate_once(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                del args, kwargs
+                self.calls += 1
+                if self.calls == 1:
+                    return Verdict(
+                        "task",
+                        "EVALUATOR_ERROR",
+                        0.0,
+                        0.0,
+                        {"evaluator_failure": {"category": "runtime_exception"}},
+                        judge_job_id="job-1",
+                    )
+                return Verdict("task", "PROVED", 1.0, 0.0, {}, judge_job_id="job-2")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = _task(root)
+            workdir = root / "worker"
+            workdir.mkdir()
+            (workdir / "result.lean").write_text(task.baseline_code, encoding="utf-8")
+            policy = FormalToolPolicy(
+                enabled=True,
+                surface_version="adaptive-timeout-quota-v1",
+                evaluate_calls_per_task=8,
+                evaluate_backend_jobs_per_task=2,
+                query_calls_per_task=8,
+                query_backend_probes_per_task=8,
+                max_candidate_bytes=1024 * 1024,
+                command_timeout_seconds=30,
+                declaration_index=DeclarationIndex(None),
+            )
+            evaluator = RetryingLean()
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=root / "judge_checks.jsonl",
+                formal_audit_path=root / "formal_tool_calls.jsonl",
+                formal_policy=policy,
+                agent_timeout_enabled=True,
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=1,
+            ).start()
+            try:
+                with broker.session(
+                    actor_id="worker",
+                    workdir=workdir,
+                    candidates={task.slug: (task, workdir / "result.lean")},
+                    deadline_monotonic=10**9,
+                ) as env:
+                    result = _post(
+                        env["CONTEXTSWARM_JUDGE_URL"],
+                        "evaluate_local",
+                        {"timeout_seconds": 60},
+                    )
+                self.assertEqual(evaluator.calls, 2)
+                self.assertEqual(result["status"], "PROVED")
+                self.assertEqual(result["judge_attempt_count"], 2)
+                self.assertEqual(result["judge_retry_count"], 1)
+                self.assertEqual(result["backend_job_count"], 2)
+                self.assertEqual(result["backend_job_numbers"], [1, 2])
+                self.assertEqual(
+                    broker.formal_summary()["tasks"][task.slug]["evaluate_backend_jobs"],
+                    2,
+                )
+            finally:
+                broker.close()
+
+    def test_confirmed_pre_admission_overload_uses_separate_retry_budget(self) -> None:
+        class FakeClock:
+            value = 4_000.0
+
+            def monotonic(self) -> float:
+                return self.value
+
+        class OverloadThenProof(LeanEvaluator):
+            def __init__(self, clock: FakeClock) -> None:
+                super().__init__(
+                    "http://unused",
+                    lean_env_id="test",
+                    backend_max_retries=0,
+                    terminal_overload_retries=1,
+                )
+                self.clock = clock
+                self.calls = 0
+
+            def _evaluate_once(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                del args
+                self.calls += 1
+                if self.calls == 1:
+                    self.clock.value += 2.0
+                    return Verdict(
+                        "task",
+                        "EVALUATOR_ERROR",
+                        0.0,
+                        2.0,
+                        {"evaluator_failure": {"category": "judge_overloaded"}},
+                        error="confirmed admission overload",
+                        judge_job_id=None,
+                    )
+                return Verdict("task", "PROVED", 1.0, 0.0, {}, judge_job_id="job-2")
+
+        clock = FakeClock()
+        evaluator = OverloadThenProof(clock)
+        task = _task(ROOT)
+        with patch("contextswarm_mini.evaluator.time.monotonic", clock.monotonic):
+            verdict = evaluator.probe_source(task, task.baseline_code, timeout_seconds=60)
+
+        self.assertEqual(verdict.status, "PROVED")
+        self.assertEqual(evaluator.calls, 2)
+        self.assertEqual(verdict.response["judge_retry_reasons"], ["overload"])
+        self.assertEqual(verdict.response["judge_attempt_timeouts_seconds"], [60, 58])
+
+    def test_broker_does_not_accept_proof_returned_after_total_budget(self) -> None:
+        """Settlement grace must not turn a late proof into success."""
+
+        class FakeClock:
+            value = 10_000.0
+
+            def monotonic(self) -> float:
+                return self.value
+
+        class LateProofEvaluator(_TimeoutEvaluator):
+            def probe_source(
+                self,
+                task: Task,
+                source: str,
+                *,
+                deadline_monotonic: float | None = None,
+                cancel_event: object | None = None,
+                timeout_seconds: int | None = None,
+                timeout_deadline_monotonic: float | None = None,
+            ) -> Verdict:
+                del source, deadline_monotonic, cancel_event, timeout_seconds
+                self.timeouts.append(timeout_deadline_monotonic)
+                clock.value += 6.0
+                return Verdict(
+                    task.slug,
+                    "PROVED",
+                    1.0,
+                    6.0,
+                    {},
+                    candidate_sha256="a" * 64,
+                    task_contract_sha256=self.expected_task_contract_sha256(task),
+                    judge_job_id="late-proof",
+                )
+
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = _task(root)
+            workdir = root / "worker"
+            workdir.mkdir()
+            (workdir / "result.lean").write_text(task.baseline_code, encoding="utf-8")
+            broker = JudgeBroker(
+                LateProofEvaluator(),
+                threading.BoundedSemaphore(1),
+                audit_path=root / "judge_checks.jsonl",
+                formal_policy=_policy(),
+                agent_timeout_enabled=True,
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=1,
+            ).start()
+            try:
+                with patch("contextswarm_mini.judge_broker.time.monotonic", clock.monotonic):
+                    with broker.session(
+                        actor_id="worker",
+                        workdir=workdir,
+                        candidates={task.slug: (task, workdir / "result.lean")},
+                        deadline_monotonic=10**9,
+                    ) as env:
+                        result = _post(
+                            env["CONTEXTSWARM_JUDGE_URL"],
+                            "judge_check",
+                            {"timeout_seconds": 5},
+                        )
+            finally:
+                broker.close()
+
+        self.assertEqual(result["status"], "EVALUATOR_TIMEOUT")
+        self.assertFalse(result["proved"])
+        self.assertEqual(result["score"], 0.0)
+        self.assertTrue(result["timeout_budget_exhausted"])
 
 
 if __name__ == "__main__":

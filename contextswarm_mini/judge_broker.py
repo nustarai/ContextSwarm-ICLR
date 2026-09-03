@@ -114,6 +114,41 @@ _JUDGE_CHECKPOINT_TERMINAL_STATUSES = frozenset(
 )
 _CHECKPOINT_VALUE_UNSET = object()
 
+# Cumulative Agent-budget fields are copied to the bounded broker/audit
+# surface.  Keep the vocabulary explicit: these values are accounting
+# metadata, not arbitrary evaluator response passthrough.
+_TIMEOUT_BUDGET_TEXT_FIELDS = frozenset(
+    {
+        "timeout_budget_mode",
+        "timeout_budget_stop_reason",
+    }
+)
+_TIMEOUT_BUDGET_NUMBER_FIELDS = frozenset(
+    {
+        "timeout_budget_seconds",
+        "timeout_budget_elapsed_seconds",
+        "timeout_budget_remaining_seconds",
+        "judge_attempt_count",
+        "judge_retry_count",
+    }
+)
+_TIMEOUT_BUDGET_BOOL_FIELDS = frozenset({"timeout_budget_exhausted"})
+_TIMEOUT_BUDGET_ARRAY_FIELDS = frozenset(
+    {
+        "judge_attempt_timeouts_seconds",
+        "judge_attempt_elapsed_seconds",
+        "judge_retry_reasons",
+        "judge_attempt_ids",
+    }
+)
+
+# Formal helper retry admission is a separate task-global quota.  Only these
+# bounded, typed markers may cross the worker/audit projection; never forward
+# arbitrary evaluator response keys.
+_FORMAL_QUOTA_TEXT_FIELDS = frozenset({"retry_blocked_reason"})
+_FORMAL_QUOTA_NUMBER_FIELDS = frozenset({"backend_job_count"})
+_FORMAL_QUOTA_BOOL_FIELDS = frozenset({"formal_backend_budget_exhausted"})
+
 
 def _default_drain_timeout_seconds(evaluator: Any) -> float:
     """Choose a closeout deadline that covers deferred Judge settlement.
@@ -673,8 +708,23 @@ class JudgeBroker:
                 "min_seconds": AGENT_TIMEOUT_MIN_SECONDS,
                 "max_seconds": AGENT_TIMEOUT_MAX_SECONDS,
                 "configured_evaluator_cap_seconds": self.agent_timeout_cap_seconds,
-                "semantics": "agent_requested_backend_execution_budget",
+                "semantics": "cumulative_total_validation_budget_across_retries",
+                "retry_scope": "same_broker_handler_and_evaluator_gate",
+                "custom_request_backend_max_retries": max(
+                    0, int(getattr(self.evaluator, "backend_max_retries", 1))
+                ),
+                "custom_request_terminal_overload_retries": max(
+                    0,
+                    int(getattr(self.evaluator, "terminal_overload_retries", 1)),
+                ),
                 "custom_request_max_retries": 0,
+                "custom_request_retry_policy": (
+                    "outer_logical_loop_with_remaining_absolute_budget"
+                ),
+                "custom_request_backend_quota": (
+                    "each_fresh_retry_reserves_one_task_backend_job_unit"
+                ),
+                "cleanup_grace": "bounded_settlement_grace_may_extend_return_after_budget",
                 "omitted_request": "configured_evaluator_timeout_and_legacy_retry_policy",
             },
             "direct_messages_allowed": (
@@ -728,7 +778,12 @@ class JudgeBroker:
         return timeout, None
 
     def _attach_timeout(
-        self, result: Mapping[str, Any], timeout: AgentTimeout | None
+        self,
+        result: Mapping[str, Any],
+        timeout: AgentTimeout | None,
+        *,
+        timeout_started: float | None = None,
+        timeout_deadline: float | None = None,
     ) -> dict[str, Any]:
         normalized = dict(result)
         # Keep the historical disabled tool response byte-compatible.  The
@@ -736,6 +791,50 @@ class JudgeBroker:
         # calls so treatment adoption and fallback behavior remain auditable.
         if timeout is not None or self.agent_timeout_enabled:
             normalized.update(timeout_fields(timeout))
+        # Evaluators place detailed cumulative accounting inside their bounded
+        # response.  Promote the same fields to the broker result so clients,
+        # formal-tool records and audit rows do not need to understand a
+        # particular evaluator response nesting shape.  Control outcomes that
+        # never reached an evaluator still get the requested budget and a
+        # zero-attempt marker below.
+        response = normalized.get("response")
+        response_fields = _safe_timeout_budget_fields(response)
+        normalized.update(response_fields)
+        normalized.update(_safe_formal_quota_fields(response))
+        normalized.update(_safe_timeout_budget_fields(normalized))
+        normalized.update(_safe_formal_quota_fields(normalized))
+        if timeout is not None:
+            normalized.setdefault("timeout_budget_mode", "cumulative_total")
+            normalized.setdefault(
+                "timeout_budget_seconds", int(timeout.effective_seconds)
+            )
+            invoked = bool(
+                normalized.get("accepted") is True
+                or normalized.get("call_index") is not None
+                or normalized.get("backend_job_number") is not None
+            )
+            normalized.setdefault("judge_attempt_count", 1 if invoked else 0)
+            normalized.setdefault("judge_retry_count", 0)
+            normalized.setdefault("timeout_budget_exhausted", False)
+            if timeout_started is not None and timeout_deadline is not None:
+                now = time.monotonic()
+                elapsed = max(
+                    0.0,
+                    min(
+                        float(timeout.effective_seconds),
+                        now - float(timeout_started),
+                    ),
+                )
+                remaining = max(0.0, float(timeout_deadline) - now)
+                normalized.setdefault(
+                    "timeout_budget_elapsed_seconds", round(elapsed, 6)
+                )
+                normalized.setdefault(
+                    "timeout_budget_remaining_seconds", round(remaining, 6)
+                )
+                if remaining <= 0:
+                    normalized["timeout_budget_exhausted"] = True
+                    normalized["timeout_budget_remaining_seconds"] = 0.0
         return normalized
 
     def formal_summary(self) -> dict[str, Any]:
@@ -997,8 +1096,21 @@ class JudgeBroker:
         # request gets a terminal ``judge.receipt`` row.  This is intentionally
         # separate from the evaluator execution clock below: validation,
         # admission, execution and audit are distinct stages in the profile.
-        request_started = time.monotonic() if self._profiling_enabled else 0.0
         timeout_request, timeout_error = self._parse_agent_timeout(payload)
+        # Capture the capability-call start only when the explicit budget is
+        # enabled (or profiling already needs the clock).  This lets the
+        # budget cover candidate snapshot and evaluator-gate admission, rather
+        # than granting a fresh full budget after a long queue wait.
+        request_started = (
+            time.monotonic()
+            if self._profiling_enabled or timeout_request is not None
+            else 0.0
+        )
+        timeout_deadline = (
+            request_started + timeout_request.effective_seconds
+            if timeout_request is not None
+            else None
+        )
 
         def finish(
             task_id: str,
@@ -1008,7 +1120,12 @@ class JudgeBroker:
             return self._finish_judge_check(
                 claim,
                 task_id,
-                self._attach_timeout(result, timeout_request),
+                self._attach_timeout(
+                    result,
+                    timeout_request,
+                    timeout_started=request_started,
+                    timeout_deadline=timeout_deadline,
+                ),
                 **kwargs,
             )
 
@@ -1215,6 +1332,11 @@ class JudgeBroker:
             )
 
             admission_deadline = claim.deadline_monotonic
+            capped_by_agent_timeout = False
+            if timeout_deadline is not None:
+                if timeout_deadline <= admission_deadline:
+                    capped_by_agent_timeout = True
+                    admission_deadline = timeout_deadline
             capped_admission = False
             if self.probe_admission_timeout_seconds is not None:
                 admission_deadline = min(
@@ -1253,6 +1375,12 @@ class JudgeBroker:
                         "This solver task was cancelled before Judge admission.",
                         retryable=False,
                     )
+                elif capped_by_agent_timeout and timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+                    result = _control_result(
+                        "EVALUATOR_TIMEOUT",
+                        "The Agent validation budget elapsed while waiting for Judge admission.",
+                        retryable=False,
+                    )
                 elif capped_admission and time.monotonic() < claim.deadline_monotonic:
                     result = _control_result(
                         "JUDGE_ADMISSION_TIMEOUT",
@@ -1274,6 +1402,19 @@ class JudgeBroker:
                 result = _control_result(
                     "TASK_CANCELLED",
                     "This solver task was cancelled during Judge admission.",
+                    retryable=False,
+                )
+            elif (
+                timeout_deadline is not None
+                and _remaining_agent_attempt_seconds(
+                    timeout_request,
+                    timeout_deadline,
+                )
+                is None
+            ):
+                result = _control_result(
+                    "EVALUATOR_TIMEOUT",
+                    "The Agent validation budget elapsed before Judge execution.",
                     retryable=False,
                 )
             elif time.monotonic() >= claim.deadline_monotonic:
@@ -1342,8 +1483,14 @@ class JudgeBroker:
                             "the configured evaluator does not support timeout_seconds"
                         )
                     evaluator_kwargs["timeout_seconds"] = (
-                        timeout_request.effective_seconds
+                        _remaining_agent_attempt_seconds(
+                            timeout_request,
+                            timeout_deadline,
+                        )
+                        or timeout_request.effective_seconds
                     )
+                    if _accepts_timeout_deadline(evaluator_call):
+                        evaluator_kwargs["timeout_deadline_monotonic"] = timeout_deadline
                 evaluator_call_started = True
                 evaluator_started_at = time.monotonic()
                 self._profile_event(
@@ -1461,9 +1608,22 @@ class JudgeBroker:
                     )
                     safe_response["settlement_deferred"] = True
                 proof_claimed = verdict_status == "PROVED" or _safe_score(verdict.score) >= 1.0
+                # The evaluator has a bounded settlement grace so it can
+                # reconcile a known Judge job after the logical deadline.  A
+                # terminal receipt observed during that grace is still too
+                # late to become worker-visible validation feedback: otherwise
+                # a slow adapter could return a proof after the Agent's total
+                # budget and accidentally establish authoritative success.
+                # Keep remote-settlement and explicit cancellation outcomes
+                # ahead of this check; they are safety states, not scores.
+                budget_expired = (
+                    timeout_deadline is not None
+                    and time.monotonic() >= timeout_deadline
+                    and not _claim_cancelled(claim)
+                )
                 if call_unsettled or deferred_remote:
                     authoritative_verdict = None
-                elif proof_claimed and time.monotonic() >= claim.deadline_monotonic:
+                elif time.monotonic() >= claim.deadline_monotonic:
                     result.update(
                         {
                             "ok": False,
@@ -1474,6 +1634,19 @@ class JudgeBroker:
                             "retryable": False,
                         }
                     )
+                    authoritative_verdict = None
+                elif budget_expired:
+                    result.update(
+                        {
+                            "ok": False,
+                            "status": "EVALUATOR_TIMEOUT",
+                            "proved": False,
+                            "score": 0.0,
+                            "error": "The Agent validation budget elapsed during Judge evaluation.",
+                            "retryable": False,
+                        }
+                    )
+                    authoritative_verdict = None
                 elif proof_claimed and _is_authoritative_proof(
                     task=binding.task,
                     verdict=verdict,
@@ -1579,7 +1752,12 @@ class JudgeBroker:
                     "retryable": False,
                 }
 
-        result = self._attach_timeout(result, timeout_request)
+        result = self._attach_timeout(
+            result,
+            timeout_request,
+            timeout_started=request_started,
+            timeout_deadline=timeout_deadline,
+        )
         audit_gate_wait_seconds = (
             time.monotonic() - gate_wait_started
             if not acquired
@@ -1631,6 +1809,7 @@ class JudgeBroker:
         # expose the same bounded receipt profile as pre-admission failures.
         # ``result`` is already sanitized above, and no response/error payload
         # is forwarded to the profiling sink.
+        budget_profile_fields = _timeout_profile_fields(result)
         self._profile_event(
             "judge.receipt",
             claim=claim,
@@ -1649,6 +1828,7 @@ class JudgeBroker:
             cache_reused=result.get("cache_reused") is True,
             candidate_sha256=snapshot.sha256 if snapshot is not None else None,
             **timeout_fields(timeout_request),
+            **budget_profile_fields,
         )
         if _valid_judge_checkpoint(
             result,
@@ -1778,6 +1958,7 @@ class JudgeBroker:
             else gate_wait_seconds
         )
         audit_started = time.monotonic()
+        budget_profile_fields = _timeout_profile_fields(normalized)
         try:
             self._audit(
                 claim,
@@ -1799,6 +1980,7 @@ class JudgeBroker:
                 effective_timeout_seconds=normalized.get("effective_timeout_seconds"),
                 timeout_clamped=normalized.get("timeout_clamped") is True,
                 timeout_source=normalized.get("timeout_source"),
+                **budget_profile_fields,
             )
         self._profile_event(
             "judge.receipt",
@@ -1815,6 +1997,7 @@ class JudgeBroker:
             effective_timeout_seconds=normalized.get("effective_timeout_seconds"),
             timeout_clamped=normalized.get("timeout_clamped") is True,
             timeout_source=normalized.get("timeout_source"),
+            **budget_profile_fields,
         )
         return normalized
 
@@ -1833,6 +2016,20 @@ class JudgeBroker:
                 retryable=False,
             )
         timeout_request, timeout_error = self._parse_agent_timeout(payload)
+        timeout_deadline = (
+            started + timeout_request.effective_seconds
+            if timeout_request is not None
+            else None
+        )
+
+        def attach_timeout(result: Mapping[str, Any]) -> dict[str, Any]:
+            return self._attach_timeout(
+                result,
+                timeout_request,
+                timeout_started=started,
+                timeout_deadline=timeout_deadline,
+            )
+
         allowed_fields = {"task_id"}
         if self.agent_timeout_enabled:
             allowed_fields.add("timeout_seconds")
@@ -1843,7 +2040,7 @@ class JudgeBroker:
                 or "evaluate_local accepts only the runner-bound task selection and optional timeout_seconds.",
                 retryable=False,
             )
-            result = self._attach_timeout(result, timeout_request)
+            result = attach_timeout(result)
             self._formal_audit(claim, "evaluate_local", "__invalid__", result, accepted=False)
             return result
         try:
@@ -1854,7 +2051,7 @@ class JudgeBroker:
                 _safe_error(exc),
                 retryable=False,
             )
-            result = self._attach_timeout(result, timeout_request)
+            result = attach_timeout(result)
             self._formal_audit(claim, "evaluate_local", "__invalid__", result, accepted=False)
             return result
         call_number = self._formal_increment(task_id, "evaluate_calls")
@@ -1869,7 +2066,7 @@ class JudgeBroker:
                 "advisory_only": True,
                 "official_score_eligible": False,
             }
-            result = self._attach_timeout(result, timeout_request)
+            result = attach_timeout(result)
             self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
             return result
         capability_failure = _formal_capability_failure(claim)
@@ -1880,7 +2077,7 @@ class JudgeBroker:
                 "advisory_only": True,
                 "official_score_eligible": False,
             }
-            result = self._attach_timeout(result, timeout_request)
+            result = attach_timeout(result)
             self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
             return result
 
@@ -1903,18 +2100,40 @@ class JudgeBroker:
                 "advisory_only": True,
                 "official_score_eligible": False,
             }
-            result = self._attach_timeout(result, timeout_request)
+            result = attach_timeout(result)
             self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
             return result
         source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        if timeout_deadline is not None and time.monotonic() >= timeout_deadline:
+            result = {
+                **_control_result(
+                    "EVALUATOR_TIMEOUT",
+                    "The Agent validation budget elapsed while freezing the local candidate.",
+                    retryable=False,
+                ),
+                "call_number": call_number,
+                "candidate_sha256": source_sha256,
+                "advisory_only": True,
+                "official_score_eligible": False,
+            }
+            result = attach_timeout(result)
+            result["timeout_budget_exhausted"] = True
+            result["timeout_budget_remaining_seconds"] = 0.0
+            self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
+            return result
         cache_key = (
             task_id,
             binding.expected_task_contract_sha256,
             source_sha256,
         )
-        with self._formal_lock:
-            cached = self._formal_evaluate_cache.get(cache_key)
-            cached_result = _json_clone(cached) if cached is not None else None
+        cached_result = None
+        # A custom total budget must exercise the evaluator under that
+        # contract.  Reusing a legacy cached diagnostic could both hide a
+        # retry and return a result produced with a different timeout.
+        if timeout_request is None:
+            with self._formal_lock:
+                cached = self._formal_evaluate_cache.get(cache_key)
+                cached_result = _json_clone(cached) if cached is not None else None
         if cached_result is not None:
             cached_result.update(
                 {
@@ -1924,7 +2143,7 @@ class JudgeBroker:
                     "accepted": True,
                 }
             )
-            cached_result = self._attach_timeout(cached_result, timeout_request)
+            cached_result = attach_timeout(cached_result)
             self._formal_audit(
                 claim,
                 "evaluate_local",
@@ -1953,9 +2172,24 @@ class JudgeBroker:
                 "advisory_only": True,
                 "official_score_eligible": False,
             }
-            result = self._attach_timeout(result, timeout_request)
+            result = attach_timeout(result)
             self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
             return result
+
+        retry_backend_numbers: list[int] = []
+
+        def reserve_retry_backend_job() -> bool:
+            """Reserve one additional task-global slot for a fresh retry."""
+
+            serial = self._formal_reserve(
+                task_id,
+                "evaluate_backend_jobs",
+                self.formal_policy.evaluate_backend_jobs_per_task,
+            )
+            if serial is None:
+                return False
+            retry_backend_numbers.append(serial)
+            return True
 
         gate_started = time.monotonic()
         acquired = False
@@ -1964,18 +2198,52 @@ class JudgeBroker:
         evaluator_unsettled_before = 0
         verdict: Verdict | None = None
         try:
+            admission_deadline = claim.deadline_monotonic
+            if timeout_deadline is not None:
+                admission_deadline = min(admission_deadline, timeout_deadline)
             acquired = self._acquire_evaluator_gate(
-                claim.deadline_monotonic,
+                admission_deadline,
                 claim=claim,
                 task_id=task_id,
             )
             if not acquired:
                 self._formal_release(task_id, "evaluate_backend_jobs", backend_number)
                 backend_number = None
-                result = _formal_gate_failure(claim, self._remote_settlement_unconfirmed())
+                if (
+                    timeout_deadline is not None
+                    and time.monotonic() >= timeout_deadline
+                    and not self._remote_settlement_unconfirmed()
+                    and not _claim_cancelled(claim)
+                ):
+                    result = _control_result(
+                        "EVALUATOR_TIMEOUT",
+                        "The Agent validation budget elapsed while waiting for local evaluation admission.",
+                        retryable=False,
+                    )
+                else:
+                    result = _formal_gate_failure(
+                        claim, self._remote_settlement_unconfirmed()
+                    )
             else:
-                probe_source = getattr(self.evaluator, "probe_source", None)
-                if not callable(probe_source):
+                if (
+                    timeout_deadline is not None
+                    and time.monotonic() >= timeout_deadline
+                ):
+                    self._release_evaluator_gate()
+                    acquired = False
+                    self._formal_release(task_id, "evaluate_backend_jobs", backend_number)
+                    backend_number = None
+                    result = _control_result(
+                        "EVALUATOR_TIMEOUT",
+                        "The Agent validation budget elapsed before local evaluation execution.",
+                        retryable=False,
+                    )
+                    # Skip evaluator invocation; the final accounting below
+                    # still records this as a zero-attempt budget exhaustion.
+                    probe_source = None
+                else:
+                    probe_source = getattr(self.evaluator, "probe_source", None)
+                if acquired and not callable(probe_source):
                     self._formal_release(task_id, "evaluate_backend_jobs", backend_number)
                     backend_number = None
                     result = _control_result(
@@ -1983,45 +2251,84 @@ class JudgeBroker:
                         "The evaluator lacks immutable diagnostic-source support.",
                         retryable=False,
                     )
-                else:
-                    options: dict[str, Any] = {
-                        "deadline_monotonic": claim.deadline_monotonic,
-                    }
-                    if _accepts_settlement_callback(probe_source):
-                        options["settlement_callback"] = self._release_evaluator_gate
-                    if _accepts_cancel_event(probe_source):
-                        options["cancel_event"] = _ClaimCancelEvent(claim)
-                    if timeout_request is not None:
-                        if not _accepts_timeout(probe_source):
-                            raise TypeError(
-                                "the configured evaluator does not support timeout_seconds"
-                            )
-                        options["timeout_seconds"] = timeout_request.effective_seconds
-                    evaluator_unsettled_before = _nonnegative_count(
-                        getattr(self.evaluator, "remote_unsettled_jobs", 0)
+                elif acquired:
+                    remaining_attempt_seconds = _remaining_agent_attempt_seconds(
+                        timeout_request,
+                        timeout_deadline,
                     )
-                    evaluator_call_started = True
-                    verdict = probe_source(binding.task, source, **options)
-                    evaluator_unsettled_after = _nonnegative_count(
-                        getattr(self.evaluator, "remote_unsettled_jobs", 0)
-                    )
-                    call_unsettled = (
-                        evaluator_unsettled_after > evaluator_unsettled_before
-                        or _has_unsettled_remote_work(
-                            _safe_verdict_status(verdict.status),
-                            verdict.response,
+                    if timeout_request is not None and remaining_attempt_seconds is None:
+                        self._release_evaluator_gate()
+                        acquired = False
+                        self._formal_release(
+                            task_id,
+                            "evaluate_backend_jobs",
+                            backend_number,
                         )
-                    )
-                    deferred_remote = _has_deferred_remote_work(
-                        _safe_verdict_status(verdict.status), verdict.response
-                    )
-                    if call_unsettled or deferred_remote:
-                        retain_evaluator_gate = True
-                    if call_unsettled and not deferred_remote:
-                        self._mark_remote_unsettled()
-                        result = _remote_settlement_control_result()
+                        backend_number = None
+                        result = _control_result(
+                            "EVALUATOR_TIMEOUT",
+                            "The Agent validation budget elapsed before local evaluation execution.",
+                            retryable=False,
+                        )
                     else:
-                        result = _formal_worker_verdict(verdict)
+                        options: dict[str, Any] = {
+                            "deadline_monotonic": claim.deadline_monotonic,
+                        }
+                        if _accepts_settlement_callback(probe_source):
+                            options["settlement_callback"] = self._release_evaluator_gate
+                        if _accepts_cancel_event(probe_source):
+                            options["cancel_event"] = _ClaimCancelEvent(claim)
+                        if timeout_request is not None:
+                            if not _accepts_timeout(probe_source):
+                                raise TypeError(
+                                    "the configured evaluator does not support timeout_seconds"
+                                )
+                            options["timeout_seconds"] = (
+                                remaining_attempt_seconds
+                                or timeout_request.effective_seconds
+                            )
+                            if _accepts_timeout_deadline(probe_source):
+                                options["timeout_deadline_monotonic"] = timeout_deadline
+                            if _accepts_retry_admission(probe_source):
+                                options["retry_admission_callback"] = reserve_retry_backend_job
+                        evaluator_unsettled_before = _nonnegative_count(
+                            getattr(self.evaluator, "remote_unsettled_jobs", 0)
+                        )
+                        evaluator_call_started = True
+                        verdict = probe_source(binding.task, source, **options)
+                        evaluator_unsettled_after = _nonnegative_count(
+                            getattr(self.evaluator, "remote_unsettled_jobs", 0)
+                        )
+                        call_unsettled = (
+                            evaluator_unsettled_after > evaluator_unsettled_before
+                            or _has_unsettled_remote_work(
+                                _safe_verdict_status(verdict.status),
+                                verdict.response,
+                            )
+                        )
+                        deferred_remote = _has_deferred_remote_work(
+                            _safe_verdict_status(verdict.status), verdict.response
+                        )
+                        if call_unsettled or deferred_remote:
+                            retain_evaluator_gate = True
+                        if call_unsettled and not deferred_remote:
+                            self._mark_remote_unsettled()
+                            result = _remote_settlement_control_result()
+                        elif (
+                            timeout_deadline is not None
+                            and time.monotonic() >= timeout_deadline
+                        ):
+                            # A narrow/custom adapter may not understand the
+                            # optional absolute-deadline keyword.  Do not let it
+                            # turn a late result into apparently valid diagnostic
+                            # feedback; the broker's hard boundary wins.
+                            result = _control_result(
+                                "EVALUATOR_TIMEOUT",
+                                "The Agent validation budget elapsed during local evaluation.",
+                                retryable=False,
+                            )
+                        else:
+                            result = _formal_worker_verdict(verdict)
         except Exception:
             evaluator_unsettled_after = _nonnegative_count(
                 getattr(self.evaluator, "remote_unsettled_jobs", 0)
@@ -2065,11 +2372,21 @@ class JudgeBroker:
                 ),
             }
         )
-        result = self._attach_timeout(result, timeout_request)
+        backend_numbers = []
+        if backend_number is not None:
+            backend_numbers.append(int(backend_number))
+        backend_numbers.extend(int(value) for value in retry_backend_numbers)
+        if backend_numbers:
+            # Keep the historical singular field above for consumers that only
+            # understand the first reservation, while exposing the bounded
+            # complete lineage for quota/audit analysis.
+            result["backend_job_numbers"] = backend_numbers[:16]
+            result["backend_job_count"] = len(backend_numbers)
+        result = attach_timeout(result)
         if (
-            not retain_evaluator_gate
-            and
-            verdict is not None
+            timeout_request is None
+            and not retain_evaluator_gate
+            and verdict is not None
             and _safe_verdict_status(verdict.status) not in _FORMAL_NONCACHEABLE_STATUSES
         ):
             with self._formal_lock:
@@ -2668,6 +2985,12 @@ class JudgeBroker:
             "status": str(result.get("status") or "UNKNOWN")[:120],
             "call_number": result.get("call_number"),
             "backend_number": backend_number,
+            "backend_job_numbers": _safe_backend_job_numbers(
+                result.get("backend_job_numbers")
+            ),
+            "backend_job_count": _safe_backend_job_count(
+                result.get("backend_job_count")
+            ),
             "backend_probe_count": result.get("backend_probe_count"),
             "cache_hit": result.get("cache_hit") is True,
             "cache_hit_count": result.get("cache_hit_count"),
@@ -2681,6 +3004,8 @@ class JudgeBroker:
             "advisory_only": True,
             "official_score_eligible": False,
         }
+        row.update(_safe_timeout_budget_fields(result))
+        row.update(_safe_formal_quota_fields(result))
         with self._audit_lock:
             with self.formal_audit_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
@@ -2994,6 +3319,7 @@ class JudgeBroker:
             "response_profile": LEAN_PROBE_RESPONSE_PROFILE,
             **failure_fields,
         }
+        row.update(_safe_timeout_budget_fields(result))
         with self._audit_lock:
             with self.audit_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
@@ -3151,6 +3477,71 @@ def _accepts_timeout(function: Callable[..., Any]) -> bool:
     )
 
 
+def _accepts_timeout_deadline(function: Callable[..., Any]) -> bool:
+    """Return whether an evaluator can receive the absolute budget deadline.
+
+    The deadline keyword is an additive capability.  Narrow test adapters and
+    older third-party evaluators may implement only ``timeout_seconds``; the
+    broker still enforces the deadline while waiting for its own admission
+    gate and falls back to a budget that starts at evaluator invocation for
+    such adapters.  Built-in evaluators accept the keyword and therefore
+    include snapshot/gate time in the same logical budget.
+    """
+
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "timeout_deadline_monotonic"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _accepts_retry_admission(function: Callable[..., Any]) -> bool:
+    """Return whether an evaluator can reserve quota for a fresh retry."""
+
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "retry_admission_callback"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _remaining_agent_attempt_seconds(
+    timeout: AgentTimeout | None,
+    deadline_monotonic: float | None,
+) -> int | None:
+    """Return an integer per-attempt cap without extending a total budget.
+
+    The absolute deadline is authoritative for built-in evaluators.  Narrow
+    adapters may only understand ``timeout_seconds``; passing the remaining
+    integer budget to them still prevents queue/snapshot time from silently
+    granting a second full attempt.  ``None`` means that the advertised
+    five-second floor can no longer be honored.
+    """
+
+    if timeout is None:
+        return None
+    if deadline_monotonic is None:
+        return int(timeout.effective_seconds)
+    try:
+        remaining = float(deadline_monotonic) - time.monotonic()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(remaining) or remaining < AGENT_TIMEOUT_MIN_SECONDS:
+        return None
+    return max(
+        AGENT_TIMEOUT_MIN_SECONDS,
+        min(int(timeout.effective_seconds), int(math.ceil(remaining))),
+    )
+
+
 def _scope(raw: Any, communication: str) -> str:
     scope = _bounded_string(raw, 16).lower() or "task"
     if scope not in {"task", "global"}:
@@ -3262,6 +3653,132 @@ def _control_result(
     if retry_after_seconds is not None:
         result["retry_after_seconds"] = retry_after_seconds
     return result
+
+
+def _safe_timeout_budget_fields(value: Any) -> dict[str, Any]:
+    """Extract bounded cumulative-budget metadata from a result/response.
+
+    This helper is deliberately stricter than the generic JSON sanitizer.  A
+    custom evaluator is allowed to return arbitrary diagnostic keys, but only
+    the small, typed timeout accounting vocabulary may cross the broker audit
+    boundary.  Arrays are capped because one logical call can contain several
+    fresh backend attempts.
+    """
+
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key in _TIMEOUT_BUDGET_TEXT_FIELDS:
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            result[key] = sanitize_worker_text(raw.strip(), 64)
+    for key in _TIMEOUT_BUDGET_NUMBER_FIELDS:
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            continue
+        if key in {"judge_attempt_count", "judge_retry_count", "timeout_budget_seconds"}:
+            if isinstance(raw, int):
+                result[key] = max(0, min(int(raw), 1_000_000))
+            continue
+        try:
+            parsed = float(raw)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(parsed) and parsed >= 0:
+            result[key] = round(parsed, 6)
+    for key in _TIMEOUT_BUDGET_BOOL_FIELDS:
+        if isinstance(value.get(key), bool):
+            result[key] = value[key]
+    raw_timeouts = value.get("judge_attempt_timeouts_seconds")
+    if isinstance(raw_timeouts, (list, tuple)):
+        result["judge_attempt_timeouts_seconds"] = [
+            max(0, min(int(item), AGENT_TIMEOUT_MAX_SECONDS))
+            for item in raw_timeouts[:16]
+            if isinstance(item, int) and not isinstance(item, bool)
+        ]
+    raw_elapsed = value.get("judge_attempt_elapsed_seconds")
+    if isinstance(raw_elapsed, (list, tuple)):
+        elapsed: list[float] = []
+        for item in raw_elapsed[:16]:
+            if isinstance(item, bool):
+                continue
+            try:
+                parsed = float(item)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(parsed) and parsed >= 0:
+                elapsed.append(round(parsed, 6))
+        result["judge_attempt_elapsed_seconds"] = elapsed
+    raw_reasons = value.get("judge_retry_reasons")
+    if isinstance(raw_reasons, (list, tuple)):
+        result["judge_retry_reasons"] = [
+            sanitize_worker_text(item.strip(), 64)
+            for item in raw_reasons[:16]
+            if isinstance(item, str) and item.strip()
+        ]
+    raw_ids = value.get("judge_attempt_ids")
+    if isinstance(raw_ids, (list, tuple)):
+        result["judge_attempt_ids"] = [
+            identifier
+            for item in raw_ids[:16]
+            if (identifier := sanitize_worker_identifier(item)) is not None
+        ]
+    return result
+
+
+def _safe_formal_quota_fields(value: Any) -> dict[str, Any]:
+    """Extract bounded markers for a formal backend-job retry admission."""
+
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, Any] = {}
+    for key in _FORMAL_QUOTA_TEXT_FIELDS:
+        raw = value.get(key)
+        if isinstance(raw, str) and raw.strip():
+            result[key] = sanitize_worker_text(raw.strip(), 64)
+    for key in _FORMAL_QUOTA_BOOL_FIELDS:
+        if isinstance(value.get(key), bool):
+            result[key] = value[key]
+    for key in _FORMAL_QUOTA_NUMBER_FIELDS:
+        raw = value.get(key)
+        if isinstance(raw, int) and not isinstance(raw, bool):
+            result[key] = max(0, min(int(raw), 1_000_000))
+    raw_numbers = value.get("backend_job_numbers")
+    if isinstance(raw_numbers, (list, tuple)):
+        result["backend_job_numbers"] = [
+            max(0, min(int(item), 1_000_000))
+            for item in raw_numbers[:16]
+            if isinstance(item, int) and not isinstance(item, bool)
+        ]
+    return result
+
+
+def _safe_backend_job_numbers(value: Any) -> list[int]:
+    """Keep formal retry reservation serials bounded and non-sensitive."""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [
+        max(0, min(int(item), 1_000_000))
+        for item in value[:16]
+        if isinstance(item, int) and not isinstance(item, bool)
+    ]
+
+
+def _safe_backend_job_count(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return max(0, min(int(value), 1_000_000))
+    return None
+
+
+def _timeout_profile_fields(value: Any) -> dict[str, Any]:
+    """Return only scalar/text timeout fields accepted by RunProfiler."""
+
+    return {
+        key: item
+        for key, item in _safe_timeout_budget_fields(value).items()
+        if key not in _TIMEOUT_BUDGET_ARRAY_FIELDS
+    }
 
 
 def _safe_roster(path: Path | None) -> list[dict[str, Any]]:
@@ -3562,7 +4079,7 @@ def _formal_worker_verdict(verdict: Verdict) -> dict[str, Any]:
         errors.append(sanitize_public_text(nested_error, limit=1_024))
     if verdict.error:
         errors.append(sanitize_public_text(verdict.error, limit=1_024))
-    return {
+    result = {
         "ok": _safe_verdict_status(verdict.status) not in _FORMAL_NONCACHEABLE_STATUSES,
         "status": _safe_verdict_status(verdict.status),
         "score": 0.0,
@@ -3574,6 +4091,15 @@ def _formal_worker_verdict(verdict: Verdict) -> dict[str, Any]:
         ),
         "elapsed_ms": int(max(0.0, verdict.elapsed_seconds) * 1_000),
     }
+    # Preserve the cumulative timeout accounting even though formal helper
+    # responses intentionally expose only a small diagnostics projection.
+    result.update(_safe_timeout_budget_fields(response))
+    # A retry can be denied by the task-global backend-job quota after the
+    # first attempt has already produced feedback.  Keep that bounded reason
+    # visible to the Agent instead of silently returning the earlier transient
+    # status as if the evaluator had simply stopped retrying.
+    result.update(_safe_formal_quota_fields(response))
+    return result
 
 
 def _formal_probe_result(verdict: Verdict) -> dict[str, Any]:
