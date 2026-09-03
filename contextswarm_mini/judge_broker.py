@@ -1482,13 +1482,35 @@ class JudgeBroker:
                         raise TypeError(
                             "the configured evaluator does not support timeout_seconds"
                         )
-                    evaluator_kwargs["timeout_seconds"] = (
-                        _remaining_agent_attempt_seconds(
-                            timeout_request,
-                            timeout_deadline,
-                        )
-                        or timeout_request.effective_seconds
+                    remaining_attempt_seconds = _remaining_agent_attempt_seconds(
+                        timeout_request,
+                        timeout_deadline,
                     )
+                    if remaining_attempt_seconds is None:
+                        # The admission check above and the evaluator call are
+                        # separate scheduling points.  If the last few seconds
+                        # disappear while entering this block, do not fall back
+                        # to a fresh full timeout for a narrow adapter that
+                        # cannot receive the absolute deadline keyword.  The
+                        # hard Agent budget wins and the already-held gate is
+                        # released before the normal audited receipt path.
+                        self._release_evaluator_gate()
+                        acquired = False
+                        return finish(
+                            task_id,
+                            _control_result(
+                                "EVALUATOR_TIMEOUT",
+                                "The Agent validation budget elapsed before Judge execution.",
+                                retryable=False,
+                            ),
+                            accepted=True,
+                            started=started,
+                            gate_wait_started=gate_wait_started,
+                            gate_wait_seconds=gate_wait,
+                            candidate_sha256=snapshot.sha256,
+                            clear_probe_active=True,
+                        )
+                    evaluator_kwargs["timeout_seconds"] = remaining_attempt_seconds
                     if _accepts_timeout_deadline(evaluator_call):
                         evaluator_kwargs["timeout_deadline_monotonic"] = timeout_deadline
                 evaluator_call_started = True

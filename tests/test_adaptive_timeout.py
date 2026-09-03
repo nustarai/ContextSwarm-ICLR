@@ -860,6 +860,51 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["score"], 0.0)
         self.assertTrue(result["timeout_budget_exhausted"])
 
+    def test_broker_fails_closed_if_narrow_adapter_floor_disappears_before_call(self) -> None:
+        """A late admission race must not grant a fresh full narrow-adapter timeout."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = _task(root)
+            workdir = root / "worker"
+            workdir.mkdir()
+            (workdir / "result.lean").write_text(task.baseline_code, encoding="utf-8")
+            evaluator = _TimeoutEvaluator()
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=root / "judge_checks.jsonl",
+                formal_policy=_policy(),
+                agent_timeout_enabled=True,
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=1,
+            ).start()
+            try:
+                # The first check is the post-admission floor check.  The
+                # second is immediately before invoking this deliberately
+                # narrow adapter, which cannot receive an absolute deadline.
+                with patch(
+                    "contextswarm_mini.judge_broker._remaining_agent_attempt_seconds",
+                    side_effect=[5, None],
+                ):
+                    with broker.session(
+                        actor_id="worker",
+                        workdir=workdir,
+                        candidates={task.slug: (task, workdir / "result.lean")},
+                        deadline_monotonic=10**9,
+                    ) as env:
+                        result = _post(
+                            env["CONTEXTSWARM_JUDGE_URL"],
+                            "judge_check",
+                            {"timeout_seconds": 5},
+                        )
+                self.assertEqual(result["status"], "EVALUATOR_TIMEOUT")
+                self.assertEqual(evaluator.timeouts, [])
+                self.assertTrue(broker.evaluator_gate.acquire(timeout=0))
+                broker.evaluator_gate.release()
+            finally:
+                broker.close()
+
 
 if __name__ == "__main__":
     unittest.main()
