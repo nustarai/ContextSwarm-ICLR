@@ -15,7 +15,7 @@ from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 from contextswarm_mini.config import load_config
-from contextswarm_mini.evaluator import LeanEvaluator
+from contextswarm_mini.evaluator import LeanEvaluator, safe_worker_response
 from contextswarm_mini.formal_tools import DeclarationIndex, FormalToolPolicy
 from contextswarm_mini.judge_broker import JudgeBroker
 from contextswarm_mini.models import Task, Verdict
@@ -358,6 +358,19 @@ process.stdout.write(JSON.stringify({
         self.assertEqual(result["timeout_budget_seconds"], 600)
         self.assertLessEqual(result["timeout_budget_elapsed_seconds"], 600.0)
         self.assertLessEqual(result["timeout_budget_remaining_seconds"], 600.0)
+
+    def test_nested_timeout_budget_scalars_are_capped_for_worker_feedback(self) -> None:
+        safe = safe_worker_response(
+            {
+                "timeout_budget_seconds": 999_999,
+                "timeout_budget_elapsed_seconds": 999_999.0,
+                "timeout_budget_remaining_seconds": 999_999.0,
+            },
+            timeout_max_seconds=600,
+        )
+        self.assertEqual(safe["timeout_budget_seconds"], 600.0)
+        self.assertEqual(safe["timeout_budget_elapsed_seconds"], 600.0)
+        self.assertEqual(safe["timeout_budget_remaining_seconds"], 600.0)
 
     def test_loaded_manifest_derives_helper_guard_for_a_larger_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

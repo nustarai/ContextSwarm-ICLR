@@ -4500,6 +4500,11 @@ def safe_worker_response(
         identifier = sanitize_worker_identifier(payload.get(key))
         if identifier is not None:
             result[key] = identifier
+    timeout_budget_number_fields = {
+        "timeout_budget_seconds",
+        "timeout_budget_elapsed_seconds",
+        "timeout_budget_remaining_seconds",
+    }
     for key in (
         "status",
         "formal_status",
@@ -4566,7 +4571,11 @@ def safe_worker_response(
     ):
         number = _safe_nonnegative_number(payload.get(key))
         if number is not None:
-            result[key] = number
+            result[key] = (
+                min(number, float(timeout_cap))
+                if key in timeout_budget_number_fields
+                else number
+            )
     attempt_timeouts = payload.get("judge_attempt_timeouts_seconds")
     if isinstance(attempt_timeouts, (list, tuple)):
         result["judge_attempt_timeouts_seconds"] = [
