@@ -1,0 +1,10 @@
+extends = ["route_claim_smoke.toml"]
+
+# Matched offline control for route_claim_smoke.toml.  It keeps the same three
+# tasks, concurrency, episodes, horizon, and profiling surface while disabling
+# only the mandatory route-claim/active-roster treatment.
+[experiment]
+name = "mobench-route-claim-smoke-control"
+
+[cps_features]
+route_claim_required = false

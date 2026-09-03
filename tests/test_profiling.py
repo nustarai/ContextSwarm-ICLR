@@ -332,6 +332,53 @@ class ProfilingTests(unittest.TestCase):
             self.assertEqual([row["backlog_limit"] for row in queue_rows], [7, 7])
             self.assertTrue(all("dropped_fields" not in row for row in queue_rows))
 
+    def test_run_profile_rows_keep_route_treatment_identity(self) -> None:
+        """A profiling stream alone must identify control versus treatment."""
+
+        with tempfile.TemporaryDirectory(
+            prefix=".contextswarm-profile-", dir=str(ROOT)
+        ) as temporary:
+            root = Path(temporary)
+            profiler = RunProfiler(
+                root,
+                enabled=True,
+                heartbeat_interval_seconds=60,
+                run_id="run-route-treatment",
+            )
+            profiler.start(root_pid=os.getpid())
+            route_identity = {
+                "active_roster_enabled": True,
+                "route_claims_enabled": True,
+                "route_claim_required": True,
+            }
+            profiler.observe_logger_event(
+                "run_started",
+                {
+                    "run_id": "run-route-treatment",
+                    "mode": "cps",
+                    **route_identity,
+                    # Rich manifest data remains outside the profiling side
+                    # channel even though its scalar identity is retained.
+                    "cps_features": {"route_claim_required": True},
+                },
+            )
+            profiler.emit(
+                "run.configuration",
+                mode="cps",
+                **route_identity,
+            )
+            profiler.close()
+
+            rows = self._rows(root / PROFILE_FILENAME)
+            for event in ("run.start", "run.configuration"):
+                row = next(item for item in rows if item["event"] == event)
+                self.assertEqual(
+                    {key: row.get(key) for key in route_identity},
+                    route_identity,
+                )
+                self.assertNotIn("cps_features", row)
+                self.assertNotIn("dropped_fields", row)
+
     def test_cgroup_scope_precedes_root_and_snapshot_never_returns_path(self) -> None:
         if os.name != "posix":
             self.skipTest("cgroup v2 probing is Unix-specific")

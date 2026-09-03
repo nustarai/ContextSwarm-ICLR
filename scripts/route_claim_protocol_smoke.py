@@ -74,25 +74,37 @@ class _AggregateProfiler:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._rows: list[tuple[str, str | None, str | None]] = []
+        self._rows: list[dict[str, Any]] = []
 
     def emit(self, event: str, **fields: Any) -> None:
         with self._lock:
             self._rows.append(
-                (
-                    str(event)[:128],
-                    str(fields.get("db_operation"))[:128]
-                    if fields.get("db_operation") is not None
-                    else None,
-                    str(fields.get("status"))[:64]
-                    if fields.get("status") is not None
-                    else None,
-                )
+                {
+                    "event": str(event)[:128],
+                    "operation": (
+                        str(fields.get("db_operation"))[:128]
+                        if fields.get("db_operation") is not None
+                        else None
+                    ),
+                    "status": (
+                        str(fields.get("status"))[:64]
+                        if fields.get("status") is not None
+                        else None
+                    ),
+                    "wall_seconds": max(0.0, float(fields.get("wall_seconds") or 0.0)),
+                    "lock_wait_seconds": max(
+                        0.0, float(fields.get("lock_wait_seconds") or 0.0)
+                    ),
+                    "lock_hold_seconds": max(
+                        0.0, float(fields.get("lock_hold_seconds") or 0.0)
+                    ),
+                    "rows_written": max(0, int(fields.get("rows_written") or 0)),
+                }
             )
 
-    def snapshot(self) -> tuple[tuple[str, str | None, str | None], ...]:
+    def snapshot(self) -> tuple[dict[str, Any], ...]:
         with self._lock:
-            return tuple(self._rows)
+            return tuple(dict(row) for row in self._rows)
 
 
 def _task(root: Path, slug: str) -> Task:
@@ -261,7 +273,12 @@ def _run(output: Path) -> dict[str, Any]:
     with store._db() as db:  # noqa: SLF001 - bounded synthetic audit summary.
         event_types = Counter(row[0] for row in db.execute("SELECT event_type FROM events"))
     profile_rows = profiler.snapshot()
-    write_commits = [row for row in profile_rows if row[0] == "cps.write.commit"]
+    write_commits = [
+        row for row in profile_rows if row["event"] == "cps.write.commit"
+    ]
+    write_operations = sorted(
+        {str(row.get("operation") or "unknown") for row in write_commits}
+    )
 
     result = {
         "schema_version": "contextswarm_route_claim_protocol_smoke_v1",
@@ -325,14 +342,48 @@ def _run(output: Path) -> dict[str, Any]:
             "write_commit_counts": dict(
                 sorted(
                     Counter(
-                        operation or "unknown"
-                        for _, operation, _ in write_commits
+                        str(row.get("operation") or "unknown")
+                        for row in write_commits
                     ).items()
                 )
             ),
             "non_ok_write_commits": sum(
-                status != "ok" for _, _, status in write_commits
+                row.get("status") != "ok" for row in write_commits
             ),
+            "write_totals": {
+                operation: {
+                    "wall_seconds": round(
+                        sum(
+                            float(row.get("wall_seconds") or 0.0)
+                            for row in write_commits
+                            if str(row.get("operation") or "unknown") == operation
+                        ),
+                        9,
+                    ),
+                    "lock_wait_seconds": round(
+                        sum(
+                            float(row.get("lock_wait_seconds") or 0.0)
+                            for row in write_commits
+                            if str(row.get("operation") or "unknown") == operation
+                        ),
+                        9,
+                    ),
+                    "lock_hold_seconds": round(
+                        sum(
+                            float(row.get("lock_hold_seconds") or 0.0)
+                            for row in write_commits
+                            if str(row.get("operation") or "unknown") == operation
+                        ),
+                        9,
+                    ),
+                    "rows_written": sum(
+                        int(row.get("rows_written") or 0)
+                        for row in write_commits
+                        if str(row.get("operation") or "unknown") == operation
+                    ),
+                }
+                for operation in write_operations
+            },
         },
         "event_counts": dict(sorted(event_types.items())),
     }

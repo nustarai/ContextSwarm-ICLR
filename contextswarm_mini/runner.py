@@ -2971,6 +2971,9 @@ def run_experiment(
         task_count=len(tasks),
         selection_enabled=config.selection.enabled,
         communication_enabled=config.communication != "none",
+        active_roster_enabled=config.active_roster_enabled,
+        route_claims_enabled=config.route_claims_enabled,
+        route_claim_required=config.route_claim_required,
         max_concurrent=config.lean_max_concurrent_evaluations,
     )
     if dry_run:

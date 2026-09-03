@@ -87,6 +87,15 @@ knowledge_promotion = false
         expected["cps_features"]["route_claim_required"] = True
         self.assertEqual(treatment.public_dict(), expected)
 
+    def test_route_mock_control_and_treatment_differ_only_by_route_flag(self) -> None:
+        control = load_config("configs/route_claim_smoke_control.toml", ROOT)
+        treatment = load_config("configs/route_claim_smoke.toml", ROOT)
+        expected = control.public_dict()
+        expected["name"] = treatment.name
+        expected["cps_features"] = dict(expected["cps_features"])
+        expected["cps_features"]["route_claim_required"] = True
+        self.assertEqual(treatment.public_dict(), expected)
+
     def test_feature_table_is_strict_and_route_requires_cps(self) -> None:
         with self.assertRaisesRegex(ConfigError, "unknown cps_features fields"):
             _load_manifest("[cps_features]\nunknown = true\n")
