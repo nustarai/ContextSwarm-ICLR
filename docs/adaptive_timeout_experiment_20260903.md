@@ -3,7 +3,8 @@
 > **实验目的**：验证让 Agent 为 `judge_check` 和 `evaluate_local` 提议一次验证预算，
 > 同时由 broker/evaluator 做硬上限裁剪，是否能缓解少量验证长尾占用大量总时长的问题。
 >
-> **记录状态**：实现与四轮 treatment run 已完成：`treatment-r1` 是旧的
+> **记录状态**：实现与四轮 treatment run 已完成，并补做了一轮配置驱动提示修正后的
+> confirmation run：`treatment-r1` 是旧的
 > `max_retries=0` 语义，`treatment-r2/r3/r4` 使用本节所述的累计预算语义。r3/r4
 > 按用户要求并发运行，并共享宿主机的外部模型/NuRouter 容量；它们的 worktree、Judge
 > runtime、端口、容器和输出目录彼此隔离。本文的数值结论仅适用于列明的
@@ -457,6 +458,54 @@ work-seconds；treatment 三轮共 6,601 jobs、20,220.548 work-seconds。也就
 recovery 语义和随机候选共同作用。当前最可信的方案收益仍是“少量昂贵 Judge tail 被硬性
 截断”，而不是已经证明数学解题质量有稳定提升。
 
+### 5.7 配置驱动提示修正后的确认轮（primary-fix confirmation）
+
+这轮用于确认用户指出的实现修正：prompt、Pi tool schema、formal helper 和 broker
+均从 manifest 的实际 `timeout_seconds` 读取 Agent cap，而不是把 300 秒写死。正式
+workload 在确认轮启动时固定于 primary fix 的 commit `57b115e`；运行期间 review
+又发现并补上了两个不改变 cap=300 正常路径的边界硬化（helper transport ceiling 和
+nested timeout metadata sanitizer），形成当前 HEAD `5865956`。因此以下一小时数值
+不能冒充 `5865956` 镜像的正式 workload 结果；后者另以完整测试和最终 mock smoke
+确认。这个 source/image 边界保留在报告中，避免把实验 artifact 与最终 PR head 混为一谈。
+
+运行身份和合同：
+
+- run ID：`20260903T205925Z-12d09a89`
+- source commit：`57b115e1c1fdc6d65a940c7be43c9bb06bd5fbaf`
+- image ID：`sha256:a02554a2d565f12d5cedf3ebb538fc5d59453c289f4771328e4b6dbccf26e69e`
+- manifest：`configs/formal_1h_cps32_profiled_adaptive_timeout.toml`，SHA-256
+  `33f0506df80db26d946236e59e070b4b065431eea892957e469494e5f3a07289`
+- horizon / parallelism：`3600 s / 32`；model / thinking：`openai-codex/gpt-5.6-sol / max`；seed `0`
+- configured Judge/Agent cap：`300 s`；formal helper command timeout：`420 s`
+
+| 指标 | confirmation run |
+|---|---:|
+| final status / score / nAUC / first proof | `DEGRADED` / `5/12` / `0.302987` / `147.579 s` |
+| all / accepted / fresh Judge rows | `2,122 / 2,116 / 2,116` |
+| fresh elapsed mean / P50 / P90 / P95 / P99 / max | `4.879 / 1.320 / 10.070 / 20.316 / 60.386 / 180.391 s` |
+| fresh elapsed total | `10,323.932 s` |
+| >60 s：n / seconds / share | `25 / 2,119.638 s / 20.531%` |
+| >120 s：n / seconds / share | `3 / 421.633 s / 4.084%` |
+| >300 s / >600 s | `0 / 0` |
+| timeout adoption / omitted / clamped | `2,116/2,116 = 100%` / `0` / `0` |
+| `judge_retry_count` sum / nonzero requests | `0 / 0` |
+| attempt count histogram | `1:2,114; 0:2` |
+
+所有 fresh accepted `judge_check` 都带有显式 timeout；请求值主要集中在 60 s（1,311
+次）、30 s（363 次）和 120 s（139 次），有效值全部落在配置的 5–300 s 范围。`evaluate_local`
+共 93 次，93/93 显式携带 timeout、clamp=0，最大 elapsed 48.085 s；`formal_query` 的
+931 次仍是独立的 legacy 查询契约。正式 workload 没有自然触发 transient retry，因而
+confirmation 只能说明长尾仍被硬 cap 约束，不能把 score=5 解释成 retry 带来的质量变化。
+
+Judge 后端共提交/完成 2,647/2,647 个 job：custom `max_retries=0` bucket 为 2,195 jobs、
+9,262.045 execution work-seconds、最大单 job 180.083 s；legacy bucket 为 452 jobs、
+722.145 work-seconds、最大 65.859 s。broker closeout 为 `active_handlers=0`、
+`drained=true`、`fifo_depth=0`、`remote_unsettled_jobs=0`，supervisor exit=0，
+transport preflight 为 `ok`，容器和本轮端口均已释放。最终 health 仍为 `DEGRADED`（127
+solver timeout、19 cancellation、28 Judge probe infrastructure error；OOM/runner/worker
+unexpected error 为 0）。profiling audit 没有敏感字段且 termination 有效，但 exit code=1：
+114 行 dropped fields（342 个字段）和 1 个未闭合 span，故不能标为 clean audit。
+
 ## 6. 解释与决策门槛
 
 ### 已达到的门槛
@@ -477,11 +526,11 @@ recovery 语义和随机候选共同作用。当前最可信的方案收益仍�
 - **质量因果**：三轮 treatment score 为 `6,6,5`，baseline 为 `5,4,5`，均值方向上高
   一题，但只有 n=3、非随机配对，而且 recovery/cache/prompt/任务轨迹都存在差异；这
   不能写成稳定的数学解题质量提升。r4 的 score=5 也说明 6 分不是每轮必现。
-- **retry 分支**：三轮实际 `judge_retry_count` 都为 0，所以正式 workload 尚未观察到
+- **retry 分支**：四轮实际 `judge_retry_count` 都为 0，所以正式 workload 尚未观察到
   “30 s 异常后用剩余 270 s”这一分支；当前只能由单元/集成测试和后续故障注入证明。
-- **健康/审计**：三轮最终均为 `DEGRADED`，worker recycle/floor deficit 和 probe
-  infrastructure error 仍存在；profiling audit 均因 dropped fields/未闭合 span 退出 1。
-  因此性能方向可信，但不能声称是 clean、完全无噪声的生产健康实验。
+- **健康/审计**：三轮 treatment 与 confirmation 均为 `DEGRADED`，worker recycle/floor
+  deficit 和 probe infrastructure error 仍存在；profiling audit 均因 dropped fields/未闭合
+  span 退出 1。因此性能方向可信，但不能声称是 clean、完全无噪声的生产健康实验。
 - **普通请求**：P50/P90 并未单调下降，方案主要解决少量昂贵极端请求，不是把每一次
   Judge 都变快；`formal_query` 仍使用 legacy timeout 合同。
 
@@ -491,16 +540,18 @@ recovery 语义和随机候选共同作用。当前最可信的方案收益仍�
 
 ### 6.1 交付决策（2026-09-04）
 
-针对最初的长尾问题，本轮证据已经足够支持提交实现 PR：原始 Judge 工具的两次 300 秒
-backend attempt 会把少数请求拖到约 600 秒；显式 Agent budget 现在由 fresh backend
+针对最初的长尾问题，三轮 treatment 加上 confirmation 的证据已经足够支持提交实现 PR：
+原始 Judge 工具的两次 300 秒 backend attempt 会把少数请求拖到约 600 秒；显式 Agent
+budget 现在由 fresh backend
 attempt、单次逻辑总预算和底层硬上限共同约束，timeout-specific retry 不会再复制一个
 完整的长尾。
 三轮累计 treatment 的 pooled 最大 fresh elapsed 为 180.865 秒，`>300 s`、`>600 s` 均为
-零，`>120 s` 耗时占比由 50.952% 降至 3.889%。
+零，`>120 s` 耗时占比由 50.952% 降至 3.889%；confirmation run 的最大 fresh elapsed
+为 180.391 秒，`>300 s`、`>600 s` 同样为零。
 
 这不是把所有异常 retry 都删除：对于有明确 candidate-independent transport/runtime 证据的
 情况，当前 evaluator 仍可在同一个 broker handler/evaluator gate 内使用剩余总预算做安全
-fresh retry；三轮正式 workload 的 `judge_retry_count` 恰好均为 0，因此这个分支没有被自然
+fresh retry；四轮正式 workload 的 `judge_retry_count` 恰好均为 0，因此这个分支没有被自然
 流量触发。对本次目标而言，关键保证是超时本身不自动再开一轮完整 300 秒，而不是依赖降低
 retry 次数来掩盖总预算问题。
 
@@ -510,9 +561,9 @@ formal helper `PUBLIC_FILES.md`、runner summary、broker policy 和审计字段
 cap。工具 schema 保留“无 maximum 字段”的软控制设计，让超 cap 请求可以到达 broker，记录
 requested 值并由底层裁剪；因此既保留可观测性，也保留硬性兜底。
 
-最终质量结论仍保持保守：baseline 三轮 score=`5,4,5`，treatment 三轮为 `6,6,5`，这是
-积极但非因果、非稳定的方向性信号；本 PR 的明确结论是长尾治理有效，不宣称数学解题质量
-已经被证明提升。
+最终质量结论仍保持保守：baseline 三轮 score=`5,4,5`，treatment 三轮为 `6,6,5`，
+confirmation run 为 `5`，这是积极但非因果、非稳定的方向性信号；本 PR 的明确结论是长尾
+治理有效，不宣称数学解题质量已经被证明提升。
 
 ### 下一步决策
 
@@ -546,16 +597,18 @@ requested 值并由底层裁剪；因此既保留可观测性，也保留硬性�
 - r2 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-20260903/runs/adaptive-timeout-20260903/treatment-r2/20260903T103509Z-251d9cbe`
 - r3 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r3-launch/runs/adaptive-timeout-20260903/treatment-r3/20260903T124445Z-c244cd48`
 - r4 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r4-launch/runs/adaptive-timeout-20260903/treatment-r4/20260903T124445Z-bacd88ea`
+- confirmation run（primary-fix image）：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-20260903/runs/adaptive-timeout-20260904-confirm/20260903T205925Z-12d09a89`
 - profiling audit：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r2/profiling-audit.json`、
   `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/profiling-audit.json`、
-  `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r4/profiling-audit.json`；三份均 `exit_code=1`，原因
-  是上文列出的 dropped fields/未闭合 span，而不是敏感字段或 termination 缺失。
+  `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r4/profiling-audit.json`、
+  `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260904-confirm/profiling-audit.json`；四份均
+  `exit_code=1`，原因是上文列出的 dropped fields/未闭合 span，而不是敏感字段或 termination 缺失。
 - Judge supervisor logs：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/judge/supervisor.log`
   和 `...-r4/judge/supervisor.log` 均记录 `supervisor_exit=0`；对应容器、backend/proxy
   进程和本轮端口在 closeout 后均已退出。
-- 当前开发分支（含 `b47afc6` 修复）的 timeout 专项测试为 `20/20 OK`，
-  `compileall` 退出码为 0；在
-  实验栈退出后的 clean worktree 上完整 `python3 -m unittest discover -s tests` 为
-  `751 tests, OK (skipped=1)`。此前高并发/顺序敏感的一次尝试曾触发短 horizon Figure4
-  断言，随后该测试单独重复 5/5 通过，第二次完整 discovery 也通过；因此不把那次环境性
-  波动记为代码回归。
+- 当前最终 HEAD `5865956` 的 timeout/formal focused tests 为 `134 passed, 1 skipped`，
+  `compileall`、`node --check` 和 `git diff --check` 均通过；实验栈退出后的 clean worktree
+  上完整 `python3 -m unittest discover -s tests` 为 `760 tests, OK (skipped=1)`。最终
+  HEAD 的 `configs/smoke.toml --mock-agent` smoke 也以 exit 0 收尾。此前高并发/顺序敏感的
+  一次尝试曾触发短 horizon Figure4 断言，随后该测试单独重复通过，第二次完整 discovery
+  也通过；因此不把那次环境性波动记为代码回归。
