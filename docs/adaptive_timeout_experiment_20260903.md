@@ -600,13 +600,14 @@ confirmation run 为 `5`，这是积极但非因果、非稳定的方向性信�
 - r4 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r4-launch/runs/adaptive-timeout-20260903/treatment-r4/20260903T124445Z-bacd88ea`
 - confirmation run（primary-fix image）：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-20260903/runs/adaptive-timeout-20260904-confirm/20260903T205925Z-12d09a89`
 - pre-merge HEAD host mock smoke：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-final-smoke/output/20260903T220703Z-ce533f47`（exit 0）
-- canonical-main merge 后的 final-head image mock smoke：
+- canonical-main merge 后、文档收尾 commit 之前的 merged-code image mock smoke：
   `runs/adaptive-timeout-final-merged-image-smoke/20260903T222645Z-018be183`（相对路径相对于本
   worktree）。该 run 使用 `configs/3min_cps.toml`、`--mock-agent`，`status=COMPLETED`、
   `score=0/12`（12 个 `MOCK_SKIPPED`，不是正式 Judge 质量结果），
   `judge_broker_closeout={active_handlers:0, drained:true, remote_unsettled_jobs:0}`；镜像
   `sha256:cdaca50697e7903b92822af31fa07e55c3f5ed32b5268dc3210ab32815d6055d` 的 OCI
-  revision label 与 merge head `40d1b71f19326c980ce5b0621b11e0b8727b4186` 一致。
+  revision label 与当时的 code merge head `40d1b71f19326c980ce5b0621b11e0b8727b4186` 一致；
+  随后的提交只更新本报告，不改变 runtime code。
 - profiling audit：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r2/profiling-audit.json`、
   `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/profiling-audit.json`、
   `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r4/profiling-audit.json`、
