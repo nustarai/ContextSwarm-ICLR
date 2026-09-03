@@ -6,7 +6,7 @@
 
 实现基线：`33296b07634c708412326c2808d5782dab3f788e`
 
-实现与自检快照：`157f1cb59569cba5a152922d04cb8ba4f7dee33c`
+最终实现与自检快照：`171ddda14e0495cba55a94ec0c2458741bd4d4d2`
 
 ## 1. 结论
 
@@ -143,7 +143,7 @@ Fail-open 是可用性选择，不是去重保证：route 服务故障期间 Age
 
 自检脚本是 [`scripts/route_claim_protocol_smoke.py`](../scripts/route_claim_protocol_smoke.py)。它每次创建全新的 SQLite 数据库和 loopback broker，使用 synthetic actor，不连接 Pi、NuRouter、Judge 或外网；成功后删除临时工作目录，只保留 bounded JSON 汇总。
 
-精确自检快照：`157f1cb59569cba5a152922d04cb8ba4f7dee33c`。
+精确自检快照：`171ddda14e0495cba55a94ec0c2458741bd4d4d2`。
 
 | 验收项 | 观测 | 结果 |
 |---|---|---|
@@ -162,13 +162,13 @@ Fail-open 是可用性选择，不是去重保证：route 服务故障期间 Age
 
 | operation | count | wall total (s) | lock wait total (s) | lock hold total (s) | rows written |
 |---|---:|---:|---:|---:|---:|
-| `actor.register` | 8 | 0.010807 | 0.000081 | 0.006919 | 16 |
-| `actor.list_active` | 2 | 0.001620 | 0.000036 | 0.000479 | 0 |
-| `actor.finish` | 3 | 0.004458 | 0.000028 | 0.002999 | 10 |
-| `route.claim` | 7 | 0.015891 | 0.002232 | 0.006719 | 12 |
-| `route.list_active` | 6 | 0.004324 | 0.000069 | 0.001453 | 2 |
-| `route.update` | 1 | 0.001470 | 0.000010 | 0.001009 | 2 |
-| `route.release` | 1 | 0.001400 | 0.000009 | 0.000907 | 2 |
+| `actor.register` | 8 | 0.011292 | 0.000080 | 0.007231 | 16 |
+| `actor.list_active` | 2 | 0.001754 | 0.000040 | 0.000414 | 0 |
+| `actor.finish` | 3 | 0.004468 | 0.000033 | 0.003041 | 10 |
+| `route.claim` | 7 | 0.017697 | 0.004286 | 0.006885 | 12 |
+| `route.list_active` | 6 | 0.004311 | 0.000070 | 0.001427 | 2 |
+| `route.update` | 1 | 0.001438 | 0.000010 | 0.000964 | 2 |
+| `route.release` | 1 | 0.001467 | 0.000011 | 0.000998 | 2 |
 
 多个并发事务的 wall totals 可以重叠，不能相加后当作整个 run 的额外时长。
 
@@ -179,7 +179,9 @@ Fail-open 是可用性选择，不是去重保证：route 服务故障期间 Age
 - Control：[`configs/route_claim_smoke_control.toml`](../configs/route_claim_smoke_control.toml)
 - Treatment：[`configs/route_claim_smoke.toml`](../configs/route_claim_smoke.toml)
 
-共同合同：3 道题、`max_parallel=3`、每题 2 episodes、3 秒 horizon、同一 source `157f1cb59569cba5a152922d04cb8ba4f7dee33c`、profiling 开启。单元测试逐字段证明 canonical public config 只在 name 和 route flag 上不同。
+共同合同：3 道题、`max_parallel=3`、每题 2 episodes、3 秒 horizon、profiling 开启。两条命令都在 clean source `157f1cb59569cba5a152922d04cb8ba4f7dee33c` 上执行；单元测试逐字段证明 canonical public config 只在 name 和 route flag 上不同。
+
+需要单列 provenance 限制：这两个 test-only mock artifact 的 `run_meta.runtime_provenance` 按设计只记录 `test-only-mock-source` / `test-only-mock-image`，`source_git_commit` 为空。因此 `157f1cb` 是本次 operator 命令和 clean worktree 的执行证据，不是 artifact 自身绑定的 Git SHA。正式 Docker A/B 必须把精确 source commit 与 image ID/digest 写入 artifact，不能沿用这组 mock provenance 做正式归因。
 
 | 指标 | Control | Treatment |
 |---|---:|---:|
@@ -224,14 +226,15 @@ Treatment 的三个身份字段会同时写入 `run_meta.json`、ordinary `run_s
 
 ## 8. 验证与独立审查
 
-冻结前已完成：
+最终实现快照 `171ddda` 已完成：
 
-- route core（CPS / broker / runner）单元测试：71/71 通过。
+- route core（CPS / broker / runner）单元测试：72/72 通过。
 - profiling/config 专项：39/39 通过。
 - protocol smoke：9/9 自检项通过，进程退出码 0。
 - control/treatment formal config：两份 `validate`、两份 `plan` 均成功，task count 均为 12。
 - Python compileall、Node `--check`、`git diff --check`：通过。
-- moving-snapshot 独立检查：route + profiling/compatibility 分组未发现 route 回归；authoritative exact-HEAD 审查在文档冻结后执行，并在交付记录中单列。
+
+独立 exact-head review 在前一冻结点 `ef2f5f4` 发现一处中等严重度合同漏洞：direct CPS 对同一 actor 的 blocked claim 进行幂等重试时，错误返回 `acquired=true` / `claimed=true`。Broker/MJS 主路径会把 blocked 再归一为不可写，因而没有在现有主路径打开 write gate；但底层接口仍与“blocked 可见、不可写”的合同冲突。`171ddda` 已把幂等返回改为只有真实 `status=active` 才取得 write lease，并增加 direct CPS 回归测试；修复后的 72 项 route core 和 9 项协议 smoke 全部通过。
 
 完整测试在精确实现快照 `157f1cb59569cba5a152922d04cb8ba4f7dee33c` 上运行 811 项，结果为 2 failures、1 skipped；没有 route-focused failure：
 
@@ -240,7 +243,9 @@ Treatment 的三个身份字段会同时写入 `run_meta.json`、ordinary `run_s
 
 中间快照 full discovery 还曾出现 `test_cli_plan_and_validate_all_four_arms` 因未关闭资源产生的 `ResourceWarning` 污染 stderr；它隔离串行 3/3 通过，并在本次精确快照 full discovery 中通过。
 
-这些结果说明两个失败都位于既有的极短 horizon 时序边界，且核心 route 测试全绿；但报告不会据此把 full suite 写成全绿，也不会把不同时间、不同系统负载下的串行频率当作严格 A/B。最终 frozen HEAD 仍需独立重跑并保留原始结果。
+独立审查在 `ef2f5f4` 上又运行一次 full discovery：811 项中 1 failure、1 skipped，失败仍是上述 backpressure 断言；两项时序测试随后在同一候选上各重复 5 次，均 5/5 通过。未改基线 `33296b0` 的可审计重跑为 backpressure 16/20 通过、LLM deadline 20/20 通过。
+
+这些结果说明两个失败都位于既有的极短 horizon 时序边界，且核心 route 测试全绿；但报告不会据此把 full suite 写成全绿，也不会把不同时间、不同系统负载下的串行频率当作严格 A/B。`171ddda` 的最终 full discovery 与独立复审结果仍应在交付记录中逐项列出。
 
 ## 9. 为什么本轮没有启动真实 12 题一小时 treatment
 
