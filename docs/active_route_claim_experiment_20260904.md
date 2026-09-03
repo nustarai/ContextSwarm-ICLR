@@ -2,15 +2,17 @@
 
 日期：2026-09-04
 
-状态：第一阶段协议已实现并通过离线机制验证；同源 control/treatment 正式配置已冻结；真实 12 题 × 1 小时效果实验尚未执行
+状态：第一阶段协议已实现并通过离线机制验证；同源 control/treatment 正式配置已冻结；真实 12 题 × 1 小时 treatment 已于 2026-09-03T17:30:05Z 三次并行启动并完成 horizon。三次均因共享 Judge 饱和而未完成 authoritative closeout，保留为真实但 `DEGRADED` 的机制/基础设施观测，不作为正式成绩 A/B。
 
 实现基线：`33296b07634c708412326c2808d5782dab3f788e`
 
-最终实现与自检快照：`171ddda14e0495cba55a94ec0c2458741bd4d4d2`
+最终实现与本次真实运行快照：`8d8c864e4ce718e6266e0e0d849e04b06647cf36`（Docker image `sha256:5ab20c1a2131942408a9da5b7c5c6d53b8031bb3a2f6ebfe250f36675cea74fa`）
 
 ## 1. 结论
 
-这套方案作为第一阶段是可行的，但当前证据只足以支持“协议机制成立”，还不足以支持“数学得分提高”或“语义重复探索已经下降”的结论。
+结论先说：真实测试已经做了，而且确实是三次同时跑；但这三次不能回答“得分是否提高”。它们证明了 route claim 在真实 Pi/CPS 流程中生效，同时暴露出共享 Judge 容量和 route-first 强制性两个新的瓶颈。
+
+这套方案作为第一阶段在协议层可行，但当前证据仍不足以支持“数学得分提高”或“语义重复探索已经下降”的结论。
 
 已经成立的部分是：
 
@@ -20,14 +22,16 @@
 4. Treatment 下，Pi 的 write/edit 在拿到有效 route lease 前被阻止；只有 broker 明确发出的 fail-open 结果才能绕过，并且必须携带规范化的 `route_claim_bypass_reason`，不能伪装成成功 claim。
 5. 三方同时竞争同一 route 的离线协议 smoke 得到 1 个 primary 和 2 个 conflict；独立验证、finish、TTL expiry、blocked、显式 release、admission-only roster 和 pre-Judge gate 均通过自检。
 6. 修复后的最终 clean 快照又运行了一对同源 3 题 mock control/treatment：两臂均完成 6/6 assignment，`health.ok=true`，profiling 审计通过且 `dropped_fields.total=0`。但 mock Agent 不调用 route tools，也不产生数学结果；它只能验证 runner lifecycle、配置身份和产物闭环。
+7. 三次真实 treatment 共登记 234 个 runner-owned actor、持久化 272 个 primary claim；最终 272/272 claim 均为 `released`，没有 active 残留、fail-open bypass 或持久 secondary claim。真实运行中出现 1 次 route conflict（run3），说明原子冲突路径确实被触发。
+8. 首批 32 个 admission 的第一次 `cps_active_routes` 查询看到同题 peer 的比例为 run1 10/32、run2 5/32、run3 7/32；在第一次 edit 前重复查询后为 12/32、6/32、11/32。所有观测到的第一次 edit 都发生在 claim 之后，但 run2 有 2 个后续 actor episode 先做 early Judge、1 个先做受 gate 约束的 CPS search，说明“route-first”目前主要依赖 Agent 遵循 prompt，尚未成为不可绕过的 broker barrier。
 
 尚未成立的部分是：
 
-- 没有真实 Pi/Judge session，因此没有 route 选择、冲突后换路、语义重复率、得分、time-to-proof 或 token/cost 的 treatment 观测。
-- 当前环境没有本轮所需的 Judge endpoint/health、同 revision declaration index、受控 NuRouter runtime 输入和 operator launch contract；因此没有把离线 mock 冒充成一小时正式实验。
+- 真实 Pi/Judge session 已有，但 Judge closeout 未完成；因此只有 horizon 内 provisional proof、route/生命周期和 profiling 观测，没有 authoritative final score 或完整 closeout time-to-proof。
+- 本次 preflight 的 Judge endpoint/health、受控 NuRouter runtime 和 operator launch contract 均满足；但 declaration-index 未配置，且 Judge 是三次 run 共享的单一 32-worker 服务，运行期间发生严重队列堆积。
 - 历史三轮都来自旧 source 且均为 `DEGRADED`。把历史 5/4/5 分直接与新实现的一次 treatment 比较，会同时混入 source、运行顺序、基础设施和故障状态差异，不构成因果对比。
 
-因此当前决策应是：保留第一阶段实现，下一步在同一精确 source/image 上做成对、重复的 control/treatment 正式实验；在该数据到位前，不声称方案改善了最终成绩。
+因此当前决策应是：保留第一阶段实现，但先把 Judge 隔离/容量和不可绕过的 claim barrier 修好，再在同一精确 source/image 上做成对、重复的 control/treatment 正式实验；本轮不声称方案改善了最终成绩。
 
 ## 2. 问题、假设与证据层级
 
@@ -40,7 +44,7 @@
 | 历史观测 | 已完成 | 原版系统是否缺少早期方向协调、重复风险有多大 | 新协议是否带来因果改善 |
 | 单元/协议机制 | 已完成 | 原子竞争、身份绑定、gate、TTL、release、fail-open 是否按合同工作 | Agent 是否会生成稳定且语义正确的 route key |
 | 同源 mock 编排 | 已完成 | treatment 是否能完成 admission/finish、配置/产物/profiling 是否闭环 | 数学效果、真实调用开销、冲突后行为 |
-| 真实重复 A/B | 未执行 | 重复率、得分、时间、成本和稳定性变化 | — |
+| 真实 treatment（3-way parallel） | 已执行但三次均 `DEGRADED` | 真实 route/lifecycle、horizon provisional proof、基础设施行为 | authoritative score、无混杂的 control/treatment 因果效果 |
 
 这个边界很重要：机制通过是启动真实实验的前提，不是实验效果本身。
 
@@ -56,6 +60,8 @@
 | 合计 | 3 runs | 14 个 proved task-runs | 240 | 211（197 + 14） | 1248 | 3 次均 `DEGRADED` |
 
 合同共同点：12 道相同任务、3600 秒 horizon、CPS32、blackboard communication、uniform allocation、相同模型和 source commit `33296b07634c708412326c2808d5782dab3f788e`。
+
+还要明确 runtime 差异：历史三轮的 NuRouter 0.2.2 binary SHA-256 为 `3fd4c9fc04e35c668c9d1bf0bfa3ac6460d210ab708c3b1fac1558ee5d79851b`、image 为 `sha256:e4f79e6c525fa0e1921e5ab925192ec5203ec3e26ab50aced8924a55eb550bb5`；本次 treatment 使用的是第 9 节记录的另一 NuRouter binary/image。也就是说，即使两边都标成 0.2.2，runtime 资产并非同一份，历史 5/4/5 只能作为非 contemporaneous 背景。
 
 与“选方向前去重”最直接相关的历史结果：
 
@@ -224,15 +230,85 @@ Treatment 中 6 次 `actor.register` 的 transaction wall total 为 0.013157s，
 
 Treatment 的三个身份字段会同时写入 `run_meta.json`、ordinary `run_started`、profiling `run.start` 和 `run.configuration`；因此单独拿到 profiling stream 也能辨认实验臂，不需要根据是否碰巧出现 route write 反推。
 
+### 7.1 三次并行真实运行结果
+
+三次命令在同一秒启动，使用同一 source/image/config 和同一个隔离 Judge backend。下表的 `horizon proofs` 是 horizon 内 `judge_proof_credited` 事件数，只是 provisional 观测；它不是 closeout 后的 authoritative score。
+
+| run | run id | horizon proofs | assignments / actor rows | claim rows | messages / pieces | scoreboard（PROVED / AGENT_FAILURE / CANCELLED / TIME_LIMIT） | 结束方式 |
+|---|---|---:|---:|---:|---:|---|---|
+| treatment-1 | `20260903T173005Z-a8c1e6e5` | 5/12 | 85 / 85 | 101 | 414 / 66 | 5 / 35 / 13 / 32 | `rc=143`；horizon 后 closeout 长时间等待，操作员有界停止 |
+| treatment-2 | `20260903T173005Z-fbb1688d` | 2/12 | 75 / 75 | 86 | 364 / 68 | 2 / 36 / 5 / 32 | `rc=143`；horizon 后 closeout 长时间等待，操作员有界停止 |
+| treatment-3 | `20260903T173005Z-c9906c53` | 3/12 | 74 / 74 | 85 | 443 / 70 | 3 / 33 / 6 / 32 | `rc=2`；`remote_settlement_unconfirmed` 后 `run_error` |
+
+三次 horizon 都正常走到约 3600 秒；run1/run2 的 `143` 是外部停止 closeout 卡住的进程，不是 solver 语义失败码，run3 则由 Judge broker closeout drain deadline 自然报错。三次合计为 10 个 horizon-credit proof、234 个 admission、272 个持久 claim、1221 条 message 和 204 个 piece。由于三次共享一个 32-worker Judge，不能把 5/2/3 与历史 5/4/5 当成同条件分数差异。
+
+若只做 descriptive scoreboard（不是 A/B 结论）：历史三轮为 5+4+5=14/36，本次三次 horizon-credit 为 5+2+3=10/36，表面差异为 −4 个 proof。这个差异同时受到新旧 source/image、NuRouter binary、三 run 共享 Judge 队列、closeout 不完整和 declaration-index 缺失影响；因此不能解释为 route claim 使成绩下降，也不能解释为它没有收益。
+
+### 7.2 真实 route 协议观测
+
+| 指标 | treatment-1 | treatment-2 | treatment-3 |
+|---|---:|---:|---:|
+| 首批 32 个 initial actor 的第一次 active-routes 查询看到同题 peer | 10/32 | 5/32 | 7/32 |
+| 首次 edit 前任何一次 active-routes 查询看到同题 peer（首批） | 12/32 | 6/32 | 11/32 |
+| 观测到 edit/write 早于 claim 的 actor | 0 | 0 | 0 |
+| 观测到 first Judge 早于 claim 的 actor | 0 | 2 | 0 |
+| 观测到受 Judge gate 约束的 CPS 操作早于 claim 的 actor | 0 | 1 | 0 |
+| `route_claim_conflict` 事件 | 0 | 0 | 1 |
+| 持久 claim（全部 `primary=1`） | 101 | 86 | 85 |
+| claim 中带 independent-verification reason | 79 | 61 | 62 |
+| 最大同时 active claim 行数 | 39 | 38 | 38 |
+| 同一 actor 的最大同时 active claim 行数 | 2 | 2 | 2 |
+| fail-open `route_claim_bypass_reason` | 0 | 0 | 0 |
+
+三个 run 的 claim 最终状态都是全量 `released`（101/101、86/86、85/85），active/unreleased 残留均为 0；三份 CPS SQLite 的 `integrity_check` 也均为 `ok`。run3 的 1 次 conflict 没有 independent-verification reason，也没有形成持久 secondary row；因此“primary uniqueness”确实在真实并发中被触发，但这不是 1 次 secondary 独立验证成功。另一个需要保留的信号是 recovery 期间同一 actor 最多同时持有 2 行 claim：run1/2/3 分别有 16/12/12 个 actor 出现多行历史 claim（额外行 16/12/12）。这提示后续应增加 single-active-lease 或明确 supersede 语义，而不能只依赖 actor 重启流程。
+
+整体看，首批第一次查询的 peer 可见率为 22/96（22.9%），把第一次 edit 前的重复查询纳入后为 29/96（30.2%）。这比历史“首批 first-edit 前读到具体 route message”4/96 的观测更有协调覆盖，但两者不是同一分母/同一信息载体，不能直接换算成语义重复率。真实 route key 的精确重复只反映协议层字符串冲突，不能替代 blinded semantic audit。表中“restricted CPS”只表示 search/inbox/send/publish 这一组原本受 Judge gate 管理的工具；run2 的那 1 个例子是在 early Judge 已完成后 search 才被正常允许，暴露的是 route-first prompt 不可强制，而不是把 Judge gate 误判为失效。
+
+### 7.3 CPS route 事务与 token 诊断
+
+`cps.write.commit` 的 route 事务没有 non-ok commit；各 run 的 `route.claim` 汇总如下。wall total 会因并发重叠，不能相加当作额外运行时。
+
+| run | claim commit 次数 | wall total (s) | lock wait total (s) | 最大单次 lock wait (ms) |
+|---|---:|---:|---:|---:|
+| treatment-1 | 135 | 0.303193 | 0.008804 | 1.306 |
+| treatment-2 | 117 | 0.264034 | 0.010692 | 3.732 |
+| treatment-3 | 119 | 0.268799 | 0.006647 | 1.293 |
+
+Profiling 还记录了 model request/token 汇总（仅供成本诊断，不含 prompt/response）：run1/run2/run3 的 request 数为 5294/5231/5584，input token 为 11.27M/11.24M/11.55M，output token 为 3.44M/3.27M/3.38M，cache-read token 为 170.80M/177.68M/195.63M。由于没有 contemporaneous control，这些数不能单独说明 route treatment 的成本增量。
+
+### 7.4 共享 Judge 饱和与 closeout 影响
+
+隔离 Judge preflight 时为 32 configured/32 ready worker，result cache 明确为 disabled；但三次 run 共用这一服务。按 horizon 开始到最终精确关闭服务的窗口汇总：
+
+| 观察 | 数值 |
+|---|---:|
+| `job_submitted` / `job_started` / `job_finished` | 4327 / 4174 / 4327 |
+| finished status：succeeded / failed / cancelled / timed_out | 1318 / 2831 / 170 / 8 |
+| `repl_recycled`（全部 request-limit） | 210 |
+| submitted queue depth p50 / p95 / max | 1 / 57 / 111 |
+| queue wait p50 / p95 / max | 185 ms / 225.2 s / 1933.6 s |
+
+Horizon 结束后 worker 已无法及时消化 closeout 队列；run3 的 closeout receipt 明确为 `active_handlers=0`、`drained=false`、`remote_unsettled_jobs=1`，run1/run2 则在相同等待条件下由操作员停止。CPS route lock wait 仍只有毫秒级，因此本轮分数/吞吐的主导混杂是共享 Judge 容量，不是 route claim SQLite 事务。
+
 ## 8. 验证与独立审查
 
-最终实现快照 `171ddda` 已完成：
+实现与单元验证沿用 `171ddda` 的 route-core 修复；本次真实 image 从 clean HEAD `8d8c864` 构建。已有验证结果为：
 
 - route core（CPS / broker / runner）单元测试：72/72 通过。
 - profiling/config 专项：39/39 通过。
 - protocol smoke：9/9 自检项通过，进程退出码 0。
 - control/treatment formal config：两份 `validate`、两份 `plan` 均成功，task count 均为 12。
 - Python compileall、Node `--check`、`git diff --check`：通过。
+
+本次真实三次 run 的 `scripts/audit_profiling.py` 结果必须单独标为不完整：
+
+| run | audit exit | dropped fields | span missing end | terminal/profile 状态 |
+|---|---:|---:|---:|---|
+| treatment-1 | 1 | 159（53 rows） | 5 | `profile_terminal_missing`；外部停止后未正常结束 |
+| treatment-2 | 1 | 129（43 rows） | 5 | `profile_terminal_missing`；外部停止后未正常结束 |
+| treatment-3 | 1 | 126（42 rows） | 3 | `profile.end` 存在，但 Judge coverage `missing_required`，随后 drain timeout/run error |
+
+这些 audit 失败来自 closeout/强制停止造成的生命周期缺口，而不是 profiling 文件无法解析；CPS、agent-wrapper、max-parallel coverage 在三次均存在。因而本轮 profiling 可用于诊断，不应被写成“审计通过”或完整性能基准。
 
 独立 exact-head review 在前一冻结点 `ef2f5f4` 发现一处中等严重度合同漏洞：direct CPS 对同一 actor 的 blocked claim 进行幂等重试时，错误返回 `acquired=true` / `claimed=true`。Broker/MJS 主路径会把 blocked 再归一为不可写，因而没有在现有主路径打开 write gate；但底层接口仍与“blocked 可见、不可写”的合同冲突。`171ddda` 已把幂等返回改为只有真实 `status=active` 才取得 write lease，并增加 direct CPS 回归测试；修复后的 72 项 route core 和 9 项协议 smoke 全部通过。
 
@@ -249,16 +325,18 @@ Treatment 的三个身份字段会同时写入 `run_meta.json`、ordinary `run_s
 
 这些结果说明失败位于既有的极短 horizon 时序边界，且核心 route 测试全绿；报告不会把 full suite 写成全绿，也不会把不同时间、不同系统负载下的串行频率当作严格 A/B。正式实验前应把该 50ms 测试的候选/基线差异作为单独兼容性调查项，而不是忽略它或把它归因于 route 去重收益。
 
-## 9. 为什么本轮没有启动真实 12 题一小时 treatment
+## 9. 本轮真实运行的 operator/runtime 边界
 
-真实 run 的代码入口已经准备好，但当前会话缺少以下 operator/runtime 输入：
+本轮实际完成了真实 Pi/Judge workload，但只使用隔离的一次性环境：
 
-- 可访问且 health/revision 匹配的 MathOlympiadBench Judge；
-- 与 Judge Mathlib revision 一致的 declaration-index；
-- 当次受控 NuRouter binary、node/coordinator config 和允许的模型容量；
-- 固定 source/image digest、外部资源采样 PID 边界和正式输出位置。
+- image/source 已冻结为 `contextswarm-iclr:route-claims-8d8c864-real3`、source `8d8c864`，运行产物的 `runtime_provenance` 写入同一 image digest 和 manifest SHA-256。
+- Judge 使用任务专属的 loopback stack（32 worker、result cache disabled）和兼容 health proxy；三次 run 共享该 stack，未触碰既有 28100/28149/28201 listener。
+- preflight 成功确认 NuRouter `0.2.2`（binary SHA-256 `cbfb7bb4543f3e4c4840e735f6070c3ea54c4ba811a9e991c485beeacdccc05b`）、Pi `0.84.3`、模型 `gpt-5.6-sol` 可见、32/32 Judge worker ready、requested Lean env accepted、result cache disabled。declaration-index 未配置，且没有把它伪装成已验证的 revision match。
+- 每个 run 使用独立 output/CPS SQLite/worker workspace；没有复制持久 Agent home、账号、Admin key、production 数据或远端长期测试环境。
 
-这些信息既不能从端口或历史路径推断，也不应从其他运行复制。没有它们时启动只会得到不可解释的 infra failure，或者越过用户的 runtime/credential 边界。因此本轮只执行了离线协议 smoke 和 mock orchestration；没有访问远端环境、没有真实模型请求、没有部署、没有账号或数据库操作。
+启动阶段有两次命令形态错误（把脚本子命令写成不接受的显式 `run`，以及把绝对 host output 传入容器导致只读路径错误）；它们都在产生 run id 前退出，不计入三次实验样本。最终有效样本是第 7.1 节列出的三个 run id。
+
+实验结束后按隔离 stack 自带的 `status/down` 精确关闭 28301/28349，并按 pid-file 身份校验停止 28350 兼容代理；复核显示这三个端口和任务进程均已消失，共享 listener 仍在。没有访问远端长期环境、没有部署、账号导入、生产写入或外部发送。
 
 ## 10. 下一轮正式实验设计
 
@@ -273,6 +351,13 @@ Treatment 的三个身份字段会同时写入 `run_meta.json`、ordinary `run_s
 5. 任一 run `DEGRADED` 时保留数据但单独标记；不要把 infra-degraded 与 clean run 无条件汇总。
 
 历史三轮可作为问题发现和量级背景，不能替代新的 contemporaneous control。
+
+本轮真实运行把下一轮的几项硬门槛提前暴露出来：
+
+1. 不要让三个一小时 run 共享一个 32-worker Judge。应为每个 arm/block 分配独立 Judge capacity pool，或先把并发降到经过排队预算验证的水平；否则 queue wait 和 closeout drain 会吞掉 treatment 差异。
+2. 把 route-first 从 prompt 约定提升为 broker 可验证的状态门槛：在 actor 的首次 Judge 之前，没有 `active` claim 或明确 independent-verification declaration 就拒绝 Judge；在首次 claim 之前继续拒绝 search/inbox/send/publish。run2 的 2 个 judge-before-claim 和 1 个 restricted-CPS-before-claim episode 说明仅靠 prompt 不够。
+3. 对 recovery/resume 增加每 actor 单 active lease 或显式 supersede：本轮每个 run 都出现多行 claim，峰值为同 actor 2 行，虽然没有同时的同 key primary overlap，仍会放大 active roster 噪声。
+4. closeout 必须有独立的 bounded drain 结果和 authoritative settlement receipt；若超时，应把 run 标成 `DEGRADED` 并停止新增 closeout poll，而不是让操作员长时间等待后再 SIGTERM。
 
 ### 10.2 预注册指标
 
@@ -300,18 +385,19 @@ Treatment 的三个身份字段会同时写入 `run_meta.json`、ordinary `run_s
 
 1. 第一阶段不是 pre-reasoning proposal barrier；它只保证 claim 在 write/edit 前。
 2. Route key 由 Agent 生成，缺少语义规范化；不同字符串可能表示同一路线，同一字符串也可能覆盖不同子路线。
-3. 正常收尾会立即 release，但持久 store 在 runner 三次 closeout 重试后仍故障时，claim 只能等 TTL 清理。
+3. 正常收尾会立即 release；本轮即使 run1/run2 在 closeout 阶段被操作员停止，最终 SQLite 仍显示 272/272 claim released。若持久 store 在 runner 重试后仍故障，claim 仍只能等 TTL 清理。
 4. 当前 formal TTL 为 3600 秒，worker heartbeat 不续租；硬崩溃可能留下最长一个 horizon 的 ghost route。
 5. `blocked` 为 peer-visible 占位而非写 lease；分析时必须区分 row 的 visibility `active` 与 envelope 的 authorization `acquired`。
 6. Fail-open 保证进度但牺牲 outage 期间的去重；必须按 bypass 分层分析结果。
 7. 尚无每 session 的 route/event quota；恶意或失控 Agent 的高频 update 需要后续限流。
 8. 新表在新 run 中自动创建，没有把历史 append-only `actors.json` 回填成可信 lifecycle。
-9. SQLite CPS32 下的实际 lock contention 尚未测量；synthetic micro-timing不能外推。
-10. 历史三轮均 `DEGRADED`，不能用 5/4/5 的简单平均充当稳定对照分数。
+9. 本轮 SQLite route claim lock wait 为每 run 0.0066–0.0107 秒总量、最大单次 1.293–3.732ms；这是本次 workload 的观测，不能外推到更高并发或不同磁盘。
+10. 三次 treatment 共用 Judge，且 closeout 不完整；历史三轮也均 `DEGRADED`，不能用 5/4/5 与本轮 5/2/3 做简单平均或因果结论。
+11. 本轮 run2 仍观测到 prompt-level route-first 违规（2 个 episode 先 Judge、1 个先 restricted CPS），虽没有 edit/write 早于 claim；必须补 broker barrier 后再扩大样本。
 
 ## 12. 复现命令边界
 
-以下命令只覆盖离线验证：
+以下命令覆盖离线验证；本轮真实运行使用同一配置和相对 output（每个 run 独立目录），三条命令在同一秒并行启动：
 
 ```bash
 python3 -m contextswarm_mini.cli \
@@ -325,4 +411,18 @@ CONTEXTSWARM_PROFILE=1 python3 -m contextswarm_mini.cli \
   --config configs/route_claim_smoke.toml run --mock-agent --output "$TREATMENT_RUNS"
 ```
 
-变量必须指向 owner-only、磁盘支持的目录；这些命令不授权真实 workload。正式一小时 run 仍需 operator 先提供并冻结第 9 节的运行合同。
+真实三次的实际入口（在隔离 Docker runner 内）为：
+
+```bash
+umask 0022
+scripts/run_docker.sh --config configs/formal_1h_cps32_profiled_route_claim.toml \
+  --output runs/route-claim-real3/run1
+scripts/run_docker.sh --config configs/formal_1h_cps32_profiled_route_claim.toml \
+  --output runs/route-claim-real3/run2
+scripts/run_docker.sh --config configs/formal_1h_cps32_profiled_route_claim.toml \
+  --output runs/route-claim-real3/run3
+```
+
+三条真实命令由 supervisor 同时后台启动；这里省略了只存在于 operator 环境的 Judge loopback 注入和 NuRouter capability 参数，避免把机器路径/凭据写入文档。变量和 output 必须指向 owner-only、磁盘支持的目录；真实 workload 需要先完成本报告第 9 节的 preflight 和隔离边界。
+
+本轮脱敏汇总产物：`/home/ubuntu/workspace/.workspace/builds/CS-20260904-route-claims-real3/evidence/route-claim-real3-summary.json`；每个 run 的原始 profiling/Judge/CPS 文件保留在 `runs/route-claim-real3/run{1,2,3}/<run-id>/`，不在报告中展开 prompt、response、route summary 或凭据。
