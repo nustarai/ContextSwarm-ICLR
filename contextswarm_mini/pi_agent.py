@@ -375,6 +375,11 @@ class PiAgent:
                     "result.cpp" if self.config.is_coding else "result.lean"
                 ),
                 "CONTEXTSWARM_LANGUAGE": "cpp" if self.config.is_coding else "lean",
+                "CONTEXTSWARM_AGENT_TIMEOUT_ENABLED": (
+                    "1"
+                    if getattr(self.config, "judge_agent_timeout_enabled", False)
+                    else "0"
+                ),
                 "EXPERIMENT_CONFIG_AISW_MAX_IN_FLIGHT": str(
                     self.config.aisw_max_in_flight
                 ),

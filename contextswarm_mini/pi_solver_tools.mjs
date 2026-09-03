@@ -12,12 +12,15 @@ const objectSchema = (properties, required = []) => ({
 });
 
 const stringSchema = (description, maxLength) => ({ type: "string", description, maxLength });
-const integerSchema = (description, maximum = 8) => ({
-  type: "integer",
-  description,
-  minimum: 1,
-  maximum,
-});
+const integerSchema = (description, maximum = 8, minimum = 1) => {
+  const schema = {
+    type: "integer",
+    description,
+    minimum,
+  };
+  if (maximum !== undefined && maximum !== null) schema.maximum = maximum;
+  return schema;
+};
 
 function brokerBaseUrl() {
   const raw = String(process.env.CONTEXTSWARM_JUDGE_URL ?? "").trim();
@@ -289,7 +292,15 @@ function isAllowedFormalCommand(command, ctx) {
     // contract, so bind its resolution to the supervisor's fixed PATH.  A
     // worker-controlled PATH (or a same-named executable in the workspace)
     // must not turn this into arbitrary code execution.
-    if (process.env.PATH !== "/usr/local/bin:/usr/bin:/bin" || tokens.length !== 2) return false;
+    if (process.env.PATH !== "/usr/local/bin:/usr/bin:/bin") return false;
+    const timeoutEnabled = enabledCapability("CONTEXTSWARM_AGENT_TIMEOUT_ENABLED");
+    const helperInvocation =
+      tokens.length === 2 ||
+      (timeoutEnabled &&
+        tokens.length === 4 &&
+        tokens[2] === "--timeout" &&
+        /^[0-9]+$/.test(tokens[3]));
+    if (!helperInvocation) return false;
     const rel = formalHelperRelative(tokens[1], ctx);
     return rel === "evaluate.py" || (mode === "mono" && /^tasks\/[^/]+\/evaluate\.py$/.test(rel ?? ""));
   }
@@ -383,20 +394,36 @@ export default function registerContextSwarmSolverTools(pi) {
   // bits for allocation/selection experiments that must remain message-free.
   const directMessages = enabledCapability("CONTEXTSWARM_CPS_DIRECT_MESSAGES", true);
   const selectionEnabled = enabledCapability("CONTEXTSWARM_CPS_SELECTION_ENABLED");
+  const agentTimeoutEnabled = enabledCapability("CONTEXTSWARM_AGENT_TIMEOUT_ENABLED");
+
+  const judgeProperties = {
+    task_id: stringSchema("Mono task slug; omit in a single-task worker", 256),
+  };
+  if (agentTimeoutEnabled) {
+    judgeProperties.timeout_seconds = integerSchema(
+      "Optional per-backend verification budget in seconds; runner clamps to 5-300",
+      null,
+      5,
+    );
+  }
 
   registerBrokerTool(pi, {
     name: "judge_check",
     label: "Controlled Judge Check",
     description:
-      `Submit the runner-bound ${candidate} to the controlled external ${language} Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.`,
+      `Submit the runner-bound ${candidate} to the controlled external ${language} Judge. The task, baseline, environment, profile, endpoint, deadline, and concurrency are fixed by the runner. For a normal single-task worker call with no arguments; Mono must provide task_id.${agentTimeoutEnabled ? " You may optionally provide integer timeout_seconds (5-300); the runner clamps it and reports the effective budget." : ""}`,
     promptSnippet: `Check the current ${candidate} through the controlled external Judge`,
     promptGuidelines: [
       "Use judge_check one candidate at a time; never attempt local compilation or raw Judge access.",
       "A retryable busy result is not permission to use a local fallback.",
+      ...(agentTimeoutEnabled
+        ? [
+            "Choose timeout_seconds as a per-backend-attempt budget: 30-60s for routine checks, 120-180s for promising heavy candidates, and 300s only for likely but known-slow checks.",
+            "An execution timeout is inconclusive feedback; do not relabel it as VERIFY_FAIL or use a local checker.",
+          ]
+        : []),
     ],
-    parameters: objectSchema({
-      task_id: stringSchema("Mono task slug; omit in a single-task worker", 256),
-    }),
+    parameters: objectSchema(judgeProperties),
   });
 
   registerBrokerTool(pi, {

@@ -21,6 +21,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 from .models import Task, Verdict
+from .timeout_policy import AgentTimeout, normalize_agent_timeout
 
 
 LEAN_PROBE_RESPONSE_PROFILE = "lean_probe_v1"
@@ -572,6 +573,18 @@ class LeanEvaluator:
             )
         except BaseException:
             self._profiling_enabled = False
+
+    def _normalize_agent_timeout(
+        self, timeout_seconds: int | None
+    ) -> AgentTimeout | None:
+        """Apply the evaluator-side hard ceiling to a worker suggestion."""
+
+        if timeout_seconds is None:
+            return None
+        return normalize_agent_timeout(
+            timeout_seconds,
+            configured_timeout_seconds=self.timeout_seconds,
+        )
 
     def _profile_event(
         self,
@@ -1374,6 +1387,7 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         """Evaluate a candidate, reusing an exact in-process probe when present."""
 
@@ -1383,6 +1397,7 @@ class LeanEvaluator:
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
             reuse_probe_cache=True,
         )
 
@@ -1394,6 +1409,7 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         """Evaluate through a fresh Judge submission, bypassing probe cache.
 
@@ -1408,6 +1424,7 @@ class LeanEvaluator:
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
             reuse_probe_cache=False,
         )
 
@@ -1420,6 +1437,7 @@ class LeanEvaluator:
         cancel_event: Any | None,
         reuse_probe_cache: bool,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         started = time.monotonic()
         code = _read_candidate(candidate_path)
@@ -1458,6 +1476,7 @@ class LeanEvaluator:
             candidate_code=code,
             cancel_event=combined_cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
         verdict.cache_reused = bool(
             verdict.cache_reused
@@ -1473,6 +1492,7 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         """Run the canonical evaluator with bounded worker-facing diagnostics."""
 
@@ -1483,6 +1503,7 @@ class LeanEvaluator:
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
 
     def probe_source(
@@ -1493,6 +1514,7 @@ class LeanEvaluator:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         """Probe a broker-owned immutable source snapshot."""
 
@@ -1505,6 +1527,7 @@ class LeanEvaluator:
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
 
     def _probe_source(
@@ -1516,6 +1539,7 @@ class LeanEvaluator:
         deadline_monotonic: float | None,
         cancel_event: threading.Event | None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         started = time.monotonic()
         if self.remote_unsettled_jobs > 0:
@@ -1540,6 +1564,7 @@ class LeanEvaluator:
             candidate_code=code,
             cancel_event=combined_cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
         verdict.cache_reused = bool(
             verdict.cache_reused
@@ -1582,6 +1607,7 @@ class LeanEvaluator:
         candidate_code: str | None,
         cancel_event: threading.Event | None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         contract_sha256 = task_contract_sha256(
             task,
@@ -1661,17 +1687,24 @@ class LeanEvaluator:
                     {"reason": "run_horizon_elapsed_before_submission"},
                     **provenance,
                 )
-            execution_timeout = self.timeout_seconds
+            agent_timeout = self._normalize_agent_timeout(timeout_seconds)
+            execution_timeout = (
+                agent_timeout.effective_seconds
+                if agent_timeout is not None
+                else self.timeout_seconds
+            )
             if remaining_horizon is not None:
                 execution_timeout = min(execution_timeout, max(1, int(remaining_horizon)))
+            backend_max_retries = 0 if agent_timeout is not None else 1
             payload = {
                 "code": code,
                 "target_code": target,
                 "timeout": execution_timeout,
-                # Preserve the established evaluator contract: one retry after
-                # a backend command timeout.  Admission/transport settlement
-                # remains a separate job-lifecycle concern.
-                "max_retries": 1,
+                # Preserve the established evaluator contract when no worker
+                # budget was supplied.  A custom budget is one backend attempt
+                # so a 60-second suggestion cannot silently become a 120-second
+                # timeout tail through the legacy retry.
+                "max_retries": backend_max_retries,
                 "problem_id": task.problem_id,
                 "lean_env_id": self.lean_env_id,
                 "verification_profile": self.verification_profile,
@@ -1825,6 +1858,7 @@ class LeanEvaluator:
                 lifecycle_budget = _job_lifecycle_budget_seconds(
                     response,
                     execution_timeout=execution_timeout,
+                    backend_max_retries=backend_max_retries,
                     maximum_lifecycle_seconds=self.max_lifecycle_seconds,
                 )
                 settlement_deadline = (
@@ -1940,6 +1974,7 @@ class LeanEvaluator:
                         lifecycle_budget = _job_lifecycle_budget_seconds(
                             response,
                             execution_timeout=execution_timeout,
+                            backend_max_retries=backend_max_retries,
                             maximum_lifecycle_seconds=self.max_lifecycle_seconds,
                         )
                         settlement_deadline = max(
@@ -2031,6 +2066,7 @@ class LeanEvaluator:
                     candidate_code=code,
                     cancel_event=cancel_event,
                     settlement_callback=settlement_callback,
+                    timeout_seconds=timeout_seconds,
                 )
                 if retried is not None:
                     return retried
@@ -2197,6 +2233,7 @@ class LeanEvaluator:
                         ),
                         cancel_event=cancel_event,
                         settlement_callback=settlement_callback,
+                        timeout_seconds=timeout_seconds,
                     )
                     if retried is not None:
                         return retried
@@ -2285,6 +2322,7 @@ class LeanEvaluator:
         candidate_code: str | None,
         cancel_event: threading.Event | None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict | None:
         """Resubmit once a previous job is definitively terminal and retryable."""
 
@@ -2305,6 +2343,7 @@ class LeanEvaluator:
             candidate_code=candidate_code,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
         prior = verdict.response.get("evaluator_overload_resubmissions", 0)
         verdict.response["evaluator_overload_resubmissions"] = (
@@ -2734,6 +2773,7 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         return self._evaluate_code(
             task,
@@ -2741,6 +2781,7 @@ class CodingEvaluator(LeanEvaluator):
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
 
     def evaluate_fresh(
@@ -2751,6 +2792,7 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         return self.evaluate(
             task,
@@ -2758,6 +2800,7 @@ class CodingEvaluator(LeanEvaluator):
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
 
     def probe(
@@ -2768,6 +2811,7 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         return self.evaluate(
             task,
@@ -2775,6 +2819,7 @@ class CodingEvaluator(LeanEvaluator):
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
 
     def probe_source(
@@ -2785,6 +2830,7 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
         settlement_callback: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         if not isinstance(candidate_code, str):
             raise TypeError("candidate_code must be a string")
@@ -2794,6 +2840,7 @@ class CodingEvaluator(LeanEvaluator):
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
             settlement_callback=settlement_callback,
+            timeout_seconds=timeout_seconds,
         )
 
     def _request(
@@ -2877,6 +2924,7 @@ class CodingEvaluator(LeanEvaluator):
         deadline_monotonic: float | None,
         cancel_event: Any | None,
         settlement_callback: Any | None,
+        timeout_seconds: int | None,
     ) -> Verdict:
         started = time.monotonic()
         source = code or ""
@@ -2892,7 +2940,14 @@ class CodingEvaluator(LeanEvaluator):
             return Verdict(task.slug, "TASK_CANCELLED", 0.0, 0.0, {"reason": "cancel_event_set"}, **provenance)
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             return Verdict(task.slug, "OUT_OF_HORIZON", 0.0, 0.0, {"reason": "run_horizon_elapsed"}, **provenance)
+        agent_timeout = self._normalize_agent_timeout(timeout_seconds)
+        execution_timeout = (
+            agent_timeout.effective_seconds
+            if agent_timeout is not None
+            else self.timeout_seconds
+        )
         job_id: str | None = None
+        cancel_endpoint: Any = None
         response: dict[str, Any] = {}
 
         def reconcile_cancel(reason: str) -> tuple[dict[str, Any], str | None, bool]:
@@ -2912,16 +2967,19 @@ class CodingEvaluator(LeanEvaluator):
             return current, error, attempted
 
         try:
+            submission_payload: dict[str, Any] = {
+                "problem_id": task.problem_id,
+                "language": task.language,
+                "code": source,
+                "submission_id": f"contextswarm-{uuid.uuid4().hex}",
+            }
+            if agent_timeout is not None:
+                submission_payload["timeout"] = execution_timeout
             submitted = self._observed_request(
                 "submit",
                 "POST",
                 "/api/judge/jobs",
-                {
-                    "problem_id": task.problem_id,
-                    "language": task.language,
-                    "code": source,
-                    "submission_id": f"contextswarm-{uuid.uuid4().hex}",
-                },
+                submission_payload,
                 task=task,
                 timeout_seconds=min(30.0, max(1.0, (deadline_monotonic - time.monotonic()) if deadline_monotonic else 30.0)),
             )
@@ -3063,8 +3121,9 @@ class MockEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: Any | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
-        del deadline_monotonic
+        del deadline_monotonic, timeout_seconds
         if _cancel_requested(cancel_event):
             return Verdict(
                 task.slug,
@@ -3102,6 +3161,7 @@ class MockEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
         if _cancel_requested(cancel_event):
             return Verdict(
@@ -3116,6 +3176,7 @@ class MockEvaluator:
             candidate_path,
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
+            timeout_seconds=timeout_seconds,
         )
 
     def probe_source(
@@ -3125,8 +3186,9 @@ class MockEvaluator:
         *,
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        timeout_seconds: int | None = None,
     ) -> Verdict:
-        del deadline_monotonic
+        del deadline_monotonic, timeout_seconds
         provenance = {
             "candidate_sha256": candidate_sha256(candidate_code),
             "task_contract_sha256": self.expected_task_contract_sha256(task),
@@ -3282,6 +3344,7 @@ def _job_lifecycle_budget_seconds(
     payload: Mapping[str, Any],
     *,
     execution_timeout: int,
+    backend_max_retries: int = 1,
     maximum_lifecycle_seconds: float,
 ) -> float:
     """Return a conservative whole-job budget from the Judge receipt.
@@ -3335,10 +3398,12 @@ def _job_lifecycle_budget_seconds(
     # and SafeVerify finalization may each consume another queue/command budget.
     # This intentionally over-bounds fast/official profiles rather than
     # cancelling a valid proof before the server's own lifecycle can settle.
-    # max_retries=1 permits two main verification attempts; a cold cached REPL
-    # can spend one additional command on its header, then formal signature and
-    # SafeVerify finalization can each spend one command.
-    return checked((3.0 * queue_budget) + (5.0 * timeout) + 20.0)
+    # One main command plus header/signature/SafeVerify accounts for four
+    # execution budgets.  Each legacy backend retry adds one more; a worker
+    # supplied timeout intentionally sets max_retries=0 to prevent a nominal
+    # 60-second budget from expanding into the historical 120-second tail.
+    retries = max(0, int(backend_max_retries))
+    return checked((3.0 * queue_budget) + ((4 + retries) * timeout) + 20.0)
 
 
 def _verdict_status(payload: Mapping[str, Any]) -> str:

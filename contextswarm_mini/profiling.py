@@ -109,6 +109,7 @@ _TEXT_FIELDS = frozenset(
         "scan_scope",
         "cpu_denominator_source",
         "cgroup_cpu_denominator_source",
+        "timeout_source",
     }
 )
 
@@ -192,6 +193,9 @@ _SCALAR_FIELDS = frozenset(
         "elapsed_seconds",
         "horizon_seconds",
         "execution_timeout_seconds",
+        "requested_timeout_seconds",
+        "effective_timeout_seconds",
+        "timeout_clamped",
         "max_concurrent_evaluations",
         "evaluator_seconds",
         "audit_seconds",
@@ -344,6 +348,9 @@ _SCALAR_FIELDS = frozenset(
         "total_tokens",
         "transaction_seconds",
         "timeout_seconds",
+        "requested_timeout_seconds",
+        "effective_timeout_seconds",
+        "timeout_clamped",
         "text_chars",
         "timed_out",
         "tokenize_count",

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from .models import Task
+from .timeout_policy import AGENT_TIMEOUT_MAX_SECONDS, AGENT_TIMEOUT_MIN_SECONDS
 
 
 FORMAL_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
@@ -161,6 +162,42 @@ Do not inspect helper source, alter capability metadata, or use any other shell
 command."""
 
 
+def _agent_timeout_instructions(enabled: bool, *, formal: bool) -> str:
+    """Render the opt-in worker guidance without changing baseline prompts."""
+
+    if not enabled:
+        return ""
+    helper = (
+        " For formal diagnostics, `python3 evaluate.py --timeout N` sends the same budget."
+        if formal
+        else ""
+    )
+    return f"""Agent-proposed validation budget (enabled for this run):
+- `judge_check` accepts an optional integer `timeout_seconds` in the advertised
+  range {AGENT_TIMEOUT_MIN_SECONDS}–{AGENT_TIMEOUT_MAX_SECONDS}.{helper} The runner
+  clamps values outside that range (and its hard evaluator ceiling) before
+  submission; the effective value is reported in the bounded receipt.
+- In this treatment, normally include a value on every validation call so the
+  experiment can observe your estimate; omit it only when you deliberately
+  choose the legacy timeout/retry behavior. For example, a Judge call can use
+  `{{"timeout_seconds": 60}}` and the formal helper can use
+  `python3 evaluate.py --timeout 60`.
+- This budget applies to one backend verification attempt. It is not the outer
+  experiment horizon, Judge-admission wait, provider/Pi timeout, or a guarantee
+  that the whole HTTP call returns within that many seconds. Omitting it keeps
+  the configured legacy timeout and retry policy.
+- As a starting heuristic, use about 30–60 seconds for routine incremental
+  checks; 120–180 seconds for a promising candidate with heavy imports,
+  elaboration, or resource-sensitive code; and reserve 300 seconds for a
+  genuinely likely near-complete but known-slow check. Use 5–15 seconds only
+  for cheap sanity feedback after an obvious edit, not for the first checkpoint
+  or immediately after changing imports/large definitions.
+- `EXECUTION_TIMEOUT` is inconclusive candidate feedback, not `VERIFY_FAIL`,
+  proof of correctness, or permission to run a local checker. After a timeout,
+  inspect the feedback and make a material edit (or leave the best candidate)
+  before trying again. Keep calls serial and respect the session budget."""
+
+
 def _is_coding_task(task: Task) -> bool:
     """Whether ``task`` is a C++ Judge task (formal remains the default)."""
 
@@ -187,6 +224,7 @@ def build_task_prompt(
     episode: int,
     communication_enabled: bool,
     formal_tools_enabled: bool = False,
+    agent_timeout_enabled: bool = False,
     direct_messages: bool = True,
     selection_enabled: bool = False,
     digest: str = "",
@@ -217,6 +255,8 @@ or a local verification process.
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 
+{_agent_timeout_instructions(agent_timeout_enabled, formal=not coding)}
+
 Relevant shared context (possibly empty):
 ---
 {context}
@@ -234,6 +274,7 @@ def build_mono_prompt(
     workspace: str,
     communication_enabled: bool,
     formal_tools_enabled: bool = False,
+    agent_timeout_enabled: bool = False,
     direct_messages: bool = True,
     selection_enabled: bool = False,
 ) -> str:
@@ -270,6 +311,8 @@ Parallel worker may omit `task_id`, but Mono may not.
 {_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
+
+{_agent_timeout_instructions(agent_timeout_enabled, formal=not coding)}
 
 Use the available wall-clock budget on concrete {noun} construction. Leave every
 task directory with its best candidate, even if some targets remain incomplete.

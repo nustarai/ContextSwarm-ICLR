@@ -543,6 +543,10 @@ class ExperimentConfig:
     docker_memory_mb: int
     docker_internet: str
     docker_network: str
+    # Optional worker-proposed Judge/evaluate timeout capability.  It is
+    # deliberately default-off so historical manifests keep the exact legacy
+    # tool surface and retry behavior.
+    judge_agent_timeout_enabled: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -640,6 +644,7 @@ class ExperimentConfig:
             "lean_judge_mode": self.lean_judge_mode,
             "lean_require_result_cache_disabled": self.lean_require_result_cache_disabled,
             "judge_kind": self.judge_kind,
+            "judge_agent_timeout_enabled": self.judge_agent_timeout_enabled,
             "formal_tools_enabled": self.formal_tools_enabled,
             "formal_tools_version": self.formal_tools_version,
             "formal_tools_evaluate_calls_per_task": self.formal_tools_evaluate_calls_per_task,
@@ -1041,6 +1046,18 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     require_result_cache_disabled = bool(
         _judge_value("require_result_cache_disabled", False)
     )
+    if "agent_timeout_enabled" in judge:
+        judge_agent_timeout_enabled = _strict_bool(
+            judge["agent_timeout_enabled"], "judge.agent_timeout_enabled"
+        )
+    elif "agent_timeout_enabled" in lean:
+        # Keep the historical [lean] table usable for local formal manifests,
+        # while making the generic [judge] spelling canonical for new arms.
+        judge_agent_timeout_enabled = _strict_bool(
+            lean["agent_timeout_enabled"], "lean.agent_timeout_enabled"
+        )
+    else:
+        judge_agent_timeout_enabled = False
     formal_tools_enabled = bool(
         formal_tools.get("enabled", judge_kind == "formal")
     )
@@ -1164,6 +1181,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         docker_memory_mb=_positive_int(docker.get("memory_mb"), "docker.memory_mb", 16384),
         docker_internet=_text(docker.get("internet"), "online"),
         docker_network=docker_network,
+        judge_agent_timeout_enabled=judge_agent_timeout_enabled,
         extra={"raw": payload},
     )
     if cfg.uses_cps and cfg.episodes_per_task < 1:

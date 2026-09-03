@@ -35,6 +35,13 @@ from .formal_tools import FormalToolPolicy, sanitize_public_text
 from .models import Task, Verdict
 from .secure_io import DEFAULT_MAX_CANDIDATE_BYTES, read_regular_bytes
 from .selection_store import CANONICAL_FEEDBACK_KINDS, SelectionStore
+from .timeout_policy import (
+    AGENT_TIMEOUT_MAX_SECONDS,
+    AGENT_TIMEOUT_MIN_SECONDS,
+    AgentTimeout,
+    normalize_agent_timeout,
+    timeout_fields,
+)
 
 
 _MAX_REQUEST_BYTES = 32 * 1024
@@ -280,6 +287,7 @@ class JudgeBroker:
         selection_enabled: bool = False,
         selection_search: Callable[[Any, str, int], Mapping[str, Any]] | None = None,
         profiler: Any | None = None,
+        agent_timeout_enabled: bool = False,
     ):
         self.evaluator = evaluator
         self.evaluator_gate = evaluator_gate
@@ -320,6 +328,19 @@ class JudgeBroker:
         # broker remains usable by narrow test/evaluator adapters without
         # importing or depending on the profiling implementation.
         self.profiler = profiler
+        if not isinstance(agent_timeout_enabled, bool):
+            raise ValueError("agent_timeout_enabled must be a boolean")
+        self.agent_timeout_enabled = agent_timeout_enabled
+        try:
+            configured_timeout = float(getattr(evaluator, "timeout_seconds", AGENT_TIMEOUT_MAX_SECONDS))
+        except (TypeError, ValueError, OverflowError):
+            configured_timeout = float(AGENT_TIMEOUT_MAX_SECONDS)
+        self.agent_timeout_cap_seconds = min(
+            AGENT_TIMEOUT_MAX_SECONDS,
+            max(1, int(configured_timeout))
+            if math.isfinite(configured_timeout) and configured_timeout > 0
+            else AGENT_TIMEOUT_MAX_SECONDS,
+        )
         try:
             self._profiling_enabled = bool(
                 profiler is not None and getattr(profiler, "enabled", False)
@@ -646,6 +667,16 @@ class JudgeBroker:
             "closeout_requires_fifo_depth": 0,
             "closeout_requires_remote_unsettled_jobs": 0,
             "drain_timeout_seconds": self.drain_timeout_seconds,
+            "agent_timeout": {
+                "enabled": self.agent_timeout_enabled,
+                "field": "timeout_seconds",
+                "min_seconds": AGENT_TIMEOUT_MIN_SECONDS,
+                "max_seconds": AGENT_TIMEOUT_MAX_SECONDS,
+                "configured_evaluator_cap_seconds": self.agent_timeout_cap_seconds,
+                "semantics": "agent_requested_backend_execution_budget",
+                "custom_request_max_retries": 0,
+                "omitted_request": "configured_evaluator_timeout_and_legacy_retry_policy",
+            },
             "direct_messages_allowed": (
                 self.direct_messages_allowed
                 if self.direct_messages_allowed is not None
@@ -677,6 +708,35 @@ class JudgeBroker:
             else {"enabled": False}
         )
         return policy
+
+    def _parse_agent_timeout(
+        self, payload: Mapping[str, Any]
+    ) -> tuple[AgentTimeout | None, str | None]:
+        """Parse the optional worker budget at the capability boundary."""
+
+        if "timeout_seconds" not in payload:
+            return None, None
+        if not self.agent_timeout_enabled:
+            return None, "timeout_seconds is not enabled for this run"
+        try:
+            timeout = normalize_agent_timeout(
+                payload.get("timeout_seconds"),
+                configured_timeout_seconds=self.agent_timeout_cap_seconds,
+            )
+        except ValueError as exc:
+            return None, str(exc)
+        return timeout, None
+
+    def _attach_timeout(
+        self, result: Mapping[str, Any], timeout: AgentTimeout | None
+    ) -> dict[str, Any]:
+        normalized = dict(result)
+        # Keep the historical disabled tool response byte-compatible.  The
+        # enabled arm records both explicit suggestions and omitted (legacy)
+        # calls so treatment adoption and fallback behavior remain auditable.
+        if timeout is not None or self.agent_timeout_enabled:
+            normalized.update(timeout_fields(timeout))
+        return normalized
 
     def formal_summary(self) -> dict[str, Any]:
         """Return public run-global counters after broker capabilities are silent."""
@@ -938,10 +998,28 @@ class JudgeBroker:
         # separate from the evaluator execution clock below: validation,
         # admission, execution and audit are distinct stages in the profile.
         request_started = time.monotonic() if self._profiling_enabled else 0.0
-        if set(payload) - {"task_id"}:
+        timeout_request, timeout_error = self._parse_agent_timeout(payload)
+
+        def finish(
+            task_id: str,
+            result: Mapping[str, Any],
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            return self._finish_judge_check(
+                claim,
+                task_id,
+                self._attach_timeout(result, timeout_request),
+                **kwargs,
+            )
+
+        allowed_fields = {"task_id"}
+        if self.agent_timeout_enabled:
+            allowed_fields.add("timeout_seconds")
+        if timeout_error or set(payload) - allowed_fields:
             result = _control_result(
                 "INVALID_REQUEST",
-                "judge_check accepts only the runner-bound task selection.",
+                timeout_error
+                or "judge_check accepts only the runner-bound task selection and optional timeout_seconds.",
                 retryable=False,
             )
             audit_task = (
@@ -949,8 +1027,7 @@ class JudgeBroker:
                 if len(claim.candidates) == 1
                 else "__invalid__"
             )
-            return self._finish_judge_check(
-                claim,
+            return finish(
                 audit_task,
                 result,
                 accepted=False,
@@ -965,8 +1042,7 @@ class JudgeBroker:
                 _safe_error(exc),
                 retryable=False,
             )
-            return self._finish_judge_check(
-                claim,
+            return finish(
                 "__invalid__",
                 result,
                 accepted=False,
@@ -981,8 +1057,7 @@ class JudgeBroker:
                     "Only one judge_check may be in flight for this solver session.",
                     retryable=True,
                 )
-                return self._finish_judge_check(
-                    claim,
+                return finish(
                     task_id,
                     result,
                     accepted=False,
@@ -995,8 +1070,7 @@ class JudgeBroker:
                     "The controlled Judge-call budget for this solver session is exhausted.",
                     retryable=False,
                 )
-                return self._finish_judge_check(
-                    claim,
+                return finish(
                     task_id,
                     result,
                     accepted=False,
@@ -1011,8 +1085,7 @@ class JudgeBroker:
                     retryable=True,
                     retry_after_seconds=round(cooldown, 3),
                 )
-                return self._finish_judge_check(
-                    claim,
+                return finish(
                     task_id,
                     result,
                     accepted=False,
@@ -1025,8 +1098,7 @@ class JudgeBroker:
                     "The experiment horizon has elapsed.",
                     retryable=False,
                 )
-                return self._finish_judge_check(
-                    claim,
+                return finish(
                     task_id,
                     result,
                     accepted=False,
@@ -1039,8 +1111,7 @@ class JudgeBroker:
                     "This solver task no longer accepts Judge work.",
                     retryable=False,
                 )
-                return self._finish_judge_check(
-                    claim,
+                return finish(
                     task_id,
                     result,
                     accepted=False,
@@ -1049,8 +1120,7 @@ class JudgeBroker:
                 )
             if self._remote_settlement_unconfirmed():
                 result = _remote_settlement_control_result()
-                return self._finish_judge_check(
-                    claim,
+                return finish(
                     task_id,
                     result,
                     accepted=False,
@@ -1114,8 +1184,7 @@ class JudgeBroker:
                     "The runner could not freeze the task candidate for Judge submission.",
                     retryable=True,
                 )
-                return self._finish_judge_check(
-                    claim,
+                return finish(
                     task_id,
                     result,
                     accepted=False,
@@ -1165,8 +1234,7 @@ class JudgeBroker:
                     "The controlled Judge admission queue failed.",
                     retryable=True,
                 )
-                return self._finish_judge_check(
-                    claim,
+                return finish(
                     task_id,
                     result,
                     accepted=False,
@@ -1232,8 +1300,7 @@ class JudgeBroker:
                         call_index = claim.probe_calls
                         accepted = True
                 if not accepted:
-                    return self._finish_judge_check(
-                        claim,
+                    return finish(
                         task_id,
                         result,
                         accepted=False,
@@ -1269,6 +1336,14 @@ class JudgeBroker:
                     evaluator_kwargs["settlement_callback"] = self._release_evaluator_gate
                 if _accepts_cancel_event(evaluator_call):
                     evaluator_kwargs["cancel_event"] = _ClaimCancelEvent(claim)
+                if timeout_request is not None:
+                    if not _accepts_timeout(evaluator_call):
+                        raise TypeError(
+                            "the configured evaluator does not support timeout_seconds"
+                        )
+                    evaluator_kwargs["timeout_seconds"] = (
+                        timeout_request.effective_seconds
+                    )
                 evaluator_call_started = True
                 evaluator_started_at = time.monotonic()
                 self._profile_event(
@@ -1276,6 +1351,7 @@ class JudgeBroker:
                     claim=claim,
                     task_id=task_id,
                     call_index=call_index,
+                    **timeout_fields(timeout_request),
                 )
                 try:
                     verdict: Verdict = evaluator_call(
@@ -1293,6 +1369,7 @@ class JudgeBroker:
                         task_id=task_id,
                         call_index=call_index,
                         elapsed_seconds=evaluator_seconds,
+                        **timeout_fields(timeout_request),
                     )
                 raw_judge_job_id = verdict.judge_job_id
                 verdict_status = _safe_verdict_status(verdict.status)
@@ -1502,6 +1579,7 @@ class JudgeBroker:
                     "retryable": False,
                 }
 
+        result = self._attach_timeout(result, timeout_request)
         audit_gate_wait_seconds = (
             time.monotonic() - gate_wait_started
             if not acquired
@@ -1570,6 +1648,7 @@ class JudgeBroker:
             audit_seconds=audit_seconds,
             cache_reused=result.get("cache_reused") is True,
             candidate_sha256=snapshot.sha256 if snapshot is not None else None,
+            **timeout_fields(timeout_request),
         )
         if _valid_judge_checkpoint(
             result,
@@ -1716,6 +1795,10 @@ class JudgeBroker:
                 task_id=task_id,
                 elapsed_seconds=max(0.0, time.monotonic() - audit_started),
                 accepted=accepted,
+                requested_timeout_seconds=normalized.get("requested_timeout_seconds"),
+                effective_timeout_seconds=normalized.get("effective_timeout_seconds"),
+                timeout_clamped=normalized.get("timeout_clamped") is True,
+                timeout_source=normalized.get("timeout_source"),
             )
         self._profile_event(
             "judge.receipt",
@@ -1728,6 +1811,10 @@ class JudgeBroker:
             gate_wait_seconds=effective_gate_wait,
             elapsed_seconds=time.monotonic() - started,
             candidate_sha256=candidate_sha256,
+            requested_timeout_seconds=normalized.get("requested_timeout_seconds"),
+            effective_timeout_seconds=normalized.get("effective_timeout_seconds"),
+            timeout_clamped=normalized.get("timeout_clamped") is True,
+            timeout_source=normalized.get("timeout_source"),
         )
         return normalized
 
@@ -1745,12 +1832,18 @@ class JudgeBroker:
                 "The manifest does not enable the bounded formal tool surface.",
                 retryable=False,
             )
-        if set(payload) - {"task_id"}:
+        timeout_request, timeout_error = self._parse_agent_timeout(payload)
+        allowed_fields = {"task_id"}
+        if self.agent_timeout_enabled:
+            allowed_fields.add("timeout_seconds")
+        if timeout_error or set(payload) - allowed_fields:
             result = _control_result(
                 "INVALID_REQUEST",
-                "evaluate_local accepts only the runner-bound task selection.",
+                timeout_error
+                or "evaluate_local accepts only the runner-bound task selection and optional timeout_seconds.",
                 retryable=False,
             )
+            result = self._attach_timeout(result, timeout_request)
             self._formal_audit(claim, "evaluate_local", "__invalid__", result, accepted=False)
             return result
         try:
@@ -1761,6 +1854,7 @@ class JudgeBroker:
                 _safe_error(exc),
                 retryable=False,
             )
+            result = self._attach_timeout(result, timeout_request)
             self._formal_audit(claim, "evaluate_local", "__invalid__", result, accepted=False)
             return result
         call_number = self._formal_increment(task_id, "evaluate_calls")
@@ -1775,6 +1869,7 @@ class JudgeBroker:
                 "advisory_only": True,
                 "official_score_eligible": False,
             }
+            result = self._attach_timeout(result, timeout_request)
             self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
             return result
         capability_failure = _formal_capability_failure(claim)
@@ -1785,6 +1880,7 @@ class JudgeBroker:
                 "advisory_only": True,
                 "official_score_eligible": False,
             }
+            result = self._attach_timeout(result, timeout_request)
             self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
             return result
 
@@ -1807,6 +1903,7 @@ class JudgeBroker:
                 "advisory_only": True,
                 "official_score_eligible": False,
             }
+            result = self._attach_timeout(result, timeout_request)
             self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
             return result
         source_sha256 = hashlib.sha256(source_bytes).hexdigest()
@@ -1827,6 +1924,7 @@ class JudgeBroker:
                     "accepted": True,
                 }
             )
+            cached_result = self._attach_timeout(cached_result, timeout_request)
             self._formal_audit(
                 claim,
                 "evaluate_local",
@@ -1855,6 +1953,7 @@ class JudgeBroker:
                 "advisory_only": True,
                 "official_score_eligible": False,
             }
+            result = self._attach_timeout(result, timeout_request)
             self._formal_audit(claim, "evaluate_local", task_id, result, accepted=False)
             return result
 
@@ -1892,6 +1991,12 @@ class JudgeBroker:
                         options["settlement_callback"] = self._release_evaluator_gate
                     if _accepts_cancel_event(probe_source):
                         options["cancel_event"] = _ClaimCancelEvent(claim)
+                    if timeout_request is not None:
+                        if not _accepts_timeout(probe_source):
+                            raise TypeError(
+                                "the configured evaluator does not support timeout_seconds"
+                            )
+                        options["timeout_seconds"] = timeout_request.effective_seconds
                     evaluator_unsettled_before = _nonnegative_count(
                         getattr(self.evaluator, "remote_unsettled_jobs", 0)
                     )
@@ -1960,6 +2065,7 @@ class JudgeBroker:
                 ),
             }
         )
+        result = self._attach_timeout(result, timeout_request)
         if (
             not retain_evaluator_gate
             and
@@ -2568,6 +2674,10 @@ class JudgeBroker:
             "candidate_sha256": _safe_hash(candidate_sha256),
             "gate_wait_seconds": round(max(0.0, gate_wait_seconds), 6),
             "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
+            "requested_timeout_seconds": result.get("requested_timeout_seconds"),
+            "effective_timeout_seconds": result.get("effective_timeout_seconds"),
+            "timeout_clamped": result.get("timeout_clamped") is True,
+            "timeout_source": str(result.get("timeout_source") or "configured_legacy")[:32],
             "advisory_only": True,
             "official_score_eligible": False,
         }
@@ -2867,6 +2977,10 @@ class JudgeBroker:
             "retryable": result.get("retryable") is True,
             "gate_wait_seconds": round(max(0.0, gate_wait_seconds), 6),
             "elapsed_seconds": round(max(0.0, elapsed_seconds), 6),
+            "requested_timeout_seconds": result.get("requested_timeout_seconds"),
+            "effective_timeout_seconds": result.get("effective_timeout_seconds"),
+            "timeout_clamped": result.get("timeout_clamped") is True,
+            "timeout_source": str(result.get("timeout_source") or "configured_legacy")[:32],
             "candidate_sha256": candidate_sha256,
             "task_contract_sha256": _safe_hash(task_contract_sha256),
             "judge_job_id": _safe_identifier(judge_job_id),
@@ -3018,6 +3132,20 @@ def _accepts_cancel_event(function: Callable[..., Any]) -> bool:
         return False
     return any(
         parameter.name == "cancel_event"
+        or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+def _accepts_timeout(function: Callable[..., Any]) -> bool:
+    """Return whether an evaluator adapter can honor a worker timeout."""
+
+    try:
+        parameters = inspect.signature(function).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "timeout_seconds"
         or parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     )

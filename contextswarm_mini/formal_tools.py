@@ -519,7 +519,7 @@ def public_files_manifest(
         "",
         "## Formal capabilities",
         "",
-        "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. Its result is agent-local feedback, never the official score.",
+        "- `python3 evaluate.py` checks the current `result.lean` and returns bounded Lean diagnostics. When the run advertises Agent timeout control, add `--timeout N` (5-300 seconds); the value is a per-backend-attempt suggestion and remains advisory, never the official score.",
         "- `./formal_query --help` describes bounded `search`, `decl`, `check`, `type`, `axioms`, and `deps` queries. `search` scans only `problem.md`, `result.lean`, `baseline/*.lean`, and the revision-bound declaration index.",
         "- `deps` returns index-related candidate premises, not a dependency graph. Verify names with `check`.",
         "- The final score comes only from the feedback-free outer evaluation of an immutable candidate snapshot.",
@@ -591,18 +591,32 @@ def request(script_file: str, operation: str, payload: dict) -> dict:
 
 _EVALUATE_SCRIPT = r'''#!/usr/bin/env python3
 from __future__ import annotations
+import argparse
 import json
-import sys
 from _contextswarm_tool_client import request
 
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        description="Bounded advisory Lean evaluation; never official proof evidence."
+    )
+    result.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="optional Agent-proposed backend-attempt budget in seconds (runner clamps it)",
+    )
+    return result
+
 def main() -> int:
+    args = parser().parse_args()
+    payload = {} if args.timeout is None else {"timeout_seconds": int(args.timeout)}
     try:
-        response = request(__file__, "evaluate_local", {})
+        response = request(__file__, "evaluate_local", payload)
     except Exception as error:
         print(json.dumps({"status": "EVALUATOR_ERROR", "message": type(error).__name__}, indent=2))
         return 2
     print(json.dumps(response, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0 if response.get("status") not in {"EVALUATOR_ERROR", "OUT_OF_HORIZON", "BUDGET_EXHAUSTED"} else 1
+    return 0 if response.get("status") not in {"EVALUATOR_ERROR", "EVALUATOR_TIMEOUT", "EXECUTION_TIMEOUT", "OUT_OF_HORIZON", "BUDGET_EXHAUSTED"} else 1
 
 if __name__ == "__main__":
     raise SystemExit(main())
