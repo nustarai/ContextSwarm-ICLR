@@ -507,7 +507,8 @@ recovery 语义和随机候选共同作用。当前最可信的方案收益仍�
 - r3 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r3-launch/runs/adaptive-timeout-20260903/treatment-r3/20260903T124445Z-c244cd48`
 - r4 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r4-launch/runs/adaptive-timeout-20260903/treatment-r4/20260903T124445Z-bacd88ea`
 - profiling audit：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r2/profiling-audit.json`、
-  `...-r3/profiling-audit.json`、`...-r4/profiling-audit.json`；三份均 `exit_code=1`，原因
+  `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/profiling-audit.json`、
+  `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r4/profiling-audit.json`；三份均 `exit_code=1`，原因
   是上文列出的 dropped fields/未闭合 span，而不是敏感字段或 termination 缺失。
 - Judge supervisor logs：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/judge/supervisor.log`
   和 `...-r4/judge/supervisor.log` 均记录 `supervisor_exit=0`；对应容器、backend/proxy
