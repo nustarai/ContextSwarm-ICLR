@@ -279,7 +279,7 @@ adoption，prompt 默认要求正常验证调用显式给值；只有刻意测�
 特别标注：这 3 个 accepted 零 attempt 行来自 `1de0079` 的旧 run-bound 镜像，仍记录了
 `EVALUATOR_TIMEOUT`、`timeout_budget_exhausted=true` 和约 45/60 s 的剩余 Agent 预算；这是
 “run horizon 先到”与“Agent 总预算耗尽”混淆的 metadata anomaly，不应当解释成真正消耗了
-全部 Agent 预算。当前开发 HEAD `27cd150`（包含 `b47afc6` 修复）已将该边界分类为
+全部 Agent 预算。当前开发分支（包含 `b47afc6` 修复）已将该边界分类为
 `OUT_OF_HORIZON`/`run_horizon`，并由
 确定性测试覆盖；正式 r2/r3/r4 数值仍严格按冻结的 `1de0079` 镜像记录。所有记录的
 `judge_retry_count` 都是 0。也就是说，这几轮 workload 没有自然触发可安全重试的
@@ -358,8 +358,7 @@ recycle 后的 cleanup/floor deficit 和 17/25 次 probe infrastructure error；
   分别为 24/13/18。因而正式 workload 没有自然触发 candidate-independent transient
   retry；不能把分数变化解释成“累计 retry 实际救回了候选”。
 - r3/r4 各自有少量 accepted 零 attempt 的 near-horizon 行，和 r2 的三条相同，仍来自
-  冻结的 `1de0079` 镜像旧分类；当前开发 HEAD `27cd150` 的修复不会回写这些历史
-  artifact。
+  冻结的 `1de0079` 镜像旧分类；当前开发分支的修复不会回写这些历史 artifact。
 
 Judge backend 的结构化日志均有完整 terminal receipt（submitted=finished）：
 
@@ -515,7 +514,7 @@ recovery 语义和随机候选共同作用。当前最可信的方案收益仍�
 - Judge supervisor logs：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/judge/supervisor.log`
   和 `...-r4/judge/supervisor.log` 均记录 `supervisor_exit=0`；对应容器、backend/proxy
   进程和本轮端口在 closeout 后均已退出。
-- 当前开发 HEAD `27cd150`（含 `b47afc6` 修复）的 timeout 专项测试为 `20/20 OK`，
+- 当前开发分支（含 `b47afc6` 修复）的 timeout 专项测试为 `20/20 OK`，
   `compileall` 退出码为 0；在
   实验栈退出后的 clean worktree 上完整 `python3 -m unittest discover -s tests` 为
   `751 tests, OK (skipped=1)`。此前高并发/顺序敏感的一次尝试曾触发短 horizon Figure4
