@@ -513,6 +513,8 @@ recovery 语义和随机候选共同作用。当前最可信的方案收益仍�
 - Judge supervisor logs：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/judge/supervisor.log`
   和 `...-r4/judge/supervisor.log` 均记录 `supervisor_exit=0`；对应容器、backend/proxy
   进程和本轮端口在 closeout 后均已退出。
-- 当前 HEAD `b47afc6` 的 timeout 专项测试为 `20/20 OK`；完整 discovery 在高并发运行期
-  通过 751 项中的其余断言，但有 2 个极短 horizon 时序断言受宿主负载影响失败，已标记
-  为环境性待复跑项，不能冒充全套 clean pass。
+- 当前 HEAD `b47afc6` 的 timeout 专项测试为 `20/20 OK`，`compileall` 退出码为 0；在
+  实验栈退出后的 clean worktree 上完整 `python3 -m unittest discover -s tests` 为
+  `751 tests, OK (skipped=1)`。此前高并发/顺序敏感的一次尝试曾触发短 horizon Figure4
+  断言，随后该测试单独重复 5/5 通过，第二次完整 discovery 也通过；因此不把那次环境性
+  波动记为代码回归。
