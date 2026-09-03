@@ -92,6 +92,34 @@ from .selection_runtime import SelectionRuntime
 from .selection_store import EXPORT_SCHEMA_VERSION, SelectionStore
 
 
+_ROUTE_ACTOR_TERMINAL_STATUSES = frozenset(
+    {
+        "aborted",
+        "cancelled",
+        "canceled",
+        "closed",
+        "closing",
+        "completed",
+        "done",
+        "error",
+        "failed",
+        "finished",
+        "proved",
+        "recovery_exhausted",
+        "solved",
+        "solved_by_peer",
+        "timed_out",
+        "timeout",
+    }
+)
+
+# Registration is an admission boundary, not a reservation/projection path.
+# Keep this whitelist aligned with CPS and the broker so an adapter cannot
+# claim a live actor using an arbitrary (or future/queued) status that the
+# write gate would later reject.
+_ROUTE_ACTOR_LIVE_STATUSES = frozenset({"active", "admitted", "running"})
+
+
 def _candidate_name(task: Task) -> str:
     return task.candidate_filename
 
@@ -190,6 +218,455 @@ def _require_selection_runtime(
     if cps_store is None or selection_runtime.cps_store is not cps_store:
         raise RuntimeError("selection runtime/shared CPS store binding mismatch")
     return capabilities
+
+
+def _route_claim_settings(config: Any) -> tuple[bool, bool, int]:
+    """Resolve the optional active-roster/route-claim treatment contract.
+
+    The route-claim work is developed in parallel with the config and Pi
+    branches.  Keep this adapter deliberately tolerant of the old config
+    shape (where the feature is absent) and of the short-lived compatibility
+    spellings used by focused harnesses.  A missing flag therefore preserves
+    baseline behavior byte-for-byte, while an explicit ``route_claim_required``
+    always enables the runner-owned roster and claim capability.
+    """
+
+    feature = getattr(config, "cps_features", None)
+    # A few manifests/harnesses use ``route_claims`` as the nested object.  Do
+    # not infer treatment from communication mode alone; it must be explicit.
+    if feature is None:
+        feature = getattr(config, "route_claims", None)
+    required_values = (
+        getattr(config, "route_claim_required", None),
+        getattr(feature, "route_claim_required", None),
+        getattr(feature, "required", None),
+    )
+    enabled_values = (
+        getattr(config, "route_claims_enabled", None),
+        getattr(config, "route_claim_enabled", None),
+        getattr(config, "active_roster_enabled", None),
+        getattr(feature, "enabled", None),
+        getattr(feature, "active_roster_enabled", None),
+    )
+    required = any(value is True for value in required_values)
+    enabled = required or any(value is True for value in enabled_values)
+    ttl_value: Any = getattr(config, "route_claim_ttl_seconds", None)
+    if ttl_value is None:
+        ttl_value = getattr(feature, "route_claim_ttl_seconds", None)
+    if ttl_value is None:
+        ttl_value = getattr(feature, "ttl_seconds", None)
+    if ttl_value is None:
+        ttl_value = 900.0
+    if isinstance(ttl_value, bool):
+        ttl = 900.0
+    else:
+        try:
+            ttl = float(ttl_value)
+        except (TypeError, ValueError):
+            ttl = 900.0
+    # The worker/Pi wire contract is an integer TTL.  Legacy compatibility
+    # objects may still expose a float; reject fractional values by falling
+    # back to the bounded default instead of letting Pi silently coerce it.
+    if not math.isfinite(ttl) or ttl <= 0 or not ttl.is_integer():
+        ttl = 900.0
+    return enabled, required, int(min(86_400.0, max(1.0, ttl)))
+
+
+def _call_optional_cps_method(
+    store: Any,
+    names: tuple[str, ...],
+    **kwargs: Any,
+) -> Any:
+    """Invoke a runner-owned CPS method across staged API revisions."""
+
+    method = None
+    for name in names:
+        candidate = getattr(store, name, None)
+        if callable(candidate):
+            method = candidate
+            break
+    if method is None:
+        return None
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return method(**kwargs)
+    accepts_var_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_var_kwargs:
+        return method(**kwargs)
+    return method(
+        **{
+            key: value
+            for key, value in kwargs.items()
+            if key in parameters
+        }
+    )
+
+
+def _register_runtime_actor(
+    store: Any,
+    *,
+    task_id: str,
+    actor_id: str,
+    episode: int,
+    route_claims_enabled: bool,
+    deadline_epoch_ms: int | None = None,
+) -> tuple[bool, str | None, Any]:
+    """Register one actor only at real scheduler/episode admission.
+
+    CPS roster state is diagnostic coordination data.  If an older store or a
+    transient SQLite failure cannot accept it, continue the candidate path
+    but return a bounded bypass reason so the runner can emit an auditable
+    marker instead of pretending that the actor was registered.
+    """
+
+    if not route_claims_enabled:
+        return False, None, None
+    try:
+        result = _call_optional_cps_method(
+            store,
+            ("register_actor", "register"),
+            task_id=task_id,
+            actor_id=actor_id,
+            episode=episode,
+            status="admitted",
+            metadata={"source": "runner_admission"},
+            deadline_epoch_ms=deadline_epoch_ms,
+        )
+    except Exception:
+        return False, "unavailable", None
+    if result is None:
+        return False, "unavailable", None
+    # ``CPSStore.register_actor`` returns the actor row directly (without an
+    # ``ok`` envelope), while lightweight adapters commonly return either a
+    # boolean or ``{"ok": ...}``.  Treat an explicit negative result as a
+    # bypass; otherwise require a recognizable actor identity so a malformed
+    # adapter response cannot be recorded as a successful admission.
+    if isinstance(result, bool):
+        # A bare boolean cannot prove which actor (or episode) was closed.
+        # Keep ``False`` as an unavailable result and reject ``True`` as a
+        # malformed closeout so active claims are never hidden by a phantom
+        # success.
+        return (False, "unavailable", result)
+    if isinstance(result, Mapping):
+        if result.get("ok") is False:
+            # Registration is an admission invariant.  A missing/rejected
+            # row means the actor was never admitted and must take the
+            # explicit fail-open path; treating it as a successful admission
+            # would leave the broker with ACTOR_NOT_ADMITTED while the Pi
+            # write gate has no bypass marker.  The ``not_found`` no-op
+            # exception belongs only to terminal closeout below.
+            return False, "unavailable", result
+        # A positive envelope is not, by itself, proof that this exact live
+        # admission was persisted.  In particular, a stale/broken adapter can
+        # return ``{"ok": true}`` or a terminal actor row for every caller.
+        # Require the canonical identity, episode, and an explicit nonterminal
+        # status.  ``active=false`` is authoritative when an adapter supplies
+        # it, matching the broker's admission projection.
+        observed_task_id = result.get("task_id")
+        observed_actor_id = result.get("actor_id")
+        identity_matches = (
+            isinstance(observed_task_id, str)
+            and isinstance(observed_actor_id, str)
+            and bool(observed_task_id)
+            and bool(observed_actor_id)
+            and observed_task_id == task_id
+            and observed_actor_id == actor_id
+        )
+        episode_matches = (
+            isinstance(result.get("episode"), int)
+            and not isinstance(result.get("episode"), bool)
+            and result.get("episode") == episode
+        )
+        status_value = str(result.get("status") or "").strip().lower()
+        live_status = status_value in _ROUTE_ACTOR_LIVE_STATUSES
+        positive_envelope = "ok" not in result or result.get("ok") is True
+        if (
+            positive_envelope
+            and identity_matches
+            and episode_matches
+            and live_status
+            and result.get("active") is True
+        ):
+            return True, None, result
+    return False, "unavailable", result
+
+
+def _finish_runtime_actor(
+    store: Any,
+    *,
+    task_id: str,
+    actor_id: str,
+    episode: int | None = None,
+    route_claims_enabled: bool,
+    status: str = "finished",
+    reason: str | None = None,
+    deadline_epoch_ms: int | None = None,
+) -> tuple[bool, str | None, Any]:
+    """Close an admitted actor and let CPS release its active claims."""
+
+    if not route_claims_enabled:
+        return False, None, None
+    try:
+        result = _call_optional_cps_method(
+            store,
+            ("finish_actor", "finish"),
+            task_id=task_id,
+            actor_id=actor_id,
+            episode=episode,
+            status=status,
+            reason=reason,
+            deadline_epoch_ms=deadline_epoch_ms,
+        )
+    except Exception:
+        return False, "unavailable", None
+    if result is None:
+        return False, "unavailable", None
+    if isinstance(result, bool):
+        # A bare boolean cannot prove which actor/episode was closed or that
+        # its route claims were released.
+        return False, "unavailable", result
+    if isinstance(result, Mapping):
+        if result.get("ok") is False:
+            # Closeout is idempotent: if admission never persisted (or a
+            # previous cleanup already removed the row), there is no claim or
+            # actor left for this call to release.  Treat only this explicit
+            # not-found response as a resolved terminal no-op; all other
+            # negative responses remain retryable/unavailable.
+            not_found = (
+                result.get("found") is False
+                and str(result.get("status") or "").strip().lower() == "not_found"
+            )
+            observed_task_id = result.get("task_id")
+            observed_actor_id = result.get("actor_id")
+            identity_matches = (
+                isinstance(observed_task_id, str)
+                and isinstance(observed_actor_id, str)
+                and bool(observed_task_id)
+                and bool(observed_actor_id)
+                and observed_task_id == task_id
+                and observed_actor_id == actor_id
+            )
+            released_claim_ids = result.get("released_claim_ids")
+            claims_released = result.get("claims_released")
+            no_release_work = (
+                isinstance(released_claim_ids, list)
+                and not released_claim_ids
+                and claims_released == 0
+                and not isinstance(claims_released, bool)
+            )
+            not_found_episode_matches = (
+                episode is None
+                or (
+                    "episode" not in result
+                    or (
+                        isinstance(result.get("episode"), int)
+                        and not isinstance(result.get("episode"), bool)
+                        and result.get("episode") == episode
+                    )
+                )
+            )
+            if (
+                not_found
+                and identity_matches
+                and not_found_episode_matches
+                and no_release_work
+            ):
+                return True, None, result
+            return False, "unavailable", result
+        # A successful CPS finish carries ``ok=true``, ``found=true``, a
+        # terminal actor row, and explicit route-release accounting.  Require
+        # that full identity-bound shape: a sparse actor echo cannot prove
+        # closeout and must remain eligible for the runner's bounded retries.
+        observed_task_id = result.get("task_id")
+        observed_actor_id = result.get("actor_id")
+        identity_matches = (
+            isinstance(observed_task_id, str)
+            and isinstance(observed_actor_id, str)
+            and bool(observed_task_id)
+            and bool(observed_actor_id)
+            and observed_task_id == task_id
+            and observed_actor_id == actor_id
+        )
+        episode_matches = (
+            episode is None
+            or (
+                "episode" in result
+                and isinstance(result.get("episode"), int)
+                and not isinstance(result.get("episode"), bool)
+                and result.get("episode") == episode
+            )
+        )
+        status_value = str(result.get("status") or "").strip().lower()
+        released_claim_ids = result.get("released_claim_ids")
+        claims_released = result.get("claims_released")
+        release_accounted = (
+            isinstance(released_claim_ids, list)
+            and isinstance(claims_released, int)
+            and not isinstance(claims_released, bool)
+            and claims_released >= 0
+            and claims_released == len(released_claim_ids)
+        )
+        if (
+            identity_matches
+            and episode_matches
+            and result.get("ok") is True
+            and result.get("found") is True
+            and status_value in _ROUTE_ACTOR_TERMINAL_STATUSES
+            and result.get("active") is False
+            and release_accounted
+        ):
+            return True, None, result
+    return False, "unavailable", result
+
+
+def _actor_finish_status(verdict: Any = None, *, fallback_reason: str | None = None) -> tuple[str, str]:
+    """Map runner outcomes to stable actor closeout labels/reasons."""
+
+    status = str(getattr(verdict, "status", "") or "").upper()
+    reason = str(fallback_reason or "").strip()
+    if not reason and verdict is not None:
+        response = getattr(verdict, "response", None)
+        if isinstance(response, Mapping):
+            # Preserve the distinction between an ordinary cancellation and a
+            # peer winning the task.  Only the small internal vocabulary is
+            # copied into lifecycle metadata; arbitrary Judge text is never
+            # persisted as an actor finish reason.
+            response_reason = str(response.get("reason") or "").strip().lower()
+            if response_reason in {
+                "task_solved_by_peer",
+                "proof_superseded_by_peer",
+                "solved_by_peer",
+            }:
+                reason = "solved_by_peer"
+    if "SOLVED" in reason.upper() or "PROOF_SUPERSEDED" in reason.upper():
+        return "cancelled", reason or "solved_by_peer"
+    if status in {"CANCELLED", "TASK_CANCELLED"}:
+        return "cancelled", reason or "cancelled"
+    if status in {"TIME_LIMIT", "OUT_OF_HORIZON", "EXECUTION_TIMEOUT", "TLE"}:
+        return "finished", reason or "timeout"
+    if status in {"AGENT_FAILURE", "BROKER_ERROR", "EVALUATOR_ERROR"}:
+        return "finished", reason or "recovery_exhausted"
+    if status in {"PROVED", "COMPILES_WITH_SORRY"}:
+        return "finished", reason or "solved"
+    return "finished", reason or "finished"
+
+
+def _pi_route_claim_kwargs(
+    pi_agent: Any,
+    *,
+    enabled: bool,
+    required: bool,
+    ttl_seconds: int,
+    bypass_reason: str | None = None,
+) -> dict[str, Any]:
+    """Return route capability kwargs only when the Pi adapter supports them."""
+
+    if not enabled:
+        return {}
+    runner = getattr(pi_agent, "run", None)
+    if not callable(runner):
+        return {}
+    try:
+        parameters = inspect.signature(runner).parameters.values()
+    except (TypeError, ValueError):
+        return {}
+    parameter_list = tuple(parameters)
+    if not any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameter_list
+    ) and not any(
+        parameter.name
+        in {
+            "route_claims_enabled",
+            "route_claim_required",
+            "route_claim_ttl_seconds",
+            "route_claim_bypass_reason",
+        }
+        for parameter in parameter_list
+    ):
+        # The historical Pi adapter has no route capability arguments.  The
+        # broker session still enforces CPS state, and this guard preserves
+        # compatibility with narrow test doubles until the Pi branch lands.
+        return {}
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameter_list
+    ):
+        result = {
+            "route_claims_enabled": enabled,
+            "route_claim_required": required,
+            "route_claim_ttl_seconds": ttl_seconds,
+        }
+        if bypass_reason is not None:
+            result["route_claim_bypass_reason"] = bypass_reason
+        return result
+    supported = {parameter.name for parameter in parameter_list}
+    return {
+        key: value
+        for key, value in {
+            "route_claims_enabled": enabled,
+            "route_claim_required": required,
+            "route_claim_ttl_seconds": ttl_seconds,
+            "route_claim_bypass_reason": bypass_reason,
+        }.items()
+        if key in supported and value is not None
+    }
+
+
+def _build_route_task_prompt(
+    task: Task,
+    *,
+    task_workspace: str,
+    agent_id: str,
+    episode: int,
+    communication_enabled: bool,
+    formal_tools_enabled: bool,
+    direct_messages: bool,
+    selection_enabled: bool,
+    digest: str,
+    route_claims_enabled: bool,
+    route_claim_required: bool,
+    route_claim_ttl_seconds: int,
+) -> str:
+    """Build a worker prompt without pre-Judge CPS context leakage.
+
+    Treatment workers must not receive the historical piece/message digest
+    before route coordination.  The prompt implementation is being extended
+    in a sibling branch; filter optional route fields for old signatures so
+    focused harnesses remain runnable during the staged merge.
+    """
+
+    values: dict[str, Any] = {
+        "task": task,
+        "task_workspace": task_workspace,
+        "agent_id": agent_id,
+        "episode": episode,
+        "communication_enabled": communication_enabled,
+        "formal_tools_enabled": formal_tools_enabled,
+        "direct_messages": direct_messages,
+        "selection_enabled": selection_enabled,
+        "digest": "" if route_claims_enabled else digest,
+        "route_claims_enabled": route_claims_enabled,
+        "route_claim_required": route_claim_required,
+        "route_claim_ttl_seconds": route_claim_ttl_seconds,
+    }
+    try:
+        parameters = inspect.signature(build_task_prompt).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return build_task_prompt(**values)
+    supported = set(parameters)
+    return build_task_prompt(
+        **{key: value for key, value in values.items() if key in supported}
+    )
 
 
 def _selection_broker_search(
@@ -2417,6 +2894,11 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "assignment_policy": config.assignment_policy,
         "allocation": config.allocation.public_dict(),
         "selection": config.selection.public_dict(),
+        "cps_features": config.cps_features.public_dict(),
+        "active_roster_enabled": config.active_roster_enabled,
+        "route_claims_enabled": config.route_claims_enabled,
+        "route_claim_required": config.route_claim_required,
+        "route_claim_ttl_seconds": config.route_claim_ttl_seconds,
         "figure4_phase": config.figure4_phase,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
@@ -2626,6 +3108,9 @@ def run_experiment(
         # double.  This marker is never set for a real experiment evaluator.
         setattr(evaluator, "_contextswarm_legacy_test_mock", True)
     evaluator_gate = threading.BoundedSemaphore(config.lean_max_concurrent_evaluations)
+    route_claims_enabled, route_claim_required, route_claim_ttl_seconds = (
+        _route_claim_settings(config)
+    )
     formal_policy = FormalToolPolicy(
         enabled=config.formal_tools_enabled,
         surface_version=config.formal_tools_version,
@@ -2656,6 +3141,9 @@ def run_experiment(
         selection_enabled=_selection_capabilities(config)[0],
         selection_search=selection_search,
         profiler=logger.profiler,
+        route_claims_enabled=route_claims_enabled,
+        route_claim_required=route_claim_required,
+        route_claim_ttl_seconds=route_claim_ttl_seconds,
     ).start()
     (run_dir / "judge_broker_policy.json").write_text(
         json.dumps(judge_broker.public_policy(), ensure_ascii=False, indent=2, sort_keys=True)
@@ -3413,6 +3901,17 @@ def _run_elastic_cps(
     allocation_lock = threading.RLock()
     roster: list[dict[str, Any]] = []
     roster_path.write_text("[]\n", encoding="utf-8")
+    route_claims_enabled, route_claim_required, route_claim_ttl_seconds = (
+        _route_claim_settings(config)
+    )
+    # ``actors.json`` remains a bounded historical projection for audit tools;
+    # the CPS actors table is authoritative for live discovery.  Keep an
+    # idempotent ledger so every admitted assignment is closed exactly once,
+    # including queue cancellation and evaluator-worker exceptions.
+    runtime_actor_lock = threading.RLock()
+    runtime_actor_assignments: dict[tuple[str, str, int], AgentAssignment] = {}
+    runtime_actor_finished: set[tuple[str, str, int]] = set()
+    runtime_actor_bypass: dict[tuple[str, str, int], str] = {}
     horizon_epoch_ms = int(
         (time.time() + max(0.0, deadline - time.monotonic())) * 1_000
     )
@@ -3479,6 +3978,130 @@ def _run_elastic_cps(
             return
         with state.lock:
             state.checker_outcome_ids.update(outcome_ids)
+
+    def register_assignment_actor(assignment: AgentAssignment) -> None:
+        """Persist live-roster admission before launching the solver."""
+
+        if not route_claims_enabled:
+            return
+        key = (assignment.task_id, assignment.agent_id, assignment.generation)
+        with runtime_actor_lock:
+            if key in runtime_actor_assignments:
+                return
+            ok, bypass_reason, result = _register_runtime_actor(
+                store,
+                task_id=assignment.task_id,
+                actor_id=assignment.agent_id,
+                episode=assignment.generation,
+                route_claims_enabled=route_claims_enabled,
+                deadline_epoch_ms=horizon_epoch_ms,
+            )
+            # Mark it as admitted even when the optional store is unavailable;
+            # this lets closeout attempt a best-effort finish if the store
+            # recovers while the worker is running.
+            runtime_actor_assignments[key] = assignment
+            if not ok:
+                runtime_actor_bypass[key] = bypass_reason or "unavailable"
+        logger.event(
+            "actor_roster_admitted" if ok else "actor_roster_bypass",
+            task_id=assignment.task_id,
+            agent_id=assignment.agent_id,
+            episode=assignment.generation,
+            route_claim_bypass_reason=bypass_reason,
+            active_roster_enabled=True,
+        )
+
+    def finish_assignment_actor(
+        assignment: AgentAssignment,
+        *,
+        verdict: Verdict | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Close one actor and release its active claims idempotently."""
+
+        if not route_claims_enabled:
+            return
+        key = (assignment.task_id, assignment.agent_id, assignment.generation)
+        with runtime_actor_lock:
+            if key not in runtime_actor_assignments or key in runtime_actor_finished:
+                return
+            runtime_actor_finished.add(key)
+        finish_status, finish_reason = _actor_finish_status(
+            verdict,
+            fallback_reason=reason,
+        )
+        ok, bypass_reason, _result = _finish_runtime_actor(
+            store,
+            task_id=assignment.task_id,
+            actor_id=assignment.agent_id,
+            episode=assignment.generation,
+            route_claims_enabled=route_claims_enabled,
+            status=finish_status,
+            reason=finish_reason,
+            # Terminal closeout must remain writable after the solver horizon;
+            # passing the expired run deadline would make CPS reject the very
+            # operation that releases stale route claims.
+            deadline_epoch_ms=None,
+        )
+        if not ok:
+            # Leave the actor pending so the runner's bounded closeout passes
+            # can retry a transient CPS failure.  A failed finish is never
+            # silently converted into a completed lifecycle record.
+            with runtime_actor_lock:
+                runtime_actor_finished.discard(key)
+        logger.event(
+            "actor_roster_finished" if ok else "actor_roster_finish_bypass",
+            task_id=assignment.task_id,
+            agent_id=assignment.agent_id,
+            episode=assignment.generation,
+            status=finish_status,
+            reason=finish_reason,
+            route_claim_bypass_reason=bypass_reason,
+            active_roster_enabled=True,
+        )
+
+    def finish_unsettled_assignment_actors(reason: str) -> None:
+        """Close assignments left in the queue when the run aborts early."""
+
+        if not route_claims_enabled:
+            return
+        # A transient SQLite/broker failure should not leave an admitted actor
+        # (and therefore its route claims) live merely because the first
+        # closeout call raced the failure.  Retry a small, time-bounded number
+        # of times; never spin indefinitely during run teardown.
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            with runtime_actor_lock:
+                pending = [
+                    assignment
+                    for key, assignment in runtime_actor_assignments.items()
+                    if key not in runtime_actor_finished
+                ]
+            if not pending:
+                return
+            for assignment in pending:
+                finish_assignment_actor(assignment, reason=reason)
+            if attempt + 1 < max_attempts:
+                time.sleep(0.02 * (attempt + 1))
+        with runtime_actor_lock:
+            unresolved = [
+                {
+                    "task_id": assignment.task_id,
+                    "agent_id": assignment.agent_id,
+                    "episode": assignment.generation,
+                }
+                for key, assignment in runtime_actor_assignments.items()
+                if key not in runtime_actor_finished
+            ]
+        if unresolved:
+            logger.event(
+                "actor_roster_unresolved",
+                reason=reason,
+                attempts=max_attempts,
+                unresolved=unresolved[:64],
+                unresolved_count=len(unresolved),
+                active_roster_enabled=True,
+            )
 
     def record_scheduler_result(result: AgentResult) -> None:
         """Publish exactly one scheduler result/event for a charged decision."""
@@ -4386,6 +5009,10 @@ def _run_elastic_cps(
         with state.lock:
             state.attempts += 1
             state.last_assignment_at = assignment.admitted_at
+        # This is the scheduler's actual admission point.  Registering here
+        # (rather than when the initial pool is planned) keeps future leases
+        # out of the live roster visible to peers.
+        register_assignment_actor(assignment)
         record_assignment(assignment, phase=phase, decision=decision)
         if phase == "initial":
             initial_assignment_count += 1
@@ -5027,6 +5654,15 @@ def _run_elastic_cps(
                 state.completed_attempts += 1
             result = _mock_result(actor, task.slug, assignment.generation)
             verdict = Verdict(task.slug, "CANCELLED", 0.0, 0.0, {"reason": "task_already_solved"})
+            # The solver was admitted but never started useful work because a
+            # peer had already solved the task. Close its roster/claims before
+            # yielding the released solver slot; evaluator bookkeeping below
+            # must not keep a non-running actor visible to later admissions.
+            finish_assignment_actor(
+                assignment,
+                verdict=verdict,
+                reason="solved_by_peer",
+            )
             logger.event("agent_finished", **result.as_dict())
             logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
             logger.event(
@@ -5050,7 +5686,7 @@ def _run_elastic_cps(
             phase="elastic_cps",
             selection_enabled=selection_enabled,
         ):
-            digest = (
+            digest = "" if route_claims_enabled else (
                 selection_runtime.digest(
                     task_id=task.slug,
                     actor_id=actor,
@@ -5060,7 +5696,7 @@ def _run_elastic_cps(
                 if selection_enabled
                 else policy.digest(task.slug, actor, query=task.theorem_name)
             )
-            prompt = build_task_prompt(
+            prompt = _build_route_task_prompt(
                 task,
                 task_workspace=str(workdir),
                 agent_id=actor,
@@ -5070,6 +5706,9 @@ def _run_elastic_cps(
                 direct_messages=direct_messages,
                 selection_enabled=selection_enabled,
                 digest=digest,
+                route_claims_enabled=route_claims_enabled,
+                route_claim_required=route_claim_required,
+                route_claim_ttl_seconds=route_claim_ttl_seconds,
             )
             if candidate_transfer:
                 prompt += (
@@ -5100,6 +5739,12 @@ def _run_elastic_cps(
                 selection_enabled=selection_enabled,
                 selection_search=selection_search,
                 roster_path=roster_path,
+                route_claims_enabled=route_claims_enabled,
+                route_claim_required=route_claim_required,
+                route_claim_ttl_seconds=route_claim_ttl_seconds,
+                route_claim_bypass_reason=runtime_actor_bypass.get(
+                    (assignment.task_id, assignment.agent_id, assignment.generation)
+                ),
                 on_authoritative_verdict=admit_early_proof,
                 cancel_event=assignment_cancel_event,
             ) as broker_env:
@@ -5118,6 +5763,15 @@ def _run_elastic_cps(
                         communication_enabled=policy.enabled,
                         direct_messages=direct_messages,
                         selection_enabled=selection_enabled,
+                        **_pi_route_claim_kwargs(
+                            pi_agent,
+                            enabled=route_claims_enabled,
+                            required=route_claim_required,
+                            ttl_seconds=route_claim_ttl_seconds,
+                            bypass_reason=runtime_actor_bypass.get(
+                                (assignment.task_id, assignment.agent_id, assignment.generation)
+                            ),
+                        ),
                     ),
                     task_id=task.slug,
                     actor_id=actor,
@@ -5131,6 +5785,25 @@ def _run_elastic_cps(
         )
         callback_failure.raise_if_failed()
         logger.event("agent_finished", **result.as_dict())
+
+        # Route ownership follows the actual Pi lifecycle, not the slower
+        # candidate-evaluation lifecycle. Release the actor as soon as the
+        # solver process ends so a newly admitted peer does not mistake a
+        # pending Judge evaluation for ongoing exploration.
+        with state.lock:
+            early_credit = state.early_proofs.get(actor)
+            already_solved = state.solved
+        if early_credit is not None:
+            solver_finish_reason = "solved"
+        elif result.cancelled:
+            solver_finish_reason = "solved_by_peer" if already_solved else "cancelled"
+        elif result.run_horizon_reached or time.monotonic() >= deadline:
+            solver_finish_reason = "timeout"
+        elif result.returncode != 0:
+            solver_finish_reason = "recovery_exhausted"
+        else:
+            solver_finish_reason = "solver_finished_pending_evaluation"
+        finish_assignment_actor(assignment, reason=solver_finish_reason)
 
         # Everything below this point is evaluator/commit work.  The queue
         # worker advances the generator only on the bounded evaluator pool, so
@@ -5412,6 +6085,8 @@ def _run_elastic_cps(
         *,
         release_backlog: bool,
     ) -> None:
+        settled_verdict: Verdict | None = None
+        settlement_reason: str | None = None
         try:
             try:
                 with logger.profile_span(
@@ -5436,9 +6111,11 @@ def _run_elastic_cps(
             ):
                 raise RuntimeError("assignment did not produce a complete settlement")
             result, verdict, _solved = settled
+            settled_verdict = verdict
             with results_lock:
                 results.append((result, verdict))
         except Exception as exc:
+            settlement_reason = "runner_error"
             record_run_failure()
             logger.event(
                 "evaluator_worker_error",
@@ -5452,6 +6129,11 @@ def _run_elastic_cps(
                 ),
             )
         finally:
+            finish_assignment_actor(
+                assignment,
+                verdict=settled_verdict,
+                reason=settlement_reason,
+            )
             if release_backlog:
                 evaluation_backlog_gate.release()
 
@@ -5465,6 +6147,7 @@ def _run_elastic_cps(
                 continue
             lease_released = False
             execution: Any | None = None
+            execution_handed_off = False
             try:
                 with logger.profile_span(
                     "attempt.wrapper.dispatch",
@@ -5521,6 +6204,7 @@ def _run_elastic_cps(
                             release_backlog=True,
                         )
                         execution = None
+                        execution_handed_off = True
                     except Exception:
                         evaluation_backlog_gate.release()
                         execution.close()
@@ -5542,6 +6226,7 @@ def _run_elastic_cps(
                         release_backlog=False,
                     )
                     execution = None
+                    execution_handed_off = True
                 replacement = claim_next()
                 if replacement is not None:
                     jobs.put(replacement)
@@ -5562,8 +6247,15 @@ def _run_elastic_cps(
                         scheduler.finish(assignment, solved=False)
                 if execution is not None:
                     execution.close()
+                if not execution_handed_off:
+                    finish_assignment_actor(assignment, reason="runner_error")
                 return
             finally:
+                if not execution_handed_off and execution is None:
+                    # A narrow branch can finish before the evaluator handoff
+                    # without entering the exception path (for example a
+                    # horizon-expired queue admission).
+                    finish_assignment_actor(assignment, reason="finished")
                 jobs.task_done()
 
     try:
@@ -5576,12 +6268,17 @@ def _run_elastic_cps(
         # Every admitted evaluator settles before candidate freezing.  This is
         # a bounded queue join, not a solver-slot join.
         evaluation_executor.shutdown(wait=True, cancel_futures=False)
+        finish_unsettled_assignment_actors("run_closeout")
 
     # Do this check after all worker/evaluator futures have settled.  A worker
     # exception may interrupt policy reconciliation, but it must not make a
     # staged scheduler process result disappear without a terminal runner
     # failure being recorded.
     lifecycle_failure = check_scheduler_result_lifecycle()
+    # Queue entries can remain unexecuted when the run-wide failure latch or
+    # horizon closes the worker loop. Reconcile every admitted actor before
+    # reporting health so no active claim survives runner closeout.
+    finish_unsettled_assignment_actors("run_closeout")
     # Preserve the runner's stable worker/admission failure contract when a
     # worker already latched the fatal bit.  The lifecycle probe above still
     # observes and reports orphaned staged rows in the no-worker-error case;
@@ -5720,6 +6417,161 @@ def _run_task_workers(
         if selection_runtime is not None
         else None
     )
+    route_claims_enabled, route_claim_required, route_claim_ttl_seconds = (
+        _route_claim_settings(config)
+    )
+    route_store = policy.store
+    route_roster_path = run_dir / "actors.json"
+    route_roster_lock = threading.RLock()
+    route_roster_projection: list[dict[str, Any]] = []
+    if policy.enabled or route_claims_enabled:
+        # This file is an audit projection only.  Never populate it with the
+        # future episode set; peers use the CPS actors table when treatment is
+        # enabled and therefore see only actual admissions.
+        route_roster_path.write_text("[]\n", encoding="utf-8")
+    route_actor_lock = threading.RLock()
+    route_actor_admitted: set[tuple[str, str, int]] = set()
+    route_actor_finished: set[tuple[str, str, int]] = set()
+    route_actor_bypass: dict[tuple[str, str, int], str] = {}
+
+    def register_task_actor(actor_id: str, episode: int, task_id: str) -> None:
+        if not route_claims_enabled:
+            return
+        key = (task_id, actor_id, episode)
+        with route_actor_lock:
+            if key in route_actor_admitted:
+                return
+            if route_store is None:
+                # Keep the admission ledger/projection explicit even when a
+                # staged harness omitted the optional CPS store.  The solver
+                # receives the same bounded fail-open marker as a transient
+                # store failure, so its pre-edit gate cannot deadlock.
+                ok, bypass_reason, _result = False, "unavailable", None
+            else:
+                ok, bypass_reason, _result = _register_runtime_actor(
+                    route_store,
+                    task_id=task_id,
+                    actor_id=actor_id,
+                    episode=episode,
+                    route_claims_enabled=route_claims_enabled,
+                    deadline_epoch_ms=int(
+                        (time.time() + max(0.0, deadline - time.monotonic())) * 1_000
+                    ),
+                )
+            route_actor_admitted.add(key)
+            if not ok:
+                route_actor_bypass[key] = bypass_reason or "unavailable"
+        with route_roster_lock:
+            route_roster_projection.append(
+                {"actor_id": actor_id, "task_id": task_id, "episode": episode}
+            )
+            temporary = route_roster_path.with_suffix(".tmp")
+            temporary.write_text(
+                json.dumps(
+                    route_roster_projection,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            temporary.replace(route_roster_path)
+        logger.event(
+            "actor_roster_admitted" if ok else "actor_roster_bypass",
+            task_id=task_id,
+            agent_id=actor_id,
+            episode=episode,
+            route_claim_bypass_reason=bypass_reason,
+            active_roster_enabled=True,
+        )
+
+    def finish_task_actor(
+        actor_id: str,
+        episode: int,
+        task_id: str,
+        *,
+        verdict: Verdict | None = None,
+        reason: str | None = None,
+    ) -> None:
+        if not route_claims_enabled:
+            return
+        key = (task_id, actor_id, episode)
+        with route_actor_lock:
+            if key not in route_actor_admitted or key in route_actor_finished:
+                return
+            route_actor_finished.add(key)
+        finish_status, finish_reason = _actor_finish_status(
+            verdict,
+            fallback_reason=reason,
+        )
+        if route_store is None:
+            # There is no durable actor row to finish.  Keep this as an
+            # explicit unresolved/bypass event rather than pretending that a
+            # claim was released; the closeout projection remains auditable.
+            ok, bypass_reason, _result = False, "unavailable", None
+        else:
+            ok, bypass_reason, _result = _finish_runtime_actor(
+                route_store,
+                task_id=task_id,
+                actor_id=actor_id,
+                episode=episode,
+                route_claims_enabled=route_claims_enabled,
+                status=finish_status,
+                reason=finish_reason,
+                # See elastic path: closeout writes must not be horizon guarded.
+                deadline_epoch_ms=None,
+            )
+        if not ok:
+            with route_actor_lock:
+                route_actor_finished.discard(key)
+        logger.event(
+            "actor_roster_finished" if ok else "actor_roster_finish_bypass",
+            task_id=task_id,
+            agent_id=actor_id,
+            episode=episode,
+            status=finish_status,
+            reason=finish_reason,
+            route_claim_bypass_reason=bypass_reason,
+            active_roster_enabled=True,
+        )
+
+    def finish_task_unsettled_actors(reason: str) -> None:
+        if not route_claims_enabled:
+            return
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            with route_actor_lock:
+                pending = [
+                    key
+                    for key in route_actor_admitted
+                    if key not in route_actor_finished
+                ]
+            if not pending:
+                return
+            for task_id, actor_id, episode in pending:
+                finish_task_actor(actor_id, episode, task_id, reason=reason)
+            if attempt + 1 < max_attempts:
+                time.sleep(0.02 * (attempt + 1))
+        with route_actor_lock:
+            unresolved = [
+                {
+                    "task_id": task_id,
+                    "agent_id": actor_id,
+                    "episode": episode,
+                }
+                for task_id, actor_id, episode in route_actor_admitted
+                if (task_id, actor_id, episode) not in route_actor_finished
+            ]
+        if unresolved:
+            logger.event(
+                "actor_roster_unresolved",
+                reason=reason,
+                attempts=max_attempts,
+                unresolved=unresolved[:64],
+                unresolved_count=len(unresolved),
+                active_roster_enabled=True,
+            )
 
     def execute(task: Task) -> tuple[AgentResult, Verdict]:
         workdir = run_dir / "workers" / task.slug
@@ -5813,6 +6665,10 @@ def _run_task_workers(
                 # directly by a narrow harness rather than normal CPS dispatch.
                 candidate_path.write_text(task.baseline_code, encoding="utf-8")
             actor = f"worker-{task.slug}-e{episode}"
+            # Admission precedes prompt construction and any Pi process.  A
+            # peer querying active routes can therefore distinguish this live
+            # actor from future episodes that have not yet been admitted.
+            register_task_actor(actor, episode, task.slug)
             with logger.profile_span(
                 "attempt.wrapper.prompt",
                 task_id=task.slug,
@@ -5823,7 +6679,7 @@ def _run_task_workers(
                 phase="task_worker",
                 selection_enabled=selection_enabled,
             ):
-                digest = (
+                digest = "" if route_claims_enabled else (
                     selection_runtime.digest(
                         task_id=task.slug,
                         actor_id=actor,
@@ -5833,7 +6689,7 @@ def _run_task_workers(
                     if selection_enabled
                     else policy.digest(task.slug, actor, query=task.theorem_name)
                 )
-                prompt = build_task_prompt(
+                prompt = _build_route_task_prompt(
                     task,
                     task_workspace=str(workdir),
                     agent_id=actor,
@@ -5843,6 +6699,9 @@ def _run_task_workers(
                     direct_messages=direct_messages,
                     selection_enabled=selection_enabled,
                     digest=digest,
+                    route_claims_enabled=route_claims_enabled,
+                    route_claim_required=route_claim_required,
+                    route_claim_ttl_seconds=route_claim_ttl_seconds,
                 )
             # Snapshot the candidate entering this logical attempt.  A failed
             # process may leave a partial file; task-level refill restores the
@@ -5868,6 +6727,12 @@ def _run_task_workers(
                         selection_enabled=selection_enabled,
                         selection_search=selection_search,
                         roster_path=(run_dir / "actors.json") if policy.enabled else None,
+                        route_claims_enabled=route_claims_enabled,
+                        route_claim_required=route_claim_required,
+                        route_claim_ttl_seconds=route_claim_ttl_seconds,
+                        route_claim_bypass_reason=route_actor_bypass.get(
+                            (task.slug, actor, episode)
+                        ),
                         on_authoritative_verdict=admit_early_proof,
                         cancel_event=run_cancel_event,
                     ) as broker_env:
@@ -5886,6 +6751,15 @@ def _run_task_workers(
                                 communication_enabled=policy.enabled,
                                 direct_messages=direct_messages,
                                 selection_enabled=selection_enabled,
+                                **_pi_route_claim_kwargs(
+                                    pi_agent,
+                                    enabled=route_claims_enabled,
+                                    required=route_claim_required,
+                                    ttl_seconds=route_claim_ttl_seconds,
+                                    bypass_reason=route_actor_bypass.get(
+                                        (task.slug, actor, episode)
+                                    ),
+                                ),
                             ),
                             task_id=task.slug,
                             actor_id=actor,
@@ -5958,6 +6832,30 @@ def _run_task_workers(
             logger.event("agent_finished", **result.as_dict())
             with early_lock:
                 credit = early_credit if early_credit and early_credit.episode == episode else None
+            # Route ownership follows the actual Pi lifecycle, not the slower
+            # candidate-evaluation lifecycle. Close this actor before starting
+            # evaluator work so later admissions do not see an idle solver as
+            # an active route owner.
+            if credit is not None:
+                solver_finish_reason = "solved"
+            elif result.cancelled:
+                with solved_lock:
+                    task_was_solved_by_peer = task.slug in solved_tasks
+                solver_finish_reason = (
+                    "solved_by_peer" if task_was_solved_by_peer else "cancelled"
+                )
+            elif result.run_horizon_reached or time.monotonic() >= deadline:
+                solver_finish_reason = "timeout"
+            elif result.returncode != 0:
+                solver_finish_reason = "recovery_exhausted"
+            else:
+                solver_finish_reason = "solver_finished_pending_evaluation"
+            finish_task_actor(
+                actor,
+                episode,
+                task.slug,
+                reason=solver_finish_reason,
+            )
             if result.returncode != 0 and credit is None:
                 # Keep prior best progress and make the failed attempt visible
                 # without turning it into a candidate Judge retry.  The
@@ -5978,6 +6876,13 @@ def _run_task_workers(
                         reason="replacement_limit",
                     )
                 if best_result is not None and best_verdict is not None:
+                    finish_task_actor(
+                        actor,
+                        episode,
+                        task.slug,
+                        verdict=best_verdict,
+                        reason="recovery_exhausted",
+                    )
                     return best_result, best_verdict
                 status = (
                     "CANCELLED"
@@ -6002,6 +6907,7 @@ def _run_task_workers(
                     source="agent_failure",
                     scoreboard_recorded=True,
                 )
+                finish_task_actor(actor, episode, task.slug, verdict=failed)
                 return result, failed
             if credit is not None:
                 _atomic_promote_source(
@@ -6066,6 +6972,7 @@ def _run_task_workers(
                     verdict=verdict,
                     feedback=feedback,
                 )
+            finish_task_actor(actor, episode, task.slug, verdict=verdict)
             if verdict.score >= 1.0:
                 break
         if best_result is None or best_verdict is None:
@@ -6074,20 +6981,33 @@ def _run_task_workers(
         return best_result, best_verdict
 
     results: list[tuple[AgentResult, Verdict]] = []
-    if policy.enabled:
+    if policy.enabled and not route_claims_enabled:
+        # Preserve the historical baseline projection.  Treatment runs use
+        # the dynamic projection above and intentionally omit future episodes.
         actors = [
-            {"actor_id": f"worker-{task.slug}-e{episode}", "task_id": task.slug, "episode": episode}
+            {
+                "actor_id": f"worker-{task.slug}-e{episode}",
+                "task_id": task.slug,
+                "episode": episode,
+            }
             for task in tasks
             for episode in range(1, config.episodes_per_task + 1)
         ]
-        (run_dir / "actors.json").write_text(
+        route_roster_path.write_text(
             json.dumps(actors, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-    with ThreadPoolExecutor(max_workers=config.max_parallel) as executor:
-        futures = {executor.submit(execute, task): task.slug for task in tasks}
-        for future in as_completed(futures):
-            results.append(future.result())
+        route_roster_projection.extend(actors)
+    try:
+        with ThreadPoolExecutor(max_workers=config.max_parallel) as executor:
+            futures = {executor.submit(execute, task): task.slug for task in tasks}
+            for future in as_completed(futures):
+                results.append(future.result())
+    finally:
+        # Covers cancellation, timeout, evaluator failure, and any unexpected
+        # exception after an episode's real admission.  ``finish_actor`` is
+        # idempotent and performs claim cleanup in the CPS transaction.
+        finish_task_unsettled_actors("run_closeout")
     results.sort(key=lambda pair: pair[1].task_id)
     return results
 

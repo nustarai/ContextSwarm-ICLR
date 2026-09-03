@@ -130,8 +130,10 @@ def _communication_instructions(
     *,
     direct_messages: bool = True,
     selection_enabled: bool = False,
+    route_claim_required: bool = False,
+    route_claim_ttl_seconds: int = 900,
 ) -> str:
-    if not enabled and not selection_enabled:
+    if not enabled and not selection_enabled and not route_claim_required:
         return (
             "This is a no-communication baseline. Do not read or write any shared "
             "CPS/blackboard state; work only from the files in this workspace."
@@ -142,8 +144,31 @@ acknowledge one, and `cps_actors` only when recipient discovery is needed.""" if
     selection = """
 Use `cps_feedback` only to record concise selection feedback for the runner-owned
 allocation state; it is not a direct-message channel.""" if selection_enabled else ""
-    return f"""This run exposes shared ContextSwarm state only through controlled CPS tools.
-Before trying a route, use `cps_search` to find relevant shared evidence. After a
+    route_claim = f"""
+This run has the active-route coordination treatment enabled. Before any extended
+reasoning, optional diagnostics, communication, or candidate edit, follow this
+fixed order:
+1. Read the public statement and immutable skeleton.
+2. Call `cps_active_routes` to inspect routes currently owned by admitted peers.
+3. Call `cps_claim_route` for the route you intend to explore, or provide a clear
+   `independent_verification_reason` in that call when deliberately checking a
+   peer's route. A conflict is information, not an automatic prohibition.
+4. Complete the mandatory early `judge_check` checkpoint.
+5. Only after the checkpoint use search/inbox/send/publish and write/edit the
+   candidate. `cps_update_route` and `cps_release_route` maintain your claim.
+Claims use the manifest-bound lease TTL of {route_claim_ttl_seconds} seconds unless
+the controlled capability applies a shorter remaining experiment horizon.
+If the broker is unavailable, preserve the explicit
+`route_claim_bypass_reason=unavailable` returned by the route capability and do
+not describe that fail-open path as a successful claim.""" if route_claim_required else ""
+    search_order = (
+        "After the early Judge checkpoint, use `cps_search` to find relevant shared "
+        "evidence."
+        if route_claim_required
+        else "Before trying a route, use `cps_search` to find relevant shared evidence."
+    )
+    return f"""This run exposes shared ContextSwarm state only through controlled CPS tools.{route_claim}
+{search_order} After a
 meaningful discovery, use `cps_publish` to leave a concise typed handoff. Use
 {direct}{selection}
 Do not access CPS through a local CLI, database, filesystem search, or custom
@@ -189,6 +214,8 @@ def build_task_prompt(
     formal_tools_enabled: bool = False,
     direct_messages: bool = True,
     selection_enabled: bool = False,
+    route_claim_required: bool = False,
+    route_claim_ttl_seconds: int = 900,
     digest: str = "",
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
@@ -213,7 +240,7 @@ or a local verification process.
 
 {_execution_contract(task)}
 
-{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
+{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled, route_claim_required=route_claim_required, route_claim_ttl_seconds=route_claim_ttl_seconds)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 
@@ -236,6 +263,8 @@ def build_mono_prompt(
     formal_tools_enabled: bool = False,
     direct_messages: bool = True,
     selection_enabled: bool = False,
+    route_claim_required: bool = False,
+    route_claim_ttl_seconds: int = 900,
 ) -> str:
     task_list = list(tasks)
     if not task_list:
@@ -267,7 +296,7 @@ Mono task-selection rule: this session owns multiple task directories. For every
 `{{"task_id": "<slug>"}}`; never make a no-argument call. A single-task
 Parallel worker may omit `task_id`, but Mono may not.
 
-{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
+{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled, route_claim_required=route_claim_required, route_claim_ttl_seconds=route_claim_ttl_seconds)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 

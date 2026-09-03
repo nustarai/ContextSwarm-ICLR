@@ -32,6 +32,12 @@ _CPS_SHARED_TOOLS = ("cps_search", "cps_publish")
 _CPS_DIRECT_TOOLS = ("cps_inbox", "cps_send", "cps_ack")
 _CPS_ACTOR_DISCOVERY_TOOL = "cps_actors"
 _CPS_SELECTION_TOOLS = ("cps_feedback",)
+_CPS_ROUTE_TOOLS = (
+    "cps_active_routes",
+    "cps_claim_route",
+    "cps_update_route",
+    "cps_release_route",
+)
 _SOLVER_EXTENSION_NAME = "pi_solver_tools.mjs"
 _FAST_MODE_EXTENSION_NAME = "pi_fast_mode.mjs"
 # Keep the helper interpreter lookup deterministic.  In particular, a worker
@@ -56,6 +62,18 @@ _BROKER_ENVIRONMENT_KEYS = frozenset(
     }
 )
 _BROKER_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
+_ROUTE_CLAIM_SYSTEM_PROMPT = """\nThis session has the active-route coordination treatment enabled. This
+treatment-specific order supersedes any generic baseline sentence above that
+would put the early Judge checkpoint before coordination. After reading
+the public task and immutable skeleton, call `cps_active_routes` and then either
+successfully call `cps_claim_route` for the route you intend to explore or make
+an explicit independent-verification declaration through that tool. Complete
+the early `judge_check` only after this route step. Do not use search, inbox,
+send, publish, or write/edit before the route step. If the controlled broker is
+temporarily unavailable, the route tool may report
+`route_claim_bypass_reason=unavailable`; preserve that reason and continue only
+on the fail-open path it explicitly reports. Never present a bypass as a claim.
+"""
 _SOLVER_SYSTEM_PROMPT = """You are a bounded formal-proof construction worker, not a general-purpose coding agent.
 Work only on the assigned result.lean and use only the explicitly provided tools.
 Do not execute shell commands, spawn background or parallel processes, run a local
@@ -66,10 +84,13 @@ judge_check tool and never reproduce it in the worker container. The
 CONTEXTSWARM_JUDGE_URL value is injected by the runner only as a session-scoped
 capability for that tool; do not read it, construct another client, or contact it
 directly. All dynamic Lean verification must use judge_check.
-Complete a mandatory early Judge checkpoint after initial file inspection and before
-extended proof search or CPS communication; do not wait for a polished proof. Any
-job-bound terminal candidate feedback, including a bounded resource or execution
-failure, is useful feedback even when it is not a proof.
+For baseline sessions without active-route treatment, complete a mandatory early judge_check checkpoint
+after initial file inspection and before extended proof search or
+CPS communication. When active-route treatment is enabled, follow the
+treatment-specific route-first contract appended by the runner; that contract
+supersedes this baseline ordering. Do not wait for a polished proof. Any job-bound
+terminal candidate feedback, including a bounded resource or execution failure,
+is useful feedback even when it is not a proof.
 If that tool is busy or unavailable, continue static proof reasoning or leave the best
 candidate for the runner; never create a local or raw-network fallback. The user prompt
 defines the assigned proof task and, when present, the controlled CPS protocol."""
@@ -91,8 +112,11 @@ compilation, test execution, resource limits, and semantic checking: submit ever
 authoritative attempt through the runner-provided judge_check tool. The
 CONTEXTSWARM_JUDGE_URL value is injected only as a session-scoped capability for
 that tool; never read it, construct another client, or contact it directly.
-Complete an early judge_check checkpoint after initial file inspection and before
-extended solution search or CPS communication; do not wait for a polished program.
+For baseline sessions without active-route treatment, complete a mandatory early judge_check checkpoint
+after initial file inspection and before extended solution search or CPS
+communication. When active-route treatment is enabled, follow the treatment-
+specific route-first contract appended by the runner; that contract supersedes this
+baseline ordering. Do not wait for a polished program.
 Compile errors, wrong answers, runtime errors, time/memory limits, and other
 job-bound terminal candidate results are useful feedback rather than experiment
 infrastructure failures. If judge_check is busy or unavailable, continue static
@@ -111,9 +135,12 @@ helpers and judge_check send all dynamic Lean work through the runner-provided r
 loopback capability. The CONTEXTSWARM_JUDGE_URL value is injected by the runner only
 as a session-scoped capability for those controlled interfaces; do not read it,
 construct another client, or contact it directly.
-Complete a mandatory early judge_check checkpoint after initial file inspection and
-before helper diagnostics, extended proof search, or CPS communication; do not wait
-for a polished proof. Any job-bound terminal candidate feedback, including a bounded
+For baseline sessions without active-route treatment, complete a mandatory early judge_check checkpoint
+after initial file inspection and before helper diagnostics,
+extended proof search, or CPS communication. When active-route treatment is enabled,
+follow the treatment-specific route-first contract appended by the runner; that
+contract supersedes this baseline ordering. Do not wait for a polished proof. Any
+job-bound terminal candidate feedback, including a bounded
 resource or execution failure, is useful feedback even when it is not a proof.
 If a controlled tool is busy or unavailable, continue static proof reasoning or leave
 the best candidate for the runner; never create a local or raw-network fallback. The
@@ -132,6 +159,11 @@ _CPS_ENVIRONMENT_KEYS = frozenset(
         "CONTEXTSWARM_ASSIGNMENT_FILE",
         "CONTEXTSWARM_BEST_CANDIDATE_FILE",
         "CONTEXTSWARM_TASK_ROOT",
+        "CONTEXTSWARM_EPISODE",
+        "CONTEXTSWARM_CPS_ROUTE_CLAIM_REQUIRED",
+        "CONTEXTSWARM_CPS_ROUTE_CLAIM_BYPASS_REASON",
+        "CONTEXTSWARM_CPS_ACTIVE_ROSTER_ENABLED",
+        "CONTEXTSWARM_CPS_ROUTE_CLAIM_TTL_SECONDS",
     }
 )
 _EVALUATOR_ENVIRONMENT_KEYS = frozenset(
@@ -198,7 +230,34 @@ class PiAgent:
         communication_enabled: bool | None = None,
         direct_messages: bool = True,
         selection_enabled: bool = False,
+        route_claims_enabled: bool | None = None,
+        route_claim_required: bool | None = None,
+        route_claim_ttl_seconds: int | None = None,
+        route_claim_bypass_reason: str | None = None,
     ) -> list[str]:
+        self._route_claim_bypass_reason(route_claim_bypass_reason)
+        route_required, _route_ttl = self._route_claim_capability(
+            route_claim_required, route_claim_ttl_seconds
+        )
+        if route_claims_enabled is not None and not isinstance(route_claims_enabled, bool):
+            raise ValueError("route_claims_enabled must be a boolean or None")
+        route_surface_enabled = route_required or (
+            route_claims_enabled if route_claims_enabled is not None else False
+        )
+        base_system_prompt = (
+            _ISOLATED_SYSTEM_PROMPT
+            if isolated
+            else _CODING_SOLVER_SYSTEM_PROMPT
+            if self.config.is_coding
+            else _FORMAL_SOLVER_SYSTEM_PROMPT
+            if self.config.formal_tools_enabled
+            else _SOLVER_SYSTEM_PROMPT
+        )
+        system_prompt = (
+            base_system_prompt + _ROUTE_CLAIM_SYSTEM_PROMPT
+            if route_required and not isolated
+            else base_system_prompt
+        )
         command = [
             self.binary(),
             "--mode",
@@ -207,15 +266,7 @@ class PiAgent:
             "--thinking",
             self.config.thinking,
             "--system-prompt",
-            (
-                _ISOLATED_SYSTEM_PROMPT
-                if isolated
-                else _CODING_SOLVER_SYSTEM_PROMPT
-                if self.config.is_coding
-                else _FORMAL_SOLVER_SYSTEM_PROMPT
-                if self.config.formal_tools_enabled
-                else _SOLVER_SYSTEM_PROMPT
-            ),
+            system_prompt,
         ]
         if session_dir is not None:
             command.extend(["--session-dir", str(session_dir)])
@@ -244,6 +295,8 @@ class PiAgent:
                             communication_enabled=communication_enabled,
                             direct_messages=direct_messages,
                             selection_enabled=selection_enabled,
+                            route_claims_enabled=route_surface_enabled,
+                            route_claim_required=route_required,
                         )
                     ),
                 ]
@@ -300,12 +353,74 @@ class PiAgent:
             "extensions": rows,
         }
 
+    def _route_claim_capability(
+        self,
+        required: bool | None = None,
+        ttl_seconds: int | None = None,
+    ) -> tuple[bool, int]:
+        """Resolve the runner-bound route capability without ambient env input.
+
+        The manifest is the default source.  Explicit call-site values are
+        useful for recovery/session tests and must be strict so a worker cannot
+        silently widen the capability by passing truthy strings or an invalid
+        lease duration.
+        """
+
+        features = getattr(self.config, "cps_features", None)
+        configured_required = bool(
+            getattr(
+                features,
+                "route_claim_required",
+                getattr(self.config, "route_claim_required", False),
+            )
+        )
+        configured_ttl_raw = getattr(
+            features,
+            "route_claim_ttl_seconds",
+            getattr(self.config, "route_claim_ttl_seconds", 900),
+        )
+        if (
+            isinstance(configured_ttl_raw, bool)
+            or not isinstance(configured_ttl_raw, int)
+        ):
+            raise ValueError("configured route claim TTL must be an integer")
+        configured_ttl = configured_ttl_raw
+        if configured_ttl <= 0:
+            raise ValueError("configured route claim TTL must be positive")
+        if required is not None and not isinstance(required, bool):
+            raise ValueError("route_claim_required must be a boolean or None")
+        if required is False and configured_required:
+            raise ValueError("cannot disable manifest-required route claims")
+        if ttl_seconds is not None:
+            if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
+                raise ValueError("route_claim_ttl_seconds must be a positive integer")
+            if ttl_seconds <= 0:
+                raise ValueError("route_claim_ttl_seconds must be a positive integer")
+        return configured_required if required is None else (configured_required or required), (
+            configured_ttl if ttl_seconds is None else ttl_seconds
+        )
+
+    @staticmethod
+    def _route_claim_bypass_reason(value: str | None) -> str | None:
+        """Normalize the runner-owned fail-open marker passed to Pi."""
+
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("route_claim_bypass_reason must be a string or None")
+        normalized = value.strip().lower()
+        if normalized not in {"unavailable", "error", "expired", "cancelled"}:
+            raise ValueError("route_claim_bypass_reason is not recognized")
+        return normalized
+
     def solver_tools(
         self,
         *,
         communication_enabled: bool | None = None,
         direct_messages: bool = True,
         selection_enabled: bool = False,
+        route_claim_required: bool | None = None,
+        route_claims_enabled: bool | None = None,
     ) -> tuple[str, ...]:
         """Return the explicit solver capability allowlist.
 
@@ -314,6 +429,12 @@ class PiAgent:
         messaging without changing any non-CPS capability.
         """
 
+        route_required, _route_ttl = self._route_claim_capability(route_claim_required)
+        if route_claims_enabled is not None and not isinstance(route_claims_enabled, bool):
+            raise ValueError("route_claims_enabled must be a boolean or None")
+        route_surface_enabled = route_required or (
+            route_claims_enabled if route_claims_enabled is not None else False
+        )
         tools = [*_FILE_TOOLS, "judge_check"]
         if self.config.formal_tools_enabled:
             tools.append("bash")
@@ -325,6 +446,13 @@ class PiAgent:
                 tools.append(_CPS_ACTOR_DISCOVERY_TOOL)
             if selection_enabled:
                 tools.extend(_CPS_SELECTION_TOOLS)
+            if route_surface_enabled:
+                tools.extend(_CPS_ROUTE_TOOLS)
+        elif route_surface_enabled:
+            # Route coordination is itself a CPS surface.  Keep this branch for
+            # explicit session overrides even when a caller has not separately
+            # enabled legacy search/direct messaging.
+            tools.extend(_CPS_ROUTE_TOOLS)
         return tuple(tools)
 
     def environment(
@@ -333,11 +461,25 @@ class PiAgent:
         task_id: str,
         actor_id: str,
         workdir: Path,
+        episode: int | None = None,
         extra_env: Mapping[str, str] | None = None,
         communication_enabled: bool | None = None,
         direct_messages: bool = True,
         selection_enabled: bool = False,
+        route_claims_enabled: bool | None = None,
+        route_claim_required: bool | None = None,
+        route_claim_ttl_seconds: int | None = None,
+        route_claim_bypass_reason: str | None = None,
     ) -> dict[str, str]:
+        route_required, route_ttl = self._route_claim_capability(
+            route_claim_required, route_claim_ttl_seconds
+        )
+        bypass_reason = self._route_claim_bypass_reason(route_claim_bypass_reason)
+        if route_claims_enabled is not None and not isinstance(route_claims_enabled, bool):
+            raise ValueError("route_claims_enabled must be a boolean or None")
+        route_surface_enabled = route_required or (
+            route_claims_enabled if route_claims_enabled is not None else False
+        )
         # Start from a deliberately tiny parent-environment allowlist.  This
         # prevents ambient PATH/PYTHONPATH and operator credentials from
         # becoming an alternate helper, evaluator, or import boundary.
@@ -386,11 +528,21 @@ class PiAgent:
                 "AISW_LEASE_RETRY_INTERVAL_SECONDS": str(self.config.aisw_lease_retry_interval_seconds),
             }
         )
+        if episode is not None:
+            if isinstance(episode, bool) or not isinstance(episode, int) or episode < 0:
+                raise ValueError("episode must be a non-negative integer")
+            env["CONTEXTSWARM_EPISODE"] = str(episode)
         # These public capability bits keep the extension's registered surface
         # aligned with the Pi allowlist.  Defaults preserve the historical
         # direct-message CPS surface for existing runner call sites.
         env["CONTEXTSWARM_CPS_DIRECT_MESSAGES"] = "1" if direct_messages else "0"
         env["CONTEXTSWARM_CPS_SELECTION_ENABLED"] = "1" if selection_enabled else "0"
+        env["CONTEXTSWARM_CPS_ROUTE_CLAIM_REQUIRED"] = "1" if route_required else "0"
+        env["CONTEXTSWARM_CPS_ROUTE_CLAIMS_ENABLED"] = "1" if route_surface_enabled else "0"
+        env["CONTEXTSWARM_CPS_ACTIVE_ROSTER_ENABLED"] = "1" if route_surface_enabled else "0"
+        env["CONTEXTSWARM_CPS_ROUTE_CLAIM_TTL_SECONDS"] = str(route_ttl)
+        if bypass_reason is not None:
+            env["CONTEXTSWARM_CPS_ROUTE_CLAIM_BYPASS_REASON"] = bypass_reason
         # Do not append an operator-supplied PYTHONPATH.  The runner package is
         # the only import root required by the controlled helper/client path.
         env["PYTHONPATH"] = str(self.config.repo_root)
@@ -466,6 +618,10 @@ class PiAgent:
         communication_enabled: bool | None = None,
         direct_messages: bool = True,
         selection_enabled: bool = False,
+        route_claims_enabled: bool | None = None,
+        route_claim_required: bool | None = None,
+        route_claim_ttl_seconds: int | None = None,
+        route_claim_bypass_reason: str | None = None,
     ) -> AgentResult:
         started = now_iso()
         profiler = self.profiler
@@ -498,6 +654,10 @@ class PiAgent:
             communication_enabled=communication_enabled,
             direct_messages=direct_messages,
             selection_enabled=selection_enabled,
+            route_claims_enabled=route_claims_enabled,
+            route_claim_required=route_claim_required,
+            route_claim_ttl_seconds=route_claim_ttl_seconds,
+            route_claim_bypass_reason=route_claim_bypass_reason,
         )
         output = _TailBuffer(6_000)
         errors = _TailBuffer(4_000)
@@ -768,6 +928,10 @@ class PiAgent:
                 communication_enabled=communication_enabled,
                 direct_messages=direct_messages,
                 selection_enabled=selection_enabled,
+                route_claims_enabled=route_claims_enabled,
+                route_claim_required=route_claim_required,
+                route_claim_ttl_seconds=route_claim_ttl_seconds,
+                route_claim_bypass_reason=route_claim_bypass_reason,
             )
             if self.trace_path is not None:
                 self.trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -781,10 +945,15 @@ class PiAgent:
                     task_id=task_id,
                     actor_id=actor_id,
                     workdir=workdir,
+                    episode=episode,
                     extra_env=extra_env,
                     communication_enabled=communication_enabled,
                     direct_messages=direct_messages,
                     selection_enabled=selection_enabled,
+                    route_claims_enabled=route_claims_enabled,
+                    route_claim_required=route_claim_required,
+                    route_claim_ttl_seconds=route_claim_ttl_seconds,
+                    route_claim_bypass_reason=route_claim_bypass_reason,
                 ),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,

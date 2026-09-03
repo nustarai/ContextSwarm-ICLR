@@ -193,6 +193,79 @@ class CPSProfileSpanTests(unittest.TestCase):
             self.assertEqual(terminal[0]["reason"], "commit_failed")
             self.assertEqual(terminal[0]["rows_written"], 0)
 
+    def test_route_lifecycle_uses_profiled_write_envelopes(self) -> None:
+        """New roster/route operations retain stable profiling attribution."""
+
+        with tempfile.TemporaryDirectory(
+            prefix=".contextswarm-route-profile-", dir=str(ROOT)
+        ) as temporary:
+            root = Path(temporary)
+            profiler = RunProfiler(
+                root / "profile",
+                enabled=True,
+                heartbeat_interval_seconds=60,
+                run_id="route-lifecycle",
+            )
+            profiler.start()
+            store = CPSStore(root / "cps.sqlite3", profiler=profiler)
+            store.register_actor("task", "actor", 1, now=100)
+            store.list_active_actors("task", now=100)
+            claimed = store.claim_route(
+                "task",
+                "actor",
+                1,
+                "algebra/main",
+                "factor the target",
+                now=100,
+            )
+            store.list_active_routes("task", now=100)
+            store.heartbeat_actor("task", "actor", now=101)
+            store.update_route_claim(
+                str(claimed["claim_id"]),
+                "actor",
+                status="blocked",
+                now=102,
+            )
+            store.release_route_claim(
+                str(claimed["claim_id"]),
+                "actor",
+                reason="test complete",
+                now=103,
+            )
+            store.finish_actor("task", "actor", episode=1, now=104)
+            profiler.close()
+
+            rows = self._rows(root / "profile" / PROFILE_FILENAME)
+            terminals = [
+                row for row in rows if row["event"] == "cps.write.commit"
+            ]
+            expected = {
+                "actor.register",
+                "actor.list_active",
+                "route.claim",
+                "route.list_active",
+                "actor.heartbeat",
+                "route.update",
+                "route.release",
+                "actor.finish",
+            }
+            observed = {
+                str(row.get("db_operation"))
+                for row in terminals
+                if row.get("status") == "ok"
+            }
+            self.assertTrue(expected.issubset(observed))
+            connect_operations = {
+                str(row.get("db_operation"))
+                for row in rows
+                if row["event"] == "cps.sqlite.connect"
+            }
+            self.assertTrue(
+                {f"write:{operation}" for operation in expected}.issubset(
+                    connect_operations
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -248,6 +248,107 @@ _SELECTION_FIELDS = frozenset(
     }
 )
 
+# CPS feature flags are kept in a separate manifest-owned table so a treatment
+# arm can be compared with a communication baseline without smuggling behavior
+# through the worker environment.  The latter two fields are reserved for the
+# follow-up receipt/knowledge-promotion experiments; they are intentionally
+# parsed and identity-bound now, but do not enable any runtime behavior here.
+_CPS_FEATURE_FIELDS = frozenset(
+    {
+        "route_claim_required",
+        "route_claim_ttl_seconds",
+        "per_recipient_receipts",
+        "knowledge_promotion",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CPSFeatureConfig:
+    """Manifest-owned CPS treatment capabilities.
+
+    ``route_claim_required`` is the first implemented treatment.  It also
+    enables the runner-owned active actor roster: an actor must be admitted and
+    visible before it can participate in route coordination.  Receipt and
+    promotion flags are recorded as part of the experiment identity but remain
+    inert until their respective protocol slices are delivered.
+    """
+
+    route_claim_required: bool = False
+    route_claim_ttl_seconds: int = 900
+    per_recipient_receipts: bool = False
+    knowledge_promotion: bool = False
+
+    @property
+    def active_roster_enabled(self) -> bool:
+        """Whether the runner-owned active actor roster is required."""
+
+        return self.route_claim_required
+
+    @property
+    def enabled(self) -> bool:
+        """Whether any route-claim/active-roster surface is enabled."""
+
+        return self.route_claim_required
+
+    @property
+    def route_claims_enabled(self) -> bool:
+        """Plural compatibility spelling used by runner adapters."""
+
+        return self.route_claim_required
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "route_claim_required": self.route_claim_required,
+            "route_claim_ttl_seconds": self.route_claim_ttl_seconds,
+            "per_recipient_receipts": self.per_recipient_receipts,
+            "knowledge_promotion": self.knowledge_promotion,
+        }
+
+    # Keep a named identity helper alongside SelectionConfig.  This makes the
+    # treatment boundary explicit to callers that build comparison hashes.
+    def hash_inputs(self) -> dict[str, Any]:
+        return self.public_dict()
+
+
+def _parse_cps_features(value: Any, *, table_name: str = "cps_features") -> CPSFeatureConfig:
+    """Parse the explicit CPS feature table with strict types and bounds."""
+
+    features = _as_dict(value, table_name)
+    unknown = set(features) - _CPS_FEATURE_FIELDS
+    if unknown:
+        raise ConfigError(
+            f"unknown {table_name} fields: " + ", ".join(sorted(unknown))
+        )
+
+    def optional_bool(key: str, default: bool = False) -> bool:
+        if key not in features:
+            return default
+        return _strict_bool(features[key], f"{table_name}.{key}")
+
+    if "route_claim_ttl_seconds" not in features:
+        ttl = 900
+    else:
+        # Do not coerce TOML booleans/floats (``True`` -> 1 and ``1.5`` -> 1)
+        # into a lease duration.  The route capability is a manifest identity
+        # and must have the same integer semantics at config, broker, and Pi
+        # boundaries.
+        ttl = _required_positive_int(
+            features,
+            "route_claim_ttl_seconds",
+            table_name,
+        )
+        if ttl > 86_400:
+            raise ConfigError(
+                f"{table_name}.route_claim_ttl_seconds must not exceed 86400"
+            )
+    return CPSFeatureConfig(
+        route_claim_required=optional_bool("route_claim_required"),
+        route_claim_ttl_seconds=ttl,
+        per_recipient_receipts=optional_bool("per_recipient_receipts"),
+        knowledge_promotion=optional_bool("knowledge_promotion"),
+    )
+
 
 @dataclass(frozen=True)
 class SelectionConfig:
@@ -544,10 +645,37 @@ class ExperimentConfig:
     docker_internet: str
     docker_network: str
     extra: dict[str, Any] = field(default_factory=dict)
+    # Appended after the historical fields so direct positional construction
+    # of ExperimentConfig in older harnesses remains source-compatible.
+    cps_features: CPSFeatureConfig = field(default_factory=CPSFeatureConfig)
 
     @property
     def uses_cps(self) -> bool:
         return self.mode == "cps" and self.communication != "none"
+
+    @property
+    def route_claim_required(self) -> bool:
+        """Compatibility view of the manifest-owned route treatment flag."""
+
+        return self.cps_features.route_claim_required
+
+    @property
+    def route_claim_ttl_seconds(self) -> int:
+        """Compatibility view of the route claim lease TTL."""
+
+        return self.cps_features.route_claim_ttl_seconds
+
+    @property
+    def active_roster_enabled(self) -> bool:
+        """Whether route coordination requires the active actor roster."""
+
+        return self.cps_features.active_roster_enabled
+
+    @property
+    def route_claims_enabled(self) -> bool:
+        """Whether the route coordination capability surface is enabled."""
+
+        return self.cps_features.route_claims_enabled
 
     @property
     def is_coding(self) -> bool:
@@ -605,6 +733,7 @@ class ExperimentConfig:
             "assignment_policy": self.assignment_policy,
             "allocation": self.allocation.public_dict(),
             "selection": self.selection.public_dict(),
+            "cps_features": self.cps_features.public_dict(),
             "figure4_phase": self.figure4_phase,
             "episodes_per_task": self.episodes_per_task,
             "max_tasks": self.max_tasks,
@@ -687,6 +816,19 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     judge = _as_dict(payload.get("judge"), "judge")
     formal_tools = _as_dict(payload.get("formal_tools"), "formal_tools")
     docker = _as_dict(payload.get("docker"), "docker")
+    raw_cps_features = payload.get("cps_features")
+    # ``[cps_features]`` is canonical.  Accept the shorter ``[cps]`` spelling
+    # for hand-authored local manifests, but reject contradictory dual tables
+    # instead of silently selecting one identity.
+    legacy_cps_features = payload.get("cps")
+    if raw_cps_features is not None and legacy_cps_features is not None:
+        if raw_cps_features != legacy_cps_features:
+            raise ConfigError("cps_features and cps tables contradict each other")
+    if raw_cps_features is None and legacy_cps_features is not None:
+        raw_cps_features = legacy_cps_features
+        cps_features = _parse_cps_features(raw_cps_features, table_name="cps")
+    else:
+        cps_features = _parse_cps_features(raw_cps_features)
     allocation = _as_dict(payload.get("allocation"), "allocation")
     allocation_formula = _as_dict(allocation.get("formula"), "allocation.formula")
     allocation_task_state = _as_dict(
@@ -709,6 +851,13 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         raise ConfigError(f"experiment.communication must be one of {sorted(allowed_communication)}")
     if mode in {"mono", "parallel"} and communication != "none":
         raise ConfigError("mono and parallel baselines must run with communication = none")
+    if cps_features.route_claim_required and (
+        mode != "cps" or communication == "none"
+    ):
+        raise ConfigError(
+            "cps_features.route_claim_required requires experiment.mode = cps "
+            "with a CPS communication surface"
+        )
     if selection_config.enabled:
         if mode != "cps":
             raise ConfigError("enabled selection requires experiment.mode = cps")
@@ -1084,6 +1233,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         assignment_policy=assignment_policy,
         allocation=allocation_config,
         selection=selection_config,
+        cps_features=cps_features,
         figure4_phase=figure4_phase,
         episodes_per_task=episodes,
         max_tasks=max_tasks,
