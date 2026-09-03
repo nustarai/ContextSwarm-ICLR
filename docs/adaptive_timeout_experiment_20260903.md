@@ -64,8 +64,8 @@ backend active job 平均约 3.98、P95 9、峰值 19，queue depth 中位数 1�
 timeout；`imo2023_p2_v2` 的非 timeout P95 已约 46.491 s；`imo2023_p4` 整体中位数
 约 21.413 s。因此不能把全局固定 60 s 当作所有题目的安全硬上限。
 
-历史数据还给出两个保护性结论：四次 early proof 的耗时约为 5.04、12.61、12.61、
-41.77 s，合法 proof 不能简单地被 60 s 硬截断；而 `EXECUTION_TIMEOUT`、
+历史数据还给出两个保护性结论：四次首轮 `judge_check` 的 `PROVED` probe elapsed
+约为 5.04、12.61、12.61、41.77 s，合法 proof 不能简单地被 60 s 硬截断；而 `EXECUTION_TIMEOUT`、
 `RESOURCE_LIMIT`、取消和基础设施错误必须与候选 `VERIFY_FAIL` 分层统计。
 
 ### 2.2 可用的同类控制样本
