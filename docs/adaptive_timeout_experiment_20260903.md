@@ -3,8 +3,9 @@
 > **实验目的**：验证让 Agent 为 `judge_check` 和 `evaluate_local` 提议一次验证预算，
 > 同时由 broker/evaluator 做硬上限裁剪，是否能缓解少量验证长尾占用大量总时长的问题。
 >
-> **记录状态**：实现与一轮 treatment run 已完成；本文的数值结论仅适用于列明的
-> source/image/Judge 合同，不能替代 matched control 或多轮因果验证。
+> **记录状态**：实现与两轮 treatment run 已完成，其中 `treatment-r2` 使用本节所述的
+> 累计预算 retry 语义；本文的数值结论仅适用于列明的 source/image/Judge 合同，不能替代
+> matched control 或多轮因果验证。
 
 ## 1. 问题与假设
 
@@ -233,6 +234,70 @@ adoption，prompt 默认要求正常验证调用显式给值；只有刻意测�
   profiler 质量问题：108 行共 324 个 dropped fields，以及 13 个未闭合 tool span；
   timeout metadata 本身未产生 dropped field。因而本轮 profiling 适合做受限性能分析，
   不应标成 clean audit。
+
+### 5.3 修订后的累计预算 run（treatment-r2）
+
+这一轮是在 `1de0079` 上重新构建镜像并完整跑满 3,600 s horizon 的匹配 treatment，目的是
+验证“retry 次数独立于 Agent 选择的秒数，但所有 fresh attempt 共用一个绝对总预算”的实现，
+而不是再次测量旧的 `max_retries=0` treatment。运行身份如下：
+
+- run ID：`20260903T103509Z-251d9cbe`
+- source commit：`1de0079c8e30c4a7f89899a28a1189e63f233d21`
+- image ID：`sha256:c065a9ae8517616bb4b50328bea5ae441476f71522417a3a7eb6793d9c0ae054`
+- manifest：`configs/formal_1h_cps32_profiled_adaptive_timeout.toml`，SHA-256
+  `33f0506df80db26d946236e59e070b4b065431eea892957e469494e5f3a07289`
+
+| 指标 | 主历史参考 | treatment-r1（旧语义） | treatment-r2（累计预算） |
+|---|---:|---:|---:|
+| final status / score | `DEGRADED` / 5 | `DEGRADED` / 4 | `DEGRADED` / 6 |
+| 全部 / accepted / rejected | 1,499 / 1,441 / 58 | 1,879 / 1,873 / 6 | 1,506 / 1,505 / 1 |
+| fresh accepted / cache reused | 1,252 / 189 | 1,636 / 237 | 1,505 / 0 |
+| timeout adoption（fresh） | 不适用 | 1,636/1,636 = 100% | 1,505/1,505 = 100% |
+| clamp / omitted（fresh） | 不适用 | 0 / 0 | 0 / 0 |
+| fresh elapsed 平均 / 中位数 | 9.891936 / 1.274114 s | 4.614044 / 1.369249 s | 4.632415 / 2.522236 s |
+| fresh elapsed P90 / P95 / P99 | 6.293134 / 20.205775 / 279.994298 s | 10.085821 / 17.262217 / 62.371901 s | 7.549156 / 12.607708 / 62.816472 s |
+| fresh elapsed 最大 | 603.289839 s | 122.214555 s | 180.865324 s |
+| fresh elapsed 累计 | 12,384.704 s | 7,548.575 s | 6,971.784 s |
+| fresh >60 s：n / 累计 / share | 25 / 8,502.041 s / 68.650% | 20 / 1,639.295 s / 21.717% | 22 / 1,763.523 s / 25.295% |
+| fresh >120 s：n / 累计 / share | 17 / 7,897.338 s / 63.767% | 4 / 487.037 s / 6.452% | 4 / 542.837 s / 7.786% |
+| fresh >300 s：n / 累计 / share | 13 / 7,008.378 s / 56.589% | 0 / 0 s / 0% | 0 / 0 s / 0% |
+| fresh >600 s：n / 累计 / share | 9 / 5,423.513 s / 43.792% | 0 / 0 s / 0% | 0 / 0 s / 0% |
+| fresh `PROVED` / `EVALUATOR_TIMEOUT` | 5 / 9 | 4 / 10 | 6 / 24 |
+
+`r2` 的 timeout 请求分布为 `15:4，20:9，25:3，30:287，35:4，40:2，45:72，60:928，
+75:3，90:86，120:88，150:5，180:13，240:1`（请求值:次数）；1,505 个 fresh accepted
+调用全部带有 `timeout_budget_mode=cumulative_total`，没有 clamp。1,502 个调用实际启动了
+一个 backend attempt，另有 3 个在 run horizon 收口前已无足够时间而零 attempt 结束；所有
+记录的 `judge_retry_count` 都是 0。也就是说，这一小时 workload 没有自然触发可安全重试的
+candidate-independent transient failure，不能把“没有 retry”误读成 retry 功能被关闭。
+
+`evaluate_local` 共 91 次，全部携带 Agent timeout、没有 clamp，均为一个 backend-job unit
+和零 retry；状态为 `VERIFY_FAIL` 53、`COMPILES_WITH_SORRY` 29、`EVALUATOR_TIMEOUT` 6、
+`CHEATING` 2、`TASK_CANCELLED` 1。`formal_query` 仍有 886 次，继续使用 legacy timeout
+合同，因此 r2 也没有覆盖所有 formal-helper backend work。
+
+后端结构化日志显示 2,064 个 job submitted 且 2,064 个 finished：显式 custom bucket
+（`max_retries=0`，由外层累计预算循环持有 retry 责任）1,580 个、execution work
+6,186.572 s、最大 180.126 s；legacy bucket（`max_retries=1`，主要是 formal-query/closeout）
+484 个、627.900 s、最大 65.433 s。这个 bucket 拆分证明单个 custom job 没有偷偷恢复
+旧的 per-job retry；它不能单独作为总成本因果估计，因为 r2 的 Agent 轨迹和 fresh 请求数
+与 r1 不相同。
+
+运行健康和证据边界：`final.json` 为 `DEGRADED`、score 6/12，149 个 assignment，
+127 个 solver timeout、22 个 solver cancellation、25 个 Judge probe infrastructure
+error；OOM/exit-137 和 runner/worker unexpected error 为 0。broker closeout 安全通过：
+`active_handlers=0`、`fifo_depth=0`、`remote_unsettled_jobs=0`，supervisor exit 0。
+profiling 共 296,158 行，序列连续且无敏感字段；`judge.execute` start/end 为 1,505/1,505。
+审计退出码为 1，具体是 351 个 dropped fields（117 行）和 1 个未闭合 span；这与 r1 的
+profiler 质量问题同类，不能标成 clean audit。workload 日志中的少量 `BrokenPipe` 是客户端
+在有界取消/超时收口后 broker 写回的既有 teardown 噪声；本次 closeout 仍确认没有未结算 job。
+
+这轮对历史参考的方向性结果是：最大 Judge-facing elapsed 从约 603 s 降到 181 s，>300 s
+和 >600 s tail 消失；但相对于旧 treatment-r1，>60 s tail 略高（25.295% 对 21.717%），
+不能归因于累计 retry 语义，因为题目轨迹、健康状态和请求分母不同。更关键的是，r2 没有
+自然瞬态 retry，所以“30 s 后剩 270 s”由确定性单元/集成测试和受控 fake-backend probe
+验证，而不是由这轮自然 workload 直接观察到。要评估 retry 是否在不牺牲 proof 率的前提下
+减少长尾，还需要 matched control 与故障注入的 transient-retry run。
 
 ## 6. 解释与决策门槛
 
