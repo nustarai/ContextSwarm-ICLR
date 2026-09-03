@@ -147,27 +147,70 @@ adoption，prompt 默认要求正常验证调用显式给值；只有刻意测�
 - **安全结果**：任何 `remote_unsettled_jobs > 0`、未配对 lifecycle span、异常 closeout
   或 profiling audit error 都会把“只降低前台等待”的解释标为不成立。
 
-## 5. 本轮结果（待填）
+## 5. 本轮结果（treatment-r1）
 
-下表在 treatment 自然结束后填写；空白不代表零。
+本轮自然运行和 closeout 已完成。Judge elapsed 的分位数使用与历史表相同的线性插值；
+`fresh` 仍定义为 accepted 且没有 completed/probe/remote cache reuse。运行身份为：
 
-| 指标 | 主历史参考 | treatment 本轮 | 变化/解释 |
+- run ID：`20260903T053854Z-c388b681`
+- source commit：`3bac388895d7ae32267f8a308076fd9e67643fae`
+- image ID：`sha256:c25872cdea49b237db614616626161647fe8f2f8a6710d583f098c4342be6240`
+- manifest：`configs/formal_1h_cps32_profiled_adaptive_timeout.toml`，SHA-256
+  `33f0506df80db26d946236e59e070b4b065431eea892957e469494e5f3a07289`
+
+| 指标 | 主历史参考 | treatment-r1 | 变化/解释 |
 |---|---:|---:|---|
-| run ID / source commit | `20260901T012227Z-8c90d3f0` / `33296b0…` | 待填 | 必须 exact readback |
-| final status / score | `DEGRADED` / 5 | 待填 | 健康与算法分开 |
-| all / accepted / rejected | 1,499 / 1,441 / 58 | 待填 | 分母不能只看成功 |
-| fresh accepted | 1,252 | 待填 | 排除 completed-cache |
-| timeout adoption | 不适用 | 待填 | explicit / omitted |
-| requested→effective 分布 | 不适用 | 待填 | 含 clamp |
-| fresh elapsed median / P95 / P99 / max | 1.274 / 20.206 / 279.994 / 603.290 s | 待填 | 同一口径 |
-| fresh >60 s：n / 累计 / share | 25 / 8,502.0 s / 68.650% | 待填 | 主要 tail 指标 |
-| fresh >120 s：n / 累计 / share | 17 / 7,897.3 s / 63.767% | 待填 | |
-| fresh >300 s：n / 累计 / share | 13 / 7,008.4 s / 56.589% | 待填 | |
-| fresh >600 s：n / 累计 / share | 9 / 5,423.5 s / 43.792% | 待填 | |
-| `EXECUTION_TIMEOUT` / `RESOURCE_LIMIT` | 9 / 3 | 待填 | 不当作 VERIFY_FAIL |
-| backend jobs / execution work-seconds | 历史报告口径 | 待填 | 与前台 elapsed 分开 |
-| proof 数 / final score | 5 / 5（历史 closeout） | 待填 | score 需健康上下文 |
-| remote unsettled / closeout | 0 / 正常 drain | 待填 | 安全门槛 |
+| final status / score | `DEGRADED` / 5 | `DEGRADED` / 4 | 健康与算法分开；不能由这一轮归因 |
+| all / accepted / rejected | 1,499 / 1,441 / 58 | 1,879 / 1,873 / 6 | treatment 调用更多，拒绝更少 |
+| fresh accepted / cache reused | 1,252 / 189 | 1,636 / 237 | fresh 数量增加 30.67% |
+| timeout adoption（fresh） | 不适用 | 1,636/1,636 = 100% | omitted legacy 0，clamp 0 |
+| `judge_check` requested→effective（fresh） | 不适用 | 15:4，20:3，30:115，45:25，60:896，90:272，120:286，150:14，180:19，300:2 | 60 s 占 54.77%；所有生效值均在 5–300 s |
+| fresh elapsed 平均 / 中位数 | 9.891936 / 1.274114 s | 4.614044 / 1.369249 s | 平均 -53.36%，中位数 +7.47% |
+| fresh elapsed P90 / P95 / P99 | 6.293134 / 20.205775 / 279.994298 s | 10.085821 / 17.262217 / 62.371901 s | P95 -14.57%，P99 -77.72% |
+| fresh elapsed 最大 | 603.289839 s | 122.214555 s | -79.74%；没有约 600 s 双 retry 尾部 |
+| fresh elapsed 累计 | 12,384.704 s | 7,548.575 s | -39.05%，同时 fresh 请求更多 |
+| fresh >60 s：n / 累计 / share | 25 / 8,502.041 s / 68.650% | 20 / 1,639.295 s / 21.717% | 累计 -80.72%，share -46.93 个百分点 |
+| fresh >120 s：n / 累计 / share | 17 / 7,897.338 s / 63.767% | 4 / 487.037 s / 6.452% | 累计 -93.83%，share -57.32 个百分点 |
+| fresh >300 s：n / 累计 / share | 13 / 7,008.378 s / 56.589% | 0 / 0 s / 0% | treatment 消除了该层 tail |
+| fresh >600 s：n / 累计 / share | 9 / 5,423.513 s / 43.792% | 0 / 0 s / 0% | treatment 消除了该层 tail |
+| `EXECUTION_TIMEOUT` / `RESOURCE_LIMIT`（fresh） | 9 / 3 | 10 / 2 | timeout 是不确定反馈，不计入 `VERIFY_FAIL` |
+| proof 数 / final score | 5 / 5（历史 closeout） | 4 / 4 | treatment 少 1 个 proof；受 agent timeout/健康差异混杂 |
+| normalized score-time AUC / first proof | 0.228833 / 93.256 s | 0.160912 / 162.375 s | 仅描述本轮轨迹，不作因果结论 |
+| remote unsettled / closeout | 0 / 正常 drain | 0 / `drained=true` | active handlers=0，FIFO=0 |
+
+### 5.1 `evaluate_local`、`formal_query` 与后端工作量
+
+- treatment 有 117 次 `evaluate_local`，117/117 都携带 Agent timeout；请求值为 15 s（2）、
+  30 s（46）、45 s（6）、60 s（53）、90 s（1）、120 s（9），没有 clamp。状态为
+  `COMPILES_WITH_SORRY` 16、`VERIFY_FAIL` 95、`EXECUTION_TIMEOUT` 5、`CHEATING` 1；
+  elapsed 累计 480.232302 s，最大 52.928130 s。
+- treatment 有 894 次 `formal_query`，其工具合同仍是 legacy（`timeout_source=configured_legacy`，
+  没有 Agent timeout 字段）。因此本实验只改变 `judge_check`/`evaluate_local`，不能声称所有
+  formal-helper backend work 都受到新预算控制。
+- 独立 Judge 后端共提交并完成 2,185 个 job，execution work 为 7,500.570 s。携带
+  `max_retries=0` 的 custom-budget bucket 为 1,705 个 job、6,868.400 s、最大 121.062 s；
+  `max_retries=1` 的 legacy bucket 为 480 个 job、632.170 s、最大 15.584 s（其中包含
+  formal-query/closeout 等非 treatment 调用）。主历史参考后端为 2,055 个 job、
+  9,747.248 s、最大 602.095 s；这是方向性证据，不是 matched causal estimate。
+- 同一工作区其他 no-timeout/recovery 运行的 backend work 约为 6,036–9,663 s，说明
+  Agent 轨迹和题目分配的随机波动很大；不能只拿 7,500.570 s 与某一个历史值比较就宣布
+  固定收益。
+
+### 5.2 运行健康与 profiling 质量
+
+- `final.json`：`DEGRADED`，score 4/12；140 次 assignment，95 次 `AGENT_FAILURE`、
+  127 次 solver timeout、13 次 solver cancellation，6 次 Judge probe infrastructure
+  error；OOM/exit-137 和 unexpected process error 均为 0。
+- broker closeout 是安全通过的：`active_handlers=0`、`fifo_depth=0`、
+  `remote_unsettled_jobs=0`。后端 event log 中 2,185 个 submitted job 都有 terminal
+  receipt；任务 supervisor 退出码为 0。服务进程在 SIGTERM 收尾时报告一次
+  `shutdown exceeded its hard deadline`，但没有留下未结算 job；这仍是后端 teardown
+  的残余风险，不应隐藏。
+- `audit_profiling.py` 读取了 303,470 行、序列连续且无敏感字段命中；适用 coverage 均为
+  `present`，`judge.execute` 的 start/end 为 1,873/1,873。审计退出码为 1，原因是既有
+  profiler 质量问题：108 行共 324 个 dropped fields，以及 13 个未闭合 tool span；
+  timeout metadata 本身未产生 dropped field。因而本轮 profiling 适合做受限性能分析，
+  不应标成 clean audit。
 
 ## 6. 解释与决策门槛
 
@@ -187,10 +230,16 @@ adoption，prompt 默认要求正常验证调用显式给值；只有刻意测�
   不同，无法做 matched comparison；
 - run 以 `DEGRADED`、未结算 job、worker process failure 或 missing profiling 结束。
 
-本轮只有初步结果时，建议下一步优先按同一 source/模型/Judge 合同补一个 matched fixed-
-timeout control，再决定是否做 2–3 轮 treatment。若 adoption 高、tail 与 backend work 都
-下降且 score 稳定，才值得研究更细的 task/history-aware 档位；不应直接把 60 s 固定成
-全局 hard cutoff。
+本轮结果支持一个有限结论：**Agent 提议 + broker/evaluator 硬裁剪 + custom call 不重试**
+确实压掉了历史约 300–600 s 的 Judge-facing 长尾；在更多 fresh 请求下，>60 s 和 >120 s
+累计耗时也明显下降。它还没有证明最终数学得分提升，甚至本轮 score 比历史少 1，且
+`formal_query` 仍走 legacy、run/profile health 仍为 degraded。
+
+下一步应先按相同 source、image、模型、Judge runtime、cache policy、seed 和 horizon 补一轮
+**matched fixed-timeout control**（flag 关闭但其余合同完全相同），再决定是否跑 2–3 轮
+treatment。若 matched control 确认 custom bucket 的 backend work 和 tail 都下降、proof
+率不显著下降，再研究 task/history-aware 档位；当前不应把 60 s 固定成全局 hard cutoff，
+也不应把本轮的 100% adoption 直接解释成 Agent 预算估计已经正确。
 
 ## 7. 证据边界
 
