@@ -203,13 +203,19 @@ logical actor 做第二次相同的 outer recovery。正在流式生成但尚未
 `fefb7644ca10f27541d52434c5e0d1a20428de61`。原始运行 ID 已在逐轮表中列出；原始
 profiling/event 证据不进入仓库，仅以脱敏聚合支撑本报告。
 
-交付前在本分支执行以下检查，并在 PR 描述中回填实际结果：
+交付前在 clean worktree 执行了以下检查，结果如下：
 
 ```text
 python3 -m compileall -q contextswarm_mini
 python3 -m unittest discover -s tests
 python3 -m contextswarm_mini.cli --config configs/smoke.toml run --mock-agent
 ```
+
+- `compileall`：通过。
+- 完整 unittest：`Ran 700 tests in 79.572s`，`OK (skipped=1)`。
+- `configs/smoke.toml --mock-agent`：返回码 0，并生成唯一的 mock run artifact。
+- 另外，1800 manifest 的 `validate --json` 返回 `ok: true`，识别到 12 个固定任务；
+  recovery/CPS 相关 focused tests 为 `31/31` 通过。
 
 这份报告与代码只构成 source/experiment provenance 交付；本次没有部署、修改远端
 Coordinator/Judge、导入账号或合并 PR。后续若接受该方向，应单独决定是否把 1800 秒
