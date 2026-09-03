@@ -744,6 +744,90 @@ process.stdout.write(JSON.stringify({
             finally:
                 broker.close()
 
+    def test_evaluate_local_retry_receives_only_remaining_total_budget(self) -> None:
+        """The formal helper shares the same absolute budget as judge_check."""
+
+        class FakeClock:
+            value = 5_000.0
+
+            def monotonic(self) -> float:
+                return self.value
+
+        class RetryingLean(LeanEvaluator):
+            def __init__(self, clock: FakeClock) -> None:
+                super().__init__(
+                    "http://unused",
+                    lean_env_id="test",
+                    backend_max_retries=1,
+                    terminal_overload_retries=0,
+                )
+                self.clock = clock
+                self.timeouts: list[int] = []
+
+            def _evaluate_once(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+                del args
+                self.timeouts.append(int(kwargs["timeout_seconds"]))
+                if len(self.timeouts) == 1:
+                    self.clock.value += 30.0
+                    return Verdict(
+                        "task",
+                        "EVALUATOR_ERROR",
+                        0.0,
+                        30.0,
+                        {"evaluator_failure": {"category": "runtime_exception"}},
+                        error="transient evaluator failure",
+                        judge_job_id="job-1",
+                    )
+                return Verdict("task", "PROVED", 1.0, 0.0, {}, judge_job_id="job-2")
+
+        clock = FakeClock()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = _task(root)
+            workdir = root / "worker"
+            workdir.mkdir()
+            (workdir / "result.lean").write_text(task.baseline_code, encoding="utf-8")
+            evaluator = RetryingLean(clock)
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=root / "judge_checks.jsonl",
+                formal_audit_path=root / "formal_tool_calls.jsonl",
+                formal_policy=_policy(),
+                agent_timeout_enabled=True,
+                min_probe_interval_seconds=0,
+                drain_timeout_seconds=1,
+            ).start()
+            try:
+                with patch(
+                    "contextswarm_mini.evaluator.time.monotonic",
+                    clock.monotonic,
+                ), patch(
+                    "contextswarm_mini.judge_broker.time.monotonic",
+                    clock.monotonic,
+                ):
+                    with broker.session(
+                        actor_id="worker",
+                        workdir=workdir,
+                        candidates={task.slug: (task, workdir / "result.lean")},
+                        deadline_monotonic=10**9,
+                    ) as env:
+                        result = _post(
+                            env["CONTEXTSWARM_JUDGE_URL"],
+                            "evaluate_local",
+                            {"timeout_seconds": 60},
+                        )
+            finally:
+                broker.close()
+
+        self.assertEqual(evaluator.timeouts, [60, 30])
+        self.assertEqual(result["status"], "PROVED")
+        self.assertEqual(result["timeout_budget_mode"], "cumulative_total")
+        self.assertEqual(result["judge_attempt_timeouts_seconds"], [60, 30])
+        self.assertEqual(result["judge_attempt_count"], 2)
+        self.assertEqual(result["judge_retry_count"], 1)
+        self.assertEqual(result["backend_job_count"], 2)
+
     def test_confirmed_pre_admission_overload_uses_separate_retry_budget(self) -> None:
         class FakeClock:
             value = 4_000.0
