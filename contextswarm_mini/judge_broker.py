@@ -819,10 +819,11 @@ class JudgeBroker:
         )
         normalized.update(_safe_formal_quota_fields(normalized))
         if timeout is not None:
-            normalized.setdefault("timeout_budget_mode", "cumulative_total")
-            normalized.setdefault(
-                "timeout_budget_seconds", int(timeout.effective_seconds)
-            )
+            # The broker owns the logical budget.  Do not let a nested
+            # evaluator diagnostic overwrite the authoritative cap or the
+            # requested/effective metadata exposed to the worker.
+            normalized["timeout_budget_mode"] = "cumulative_total"
+            normalized["timeout_budget_seconds"] = int(timeout.effective_seconds)
             invoked = bool(
                 normalized.get("accepted") is True
                 or normalized.get("call_index") is not None
@@ -841,15 +842,33 @@ class JudgeBroker:
                     ),
                 )
                 remaining = max(0.0, float(timeout_deadline) - now)
-                normalized.setdefault(
-                    "timeout_budget_elapsed_seconds", round(elapsed, 6)
-                )
-                normalized.setdefault(
-                    "timeout_budget_remaining_seconds", round(remaining, 6)
+                normalized["timeout_budget_elapsed_seconds"] = round(elapsed, 6)
+                normalized["timeout_budget_remaining_seconds"] = round(
+                    min(float(timeout.effective_seconds), remaining), 6
                 )
                 if remaining <= 0:
                     normalized["timeout_budget_exhausted"] = True
                     normalized["timeout_budget_remaining_seconds"] = 0.0
+            else:
+                # When the caller did not provide timestamps, preserve
+                # evaluator accounting only within the broker's configured
+                # cap.  This keeps a malformed nested value from advertising
+                # more budget than the hard boundary actually allows.
+                for key in (
+                    "timeout_budget_elapsed_seconds",
+                    "timeout_budget_remaining_seconds",
+                ):
+                    raw_value = normalized.get(key)
+                    if isinstance(raw_value, (int, float)) and not isinstance(
+                        raw_value, bool
+                    ):
+                        normalized[key] = round(
+                            max(
+                                0.0,
+                                min(float(timeout.effective_seconds), float(raw_value)),
+                            ),
+                            6,
+                        )
         return normalized
 
     def formal_summary(self) -> dict[str, Any]:
@@ -3752,16 +3771,20 @@ def _safe_timeout_budget_fields(
         raw = value.get(key)
         if isinstance(raw, bool):
             continue
-        if key in {"judge_attempt_count", "judge_retry_count", "timeout_budget_seconds"}:
+        if key in {"judge_attempt_count", "judge_retry_count"}:
             if isinstance(raw, int):
                 result[key] = max(0, min(int(raw), 1_000_000))
+            continue
+        if key == "timeout_budget_seconds":
+            if isinstance(raw, int):
+                result[key] = max(0, min(int(raw), int(timeout_cap)))
             continue
         try:
             parsed = float(raw)
         except (TypeError, ValueError, OverflowError):
             continue
         if math.isfinite(parsed) and parsed >= 0:
-            result[key] = round(parsed, 6)
+            result[key] = round(min(parsed, float(timeout_cap)), 6)
     for key in _TIMEOUT_BUDGET_BOOL_FIELDS:
         if isinstance(value.get(key), bool):
             result[key] = value[key]

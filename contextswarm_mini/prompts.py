@@ -165,7 +165,9 @@ command."""
 def _scaled_timeout_value(cap: int, floor: int, ratio: float) -> int:
     """Scale a heuristic by the configured cap while preserving its bounds."""
 
-    return max(floor, min(cap, int(round(cap * ratio))))
+    # Match JavaScript ``Math.round`` used by the Pi extension (positive
+    # values only, so adding 0.5 gives the same half-up result).
+    return max(floor, min(cap, int(cap * ratio + 0.5)))
 
 
 def _timeout_tier(low: int, high: int, *, ratio_label: str) -> str:
@@ -181,6 +183,7 @@ def _agent_timeout_instructions(
     enabled: bool,
     *,
     formal: bool,
+    formal_tools_enabled: bool = False,
     configured_timeout_seconds: int | float | None = None,
 ) -> str:
     """Render the opt-in worker guidance without changing baseline prompts."""
@@ -208,9 +211,12 @@ def _agent_timeout_instructions(
     )
     helper = (
         " For formal diagnostics, `python3 evaluate.py --timeout N` sends the same budget."
-        if formal
+        if formal and formal_tools_enabled
         else ""
     )
+    example = f'`{{"timeout_seconds": {routine_example}}}`'
+    if formal and formal_tools_enabled:
+        example += f" and the formal helper can use `python3 evaluate.py --timeout {routine_example}`"
     return f"""Agent-proposed validation budget (enabled for this run):
 - `judge_check` accepts an optional integer `timeout_seconds` in the advertised
   range {floor}–{cap} seconds.{helper} The runner
@@ -219,8 +225,7 @@ def _agent_timeout_instructions(
 - In this treatment, normally include a value on every validation call so the
   experiment can observe your estimate; omit it only when you deliberately
   choose the legacy timeout/retry behavior. For example, a routine check can use
-  `{{"timeout_seconds": {routine_example}}}` and the formal helper can use
-  `python3 evaluate.py --timeout {routine_example}`.
+  {example}.
 - This is one cumulative logical validation budget across all evaluator retries.
   The runner owns one absolute deadline: a first attempt that fails abnormally
   after about one tenth of the selected budget leaves the remainder for a safe
@@ -308,6 +313,7 @@ or a local verification process.
 {_agent_timeout_instructions(
     agent_timeout_enabled,
     formal=not coding,
+    formal_tools_enabled=formal_tools_enabled and not coding,
     configured_timeout_seconds=agent_timeout_cap_seconds,
 )}
 
@@ -370,6 +376,7 @@ Parallel worker may omit `task_id`, but Mono may not.
 {_agent_timeout_instructions(
     agent_timeout_enabled,
     formal=not coding,
+    formal_tools_enabled=formal_tools_enabled and not coding,
     configured_timeout_seconds=agent_timeout_cap_seconds,
 )}
 

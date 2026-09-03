@@ -563,6 +563,9 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 _MAX_RESPONSE_BYTES = 1024 * 1024
+_DEFAULT_TRANSPORT_TIMEOUT_SECONDS = 480.0
+_TRANSPORT_TIMEOUT_GRACE_SECONDS = 120.0
+_MAX_TRANSPORT_TIMEOUT_SECONDS = 2_147_000_000.0
 
 def request(script_file: str, operation: str, payload: dict) -> dict:
     root = Path(script_file).resolve().parent
@@ -591,9 +594,29 @@ def request(script_file: str, operation: str, payload: dict) -> dict:
     if len(encoded) > 128 * 1024:
         raise RuntimeError("formal tool request is too large")
     raw_deadline = str(os.environ.get("CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS") or "")
-    deadline_seconds = 480.0
+    # The helper's HTTP transport must outlive the configured Agent/Judge
+    # budget plus the bounded handoff grace.  The historical 480-second
+    # default remains for callers without the public cap environment, while a
+    # larger manifest cap (for example 600s) is not cut off by this client.
+    raw_cap = str(os.environ.get("CONTEXTSWARM_AGENT_TIMEOUT_MAX_SECONDS") or "")
+    transport_ceiling = _DEFAULT_TRANSPORT_TIMEOUT_SECONDS
+    if raw_cap.isascii() and raw_cap.isdigit() and int(raw_cap) > 0:
+        transport_ceiling = min(
+            _MAX_TRANSPORT_TIMEOUT_SECONDS,
+            max(
+                transport_ceiling,
+                float(int(raw_cap)) + _TRANSPORT_TIMEOUT_GRACE_SECONDS,
+            ),
+        )
+    deadline_seconds = transport_ceiling
     if raw_deadline.isascii() and raw_deadline.isdigit():
-        deadline_seconds = max(0.1, min(480.0, (int(raw_deadline) / 1000.0) - time.time() + 10.0))
+        deadline_seconds = max(
+            0.1,
+            min(
+                transport_ceiling,
+                (int(raw_deadline) / 1000.0) - time.time() + 10.0,
+            ),
+        )
     request = Request(
         f"{base_url}/{operation}",
         data=encoded,

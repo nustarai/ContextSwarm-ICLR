@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from urllib.request import Request, urlopen
@@ -153,6 +155,21 @@ class AdaptiveTimeoutTests(unittest.TestCase):
         )
         self.assertIn("range 3–3 seconds", prompt)
         self.assertIn("rounded for this configured cap", prompt)
+
+    def test_prompt_omits_formal_helper_when_surface_is_disabled(self) -> None:
+        task = _task(ROOT)
+        prompt = build_task_prompt(
+            task,
+            task_workspace="tasks/task",
+            agent_id="worker-task-e1",
+            episode=1,
+            communication_enabled=False,
+            formal_tools_enabled=False,
+            agent_timeout_enabled=True,
+            agent_timeout_cap_seconds=600,
+        )
+        self.assertIn("Agent-proposed validation budget", prompt)
+        self.assertNotIn("evaluate.py --timeout", prompt)
 
     def test_solver_schema_and_formal_guard_follow_capability_bit(self) -> None:
         node = shutil.which("node")
@@ -305,6 +322,42 @@ process.stdout.write(JSON.stringify({
                 self.assertEqual(evaluator.timeouts, [600])
             finally:
                 broker.close()
+
+    def test_broker_budget_projection_cannot_be_overwritten_by_nested_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evaluator = _TimeoutEvaluator()
+            broker = JudgeBroker(
+                evaluator,
+                threading.BoundedSemaphore(1),
+                audit_path=root / "judge_checks.jsonl",
+                formal_policy=_policy(),
+                agent_timeout_enabled=True,
+                agent_timeout_cap_seconds=600,
+                drain_timeout_seconds=1,
+            )
+            timeout = normalize_agent_timeout(
+                600, configured_timeout_seconds=600
+            )
+            started = time.monotonic() - 30.0
+            result = broker._attach_timeout(
+                {
+                    "accepted": True,
+                    "response": {
+                        "timeout_budget_mode": "forged",
+                        "timeout_budget_seconds": 999_999,
+                        "timeout_budget_elapsed_seconds": 999_999.0,
+                        "timeout_budget_remaining_seconds": 999_999.0,
+                    },
+                },
+                timeout,
+                timeout_started=started,
+                timeout_deadline=time.monotonic() + 570.0,
+            )
+        self.assertEqual(result["timeout_budget_mode"], "cumulative_total")
+        self.assertEqual(result["timeout_budget_seconds"], 600)
+        self.assertLessEqual(result["timeout_budget_elapsed_seconds"], 600.0)
+        self.assertLessEqual(result["timeout_budget_remaining_seconds"], 600.0)
 
     def test_loaded_manifest_derives_helper_guard_for_a_larger_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

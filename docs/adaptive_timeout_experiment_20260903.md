@@ -98,6 +98,9 @@ matched control。
   `formal_tools.command_timeout_seconds` 至少提升到 `configured + 120` 秒；这是 Pi Bash
   外层的 handoff margin，不改变 Judge/evaluator cap。这样即使把 cap 配成 600 或更大，
   `evaluate.py --timeout N` 也不会先被 shell guard 截断；默认 cap=300 仍保持历史 420 秒。
+- staged formal-tool client 的 HTTP transport ceiling 也从同一 Agent cap 推导：无 cap 环境时
+  保留历史 480 秒默认值，启用 cap 后至少为 `max(480, configured + 120)`，再受 broker
+  session deadline 约束。这样较大 cap 不会在 helper 客户端层被固定的 480 秒提前断开。
 - receipt、audit 和 profiling 记录 `requested_timeout_seconds`、
   `effective_timeout_seconds`、`timeout_clamped`、`timeout_source`。这四个字段只记录
   有界策略元数据，不记录 prompt、候选源码、token 或原始 Judge response。

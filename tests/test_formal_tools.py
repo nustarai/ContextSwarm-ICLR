@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from dataclasses import replace
@@ -10,6 +11,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
@@ -433,6 +435,60 @@ class PiEnvironmentTests(unittest.TestCase):
         )
         self.assertIn("5–600 second range", public)
         self.assertNotIn("5-300", public)
+
+    def test_staged_client_transport_ceiling_follows_configured_timeout_cap(self) -> None:
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self, _limit):
+                return b"{}"
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            stage_worker_tools(
+                root,
+                capability=ToolCapability(
+                    task_id="task", surface_version="formal-test-v1"
+                ),
+                baseline_names=["task.lean"],
+                agent_timeout_enabled=True,
+                agent_timeout_cap_seconds=600,
+            )
+            module_path = root / "_contextswarm_tool_client.py"
+            spec = importlib.util.spec_from_file_location(
+                "contextswarm_generated_tool_client", module_path
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            observed: dict[str, float] = {}
+
+            def fake_urlopen(_request, *, timeout):
+                observed["timeout"] = float(timeout)
+                return _Response()
+
+            token = "a" * 43
+            with patch.object(module, "urlopen", fake_urlopen), patch.dict(
+                os.environ,
+                {
+                    "CONTEXTSWARM_JUDGE_URL": f"http://127.0.0.1:12345/{token}",
+                    "CONTEXTSWARM_AGENT_TIMEOUT_MAX_SECONDS": "600",
+                    "CONTEXTSWARM_BROKER_DEADLINE_EPOCH_MS": str(
+                        int((time.time() + 3600) * 1000)
+                    ),
+                },
+                clear=False,
+            ):
+                self.assertEqual(
+                    module.request(str(root / "evaluate.py"), "evaluate_local", {}),
+                    {},
+                )
+        self.assertGreaterEqual(observed["timeout"], 719.9)
+        self.assertLessEqual(observed["timeout"], 720.1)
 
 
 if __name__ == "__main__":
