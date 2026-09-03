@@ -1,0 +1,13 @@
+extends = ["formal_1h_cps32_profiled_clean.toml"]
+
+# Comparison arm for the recovery-no-timeout experiment.  The only runtime
+# change relative to formal_1h_cps32_profiled_clean.toml is the per-Pi-agent
+# wall-time ceiling: one uninterrupted 1800-second invocation.  The outer
+# one-hour horizon, task/model/CPS contract, Judge 300-second timeout and
+# recovery classifier remain inherited and unchanged.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-agent1800"
+
+[pi]
+timeout_seconds = 1800
+
