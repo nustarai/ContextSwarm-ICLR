@@ -245,7 +245,9 @@ Treatment 的三个身份字段会同时写入 `run_meta.json`、ordinary `run_s
 
 独立审查在 `ef2f5f4` 上又运行一次 full discovery：811 项中 1 failure、1 skipped，失败仍是上述 backpressure 断言；两项时序测试随后在同一候选上各重复 5 次，均 5/5 通过。未改基线 `33296b0` 的可审计重跑为 backpressure 16/20 通过、LLM deadline 20/20 通过。
 
-这些结果说明两个失败都位于既有的极短 horizon 时序边界，且核心 route 测试全绿；但报告不会据此把 full suite 写成全绿，也不会把不同时间、不同系统负载下的串行频率当作严格 A/B。`171ddda` 的最终 full discovery 与独立复审结果仍应在交付记录中逐项列出。
+修复后 clean `d297275e08e5a7341daa0e8c774e04de341342f9` 又运行了完整 discovery：812 项中 1 failure、1 skipped，唯一失败变为 `test_llm_admission_deadline_summary_is_selectable`（日志：`evidence/full_unittest_d297275.log`），没有 route-focused failure。当前候选的串行 10 次重复为 backpressure 5/10 通过、LLM deadline 10/10 通过（日志：`evidence/final_serial_repeat10_backpressure_d297275.log`、`evidence/final_serial_repeat10_llm_deadline_d297275.log`）；同一交替 block 的基线/候选 backpressure 分别为 13/20 与 6/20（日志：`evidence/paired_repeat20_backpressure_33296b0_vs_d297275.log`）。这些测试都把 horizon 压到 50ms，结果受调度和机器负载高度影响；它们只能标记 disabled-path/时序兼容风险，不能当作生产吞吐或 A/B 效果指标。
+
+这些结果说明失败位于既有的极短 horizon 时序边界，且核心 route 测试全绿；报告不会把 full suite 写成全绿，也不会把不同时间、不同系统负载下的串行频率当作严格 A/B。正式实验前应把该 50ms 测试的候选/基线差异作为单独兼容性调查项，而不是忽略它或把它归因于 route 去重收益。
 
 ## 9. 为什么本轮没有启动真实 12 题一小时 treatment
 
