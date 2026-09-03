@@ -3,8 +3,8 @@
 > **实验目的**：验证让 Agent 为 `judge_check` 和 `evaluate_local` 提议一次验证预算，
 > 同时由 broker/evaluator 做硬上限裁剪，是否能缓解少量验证长尾占用大量总时长的问题。
 >
-> **记录状态**：实现与一轮 treatment run 的结果在本文件中逐步补齐；在没有 run 产物
-> 前，任何“节省”或“提升”都只是待验证假设。
+> **记录状态**：实现与一轮 treatment run 已完成；本文的数值结论仅适用于列明的
+> source/image/Judge 合同，不能替代 matched control 或多轮因果验证。
 
 ## 1. 问题与假设
 
