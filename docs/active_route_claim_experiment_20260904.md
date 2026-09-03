@@ -19,7 +19,7 @@
 3. `cps_active_routes` 和 `cps_claim_route` 是仅有的首次 terminal Judge checkpoint 前 CPS 能力；原有 search、inbox、send、publish 以及 route update/release 仍受 Judge gate 约束。
 4. Treatment 下，Pi 的 write/edit 在拿到有效 route lease 前被阻止；只有 broker 明确发出的 fail-open 结果才能绕过，并且必须携带规范化的 `route_claim_bypass_reason`，不能伪装成成功 claim。
 5. 三方同时竞争同一 route 的离线协议 smoke 得到 1 个 primary 和 2 个 conflict；独立验证、finish、TTL expiry、blocked、显式 release、admission-only roster 和 pre-Judge gate 均通过自检。
-6. 同源的 3 题 mock control/treatment 都完成 6/6 assignment，`health.ok=true`，profiling 审计通过且 `dropped_fields.total=0`。但 mock Agent 不调用 route tools，也不产生数学结果；它只能验证 runner lifecycle、配置身份和产物闭环。
+6. 修复后的最终 clean 快照又运行了一对同源 3 题 mock control/treatment：两臂均完成 6/6 assignment，`health.ok=true`，profiling 审计通过且 `dropped_fields.total=0`。但 mock Agent 不调用 route tools，也不产生数学结果；它只能验证 runner lifecycle、配置身份和产物闭环。
 
 尚未成立的部分是：
 
@@ -179,27 +179,27 @@ Fail-open 是可用性选择，不是去重保证：route 服务故障期间 Age
 - Control：[`configs/route_claim_smoke_control.toml`](../configs/route_claim_smoke_control.toml)
 - Treatment：[`configs/route_claim_smoke.toml`](../configs/route_claim_smoke.toml)
 
-共同合同：3 道题、`max_parallel=3`、每题 2 episodes、3 秒 horizon、profiling 开启。两条命令都在 clean source `157f1cb59569cba5a152922d04cb8ba4f7dee33c` 上执行；单元测试逐字段证明 canonical public config 只在 name 和 route flag 上不同。
+共同合同：3 道题、`max_parallel=3`、每题 2 episodes、3 秒 horizon、profiling 开启。下面这对命令在最终 clean worktree HEAD `96a0eb5903143f6f9175ef475e53cd166a51130f`（代码修复父提交 `171ddda14e0495cba55a94ec0c2458741bd4d4d2`）上执行；单元测试逐字段证明 canonical public config 只在 name 和 route flag 上不同。
 
-需要单列 provenance 限制：这两个 test-only mock artifact 的 `run_meta.runtime_provenance` 按设计只记录 `test-only-mock-source` / `test-only-mock-image`，`source_git_commit` 为空。因此 `157f1cb` 是本次 operator 命令和 clean worktree 的执行证据，不是 artifact 自身绑定的 Git SHA。正式 Docker A/B 必须把精确 source commit 与 image ID/digest 写入 artifact，不能沿用这组 mock provenance 做正式归因。
+需要单列 provenance 限制：这两个 test-only mock artifact 的 `run_meta.runtime_provenance` 按设计只记录 `test-only-mock-source` / `test-only-mock-image`，`source_git_commit` 为空。因此 `96a0eb`/`171ddda` 是本次 operator 命令和 clean worktree 的执行证据，不是 artifact 自身绑定的 Git SHA。正式 Docker A/B 必须把精确 source commit 与 image ID/digest 写入 artifact，不能沿用这组 mock provenance 做正式归因。
 
 | 指标 | Control | Treatment |
 |---|---:|---:|
-| run id | `20260903T161245Z-259f5c17` | `20260903T161246Z-d1358f2b` |
+| run id | `20260903T164057Z-9173033c` | `20260903T164058Z-5edbe0e9` |
 | final status | `COMPLETED` | `COMPLETED` |
 | health | `ok=true` | `ok=true` |
 | assigned / attempted / finished | 6 / 6 / 6 | 6 / 6 / 6 |
 | verdict | 6 × `MOCK_SKIPPED` | 6 × `MOCK_SKIPPED` |
 | profiling rows | 266 | 272 |
 | profiling dropped fields | 0 | 0 |
-| profiler elapsed | 0.330639s | 0.331525s |
+| profiler elapsed | 0.319033s | 0.374645s |
 | actor rows at closeout | 0 | 6，全部 `finished` |
 | route claim rows | 0 | 0（mock Agent 不调用 route tools） |
 | CPS lifecycle events | 0 | 12（6 register + 6 finish） |
 
-本样本 treatment 比 control 多 0.000886 秒，约 0.27%。这只是一次亚秒、非随机化 mock；此前的同类一次样本甚至出现过相反方向的约 50ms 差异，说明这种尺度主要受调度/文件系统噪声支配。不能据此声称真实开销是 0.27%，也不能声称无开销。
+本次样本 treatment 比 control 多 0.055612 秒，约 17.43%。这只是一次亚秒、顺序执行、非随机化 mock；前一对同类样本甚至只有约 0.27% 差异，说明这种尺度主要受调度/文件系统噪声支配。不能据此声称真实开销是 17.43%，也不能声称无开销。原始 run 与审计报告分别保存在 `runs-paired-96a0eb5/`、`evidence/paired_control_audit_96a0eb5.json` 和 `evidence/paired_treatment_audit_96a0eb5.json`。
 
-Treatment 中 6 次 `actor.register` 的 transaction wall total 为 0.010717s，6 次 `actor.finish` 为 0.028293s；合计 0.039010s。由于多个 Agent 并发，这些 transaction wall totals 彼此可能重叠，也不能与两臂 run elapsed 直接相减做因果归因。
+Treatment 中 6 次 `actor.register` 的 transaction wall total 为 0.013157s，6 次 `actor.finish` 为 0.050704s；合计 0.063861s。由于多个 Agent 并发，这些 transaction wall totals 彼此可能重叠，也不能与两臂 run elapsed 直接相减做因果归因。
 
 更关键的限制是：mock solver 不加载 Pi extension，不会执行 active-routes、claim、conflict/reroute 或 write gate。因此这组数据验证的是 lifecycle/profiling plumbing，而不是 route 去重效果。
 
