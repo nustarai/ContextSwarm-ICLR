@@ -464,9 +464,10 @@ recovery 语义和随机候选共同作用。当前最可信的方案收益仍�
 均从 manifest 的实际 `timeout_seconds` 读取 Agent cap，而不是把 300 秒写死。正式
 workload 在确认轮启动时固定于 primary fix 的 commit `57b115e`；运行期间 review
 又发现并补上了两个不改变 cap=300 正常路径的边界硬化（helper transport ceiling 和
-nested timeout metadata sanitizer），形成当前 HEAD `5865956`。因此以下一小时数值
-不能冒充 `5865956` 镜像的正式 workload 结果；后者另以完整测试和最终 mock smoke
-确认。这个 source/image 边界保留在报告中，避免把实验 artifact 与最终 PR head 混为一谈。
+nested timeout metadata sanitizer），形成代码 hardening commit `5865956`；本节结果随后
+由独立文档 commit 记录。因此以下一小时数值不能冒充 `5865956` 镜像的正式
+workload 结果；后者另以完整测试和最终 mock smoke 确认。这个 source/image 边界保留在
+报告中，避免把实验 artifact 与最终 PR head 混为一谈。
 
 运行身份和合同：
 
@@ -598,6 +599,7 @@ confirmation run 为 `5`，这是积极但非因果、非稳定的方向性信�
 - r3 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r3-launch/runs/adaptive-timeout-20260903/treatment-r3/20260903T124445Z-c244cd48`
 - r4 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r4-launch/runs/adaptive-timeout-20260903/treatment-r4/20260903T124445Z-bacd88ea`
 - confirmation run（primary-fix image）：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-20260903/runs/adaptive-timeout-20260904-confirm/20260903T205925Z-12d09a89`
+- final HEAD mock smoke：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-final-smoke/output/20260903T220703Z-ce533f47`（exit 0）
 - profiling audit：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r2/profiling-audit.json`、
   `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/profiling-audit.json`、
   `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r4/profiling-audit.json`、
@@ -606,7 +608,7 @@ confirmation run 为 `5`，这是积极但非因果、非稳定的方向性信�
 - Judge supervisor logs：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/judge/supervisor.log`
   和 `...-r4/judge/supervisor.log` 均记录 `supervisor_exit=0`；对应容器、backend/proxy
   进程和本轮端口在 closeout 后均已退出。
-- 当前最终 HEAD `5865956` 的 timeout/formal focused tests 为 `134 passed, 1 skipped`，
+- 代码 hardening commit `5865956`（随后由独立文档 commit 记录）的 timeout/formal focused tests 为 `134 passed, 1 skipped`，
   `compileall`、`node --check` 和 `git diff --check` 均通过；实验栈退出后的 clean worktree
   上完整 `python3 -m unittest discover -s tests` 为 `760 tests, OK (skipped=1)`。最终
   HEAD 的 `configs/smoke.toml --mock-agent` smoke 也以 exit 0 收尾。此前高并发/顺序敏感的
