@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: putnambench, repeat 2, uniform_refill.
+extends = ["../../_putnambench.toml"]
+
+[experiment]
+name = "figure4-formal-putnambench-r02-uniform_refill"
+output_root = "runs/figure4_formal_6datasets/putnambench/repeat-02/uniform_refill"
+paired_repeat_id = 2
+seed = 1730
+
+[allocation]
+policy = "uniform_refill"

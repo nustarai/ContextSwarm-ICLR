@@ -132,6 +132,17 @@ function timeoutTier(low, high, ratioLabel) {
     : `${rendered} (${ratioLabel} of the cap)`;
 }
 
+function cpsScopeProperties(allowGlobal) {
+  if (!allowGlobal) return {};
+  return {
+    scope: {
+      type: "string",
+      enum: ["task", "global"],
+      description: "global is available only in hybrid mode",
+    },
+  };
+}
+
 function normalizeExistingPath(rawPath, cwd) {
   if (typeof rawPath !== "string" || !rawPath.trim()) return null;
   const lexical = isAbsolute(rawPath) ? resolve(rawPath) : resolve(cwd, rawPath);
@@ -444,6 +455,8 @@ export default function registerContextSwarmSolverTools(pi) {
       agentTimeout.minimum,
     );
   }
+  const globalScope = !selectionEnabled && enabledCapability("CONTEXTSWARM_CPS_GLOBAL_SCOPE");
+  const scopeProperties = cpsScopeProperties(globalScope);
 
   registerBrokerTool(pi, {
     name: "judge_check",
@@ -486,7 +499,7 @@ export default function registerContextSwarmSolverTools(pi) {
         title: stringSchema("Concise title", 300),
         body: stringSchema("Reusable proof information", 8_000),
         tags: { type: "array", items: stringSchema("Tag", 64), maxItems: 8 },
-        scope: { type: "string", enum: ["task", "global"], description: "global is available only in hybrid mode" },
+        ...scopeProperties,
       },
       ["title", "body"],
     ),
@@ -509,7 +522,7 @@ export default function registerContextSwarmSolverTools(pi) {
       {
         recipient: stringSchema("Recipient actor id; omit for a broadcast", 256),
         body: stringSchema("Message body", 8_000),
-        scope: { type: "string", enum: ["task", "global"], description: "global is available only in hybrid mode" },
+        ...scopeProperties,
       },
       ["body"],
     ),

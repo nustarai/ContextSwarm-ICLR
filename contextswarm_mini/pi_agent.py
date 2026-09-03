@@ -25,6 +25,7 @@ from .config import ExperimentConfig
 from .models import AgentResult
 from .profiling import RunProfiler
 from .timeout_policy import agent_timeout_bounds
+from .provider_diagnostics import is_provider_diagnostic
 
 
 _STDERR_LINE_LIMIT_BYTES = 256 * 1024
@@ -407,6 +408,14 @@ class PiAgent:
         # direct-message CPS surface for existing runner call sites.
         env["CONTEXTSWARM_CPS_DIRECT_MESSAGES"] = "1" if direct_messages else "0"
         env["CONTEXTSWARM_CPS_SELECTION_ENABLED"] = "1" if selection_enabled else "0"
+        # Global scope is a capability of legacy hybrid communication only.
+        # Ordinary blackboard workers do not need to see or request it, while
+        # selector-enabled workers use their separate project-shared path.
+        env["CONTEXTSWARM_CPS_GLOBAL_SCOPE"] = (
+            "1"
+            if self.config.communication == "hybrid" and not selection_enabled
+            else "0"
+        )
         # Do not append an operator-supplied PYTHONPATH.  The runner package is
         # the only import root required by the controlled helper/client path.
         env["PYTHONPATH"] = str(self.config.repo_root)
@@ -531,6 +540,9 @@ class PiAgent:
         pending_assistant_error = ""
         retry_final_error = ""
         assistant_streamed = False
+        assistant_stop_reason = ""
+        assistant_success = False
+        transport_diagnostic_seen = False
         request_id = f"contextswarm-{uuid.uuid4().hex}"
         session_id = _session_id(self.trace_path, actor_id, episode)
         session_root = workdir / ".pi" / "sessions"
@@ -625,6 +637,9 @@ class PiAgent:
             nonlocal pending_assistant_error
             nonlocal retry_final_error
             nonlocal assistant_streamed
+            nonlocal assistant_stop_reason
+            nonlocal assistant_success
+            nonlocal transport_diagnostic_seen
 
             payload = _parse_json_line(line)
             if profiling_enabled:
@@ -632,6 +647,8 @@ class PiAgent:
             if payload is None:
                 value = line.strip()
                 if value:
+                    if _is_transport_diagnostic(value):
+                        transport_diagnostic_seen = True
                     errors.append(f"Pi emitted non-JSON RPC output: {_redact_sensitive_text(value)}")
                 return
             events += 1
@@ -669,9 +686,12 @@ class PiAgent:
             outcome = _assistant_outcome(payload)
             if outcome is not None:
                 stop_reason, error_message = outcome
+                assistant_stop_reason = stop_reason
                 if stop_reason == "error":
+                    assistant_success = False
                     pending_assistant_error = error_message or "Pi assistant stopped with an error"
                 elif stop_reason in {"stop", "toolUse"}:
+                    assistant_success = True
                     pending_assistant_error = ""
                     retry_final_error = ""
 
@@ -696,6 +716,8 @@ class PiAgent:
 
             diagnostic = _event_error(payload)
             if diagnostic:
+                if _is_transport_diagnostic(diagnostic):
+                    transport_diagnostic_seen = True
                 errors.append(f"{event_type}: {_redact_sensitive_text(diagnostic)}")
             if trace_handle is not None:
                 row = {
@@ -729,8 +751,11 @@ class PiAgent:
                 consume_stdout_line(raw.decode("utf-8", errors="replace"))
 
         def consume_stderr_line(raw: bytes) -> None:
+            nonlocal transport_diagnostic_seen
             value = raw.decode("utf-8", errors="replace").rstrip("\r")
             if value:
+                if _is_transport_diagnostic(value):
+                    transport_diagnostic_seen = True
                 errors.append(_redact_sensitive_text(value))
 
         def consume_stderr_bytes(chunk: bytes, *, final: bool = False) -> None:
@@ -1026,6 +1051,19 @@ class PiAgent:
             events=events,
             timed_out=timed_out,
             cancelled=cancelled,
+            settled=settled_seen,
+            assistant_success=assistant_success,
+            assistant_stop_reason=assistant_stop_reason or None,
+            transport_diagnostic=transport_diagnostic_seen,
+            transport_recovered=bool(
+                transport_diagnostic_seen
+                and settled_seen
+                and assistant_success
+                and not timed_out
+                and not cancelled
+                and not prompt_rejected
+                and returncode == 0
+            ),
         )
 
 
@@ -1273,6 +1311,42 @@ def _error_category(value: str) -> str:
         if any(needle in lowered for needle in needles):
             return category
     return "other"
+
+
+def _is_transport_diagnostic(value: str) -> bool:
+    """Return whether text describes provider transport/retry noise.
+
+    This classifier is intentionally narrower than the final-agent failure
+    decision.  A diagnostic can be emitted for an intermediate attempt that
+    Pi subsequently recovers; callers must combine this bit with the final
+    assistant outcome and settlement evidence before treating it as a slot
+    failure.
+    """
+
+    lowered = str(value or "").lower()
+    return is_provider_diagnostic(value) or any(
+        marker in lowered
+        for marker in (
+            "upstream request failed",
+            "upstream connect error",
+            "websocket",
+            "connection reset",
+            "connection refused",
+            "connection timeout",
+            "connection termination",
+            "network error",
+            "fetch failed",
+            "transport failure",
+            "transport error",
+            "request timed out",
+            "request timeout",
+            "timed out",
+            "timeout",
+            "oauth",
+            "rate limit",
+            "too many requests",
+        )
+    )
 
 
 _URL_PATTERN = re.compile(r"\b(?:https?|wss?)://[^\s<>'\"]+", re.IGNORECASE)

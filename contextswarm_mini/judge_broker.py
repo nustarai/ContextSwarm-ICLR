@@ -45,7 +45,15 @@ from .timeout_policy import (
 
 
 _MAX_REQUEST_BYTES = 32 * 1024
-_MAX_PROBE_CALLS_PER_SESSION = 32
+# Keep a per-session guard, but leave enough room for a bounded CPS solver to
+# work through a hard task.  The old value (32) was routinely reached by
+# normal formal agents before the one-hour horizon, turning an otherwise
+# valid candidate-attempt stream into a fail-closed infrastructure error.
+# 128 remains finite and, together with the one-second admission interval and
+# the fixed horizon, bounds one session to a small, auditable share of Judge
+# capacity.  This is a broker-wide runtime guard and is identical for every
+# allocation arm; it is not a policy-specific tuning knob.
+_MAX_PROBE_CALLS_PER_SESSION = 128
 _MIN_PROBE_INTERVAL_SECONDS = 1.0
 _PROBE_ADMISSION_TIMEOUT_SECONDS: float | None = None
 _AGENT_TIMEOUT_BOUNDARY_EPSILON_SECONDS = 0.01
@@ -3260,12 +3268,18 @@ class JudgeBroker:
                         task_id=task_id,
                         recipient=claim.actor_id,
                         limit=limit,
+                        include_global=claim.communication == "hybrid",
                     )
                 ],
             }
         if operation == "cps_ack":
             message_id = _required_string(payload.get("message_id"), "message_id", 64)
-            visible = store.inbox(task_id=task_id, recipient=claim.actor_id, limit=50)
+            visible = store.inbox(
+                task_id=task_id,
+                recipient=claim.actor_id,
+                limit=50,
+                include_global=claim.communication == "hybrid",
+            )
             if not any(str(item.get("id")) == message_id for item in visible):
                 return {"ok": False, "status": "MESSAGE_NOT_VISIBLE", "acked": False}
             return {

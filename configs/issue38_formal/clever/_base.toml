@@ -1,0 +1,95 @@
+# Issue #38 formal NuRouter matrix base for clever.
+# Every leaf differs only in selector policy, paired seed, and run identity.
+extends = ["../../figure3_dev/_base.toml"]
+
+[experiment]
+name = "issue38-formal-clever-base"
+dataset = "clever"
+dataset_root = "benchmarks/clever"
+problem_ids = "benchmarks/clever/problem_ids.json"
+output_root = "runs/issue38_formal/clever"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 24
+initial_agents_per_task = 2
+max_attempts_per_task = 0
+cancel_on_proved = true
+assignment_policy = "least_active"
+episodes_per_task = 2
+max_tasks = 12
+time_limit_seconds = 3600
+seed = 1729
+figure3_readiness = "issue38_formal_nurouter_v1"
+
+[allocation]
+policy = "uniform_refill"
+piece_limit_per_task = 3
+piece_body_chars = 1200
+agent_timeout_seconds = 3600
+
+[pi]
+model = "openai-codex/gpt-5.6-sol"
+thinking = "max"
+fast_mode = false
+timeout_seconds = 3600
+http_idle_timeout_ms = 600000
+
+[pi.retry]
+enabled = true
+max_retries = 10
+base_delay_ms = 2000
+
+[pi.retry.provider]
+max_retries = 0
+max_retry_delay_ms = 60000
+
+[pi.recovery]
+enabled = true
+max_restarts = 1
+base_delay_ms = 1000
+
+[nurouter]
+# Historical AISW_* environment names below are launcher compatibility only.
+enabled = true
+binary = "~/.local/share/contextswarm/aisw-linux-aarch64"
+node_config = "~/.nurouter/node.toml"
+coordinator_url = ""
+account = ""
+group = ""
+max_in_flight = 24
+lease_wait_seconds = 7200
+lease_retry_interval_seconds = 2
+
+[judge]
+kind = "formal"
+env_id = "formal_clever"
+timeout_seconds = 300
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 4
+verification_profile = "formal_proof"
+judge_mode = "fast"
+require_result_cache_disabled = true
+
+
+[formal_tools]
+enabled = false
+require_decl_index = false
+
+[docker]
+image = "contextswarm-iclr:issue38-formal"
+memory_mb = 16384
+internet = "online"
+network = "host"
+
+[selection]
+enabled = true
+selector_version = "issue38_formal_v1"
+visibility = "project_shared"
+trace_slot_limit = 8
+context_token_budget = 4096
+tokenizer = "utf8_bytes_ceil_div4_v1"
+seed = 1729
+tie_break = "trace_id_asc"
+direct_messages = false
+candidate_transfer = false
+

@@ -3116,9 +3116,26 @@ class LeanEvaluator:
                     max(0.0, deadline - time.monotonic()),
                 )
             )
+        # A runner-owned cancellation is candidate-independent even when the
+        # Judge does not echo the newer ``retryable``/disposition marker.  In
+        # particular, the elastic runner uses ``full_score`` to stop all
+        # remaining slots and may also propagate ``runner_failure`` or the
+        # process settlement latch through its OR-cancel view.  Once DELETE
+        # was attempted and the receipt is bound to this exact job, retaining
+        # the permit behind a bounded watcher is safe: the watcher accepts a
+        # terminal receipt only for this identity.  Unknown identities still
+        # take the fail-closed path below.
         if attempted and (
             cancellation_reason
-            in {"task_solved_by_peer", "broker_revoked", "horizon_elapsed"}
+            in {
+                "task_solved_by_peer",
+                "broker_revoked",
+                "horizon_elapsed",
+                "full_score",
+                "runner_failure",
+                "remote_settlement_unconfirmed",
+                "cancelled",
+            }
             or retryable_cancel_observed
         ):
             # The submission identity is known and a DELETE was attempted, but
@@ -3679,7 +3696,7 @@ class CodingEvaluator(LeanEvaluator):
                 # either case the identity is known, so retain the permit in
                 # the bounded watcher path rather than latching before the
                 # receipt has had a chance to settle.
-                cancellation_reason="task_solved_by_peer",
+                cancellation_reason=reason,
                 on_settled=settlement_callback,
             )
             return current, error, attempted
