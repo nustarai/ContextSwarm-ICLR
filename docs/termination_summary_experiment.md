@@ -253,6 +253,39 @@ recovery 关闭；为了保持与 baseline 的既有合同一致，本 manifest 
 `DEGRADED` 及上述 Judge/进程错误意味着这次的分数只能作为该轮运行结果，不能和
 历史原版分数直接做因果归因；它不表示 closeout 本身造成了得分变化。
 
+### 时间加权质量：score-time AUC / normalized nAUC
+
+本实验不能只看最终 `score/12`。runner 的正式时间指标是
+`final.json.score_time.normalized_score_time_auc`（通常简称 nAUC）：先以每个任务
+第一次被 authoritative Judge 接受的 `PROVED` 时间构造累计得分曲线 `S(t)`，再计算
+
+```text
+score_time_auc = ∫[0,H] S(t) dt
+normalized_score_time_auc = score_time_auc / (H × task_count)
+```
+
+`H=3600` 秒、`task_count=12`；越大表示越早得到更多正确证明。termination-summary
+正文和 closeout 诊断不会直接计入这条曲线，只有真实 Judge/solver 的 accepted proof
+记录计入，因此发布一条 summary 不会凭空抬高 AUC。
+
+本轮正式 treatment 的时间指标是：
+
+| 指标 | 数值 |
+| --- | ---: |
+| `score_time_auc` | 14,309.109918 task-seconds |
+| `normalized_score_time_auc` | **0.33122940** |
+| `time_to_first_proof` | 90.790556 秒 |
+| `time_to_2/3/4/5/6_proofs` | 981.642505 / 1028.598113 / 1137.951223 / 1435.809985 / 2616.097700 秒 |
+| `time_to_7+_proofs` | 未达到 |
+
+作为非匹配的历史背景，同一 formal CPS32 家族的原版记录中，
+`baseline-r1` 的 nAUC 为 0.19257849，`baseline-r2` 为 0.27166079；另一轮原版
+`message-receipt` run 为 0.24765796。当前 0.33122940 在数值上高于这些记录，但它们
+不是同 commit、同时间窗口的 paired baseline，而且本轮 health 为 `DEGRADED`，所以
+不能把这个差值归因于 termination summary。之前“结果没有变好”的说法如果只指
+最终 `score/12` 是不完整的；加入 nAUC 后，正确表述应是“本轮 nAUC 数值较高，但
+改动带来的提升尚未被匹配实验识别”。
+
 ### 为什么会出现几十次 retry
 
 这里的 retry 不是 termination-summary 自己重复发送，也不是 checkpoint 恢复实验。
