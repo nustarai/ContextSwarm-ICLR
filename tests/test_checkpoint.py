@@ -80,6 +80,33 @@ class _PartialThenSuccessPi:
         )
 
 
+class _PartialThenBaselineThenSuccessPi(_PartialThenSuccessPi):
+    """Leave the active candidate at baseline on the second failed attempt."""
+
+    def run(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        attempt = len(self.calls)
+        workdir = Path(kwargs["workdir"])
+        if attempt >= 3:
+            metadata = json.loads(
+                (workdir / "checkpoint" / "checkpoint.json").read_text()
+            )
+            candidate = (workdir / "checkpoint" / "result.lean").read_text()
+            self.handoff_seen.append((metadata["candidate"]["source"], candidate))
+        if attempt == 1:
+            (workdir / "result.lean").write_text("partial-1\n")
+        now = "2026-01-01T00:00:00+00:00"
+        return AgentResult(
+            agent_id=str(kwargs["actor_id"]),
+            task_id=str(kwargs["task_id"]),
+            episode=int(kwargs["episode"]),
+            returncode=0 if attempt >= 3 else 1,
+            started_at=now,
+            finished_at=now,
+            error_tail="process failure" if attempt < 3 else "",
+        )
+
+
 class _SkippedEvaluator:
     is_mock_evaluator = True
 
@@ -534,6 +561,55 @@ class CheckpointRunnerIntegrationTests(unittest.TestCase):
             self.assertFalse(published_payload["score_eligible"])
             self.assertLessEqual(len(published[0]["body"].encode("utf-8")), 7_500)
             self.assertTrue(all(not verdict.status.startswith("PROVED") for _, verdict in results))
+
+    def test_changed_checkpoint_is_carried_forward_over_unchanged_closeout(self) -> None:
+        base = load_config("configs/smoke.toml", ROOT)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            initial_agents_per_task=1,
+            max_attempts_per_task=3,
+            pi_recovery_enabled=False,
+            checkpoint=CheckpointConfig(enabled=True, transfer=True, publish=False),
+            time_limit_seconds=2,
+        )
+        task = load_tasks(config)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            store = CPSStore(run_dir / "cps.sqlite3")
+            policy = make_policy(config.communication, store)
+            pi = _PartialThenBaselineThenSuccessPi()
+            _run_elastic_cps(
+                config,
+                [task],
+                run_dir,
+                logger,
+                _SkippedEvaluator(),
+                pi,
+                policy,
+                mock_agent=False,
+                deadline=time.monotonic() + 2,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=_Broker(),
+                scheduler_result_sink=[],
+            )
+            self.assertEqual(pi.handoff_seen, [("carry_forward_changed_checkpoint", "partial-1\n")])
+            latest = json.loads(
+                (run_dir / "workers" / task.slug / "checkpoints" / "latest.json").read_text()
+            )
+            metadata = json.loads(
+                (
+                    run_dir
+                    / "workers"
+                    / task.slug
+                    / "checkpoints"
+                    / latest["metadata"]
+                ).read_text()
+            )
+            self.assertEqual(metadata["candidate"]["source"], "carry_forward_changed_checkpoint")
+            self.assertTrue(metadata["candidate"]["changed_from_baseline"])
 
 
 if __name__ == "__main__":

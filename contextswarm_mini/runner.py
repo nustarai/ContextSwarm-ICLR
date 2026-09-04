@@ -5221,6 +5221,7 @@ def _run_elastic_cps(
                 return
             try:
                 with state.lock:
+                    prior_checkpoint = state.latest_checkpoint
                     feedback = (
                         state.last_feedback
                         if feedback_override is None
@@ -5236,6 +5237,35 @@ def _run_elastic_cps(
                         if state.best_candidate
                         else None
                     )
+                checkpoint_candidate_path = candidate_path
+                candidate_source = "attempt_workspace"
+                # A worker may finish without changing the active verified
+                # candidate after a peer already produced a useful partial.
+                # Keep that partial in the new immutable snapshot so the on-disk
+                # latest.json remains as useful as the in-memory handoff.
+                # The size guard avoids an unbounded pre-read; CheckpointStore
+                # remains the authority for the final bounded capture.
+                current_candidate_hash: str | None = None
+                current_candidate_missing = False
+                try:
+                    if candidate_path.stat().st_size <= config.checkpoint.max_candidate_bytes:
+                        current_candidate_hash = _file_sha256(candidate_path)
+                    else:
+                        current_candidate_hash = "__too_large__"
+                except OSError:
+                    current_candidate_missing = True
+                if (
+                    prior_checkpoint is not None
+                    and prior_checkpoint.candidate_changed_from_baseline
+                    and prior_checkpoint.candidate_path is not None
+                    and (
+                        current_candidate_missing
+                        or current_candidate_hash
+                        == (best_sha256 or baseline_sha256)
+                    )
+                ):
+                    checkpoint_candidate_path = prior_checkpoint.candidate_path
+                    candidate_source = "carry_forward_changed_checkpoint"
                 context = _checkpoint_context(
                     store,
                     task.slug,
@@ -5259,7 +5289,7 @@ def _run_elastic_cps(
                     ref = checkpoint_store.save(
                         task_id=task.slug,
                         task_root=state.task_root,
-                        candidate_path=candidate_path,
+                        candidate_path=checkpoint_candidate_path,
                         candidate_filename=task.candidate_filename,
                         baseline_sha256=baseline_sha256,
                         actor_id=actor,
@@ -5276,6 +5306,7 @@ def _run_elastic_cps(
                             else str(validation_feedback_override)
                         ),
                         best_candidate_sha256=best_sha256,
+                        candidate_source=candidate_source,
                     )
                 with state.lock:
                     prior_checkpoint = state.latest_checkpoint
@@ -5305,6 +5336,7 @@ def _run_elastic_cps(
                     candidate_status=candidate.get("status"),
                     candidate_bytes=candidate.get("bytes"),
                     candidate_sha256=candidate.get("sha256"),
+                    candidate_source=candidate.get("source"),
                     candidate_changed_from_baseline=bool(
                         candidate.get("changed_from_baseline")
                     ),

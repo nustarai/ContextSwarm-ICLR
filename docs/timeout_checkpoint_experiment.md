@@ -89,7 +89,7 @@
 - `latest.json`：原子更新的 latest 指针；
 - `index.jsonl`：按保存顺序的 bounded ledger。
 
-记录至少包含 candidate 文件状态/大小/SHA-256、attempt/recovery 序号、timeout/cancel/horizon/process-failure 原因、是否仍待 retry、最近验证状态/反馈、有限的 CPS pieces 和 task-local messages、`completed_work`、`ruled_out`、`next_step`。所有文本经过长度限制和 endpoint/credential/path 脱敏；目录为 0700，文件为 0600。
+记录至少包含 candidate 文件状态/大小/SHA-256/来源（当前 workspace 或 carry-forward）、attempt/recovery 序号、timeout/cancel/horizon/process-failure 原因、是否仍待 retry、最近验证状态/反馈、有限的 CPS pieces 和 task-local messages、`completed_work`、`ruled_out`、`next_step`。所有文本经过长度限制和 endpoint/credential/path 脱敏；目录为 0700，文件为 0600。
 
 ### 下一次 assignment 的交接
 
@@ -108,10 +108,12 @@ Runner 能强制保存已经存在于文件、CPS、Judge feedback 和可读 res
 已通过：
 
 - checkpoint store 原子写入、不可变序号、hash 校验、路径/凭据脱敏和 0600/0700 权限测试；
-- recovery sink 在失败尝试重试前收到记录，并在成功返回时收到最终记录；
+- recovery sink 在失败尝试重试前收到记录，并在成功返回时收到最终记录；若后续尝试
+  仍只留下已验证 best，则会 carry-forward 先前的 changed candidate，避免 latest 指针
+  被空 baseline closeout 覆盖；
 - message-only blocker 被加入 bounded ruled-out context，即使 direct message 已 ack；
 - mock CPS runner：两次失败写入 `partial-1`/`partial-2`，新的 assignment 读到 `checkpoint/result.lean=partial-2`，Judge 只评估第三次新候选；checkpoint piece 从未成为 proof；
-- 现有 recovery/CPS partial focused tests（含 slot refill）通过；checkpoint/recovery focused 合计 **29 个测试通过（29/29）**。
+- 现有 recovery/CPS partial focused tests（含 slot refill）通过；checkpoint/recovery focused 合计 **30 个测试通过（30/30）**。
 
 另做了一次同配置的短时 mock smoke（baseline 与 treatment 各一轮，`configs/smoke.toml`、1 题、30 秒合同）：
 
@@ -139,7 +141,7 @@ python3 -m unittest discover -s tests
 `FAILED (failures=2, skipped=1)`：两个失败分别是既有的 0.05 秒短 horizon
 时序测试（evaluator backpressure 和 scheduler non-admission），不涉及 checkpoint
 代码；把同一两个测试放在冻结原版 worktree 上重跑时也复现了这两个失败，因此将其
-归类为环境/时序波动，不能当作本次功能回归。checkpoint 相关聚焦集合为 29/29，
+归类为环境/时序波动，不能当作本次功能回归。checkpoint 相关聚焦集合为 30/30，
 `compileall` 通过；脏树时出现的 tracked-files 门禁失败已在 clean-tree 重跑中消失。
 
 ## 5. 真实 A/B 对照合同

@@ -218,6 +218,7 @@ class CheckpointStore:
         latest_validation_status: str = "",
         latest_validation_feedback: str = "",
         best_candidate_sha256: str | None = None,
+        candidate_source: str = "attempt_workspace",
     ) -> CheckpointRef:
         """Save one bounded candidate/result snapshot.
 
@@ -231,6 +232,9 @@ class CheckpointStore:
         safe_task = self._safe_task_id(task_id)
         safe_actor = self._safe_actor_id(actor_id)
         safe_candidate_filename = self._safe_candidate_filename(candidate_filename)
+        safe_candidate_source = (
+            sanitize_worker_text(candidate_source, 96) or "attempt_workspace"
+        )
         # Check lexical containment without resolving the final component: a
         # symlink candidate inside the task root must be reported as
         # ``not_regular`` below, not followed (or rejected as an opaque path)
@@ -267,6 +271,7 @@ class CheckpointStore:
             _private_dir(directory)
             candidate_record: dict[str, Any] = {
                 "filename": safe_candidate_filename,
+                "source": safe_candidate_source,
                 "status": "missing",
                 "bytes": None,
                 "sha256": None,
@@ -541,6 +546,8 @@ class CheckpointStore:
                 },
                 "candidate": {
                     "filename": sanitize_worker_text(candidate.get("filename"), 32),
+                    "source": sanitize_worker_text(candidate.get("source"), 96)
+                    or "attempt_workspace",
                     "status": sanitize_worker_text(candidate.get("status"), 32),
                     "bytes": candidate.get("bytes")
                     if isinstance(candidate.get("bytes"), int)
