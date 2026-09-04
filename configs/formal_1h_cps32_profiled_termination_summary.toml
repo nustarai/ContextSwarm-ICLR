@@ -1,0 +1,28 @@
+extends = ["formal_1h_cps32_profiled_clean.toml"]
+
+# Matched one-hour MathOlympiadBench CPS arm.  The sole treatment is a
+# cooperative semantic closeout: when a live Agent is about to time out or be
+# cancelled, Pi receives a bounded steer request; a settled live provider/
+# assistant error receives a same-session prompt.  In either case it must
+# summarize its own work and publish durable knowledge to the shared CPS
+# blackboard.  The pre-existing
+# formal CPS candidate-transfer behavior remains identical to the baseline;
+# this arm adds no checkpoint/recovery transfer or workspace snapshot.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-termination-summary"
+
+[checkpoint]
+# Checkpoint/recover is a separate workstream and is intentionally disabled in
+# this comparison arm.
+enabled = false
+transfer = false
+publish = false
+
+[termination_summary]
+enabled = true
+# Reserved inside each 900s Pi timeout; it does not extend the one-hour arm.
+grace_seconds = 45
+on_timeout = true
+on_cancel = true
+on_error = true
+max_prompt_chars = 4000

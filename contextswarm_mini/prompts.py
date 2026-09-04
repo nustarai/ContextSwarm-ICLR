@@ -171,6 +171,20 @@ def _execution_contract(task: Task) -> str:
     return CODING_EXECUTION_CONTRACT if _is_coding_task(task) else FORMAL_EXECUTION_CONTRACT
 
 
+def _termination_summary_execution_exception(enabled: bool) -> str:
+    """Expose closeout-only CPS verbs only to sessions that have that surface."""
+
+    if not enabled:
+        return ""
+    return """\nTermination-closeout exception (runner-owned and bounded): If the runner sends a
+user message beginning `RUNNER-REQUESTED TERMINATION CLOSEOUT`, that message
+temporarily supersedes the early-Judge ordering for this one closeout turn. Do
+not call `judge_check` or start another evaluation route; use task-local
+`cps_search` and publish exactly one `kind=\"termination_summary\"` piece with
+`cps_publish`. This exception does not establish a proof/solution or authorize
+other CPS/direct-message operations.\n"""
+
+
 def _candidate_context(task: Task) -> tuple[str, str, str]:
     """Return candidate filename, baseline glob, and candidate noun."""
 
@@ -189,6 +203,7 @@ def build_task_prompt(
     formal_tools_enabled: bool = False,
     direct_messages: bool = True,
     selection_enabled: bool = False,
+    termination_summary_enabled: bool = False,
     digest: str = "",
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
@@ -212,6 +227,7 @@ the only authority for success; do not claim success from intuition, a text scan
 or a local verification process.
 
 {_execution_contract(task)}
+{_termination_summary_execution_exception(termination_summary_enabled)}
 
 {_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
 
@@ -228,6 +244,63 @@ When feedback is useful, check one candidate at a time with `judge_check`.
 """
 
 
+def build_termination_summary_prompt(
+    task: Task,
+    *,
+    reason: str,
+    closeout_id: str,
+    max_chars: int = 4_000,
+) -> str:
+    """Build the runner's cooperative semantic-closeout message.
+
+    This message is intentionally about the *same Agent's conversation* and
+    the shared CPS blackboard.  It does not mention a candidate snapshot,
+    filesystem handoff, retry, or any other recovery mechanism.  The bounded
+    id gives the runner an auditable way to distinguish a new closeout piece
+    from an older piece by the same actor without exposing host state.
+    """
+
+    bounded_reason = str(reason or "termination").strip()[:64] or "termination"
+    bounded_id = str(closeout_id or "closeout").strip()[:64] or "closeout"
+    limit = max(512, min(int(max_chars), 8_000))
+    return f"""RUNNER-REQUESTED TERMINATION CLOSEOUT (mandatory; this is not a new exploration)
+
+The runner is ending your current attempt for task {task.slug!r} because of
+{bounded_reason!r}. Stop the current proof/program direction as soon as the
+current safe tool call returns. Do not start another route, and do not spend
+the remaining grace period polishing a candidate.
+
+This is a request to the same Agent/session that produced the work; it is not a
+message to another Agent and it is not a recovery checkpoint.
+
+Before publishing, inspect this conversation and use `cps_search` to check what
+you already published for this task. Recover every durable, reusable finding
+from THIS attempt that is not already in CPS, including partial constructions,
+concrete counterexamples, ruled-out directions, validation/Judge feedback, and
+the most useful next step. Do not invent a proof or upgrade an unverified claim.
+
+Use the `cps_publish` tool to publish one concise CPS piece with
+`kind="termination_summary"`, a title that
+starts with `termination_summary`, and the tag `forced_closeout:{bounded_id}`.
+Use a compact body with these headings:
+
+new_findings:
+counterexamples_or_ruled_out:
+validation_feedback:
+next_step:
+
+If there is no new publishable knowledge, still publish the required piece and
+write `no_new_publishable_finding` plus the reason. Do not publish credentials,
+absolute host paths, raw endpoints, a full transcript, or private chain-of-
+thought. After the CPS write succeeds, reply exactly
+`TERMINATION_SUMMARY_COMPLETE` (the reply is only a diagnostic marker; the CPS
+piece is the source of truth).
+
+Keep the CPS body below {limit} characters. The closeout id is only an audit
+label; it is not a task secret and must not be used to access anything else.
+"""
+
+
 def build_mono_prompt(
     tasks: Iterable[Task],
     *,
@@ -236,6 +309,7 @@ def build_mono_prompt(
     formal_tools_enabled: bool = False,
     direct_messages: bool = True,
     selection_enabled: bool = False,
+    termination_summary_enabled: bool = False,
 ) -> str:
     task_list = list(tasks)
     if not task_list:
@@ -261,6 +335,7 @@ Do not modify the source statement or baseline. The runner
 evaluates every candidate after this session and counts only canonical PROVED verdicts.
 
 {contract}
+{_termination_summary_execution_exception(termination_summary_enabled)}
 
 Mono task-selection rule: this session owns multiple task directories. For every
 `judge_check` call in Mono, pass the exact current task slug as

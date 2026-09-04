@@ -96,6 +96,26 @@ class PromptContractTests(unittest.TestCase):
             prompt.index("Before trying a route, use `cps_search`"),
         )
 
+    def test_termination_closeout_exception_is_treatment_only(self) -> None:
+        task = _task()
+        baseline = build_task_prompt(
+            task,
+            task_workspace="tasks/sample",
+            agent_id="worker-sample-e1",
+            episode=1,
+            communication_enabled=True,
+        )
+        treatment = build_task_prompt(
+            task,
+            task_workspace="tasks/sample",
+            agent_id="worker-sample-e1",
+            episode=1,
+            communication_enabled=True,
+            termination_summary_enabled=True,
+        )
+        self.assertNotIn("RUNNER-REQUESTED TERMINATION CLOSEOUT", baseline)
+        self.assertIn("RUNNER-REQUESTED TERMINATION CLOSEOUT", treatment)
+
     def test_only_cps_prompt_exposes_controlled_communication_tools(self) -> None:
         prompts = self._all_solver_prompts()
         for tool in CPS_TOOLS:

@@ -1,4 +1,11 @@
-# MathOlympiadBench：超时终止 checkpoint 对比实验
+# MathOlympiadBench：超时终止 checkpoint 对比实验（历史草案）
+
+> **已废止为本次任务的实验合同。** 本文件记录的是早期“私有候选
+> checkpoint + 下一 assignment transfer”实现，混合了 recovery 与共享知识
+> 发布，不能用来回答当前任务。当前任务只验证同一 Agent 在 timeout/cancel
+> 前通过 Pi `steer` 自主总结并向 CPS 发布，见
+> [`termination_summary_experiment.md`](termination_summary_experiment.md)。
+> checkpoint/recover 的后续交接见 [`recovery_checkpoint_handoff.md`](recovery_checkpoint_handoff.md)。
 
 ## 结论先行
 

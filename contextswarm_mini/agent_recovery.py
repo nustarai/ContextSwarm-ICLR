@@ -4,6 +4,14 @@ The Pi runtime already retries provider requests inside a live session.  This
 module owns the narrower outer boundary: when that whole RPC process/session
 exits abnormally, restart the same logical actor against its persisted session
 and workspace, without extending the experiment horizon.
+
+This module is intentionally not the termination-summary protocol.  A summary
+is a cooperative same-session closeout command (``steer`` while active or a
+normal ``prompt`` once settled) sent to the ending Agent so that it can publish
+shared CPS knowledge; recovery is a later restart of the same private
+session/workspace.  The optional result sink below is retained as a diagnostic
+hook for the separate recovery workstream and is not used to synthesize or
+publish semantic summaries.
 """
 
 from __future__ import annotations
@@ -157,7 +165,10 @@ def is_recoverable_agent_failure(
     verification failures, and other Judge verdicts are candidate-attempt
     outcomes, not process/session failures.  A timeout may be recoverable only
     when it was an inner Pi timeout and the fixed run deadline still has time;
-    reaching the run horizon itself is terminal.
+    reaching the run horizon itself is terminal.  Termination-summary state is
+    intentionally not consulted here: the summary and recovery policies are
+    independent so a matched A/B arm does not silently change its restart
+    budget.  A future recovery workstream may define an explicit handoff rule.
     """
 
     now = time.monotonic() if now_monotonic is None else float(now_monotonic)

@@ -189,6 +189,12 @@ class _SessionClaim:
         Callable[[Task, Verdict, CandidateSnapshot], None] | None
     ) = None
     cancel_event: threading.Event | None = None
+    # Optional runner-owned signal that temporarily permits the ending Agent
+    # to search/publish semantic termination knowledge even when it was
+    # interrupted before the ordinary early Judge checkpoint.  This is not a
+    # general CPS bypass: the signal is active only during the bounded Pi
+    # closeout command window and is cleared before the session is released.
+    termination_summary_event: Any | None = None
     revoked_event: threading.Event = field(default_factory=threading.Event, repr=False)
     probe_calls: int = 0
     last_probe_started: float = 0.0
@@ -711,6 +717,7 @@ class JudgeBroker:
             Callable[[Task, Verdict, CandidateSnapshot], None] | None
         ) = None,
         cancel_event: threading.Event | None = None,
+        termination_summary_event: Any | None = None,
     ) -> Iterator[dict[str, str]]:
         """Issue and later revoke a capability bound to exact candidates."""
 
@@ -829,6 +836,7 @@ class JudgeBroker:
             roster_path=Path(roster_path).resolve() if roster_path is not None else None,
             on_authoritative_verdict=on_authoritative_verdict,
             cancel_event=cancel_event,
+            termination_summary_event=termination_summary_event,
         )
         with self._claims_lock:
             self._claims[token] = claim
@@ -890,6 +898,26 @@ class JudgeBroker:
             return
         if not isinstance(payload, Mapping):
             self._send_json(handler, 400, {"ok": False, "status": "INVALID_REQUEST"})
+            return
+
+        if _termination_summary_active(claim) and operation in {
+            "judge_check",
+            "evaluate_local",
+            "formal_query",
+        }:
+            # The closeout prompt is a bounded knowledge-recovery turn, not a
+            # chance to start another proof/evaluation route.  Keep all
+            # controlled Judge surfaces closed while the cancellation mask is
+            # active; ``cps_search``/``cps_publish`` remain handled below.
+            self._send_json(
+                handler,
+                200,
+                _control_result(
+                    "TERMINATION_CLOSEOUT_ACTIVE",
+                    "Termination closeout permits only cps_search and cps_publish.",
+                    retryable=False,
+                ),
+            )
             return
 
         try:
@@ -2610,7 +2638,19 @@ class JudgeBroker:
                 )
             with claim.lock:
                 checkpoint_reached = claim.judge_checkpoint_reached
-            if not checkpoint_reached:
+            closeout_active = _termination_summary_active(claim)
+            if closeout_active and operation not in {"cps_search", "cps_publish"}:
+                # During the forced closeout the ending Agent is allowed to
+                # inspect its own task-local history and publish the one
+                # summary piece.  Do not let it open a new direct-message,
+                # selection-feedback, or Judge path while the cancellation
+                # mask is active.
+                return _control_result(
+                    "CPS_CAPABILITY_DENIED",
+                    "Termination closeout permits only cps_search and cps_publish.",
+                    retryable=False,
+                )
+            if not checkpoint_reached and not closeout_active:
                 return _control_result(
                     "JUDGE_CHECK_REQUIRED",
                     "Complete a terminal judge_check before using CPS communication.",
@@ -2671,7 +2711,11 @@ class JudgeBroker:
         if operation == "cps_search":
             query = _bounded_string(payload.get("query"), 500)
             limit = _bounded_limit(payload.get("limit"), default=8, maximum=8)
-            if claim.selection_enabled and claim.selection_search is not None:
+            if (
+                claim.selection_enabled
+                and claim.selection_search is not None
+                and not _termination_summary_active(claim)
+            ):
                 try:
                     selected = claim.selection_search(claim, query, limit)
                 except Exception:
@@ -2689,7 +2733,14 @@ class JudgeBroker:
                         task_id=task_id,
                         query=query,
                         limit=limit,
-                        include_global=claim.communication == "hybrid",
+                        # A forced closeout is deliberately task-local even
+                        # for a legacy hybrid session; it must not pull a
+                        # global/other-task observation into the ending
+                        # Agent's semantic summary.
+                        include_global=(
+                            claim.communication == "hybrid"
+                            and not _termination_summary_active(claim)
+                        ),
                     )
                 ],
             }
@@ -2707,7 +2758,43 @@ class JudgeBroker:
             if not isinstance(tags_raw, list):
                 raise ValueError("tags must be an array")
             tags = [_bounded_string(item, 64) for item in tags_raw[:8]]
+            if _termination_summary_active(claim):
+                # The closeout command has a narrow publication contract.  It
+                # prevents a late ordinary handoff from being mistaken for
+                # the forced summary and gives the runner a stable receipt
+                # predicate without inspecting model text.
+                if kind != "termination_summary":
+                    return _control_result(
+                        "INVALID_REQUEST",
+                        "Termination closeout requires kind=termination_summary.",
+                        retryable=False,
+                    )
+                if not title.casefold().startswith("termination_summary"):
+                    return _control_result(
+                        "INVALID_REQUEST",
+                        "Termination closeout title must start with termination_summary.",
+                        retryable=False,
+                    )
+                if not any(
+                    tag.casefold().startswith("forced_closeout:")
+                    and bool(tag.split(":", 1)[1].strip())
+                    for tag in tags
+                ):
+                    return _control_result(
+                        "INVALID_REQUEST",
+                        "Termination closeout requires a forced_closeout tag.",
+                        retryable=False,
+                    )
             scope = _scope(payload.get("scope"), claim.communication)
+            if _termination_summary_active(claim) and scope != "task":
+                # A closeout is a task-local knowledge receipt.  Even a
+                # hybrid session must not let an ending worker turn this
+                # emergency path into a global broadcast channel.
+                return _control_result(
+                    "INVALID_REQUEST",
+                    "Termination closeout requires task-local scope.",
+                    retryable=False,
+                )
             item = store.create_piece(
                 task_id="__global__" if scope == "global" else task_id,
                 author=claim.actor_id,
@@ -2909,9 +2996,32 @@ def _select_task_id(claim: _SessionClaim, raw: Any) -> str:
 
 
 def _claim_cancelled(claim: _SessionClaim) -> bool:
-    return claim.revoked_event.is_set() or (
-        claim.cancel_event is not None and claim.cancel_event.is_set()
-    )
+    if claim.revoked_event.is_set():
+        return True
+    # A closeout signal is an explicit, short-lived exception to the source
+    # cancellation guard.  The ending Agent still cannot outlive broker
+    # revocation or the claim deadline, and the signal is cleared as soon as
+    # PiAgent returns.  Keeping this check here (rather than relying on the
+    # caller to pass the exact same adapter as both fields) makes the broker
+    # contract safe for narrow test/integration adapters too.
+    if _termination_summary_active(claim):
+        return False
+    return claim.cancel_event is not None and claim.cancel_event.is_set()
+
+
+def _termination_summary_active(claim: _SessionClaim) -> bool:
+    signal = claim.termination_summary_event
+    if signal is None:
+        return False
+    active = getattr(signal, "termination_summary_active", None)
+    if callable(active):
+        try:
+            return bool(active())
+        except Exception:
+            return False
+    # A narrow injected Event-compatible adapter may expose the active phase
+    # directly; never infer it from the cancellation event itself.
+    return False
 
 
 def _cps_capability_failure(claim: _SessionClaim) -> dict[str, Any] | None:

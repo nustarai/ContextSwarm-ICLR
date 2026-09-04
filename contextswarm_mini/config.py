@@ -261,6 +261,18 @@ _CHECKPOINT_FIELDS = frozenset(
 )
 
 
+_TERMINATION_SUMMARY_FIELDS = frozenset(
+    {
+        "enabled",
+        "grace_seconds",
+        "on_timeout",
+        "on_cancel",
+        "on_error",
+        "max_prompt_chars",
+    }
+)
+
+
 @dataclass(frozen=True)
 class CheckpointConfig:
     """Manifest-owned policy for bounded termination handoffs.
@@ -325,6 +337,95 @@ def _parse_checkpoint(value: Any) -> CheckpointConfig:
             "checkpoint.max_context_items",
             6,
         ),
+    )
+
+
+@dataclass(frozen=True)
+class TerminationSummaryConfig:
+    """Cooperative semantic closeout, kept separate from recovery checkpoints.
+
+    When an Agent is about to be stopped by a timeout or cancellation, or a
+    still-live session settles with a provider/assistant error, the runner can
+    reserve a short grace period and send a same-session Pi RPC closeout
+    command (``steer`` while active, ``prompt`` after ``agent_settled``) asking
+    that same Agent to inspect its own conversation and publish durable CPS
+    knowledge.  This configuration never transfers files or candidate state
+    to another Agent; those concerns remain in :class:`CheckpointConfig` and
+    are owned by the separate recovery workstream.
+    """
+
+    enabled: bool = False
+    grace_seconds: float = 45.0
+    # Timeout and cancellation are deliberately separate switches.  A run can
+    # reserve the closeout protocol for the hard timeout while keeping an
+    # operator-initiated cancellation as an immediate stop (or vice versa).
+    on_timeout: bool = True
+    on_cancel: bool = True
+    # A settled provider/process error can still leave useful conversation
+    # context.  Requesting a closeout is cooperative when the RPC process is
+    # still alive; a hard crash remains an explicit missing-publication case.
+    on_error: bool = True
+    max_prompt_chars: int = 4_000
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "grace_seconds": self.grace_seconds,
+            "on_timeout": self.on_timeout,
+            "on_cancel": self.on_cancel,
+            "on_error": self.on_error,
+            "max_prompt_chars": self.max_prompt_chars,
+        }
+
+
+def _parse_termination_summary(value: Any) -> TerminationSummaryConfig:
+    table = _as_dict(value, "termination_summary")
+    unknown = set(table) - _TERMINATION_SUMMARY_FIELDS
+    if unknown:
+        raise ConfigError(
+            "unknown termination_summary fields: " + ", ".join(sorted(unknown))
+        )
+
+    def flag(key: str, default: bool) -> bool:
+        if key not in table:
+            return default
+        return _strict_bool(table[key], f"termination_summary.{key}")
+
+    enabled = flag("enabled", False)
+    raw_grace = table.get("grace_seconds")
+    if isinstance(raw_grace, bool):
+        raise ConfigError("termination_summary.grace_seconds must be a finite number")
+    grace = _number(
+        raw_grace,
+        "termination_summary.grace_seconds",
+        45.0,
+    )
+    # A very small grace period is not observable over the RPC framing and a
+    # huge one silently changes the experiment horizon.  Keep the knob useful
+    # for tests and bounded for real runs.
+    if grace < 1.0 or grace > 300.0:
+        raise ConfigError(
+            "termination_summary.grace_seconds must be between 1 and 300"
+        )
+    raw_max_prompt_chars = table.get("max_prompt_chars")
+    if isinstance(raw_max_prompt_chars, bool):
+        raise ConfigError("termination_summary.max_prompt_chars must be an integer")
+    max_prompt_chars = _positive_int(
+        raw_max_prompt_chars,
+        "termination_summary.max_prompt_chars",
+        4_000,
+    )
+    if max_prompt_chars < 512 or max_prompt_chars > 8_000:
+        raise ConfigError(
+            "termination_summary.max_prompt_chars must be between 512 and 8000"
+        )
+    return TerminationSummaryConfig(
+        enabled=enabled,
+        grace_seconds=grace,
+        on_timeout=flag("on_timeout", True),
+        on_cancel=flag("on_cancel", True),
+        on_error=flag("on_error", True),
+        max_prompt_chars=max_prompt_chars,
     )
 
 
@@ -569,6 +670,7 @@ class ExperimentConfig:
     allocation: AllocationConfig
     selection: SelectionConfig
     checkpoint: CheckpointConfig
+    termination_summary: TerminationSummaryConfig
     figure4_phase: str
     episodes_per_task: int
     max_tasks: int
@@ -686,6 +788,7 @@ class ExperimentConfig:
             "allocation": self.allocation.public_dict(),
             "selection": self.selection.public_dict(),
             "checkpoint": self.checkpoint.public_dict(),
+            "termination_summary": self.termination_summary.public_dict(),
             "figure4_phase": self.figure4_phase,
             "episodes_per_task": self.episodes_per_task,
             "max_tasks": self.max_tasks,
@@ -781,6 +884,9 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     )
     selection_config = _parse_selection(payload.get("selection"))
     checkpoint_config = _parse_checkpoint(payload.get("checkpoint"))
+    termination_summary_config = _parse_termination_summary(
+        payload.get("termination_summary")
+    )
 
     mode = _text(experiment.get("mode"), "cps").lower()
     if mode not in {"mono", "parallel", "cps"}:
@@ -791,6 +897,12 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         raise ConfigError(f"experiment.communication must be one of {sorted(allowed_communication)}")
     if mode in {"mono", "parallel"} and communication != "none":
         raise ConfigError("mono and parallel baselines must run with communication = none")
+    if termination_summary_config.enabled and (
+        mode != "cps" or communication == "none"
+    ):
+        raise ConfigError(
+            "termination_summary.enabled requires a CPS run with shared communication"
+        )
     if selection_config.enabled:
         if mode != "cps":
             raise ConfigError("enabled selection requires experiment.mode = cps")
@@ -1167,6 +1279,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         allocation=allocation_config,
         selection=selection_config,
         checkpoint=checkpoint_config,
+        termination_summary=termination_summary_config,
         figure4_phase=figure4_phase,
         episodes_per_task=episodes,
         max_tasks=max_tasks,

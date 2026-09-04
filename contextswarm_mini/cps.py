@@ -836,6 +836,120 @@ class CPSStore:
             )
         return row
 
+    def pieces_by_actor(
+        self,
+        *,
+        task_id: str,
+        author: str,
+        kind: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, task/actor-scoped piece ledger for closeout audit.
+
+        The termination-summary supervisor uses this read only to compare the
+        CPS ids that existed before and after a cooperative ``steer`` request.
+        It never builds a summary body from these rows and therefore cannot
+        accidentally merge another Agent's conversation into the ending
+        Agent's report.  Keep the query actor-scoped so concurrent Agents on a
+        task remain independent.
+        """
+
+        limit = max(1, min(int(limit), 500))
+        task_value = _clip(task_id, 256)
+        author_value = _clip(author, 256)
+        kind_value = _clip(kind, 64) if kind is not None else None
+        with self._db(operation="pieces_by_actor" if self._profiling_enabled else "generic") as db:
+            if kind_value is None:
+                rows = db.execute(
+                    """SELECT id,task_id,author,kind,title,body,tags,created_at
+                       FROM pieces
+                       WHERE active=1 AND task_id=? AND author=?
+                       ORDER BY rowid DESC LIMIT ?""",
+                    (task_value, author_value, limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """SELECT id,task_id,author,kind,title,body,tags,created_at
+                       FROM pieces
+                       WHERE active=1 AND task_id=? AND author=? AND kind=?
+                       ORDER BY rowid DESC LIMIT ?""",
+                    (task_value, author_value, kind_value, limit),
+                ).fetchall()
+        result: list[dict[str, Any]] = []
+        for raw in rows:
+            item = dict(raw)
+            try:
+                item["tags"] = json.loads(item.get("tags") or "[]")
+            except json.JSONDecodeError:
+                item["tags"] = []
+            # This method is an audit ledger, not a context injection path.
+            # Bound text in case a future caller logs a returned row.
+            item["title"] = _clip(item.get("title"), 300)
+            item["body"] = _clip(item.get("body"), _MAX_TEXT)
+            parsed_tags = item.get("tags")
+            item["tags"] = [
+                _clip(tag, 64)
+                for tag in parsed_tags[:8]
+                if isinstance(tag, str)
+            ] if isinstance(parsed_tags, list) else []
+            result.append(item)
+        return result
+
+    def piece_headers_by_actor(
+        self,
+        *,
+        task_id: str,
+        author: str,
+        kind: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return bounded actor-scoped piece metadata without message bodies.
+
+        Termination-closeout accounting only needs ids, titles, and tags.  Keep
+        that read separate from :meth:`pieces_by_actor` so the runner cannot
+        accidentally materialize a model's full CPS text while checking
+        whether a publication receipt exists.
+        """
+
+        limit = max(1, min(int(limit), 500))
+        task_value = _clip(task_id, 256)
+        author_value = _clip(author, 256)
+        kind_value = _clip(kind, 64) if kind is not None else None
+        with self._db(
+            operation="piece_headers_by_actor" if self._profiling_enabled else "generic"
+        ) as db:
+            if kind_value is None:
+                rows = db.execute(
+                    """SELECT id,task_id,author,kind,title,tags,created_at
+                       FROM pieces
+                       WHERE active=1 AND task_id=? AND author=?
+                       ORDER BY rowid DESC LIMIT ?""",
+                    (task_value, author_value, limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    """SELECT id,task_id,author,kind,title,tags,created_at
+                       FROM pieces
+                       WHERE active=1 AND task_id=? AND author=? AND kind=?
+                       ORDER BY rowid DESC LIMIT ?""",
+                    (task_value, author_value, kind_value, limit),
+                ).fetchall()
+        result: list[dict[str, Any]] = []
+        for raw in rows:
+            item = dict(raw)
+            try:
+                parsed_tags = json.loads(item.get("tags") or "[]")
+            except json.JSONDecodeError:
+                parsed_tags = []
+            item["title"] = _clip(item.get("title"), 300)
+            item["tags"] = [
+                _clip(tag, 64)
+                for tag in parsed_tags[:8]
+                if isinstance(tag, str)
+            ] if isinstance(parsed_tags, list) else []
+            result.append(item)
+        return result
+
     def search(
         self,
         *,

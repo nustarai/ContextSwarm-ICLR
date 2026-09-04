@@ -232,6 +232,19 @@ Pi transport 设置由共享 `[pi]` / `[pi.retry]` manifest 明确控制，三�
 Judge 返回的候选 verdict 不会触发这层恢复。每次失败、安排重启、恢复成功或耗尽都会
 写入 `events.jsonl`，便于区分 agent 进程故障与候选本身的 PE/WA/超时。
 
+如果需要验证“结束前遗漏的共享知识是否被回收”，CPS arm 可以显式开启
+`[termination_summary]`。在 timeout、cancel 或仍存活的 provider/assistant error
+边界，runner 会向同一 Pi session 发一次 closeout command，要求它停止当前路线、检查
+自己的对话和 task-local CPS，并用 `kind = "termination_summary"` 发布一条带 closeout
+tag 的摘要；正常 `agent_settled` 不发送额外提醒。该摘要是共享知识发布，不是
+checkpoint，也不会把未验证 candidate 直接计分或自动注入另一个 Agent。timeout/cancel
+在原 turn 仍运行时使用 `steer`；已经 `agent_settled` 的 live provider/assistant error
+使用同一 session 的普通 `prompt` 启动 closeout turn。硬崩溃/SIGKILL/通信不可用时无法
+合作总结，或命令写入失败时，runner 会区分记录 `request_sent=false` 与
+`termination_summary_missing`。配置、指标和 A/B 合同见
+[`docs/termination_summary_experiment.md`](docs/termination_summary_experiment.md)，
+recover/checkpoint 的独立交接见 [`docs/recovery_checkpoint_handoff.md`](docs/recovery_checkpoint_handoff.md)。
+
 每个 worker 的实际 Pi settings 写入其私有 `.pi/settings.json`；每次调用的原始
 session 进一步隔离在该 worker 的 `.pi/sessions/<session-id>/`，避免 CPS 高并发
 反复扫描其他 session，也不为 Mono/Parallel 增加共享通信面。它们位于 run 目录

@@ -1,0 +1,22 @@
+extends = ["formal_1h_cps32_profiled_clean.toml"]
+
+# Paired offline control for the bounded termination-summary plumbing fixture.
+# It keeps the same task/capacity/time settings and leaves the closeout feature
+# disabled; this is not a paper-quality baseline or a real Judge run.
+[experiment]
+name = "mobench-termination-summary-baseline-mock"
+max_parallel = 2
+initial_agents_per_task = 1
+max_attempts_per_task = 1
+episodes_per_task = 1
+max_tasks = 2
+time_limit_seconds = 10
+
+[aisw]
+enabled = false
+
+[formal_tools]
+enabled = false
+
+[pi]
+timeout_seconds = 2

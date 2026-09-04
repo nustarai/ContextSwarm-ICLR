@@ -109,6 +109,16 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertIn("Rely on your own reasoning", system_prompt)
         self.assertIn("do not copy or\ntrust externally sourced solutions", system_prompt)
 
+    def test_termination_closeout_system_exception_is_treatment_only(self) -> None:
+        agent = PiAgent(load_config("configs/smoke.toml", ROOT))
+        baseline = agent.command()
+        treatment = agent.command(termination_summary_enabled=True)
+        baseline_prompt = baseline[baseline.index("--system-prompt") + 1]
+        treatment_prompt = treatment[treatment.index("--system-prompt") + 1]
+        self.assertNotIn("RUNNER-REQUESTED TERMINATION CLOSEOUT", baseline_prompt)
+        self.assertIn("RUNNER-REQUESTED TERMINATION CLOSEOUT", treatment_prompt)
+        self.assertTrue(treatment_prompt.startswith(baseline_prompt + "\n"))
+
     def test_isolated_scheduler_has_no_tools_and_a_read_only_system_prompt(self) -> None:
         command = PiAgent(load_config("configs/smoke.toml", ROOT)).command(isolated=True)
         self.assertIn("--no-tools", command)

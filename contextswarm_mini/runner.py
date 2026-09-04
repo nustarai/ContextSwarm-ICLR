@@ -87,7 +87,11 @@ from .launch_contract import LaunchContractError, verify_manifest_binding
 from .models import AgentResult, Task, Verdict
 from .pi_agent import PiAgent
 from .preflight import PreflightError, run_preflight
-from .prompts import build_mono_prompt, build_task_prompt
+from .prompts import (
+    build_mono_prompt,
+    build_task_prompt,
+    build_termination_summary_prompt,
+)
 from .profiling import RunProfiler
 from .selection_runtime import SelectionRuntime
 from .selection_store import EXPORT_SCHEMA_VERSION, SelectionStore
@@ -775,6 +779,65 @@ class _AnyCancelEvent:
         return None
 
 
+class _TerminationSummaryCancelEvent:
+    """Two-phase cancellation view used during cooperative closeout.
+
+    The scheduler's source event remains authoritative, but a live Agent must
+    get a short opportunity to call ``cps_publish`` after that event is set.
+    While the Pi RPC is handling the runner's steer message, this adapter masks
+    the source from the broker's write guard.  Once PiAgent returns, the mask is
+    removed and normal cancellation/revocation is visible again.  The
+    ``requested`` method lets PiAgent observe the source without weakening the
+    hard cancellation checks used everywhere else.
+    """
+
+    def __init__(self, source: Any):
+        self._source = source
+        self._closeout_active = threading.Event()
+
+    def requested(self) -> bool:
+        try:
+            return bool(self._source.is_set())
+        except Exception:
+            return True
+
+    def begin_termination_summary(self) -> None:
+        self._closeout_active.set()
+
+    def finish_termination_summary(self) -> None:
+        self._closeout_active.clear()
+
+    def termination_summary_active(self) -> bool:
+        return self._closeout_active.is_set()
+
+    def is_set(self) -> bool:
+        return self.requested() and not self._closeout_active.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while not self.is_set():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                delay = min(remaining, 0.02)
+            else:
+                delay = 0.02
+            threading.Event().wait(delay)
+        return True
+
+    def cancellation_reason(self) -> str | None:
+        getter = getattr(self._source, "cancellation_reason", None)
+        if callable(getter):
+            try:
+                reason = getter()
+            except Exception:
+                reason = None
+            if isinstance(reason, str) and reason:
+                return reason
+        return None
+
+
 class RemoteJudgeSettlementError(RuntimeError):
     """The run cannot safely admit work while a remote job is unaccounted for."""
 
@@ -841,6 +904,21 @@ def _run_solver_with_recovery(
         settled=result.returncode == 0,
         agent_run_horizon_reached=result.run_horizon_reached,
         recoverable_invocation_error=result.recoverable_invocation_error,
+        termination_summary_requested=bool(
+            getattr(result, "termination_summary_requested", False)
+        ),
+        termination_summary_request_sent=bool(
+            getattr(result, "termination_summary_request_sent", False)
+        ),
+        termination_summary_completed=bool(
+            getattr(result, "termination_summary_completed", False)
+        ),
+        termination_summary_publish_count=int(
+            getattr(result, "termination_summary_publish_count", 0) or 0
+        ),
+        termination_summary_publish_verified=bool(
+            getattr(result, "termination_summary_publish_verified", False)
+        ),
     )
     return result
 
@@ -1942,6 +2020,144 @@ def _checkpoint_prompt_block(ref: CheckpointRef | None) -> str:
     )
 
 
+def _termination_summary_piece_ids(
+    store: CPSStore | None,
+    *,
+    task_id: str,
+    actor_id: str,
+) -> set[str]:
+    """Read only the ending actor's summary ids for publication accounting."""
+
+    if store is None:
+        return set()
+    try:
+        rows = store.piece_headers_by_actor(
+            task_id=task_id,
+            author=actor_id,
+            kind="termination_summary",
+            limit=500,
+        )
+    except Exception:
+        return set()
+    return {
+        str(row.get("id") or "")
+        for row in rows
+        if isinstance(row, Mapping) and str(row.get("id") or "")
+    }
+
+
+def _termination_summary_piece_matches(
+    row: Mapping[str, Any],
+    *,
+    closeout_id: str,
+) -> bool:
+    """Check the bounded receipt contract without reading the piece body."""
+
+    if str(row.get("kind") or "") != "termination_summary":
+        return False
+    if not str(row.get("title") or "").casefold().startswith(
+        "termination_summary"
+    ):
+        return False
+    tags = row.get("tags")
+    if not isinstance(tags, list):
+        return False
+    expected = f"forced_closeout:{closeout_id}".casefold()
+    return any(str(tag).casefold() == expected for tag in tags)
+
+
+def _termination_summary_final_evidence(
+    run_dir: Path,
+    config: ExperimentConfig,
+) -> dict[str, Any]:
+    """Summarize cooperative closeout lifecycle without copying message text."""
+
+    counts: Counter[str] = Counter()
+    requested = request_sent = completed = verified = missing = unavailable = audit_failed = 0
+    eligible_terminations = 0
+    requested_keys: set[tuple[str, str, str, str, str]] = set()
+
+    def event_key(row: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
+        """Join lifecycle rows without relying on event ordering alone."""
+
+        def field_text(name: str) -> str:
+            value = row.get(name)
+            return "" if value is None else str(value)
+
+        return (
+            field_text("task_id"),
+            field_text("agent_id"),
+            # Preserve episode 0; ``or ""`` would merge it with a missing
+            # episode and could under-count the first assignment's lifecycle.
+            field_text("episode"),
+            field_text("closeout_id"),
+            # A single logical actor can have several process attempts under
+            # the independent recovery policy.  Keep each closeout lifecycle
+            # distinct while accepting old rows that lack this optional key.
+            field_text("process_attempt")
+            or field_text("recovery_attempt"),
+        )
+
+    try:
+        handle = (run_dir / "events.jsonl").open(encoding="utf-8")
+    except OSError:
+        handle = None
+    if handle is not None:
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event = str(row.get("event") or "")
+                if not event.startswith("termination_summary_"):
+                    continue
+                counts[event] += 1
+                if event == "termination_summary_requested":
+                    requested += 1
+                    request_sent += int(row.get("request_sent") is True)
+                    key = event_key(row)
+                    if key not in requested_keys:
+                        requested_keys.add(key)
+                        eligible_terminations += 1
+                elif event == "termination_summary_completed":
+                    completed += 1
+                elif event == "termination_summary_missing":
+                    missing += 1
+                elif event == "termination_summary_unavailable":
+                    unavailable += 1
+                    # A write failure emits both requested and unavailable;
+                    # count that closeout once.  A process that dies before a
+                    # steer emits only unavailable/missing and still counts
+                    # as one eligible termination.
+                    if row.get("request_sent") is False:
+                        key = event_key(row)
+                        if key not in requested_keys:
+                            requested_keys.add(key)
+                            eligible_terminations += 1
+                elif event == "termination_summary_audit_failed":
+                    audit_failed += 1
+                elif event == "termination_summary_published":
+                    verified += int(row.get("publish_count", 0) or 0)
+    return {
+        "schema_version": "contextswarm_termination_summary_evidence_v1",
+        "enabled": bool(config.termination_summary.enabled),
+        "grace_seconds": config.termination_summary.grace_seconds,
+        "on_timeout": bool(config.termination_summary.on_timeout),
+        "on_cancel": bool(config.termination_summary.on_cancel),
+        "on_error": bool(config.termination_summary.on_error),
+        "requests": requested,
+        "request_sent": request_sent,
+        "eligible_terminations": eligible_terminations,
+        "agent_closeouts_completed": completed,
+        "published_piece_count": verified,
+        "missing_publication": missing,
+        "communication_unavailable": unavailable,
+        "audit_failures": audit_failed,
+        "events": dict(sorted(counts.items())),
+    }
+
+
 def _seconds_since_cps_timestamp(raw: str) -> float | None:
     value = str(raw or "").strip()
     if not value:
@@ -2665,6 +2881,7 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "allocation": config.allocation.public_dict(),
         "selection": config.selection.public_dict(),
         "checkpoint": config.checkpoint.public_dict(),
+        "termination_summary": config.termination_summary.public_dict(),
         "figure4_phase": config.figure4_phase,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
@@ -3719,6 +3936,13 @@ def _run_elastic_cps(
         )
         if selection_runtime is not None
         else None
+    )
+
+    # This experiment arm is intentionally about semantic CPS closeout only.
+    # The separately owned checkpoint/recovery path may still exist in the
+    # runner for a future arm, but it is not enabled or consulted here.
+    termination_summary_enabled = bool(
+        config.termination_summary.enabled and policy.enabled
     )
 
     def record_run_failure() -> None:
@@ -5193,15 +5417,40 @@ def _run_elastic_cps(
         actor = assignment.agent_id
         task = state.task
         candidate_path = _candidate_path(workdir, task)
-        assignment_cancel_event = _AnyCancelEvent(
+        assignment_source_cancel_event = _AnyCancelEvent(
             run_cancel_event,
             state.cancel_event,
             reasons=("runner_failure", "task_solved_by_peer"),
+        )
+        assignment_cancel_event: Any = (
+            _TerminationSummaryCancelEvent(assignment_source_cancel_event)
+            if termination_summary_enabled
+            else assignment_source_cancel_event
         )
         baseline_sha256 = hashlib.sha256(
             task.baseline_code.encode("utf-8")
         ).hexdigest()
         last_recovery_attempt = 0
+        termination_closeout_id = uuid.uuid4().hex[:24]
+        termination_piece_ids_before = (
+            _termination_summary_piece_ids(
+                store,
+                task_id=task.slug,
+                actor_id=actor,
+            )
+            if termination_summary_enabled
+            else set()
+        )
+        termination_prompt = (
+            build_termination_summary_prompt(
+                task,
+                reason="termination",
+                closeout_id=termination_closeout_id,
+                max_chars=config.termination_summary.max_prompt_chars,
+            )
+            if termination_summary_enabled
+            else None
+        )
 
         def save_checkpoint_result(
             result: AgentResult,
@@ -5466,6 +5715,8 @@ def _run_elastic_cps(
         ) -> None:
             """Refresh the immutable handoff with the final Judge boundary."""
 
+            if checkpoint_store is None:
+                return
             save_checkpoint_result(
                 result,
                 last_recovery_attempt,
@@ -5475,6 +5726,160 @@ def _run_elastic_cps(
                 validation_feedback_override=feedback,
                 publish=publish,
             )
+
+        termination_piece_ids_seen = set(termination_piece_ids_before)
+        termination_summary_recorded_attempts: set[int] = set()
+
+        def record_termination_summary(
+            result: AgentResult,
+            *,
+            recovery_attempt: int = 0,
+        ) -> None:
+            """Audit one process attempt without synthesizing Agent content.
+
+            ``run_with_recovery`` invokes its result hook before launching a
+            replacement process.  Recording at that boundary is essential:
+            otherwise a first timed-out Agent could publish a summary and then
+            be replaced by a normal recovery result, leaving no lifecycle
+            receipt for the publication.  The process-attempt key also keeps
+            independent retries from being collapsed into one logical row.
+            """
+
+            if not termination_summary_enabled:
+                return
+            try:
+                process_attempt = max(0, int(recovery_attempt))
+            except (TypeError, ValueError, OverflowError):
+                process_attempt = 0
+            if process_attempt in termination_summary_recorded_attempts:
+                return
+            termination_summary_recorded_attempts.add(process_attempt)
+
+            def emit(event: str, **fields: Any) -> None:
+                logger.event(
+                    event,
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    process_attempt=process_attempt,
+                    closeout_id=termination_closeout_id,
+                    **fields,
+                )
+
+            if not result.termination_summary_requested:
+                # A process can exit between the last poll and the soft
+                # boundary, or an explicitly disabled trigger can take the
+                # immediate-stop path.  Keep those cases visible without
+                # pretending that the runner reconstructed a summary.
+                if result.timed_out or result.cancelled or result.returncode != 0:
+                    if result.cancelled and not config.termination_summary.on_cancel:
+                        reason = "cancel_trigger_disabled"
+                    elif result.timed_out and not config.termination_summary.on_timeout:
+                        reason = "timeout_trigger_disabled"
+                    elif (
+                        result.returncode != 0
+                        and not result.timed_out
+                        and not result.cancelled
+                        and not config.termination_summary.on_error
+                    ):
+                        reason = "error_trigger_disabled"
+                    else:
+                        reason = "process_exited_before_closeout"
+                    emit(
+                        "termination_summary_unavailable",
+                        reason=reason,
+                        request_sent=False,
+                    )
+                    if reason == "process_exited_before_closeout":
+                        emit(
+                            "termination_summary_missing",
+                            closeout_completed=False,
+                            request_sent=False,
+                        )
+                return
+            reason = result.termination_summary_reason or "termination"
+            request_sent = bool(result.termination_summary_request_sent)
+            emit(
+                "termination_summary_requested",
+                reason=reason,
+                grace_seconds=config.termination_summary.grace_seconds,
+                request_sent=request_sent,
+            )
+            if not request_sent:
+                emit(
+                    "termination_summary_unavailable",
+                    reason="closeout_command_write_failed",
+                    request_sent=False,
+                )
+                emit(
+                    "termination_summary_missing",
+                    closeout_completed=False,
+                    request_sent=False,
+                )
+                return
+            if store is None:
+                emit(
+                    "termination_summary_unavailable",
+                    reason=(
+                        "communication_disabled"
+                        if not policy.enabled
+                        else "cps_store_unavailable"
+                    ),
+                    request_sent=True,
+                )
+                emit(
+                    "termination_summary_missing",
+                    closeout_completed=bool(result.termination_summary_completed),
+                    request_sent=True,
+                )
+                return
+            try:
+                rows = store.piece_headers_by_actor(
+                    task_id=task.slug,
+                    author=actor,
+                    kind="termination_summary",
+                    limit=500,
+                )
+                after_ids = {
+                    str(row.get("id") or "")
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and str(row.get("id") or "")
+                    and _termination_summary_piece_matches(
+                        row,
+                        closeout_id=termination_closeout_id,
+                    )
+                }
+            except Exception as exc:
+                emit(
+                    "termination_summary_audit_failed",
+                    error_kind=_profile_error_kind(exc),
+                )
+                emit(
+                    "termination_summary_missing",
+                    closeout_completed=bool(result.termination_summary_completed),
+                    request_sent=True,
+                    audit_failed=True,
+                )
+                return
+            new_ids = sorted(after_ids - termination_piece_ids_seen)
+            termination_piece_ids_seen.update(after_ids)
+            result.termination_summary_publish_count = len(new_ids)
+            result.termination_summary_publish_verified = bool(new_ids)
+            if result.termination_summary_completed:
+                emit("termination_summary_completed")
+            if new_ids:
+                emit(
+                    "termination_summary_published",
+                    publish_count=len(new_ids),
+                    piece_ids=new_ids[:16],
+                )
+            else:
+                emit(
+                    "termination_summary_missing",
+                    closeout_completed=bool(result.termination_summary_completed),
+                    request_sent=True,
+                )
 
         def admit_task_proof(
             verdict: Verdict,
@@ -5616,7 +6021,8 @@ def _run_elastic_cps(
             with state.lock:
                 state.completed_attempts += 1
             result = _mock_result(actor, task.slug, assignment.generation)
-            save_checkpoint_result(result, 0, False)
+            if checkpoint_store is not None:
+                save_checkpoint_result(result, 0, False)
             verdict = Verdict(task.slug, "CANCELLED", 0.0, 0.0, {"reason": "task_already_solved"})
             logger.event("agent_finished", **result.as_dict())
             logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
@@ -5660,6 +6066,7 @@ def _run_elastic_cps(
                 formal_tools_enabled=config.formal_tools_enabled,
                 direct_messages=direct_messages,
                 selection_enabled=selection_enabled,
+                termination_summary_enabled=termination_summary_enabled,
                 digest=digest,
             )
             if candidate_transfer:
@@ -5673,8 +6080,28 @@ def _run_elastic_cps(
                 prompt += _checkpoint_prompt_block(checkpoint_ref)
         if mock_agent:
             result = _mock_result(actor, task.slug, assignment.generation)
-            save_checkpoint_result(result, 0, False)
+            if checkpoint_store is not None:
+                save_checkpoint_result(result, 0, False)
         else:
+            def on_solver_result(
+                attempt_result: AgentResult,
+                recovery_attempt: int,
+                retry_pending: bool,
+            ) -> None:
+                # Keep the two side channels independent.  A checkpoint hook
+                # may be disabled for this treatment while semantic closeout
+                # still needs one receipt per process attempt.
+                if checkpoint_store is not None:
+                    save_checkpoint_result(
+                        attempt_result,
+                        recovery_attempt,
+                        retry_pending,
+                    )
+                record_termination_summary(
+                    attempt_result,
+                    recovery_attempt=recovery_attempt,
+                )
+
             with judge_broker.session(
                 actor_id=actor,
                 episode=assignment.generation,
@@ -5690,6 +6117,9 @@ def _run_elastic_cps(
                 roster_path=roster_path,
                 on_authoritative_verdict=admit_early_proof,
                 cancel_event=assignment_cancel_event,
+                termination_summary_event=(
+                    assignment_cancel_event if termination_summary_enabled else None
+                ),
             ) as broker_env:
                 result = _run_solver_with_recovery(
                     config,
@@ -5706,13 +6136,38 @@ def _run_elastic_cps(
                         communication_enabled=policy.enabled,
                         direct_messages=direct_messages,
                         selection_enabled=selection_enabled,
+                        termination_summary_prompt=termination_prompt,
+                        termination_summary_grace_seconds=(
+                            config.termination_summary.grace_seconds
+                            if termination_summary_enabled
+                            else 0.0
+                        ),
+                        termination_summary_on_timeout=(
+                            config.termination_summary.on_timeout
+                            if termination_summary_enabled
+                            else False
+                        ),
+                        termination_summary_on_cancel=(
+                            config.termination_summary.on_cancel
+                            if termination_summary_enabled
+                            else False
+                        ),
+                        termination_summary_on_error=(
+                            config.termination_summary.on_error
+                            if termination_summary_enabled
+                            else False
+                        ),
                     ),
                     task_id=task.slug,
                     actor_id=actor,
                     episode=assignment.generation,
                     deadline=deadline,
                     cancel_event=assignment_cancel_event,
-                    on_result=save_checkpoint_result,
+                    on_result=(
+                        on_solver_result
+                        if checkpoint_store is not None or termination_summary_enabled
+                        else None
+                    ),
                 )
         _raise_if_remote_settlement_unconfirmed(
             evaluator,
@@ -8107,6 +8562,7 @@ def _write_final(
         },
         "cps": dict(cps_summary or {"enabled": False}),
         "checkpoint": _checkpoint_final_evidence(run_dir, config),
+        "termination_summary": _termination_summary_final_evidence(run_dir, config),
         "selection": _selection_final_evidence(
             run_dir,
             config,
