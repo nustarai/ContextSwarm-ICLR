@@ -1,0 +1,18 @@
+extends = ["canary.toml"]
+
+# Matched real-Pi/real-Judge baseline for the progress-window canary.  The
+# horizon, Pi timeout, recovery policy, task count, and formal Judge contract
+# match termination_summary_real_canary_progress.toml; only the semantic
+# termination closeout is absent.
+[experiment]
+name = "mobench-controlled-judge-termination-summary-canary-progress-baseline"
+time_limit_seconds = 120
+
+[pi]
+timeout_seconds = 900
+
+[pi.recovery]
+enabled = false
+
+[formal_tools]
+require_decl_index = false
