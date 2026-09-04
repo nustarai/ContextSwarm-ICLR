@@ -321,6 +321,51 @@ class PiTerminationSummaryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 124)
             self.assertIn("closeout response", result.output_tail)
 
+    def test_multiturn_closeout_keeps_completion_evidence(self) -> None:
+        """Continuation turns must not erase the matching closeout message."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _write_fake(
+                root,
+                "import json, sys, time\n"
+                "request=json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'id':request['id'],'type':'response','success':True}), flush=True)\n"
+                "print(json.dumps({'type':'agent_start'}), flush=True)\n"
+                "time.sleep(1.2)\n"
+                "while True:\n"
+                " line=sys.stdin.readline()\n"
+                " if not line: break\n"
+                " command=json.loads(line)\n"
+                " if command.get('type') != 'steer': continue\n"
+                " print(json.dumps({'id':command.get('id'),'type':'response','success':True}), flush=True)\n"
+                " print(json.dumps({'type':'turn_start'}), flush=True)\n"
+                " print(json.dumps({'type':'message_start','message':{'role':'user','content':[{'type':'text','text':command.get('message','')}]}}), flush=True)\n"
+                " print(json.dumps({'type':'message_end','message':{'role':'assistant','stopReason':'toolUse'}}), flush=True)\n"
+                " print(json.dumps({'type':'turn_end'}), flush=True)\n"
+                " print(json.dumps({'type':'turn_start'}), flush=True)\n"
+                " print(json.dumps({'type':'message_end','message':{'role':'assistant','stopReason':'stop'}}), flush=True)\n"
+                " print(json.dumps({'type':'agent_end','willRetry':False}), flush=True)\n"
+                " print(json.dumps({'type':'agent_settled'}), flush=True)\n"
+                " break\n",
+            )
+            result = PiAgent(_fake_config(fake, timeout=2)).run(
+                task_id="task",
+                actor_id="agent",
+                episode=1,
+                prompt="work",
+                workdir=root,
+                termination_summary_prompt="publish closeout",
+                termination_summary_grace_seconds=0.5,
+            )
+            self.assertTrue(result.timed_out)
+            self.assertTrue(result.termination_summary_requested)
+            self.assertTrue(result.termination_summary_request_sent)
+            self.assertTrue(result.termination_summary_completed)
+            # The invocation remains a timeout for recovery/accounting even
+            # though its cooperative closeout settled cleanly.
+            self.assertEqual(result.returncode, 124)
+
     def test_normal_completion_does_not_receive_steer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

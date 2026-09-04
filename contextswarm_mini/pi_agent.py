@@ -889,9 +889,14 @@ class PiAgent:
                 # lifecycle marker that Pi has reached the closeout command. A
                 # user-message hash below prevents a buffered initial prompt
                 # from being mistaken for that turn.
-                termination_summary_turn_started = True
-                termination_summary_message_seen = False
-                termination_summary_settled_after_turn = False
+                # A single closeout can contain several tool-use turns. Keep
+                # the matching user-message/settlement evidence sticky across
+                # those continuation turns; resetting it here would make a
+                # real multi-turn closeout publish successfully but never
+                # receive a completion receipt.
+                if not termination_summary_turn_started:
+                    termination_summary_turn_started = True
+                    termination_summary_settled_after_turn = False
             if (
                 termination_summary_requested
                 and event_type == "message_start"
