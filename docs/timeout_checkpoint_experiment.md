@@ -125,9 +125,9 @@ python3 -m unittest discover -s tests
 提交后的 clean-tree 全套 discovery 实际运行了 735 个测试，结果为
 `FAILED (failures=2, skipped=1)`：两个失败分别是既有的 0.05 秒短 horizon
 时序测试（evaluator backpressure 和 scheduler non-admission），不涉及 checkpoint
-代码；前者单独重跑仍会复现，后者单独重跑通过，属于环境/时序波动，不能当作本次
-功能回归。checkpoint 相关聚焦集合为 29/29，`compileall` 通过；脏树时出现的
-tracked-files 门禁失败已在 clean-tree 重跑中消失。
+代码；把同一两个测试放在冻结原版 worktree 上重跑时也复现了这两个失败，因此将其
+归类为环境/时序波动，不能当作本次功能回归。checkpoint 相关聚焦集合为 29/29，
+`compileall` 通过；脏树时出现的 tracked-files 门禁失败已在 clean-tree 重跑中消失。
 
 ## 5. 真实 A/B 对照合同
 
