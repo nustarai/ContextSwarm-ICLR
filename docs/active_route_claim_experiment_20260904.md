@@ -2,6 +2,8 @@
 
 日期：2026-09-04
 
+> 更新说明（2026-09-05）：本文保留第一阶段实现、早期共享 Judge 尝试和顺序隔离运行的历史记录。最新的“弱提示词 vs 强提示词”真实 A/B、按 prompt-exposed 分母计算的语义重复指标，以及最终决策见 [`activity_feedback_final_conclusion_20260905.md`](activity_feedback_final_conclusion_20260905.md)。不要把本文早期的“尚未证明语义重复下降”段落当作最新实验结论。
+
 状态：第一阶段协议已实现并通过离线机制验证；同源 control/treatment 正式配置已冻结。此前曾误用共享 Judge 做过三次并行 treatment（历史记录保留在第 7 节，不能用于成绩比较）；按用户纠正后的协议，已于 2026-09-03 依次完成三次真实、严格顺序、每轮独立 Judge stack/workspace 的 12 题 × 1 小时 treatment，详见第 13 节。三次新 run 均 `runner rc=0`、最终记录为 `6/12` 且运行健康状态为 `DEGRADED`；它们是有效的隔离机制/基础设施观测，但仍不是 control/treatment 因果 A/B。
 
 实现基线（历史报告中的实现锚点）：`33296b07634c708412326c2808d5782dab3f788e`
