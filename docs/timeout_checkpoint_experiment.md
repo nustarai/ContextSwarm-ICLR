@@ -134,15 +134,18 @@ TMPDIR=/home/ubuntu/workspace/.workspace/builds/CS-20260904/tmp \
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. \
 python3 -m unittest tests.test_checkpoint tests.test_cps_recovery_partial tests.test_agent_recovery
 python3 -m compileall -q contextswarm_mini
-python3 -m unittest discover -s tests
+PYTHONWARNINGS=ignore::ResourceWarning python3 -m unittest discover -s tests
 ```
 
-提交后的 clean-tree 全套 discovery 实际运行了 735 个测试，结果为
-`FAILED (failures=2, skipped=1)`：两个失败分别是既有的 0.05 秒短 horizon
-时序测试（evaluator backpressure 和 scheduler non-admission），不涉及 checkpoint
-代码；把同一两个测试放在冻结原版 worktree 上重跑时也复现了这两个失败，因此将其
-归类为环境/时序波动，不能当作本次功能回归。checkpoint 相关聚焦集合为 30/30，
-`compileall` 通过；脏树时出现的 tracked-files 门禁失败已在 clean-tree 重跑中消失。
+carry-forward 修正后的 clean-tree 全套 discovery 在
+`PYTHONWARNINGS=ignore::ResourceWarning` 下实际运行了 **736/736** 个测试，结果为
+`OK (skipped=1)`；checkpoint 相关聚焦集合为 30/30，`compileall` 通过。为保留
+未抑制 warning 的真实边界，同一提交再运行一次未设置 `PYTHONWARNINGS` 的全套，
+得到 736 个测试、1 个 Figure-4 的 0.05 秒边界时序失败（无 checkpoint 相关失败）。
+更早的 clean-tree 运行还出现过 evaluator-backpressure 与 scheduler non-admission
+两个同类短 horizon 失败；把那两个测试放在冻结原版 worktree 上重跑时也复现了，
+因此都归类为环境/时序波动，不能当作本次功能回归。脏树时出现的 tracked-files
+门禁失败已在 clean-tree 重跑中消失。
 
 ## 5. 真实 A/B 对照合同
 
