@@ -850,19 +850,37 @@ class CPSStore:
                     released_at TEXT,
                     independent_verification_reason TEXT,
                     is_primary INTEGER NOT NULL DEFAULT 1,
-                    release_reason TEXT
+                    release_reason TEXT,
+                    -- ``unique`` is retained for legacy route leases.  The
+                    -- activity-feedback treatment records ``opaque`` here:
+                    -- route_key is then only an internal handle and the
+                    -- human-readable ``summary`` is the peer-visible
+                    -- direction description.
+                    route_key_semantics TEXT NOT NULL DEFAULT 'unique'
                 );
                 CREATE INDEX IF NOT EXISTS route_claims_task_status
                     ON route_claims(task_id, status, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS route_claims_actor_status
                     ON route_claims(task_id, actor_id, status, updated_at DESC);
-                -- A secondary independent-verification claim may coexist with
-                -- the primary owner, but two primary owners may not.
-                CREATE UNIQUE INDEX IF NOT EXISTS route_claims_one_primary
-                    ON route_claims(task_id, route_key)
-                    WHERE is_primary=1 AND LOWER(TRIM(status)) IN ('active', 'blocked');
+                CREATE INDEX IF NOT EXISTS route_claims_task_route_status
+                    ON route_claims(task_id, route_key, status, created_at ASC);
                 """
             )
+            # Databases created by the first route-claim revision do not have
+            # the semantics marker.  Migrate that one additive column in place
+            # and remove the old SQLite uniqueness index.  Legacy callers keep
+            # uniqueness through the ``enforce_route_uniqueness`` code path;
+            # the activity treatment can therefore admit multiple primary
+            # descriptions for the same textual key without a schema race.
+            columns = {
+                str(row[1])
+                for row in db.execute("PRAGMA table_info(route_claims)").fetchall()
+            }
+            if "route_key_semantics" not in columns:
+                db.execute(
+                    "ALTER TABLE route_claims ADD COLUMN route_key_semantics TEXT NOT NULL DEFAULT 'unique'"
+                )
+            db.execute("DROP INDEX IF EXISTS route_claims_one_primary")
 
     @classmethod
     def _begin_write(
@@ -1526,6 +1544,14 @@ class CPSStore:
         item["independent_verification"] = bool(
             str(item.get("independent_verification_reason") or "").strip()
         )
+        semantics = str(item.get("route_key_semantics") or "unique").strip().lower()
+        item["route_key_semantics"] = (
+            semantics if semantics in {"unique", "opaque"} else "unique"
+        )
+        # ``summary`` is the durable, bounded public activity description.  The
+        # alias makes the intent explicit to prompt/rendering adapters without
+        # changing the historical route-claim column or API spelling.
+        item["activity_description"] = str(item.get("summary") or "")
         return item
 
     @staticmethod
@@ -2256,26 +2282,47 @@ class CPSStore:
         ttl: float | None = None,
         independent_verification_reason: str | None = None,
         independent_reason: str | None = None,
+        enforce_route_uniqueness: bool = True,
+        # Compatibility spelling for small adapters and experiment harnesses.
+        # The canonical name above is deliberately explicit about what is
+        # being disabled: only the textual route-key uniqueness check, never
+        # actor/episode ownership or the lease lifecycle.
+        enforce_uniqueness: bool | None = None,
         now: Any = None,
         deadline_epoch_ms: int | None = None,
         cancel_guard: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Atomically claim a task route.
 
-        Exactly one primary claim can be active for ``(task_id, route_key)``.
-        A competing caller may create a non-primary claim only when it gives a
-        bounded independent-verification reason.  A conflict without that
-        reason is represented by a bounded response and event; no phantom row
-        is inserted.
+        Legacy callers enforce one primary claim for ``(task_id, route_key)``.
+        The activity-feedback treatment passes ``enforce_route_uniqueness=False``:
+        every admitted actor may then publish its own bounded ``summary``
+        description, even when its opaque route handle happens to match a
+        peer's handle.  Actor/episode binding, TTL, and atomic lifecycle
+        closeout remain enforced in both modes.
         """
 
         task = _identifier(task_id, "task_id")
         actor = _identifier(actor_id, "actor_id")
         episode_value = self._validate_episode(episode)
+        if not isinstance(enforce_route_uniqueness, bool):
+            raise ValueError("enforce_route_uniqueness must be a boolean")
+        if enforce_uniqueness is not None:
+            if not isinstance(enforce_uniqueness, bool):
+                raise ValueError("enforce_uniqueness must be a boolean or None")
+            if enforce_route_uniqueness is not True and enforce_route_uniqueness != enforce_uniqueness:
+                raise ValueError(
+                    "enforce_route_uniqueness and enforce_uniqueness contradict each other"
+                )
+            enforce_route_uniqueness = enforce_uniqueness
         route = _identifier(route_key, "route_key", limit=_ROUTE_KEY_LIMIT)
         if short_summary is not None:
             summary = short_summary
-        summary_value = _clip(summary, _ROUTE_SUMMARY_LIMIT)
+        # Route summaries are the peer-visible activity declaration. Keep the
+        # persisted value to one bounded line so a model-generated newline
+        # cannot turn the next worker's prompt into an additional instruction
+        # channel.
+        summary_value = " ".join(_clip(summary, _ROUTE_SUMMARY_LIMIT).split())
         reason_value = independent_verification_reason
         if independent_reason is not None:
             reason_value = independent_reason
@@ -2481,15 +2528,19 @@ class CPSStore:
                         actor_registered=actor_registered,
                     )
 
-                primary = db.execute(
-                    """SELECT * FROM route_claims
-                       WHERE task_id=? AND route_key=?
-                         AND is_primary=1 AND LOWER(TRIM(status)) IN ('active', 'blocked')
-                       ORDER BY created_at ASC, claim_id ASC LIMIT 1""",
-                    (task, route),
-                ).fetchone()
+                primary = (
+                    db.execute(
+                        """SELECT * FROM route_claims
+                           WHERE task_id=? AND route_key=?
+                             AND is_primary=1 AND LOWER(TRIM(status)) IN ('active', 'blocked')
+                           ORDER BY created_at ASC, claim_id ASC LIMIT 1""",
+                        (task, route),
+                    ).fetchone()
+                    if enforce_route_uniqueness
+                    else None
+                )
                 primary_item = self._claim_row(primary)
-                if primary_item is not None and not reason_value:
+                if enforce_route_uniqueness and primary_item is not None and not reason_value:
                     # Keep conflict responses useful but bounded; callers can
                     # choose another route or retry with an explicit reason.
                     self._insert_event(
@@ -2528,13 +2579,17 @@ class CPSStore:
 
                 claim_id = uuid.uuid4().hex
                 is_primary = 1 if primary_item is None else 0
+                route_key_semantics = (
+                    "unique" if enforce_route_uniqueness else "opaque"
+                )
                 status_value = "active"
                 db.execute(
                     """INSERT INTO route_claims(
                            claim_id,task_id,actor_id,episode,route_key,summary,status,
                            created_at,updated_at,expires_at,released_at,
-                           independent_verification_reason,is_primary,release_reason)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           independent_verification_reason,is_primary,release_reason,
+                           route_key_semantics)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         claim_id,
                         task,
@@ -2550,6 +2605,7 @@ class CPSStore:
                         reason_value,
                         is_primary,
                         None,
+                        route_key_semantics,
                     ),
                 )
                 claim_item = self._claim_row(
@@ -2573,6 +2629,7 @@ class CPSStore:
                         "summary": summary_value,
                         "status": status_value,
                         "is_primary": bool(is_primary),
+                        "route_key_semantics": route_key_semantics,
                         "independent_verification_reason": reason_value,
                     },
                 )
@@ -2624,7 +2681,11 @@ class CPSStore:
             status_value = None
         if short_summary is not None:
             summary = short_summary
-        summary_value = _clip(summary, _ROUTE_SUMMARY_LIMIT) if summary is not None else None
+        summary_value = (
+            " ".join(_clip(summary, _ROUTE_SUMMARY_LIMIT).split())
+            if summary is not None
+            else None
+        )
         reason_value = independent_verification_reason
         if independent_reason is not None:
             reason_value = independent_reason

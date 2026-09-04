@@ -272,6 +272,115 @@ def _route_claim_settings(config: Any) -> tuple[bool, bool, int]:
     return enabled, required, int(min(86_400.0, max(1.0, ttl)))
 
 
+def _activity_feedback_settings(config: Any, route_claims_enabled: bool) -> bool:
+    """Resolve the peer-activity feedback treatment independently of routing.
+
+    The first route-claim implementation used ``route_key`` uniqueness as a
+    protocol guard.  The new treatment keeps the runner-owned lease for
+    lifecycle/write gating, but exposes the Agent's short ``summary`` as an
+    advisory activity description.  It is enabled for route-capable runner
+    sessions by default; a manifest/test adapter may explicitly disable it
+    without changing the legacy route surface.
+    """
+
+    if not route_claims_enabled:
+        return False
+    feature = getattr(config, "cps_features", None)
+    if feature is None:
+        feature = getattr(config, "route_claims", None)
+    for owner in (config, feature):
+        if owner is None:
+            continue
+        for name in (
+            "activity_feedback_enabled",
+            "peer_activity_feedback_enabled",
+            "activity_enabled",
+        ):
+            value = getattr(owner, name, None)
+            if isinstance(value, bool):
+                return value
+    return True
+
+
+def _peer_activity_context(
+    store: Any,
+    *,
+    task_id: str,
+    actor_id: str,
+    limit: int = 24,
+    max_chars: int = 6_000,
+) -> str:
+    """Render a bounded snapshot of concurrent Agent activity descriptions.
+
+    This is intentionally a runner-side, ephemeral prompt projection.  It
+    carries no route key and never asks the allocator to choose a direction;
+    each Agent remains responsible for deciding whether to avoid or repeat a
+    peer's reported activity.  A store/read failure is represented explicitly
+    so an empty list is not mistaken for proof that no peers exist.
+    """
+
+    if store is None:
+        return "(peer activity snapshot unavailable; query `cps_active_routes` after admission)"
+    try:
+        raw = _call_optional_cps_method(
+            store,
+            (
+                "list_active_routes",
+                "active_routes",
+                "list_route_claims",
+                "cps_active_routes",
+            ),
+            task_id=task_id,
+            limit=max(1, min(int(limit), 100)),
+            include_closing=False,
+        )
+    except Exception:
+        return "(peer activity snapshot unavailable; query `cps_active_routes` after admission)"
+    if isinstance(raw, Mapping):
+        present = [key for key in ("routes", "claims", "items") if key in raw]
+        if len(present) != 1 or not isinstance(raw.get(present[0]), (list, tuple)):
+            return "(peer activity snapshot unavailable; query `cps_active_routes` after admission)"
+        rows = list(raw[present[0]])
+    elif isinstance(raw, (list, tuple)):
+        rows = list(raw)
+    else:
+        return "(peer activity snapshot unavailable; query `cps_active_routes` after admission)"
+
+    lines: list[str] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("task_id") or "") != str(task_id):
+            continue
+        if str(row.get("actor_id") or "") == str(actor_id):
+            continue
+        status = str(row.get("status") or "active").strip().lower()
+        if status not in {"active", "blocked"}:
+            continue
+        description = row.get("activity_description") or row.get("summary")
+        if not isinstance(description, str) or not description.strip():
+            continue
+        # Keep public activity text bounded and apply the same endpoint/path/
+        # credential redaction used for worker-facing diagnostics.
+        description_text = " ".join(sanitize_worker_text(description, 700).split())
+        peer = " ".join(sanitize_worker_text(row.get("actor_id"), 256).split())
+        if not description_text or not peer:
+            continue
+        episode = row.get("episode")
+        episode_text = (
+            str(episode)
+            if isinstance(episode, int) and not isinstance(episode, bool)
+            else "?"
+        )
+        lines.append(f"- {peer} (episode {episode_text}, {status}): {description_text}")
+        if len(lines) >= max(1, min(int(limit), 100)):
+            break
+    if not lines:
+        return "(no currently declared peer activity was visible at this admission snapshot)"
+    rendered = "\n".join(lines)
+    return rendered if len(rendered) <= max_chars else rendered[:max_chars] + "\n[peer activity truncated]"
+
+
 def _call_optional_cps_method(
     store: Any,
     names: tuple[str, ...],
@@ -562,8 +671,14 @@ def _pi_route_claim_kwargs(
     required: bool,
     ttl_seconds: int,
     bypass_reason: str | None = None,
+    activity_feedback_enabled: bool = False,
 ) -> dict[str, Any]:
-    """Return route capability kwargs only when the Pi adapter supports them."""
+    """Return route/activity capability kwargs for the Pi adapter.
+
+    Narrow historical test doubles may not accept the new activity bit.  Keep
+    the introspection seam so they continue to receive the route contract while
+    real ``PiAgent`` sessions get the semantic-summary treatment explicitly.
+    """
 
     if not enabled:
         return {}
@@ -585,6 +700,7 @@ def _pi_route_claim_kwargs(
             "route_claim_required",
             "route_claim_ttl_seconds",
             "route_claim_bypass_reason",
+            "activity_feedback_enabled",
         }
         for parameter in parameter_list
     ):
@@ -600,6 +716,7 @@ def _pi_route_claim_kwargs(
             "route_claims_enabled": enabled,
             "route_claim_required": required,
             "route_claim_ttl_seconds": ttl_seconds,
+            "activity_feedback_enabled": activity_feedback_enabled,
         }
         if bypass_reason is not None:
             result["route_claim_bypass_reason"] = bypass_reason
@@ -612,6 +729,7 @@ def _pi_route_claim_kwargs(
             "route_claim_required": required,
             "route_claim_ttl_seconds": ttl_seconds,
             "route_claim_bypass_reason": bypass_reason,
+            "activity_feedback_enabled": activity_feedback_enabled,
         }.items()
         if key in supported and value is not None
     }
@@ -631,6 +749,8 @@ def _build_route_task_prompt(
     route_claims_enabled: bool,
     route_claim_required: bool,
     route_claim_ttl_seconds: int,
+    concurrent_activity: str = "",
+    activity_feedback_enabled: bool = False,
 ) -> str:
     """Build a worker prompt without pre-Judge CPS context leakage.
 
@@ -649,10 +769,12 @@ def _build_route_task_prompt(
         "formal_tools_enabled": formal_tools_enabled,
         "direct_messages": direct_messages,
         "selection_enabled": selection_enabled,
-        "digest": "" if route_claims_enabled else digest,
+        "digest": "" if (route_claims_enabled or activity_feedback_enabled) else digest,
         "route_claims_enabled": route_claims_enabled,
         "route_claim_required": route_claim_required,
         "route_claim_ttl_seconds": route_claim_ttl_seconds,
+        "concurrent_activity": concurrent_activity,
+        "activity_feedback_enabled": activity_feedback_enabled,
     }
     try:
         parameters = inspect.signature(build_task_prompt).parameters
@@ -2899,6 +3021,9 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "route_claims_enabled": config.route_claims_enabled,
         "route_claim_required": config.route_claim_required,
         "route_claim_ttl_seconds": config.route_claim_ttl_seconds,
+        "activity_feedback_enabled": _activity_feedback_settings(
+            config, bool(config.route_claims_enabled)
+        ),
         "figure4_phase": config.figure4_phase,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
@@ -2974,6 +3099,9 @@ def run_experiment(
         active_roster_enabled=config.active_roster_enabled,
         route_claims_enabled=config.route_claims_enabled,
         route_claim_required=config.route_claim_required,
+        activity_feedback_enabled=_activity_feedback_settings(
+            config, bool(config.route_claims_enabled)
+        ),
         max_concurrent=config.lean_max_concurrent_evaluations,
     )
     if dry_run:
@@ -3114,6 +3242,9 @@ def run_experiment(
     route_claims_enabled, route_claim_required, route_claim_ttl_seconds = (
         _route_claim_settings(config)
     )
+    activity_feedback_enabled = _activity_feedback_settings(
+        config, route_claims_enabled
+    )
     formal_policy = FormalToolPolicy(
         enabled=config.formal_tools_enabled,
         surface_version=config.formal_tools_version,
@@ -3147,6 +3278,7 @@ def run_experiment(
         route_claims_enabled=route_claims_enabled,
         route_claim_required=route_claim_required,
         route_claim_ttl_seconds=route_claim_ttl_seconds,
+        activity_feedback_enabled=activity_feedback_enabled,
     ).start()
     (run_dir / "judge_broker_policy.json").write_text(
         json.dumps(judge_broker.public_policy(), ensure_ascii=False, indent=2, sort_keys=True)
@@ -3906,6 +4038,9 @@ def _run_elastic_cps(
     roster_path.write_text("[]\n", encoding="utf-8")
     route_claims_enabled, route_claim_required, route_claim_ttl_seconds = (
         _route_claim_settings(config)
+    )
+    activity_feedback_enabled = _activity_feedback_settings(
+        config, route_claims_enabled
     )
     # ``actors.json`` remains a bounded historical projection for audit tools;
     # the CPS actors table is authoritative for live discovery.  Keep an
@@ -5712,6 +5847,12 @@ def _run_elastic_cps(
                 route_claims_enabled=route_claims_enabled,
                 route_claim_required=route_claim_required,
                 route_claim_ttl_seconds=route_claim_ttl_seconds,
+                concurrent_activity=_peer_activity_context(
+                    store,
+                    task_id=task.slug,
+                    actor_id=actor,
+                ) if activity_feedback_enabled else "",
+                activity_feedback_enabled=activity_feedback_enabled,
             )
             if candidate_transfer:
                 prompt += (
@@ -5745,6 +5886,7 @@ def _run_elastic_cps(
                 route_claims_enabled=route_claims_enabled,
                 route_claim_required=route_claim_required,
                 route_claim_ttl_seconds=route_claim_ttl_seconds,
+                activity_feedback_enabled=activity_feedback_enabled,
                 route_claim_bypass_reason=runtime_actor_bypass.get(
                     (assignment.task_id, assignment.agent_id, assignment.generation)
                 ),
@@ -5771,6 +5913,7 @@ def _run_elastic_cps(
                             enabled=route_claims_enabled,
                             required=route_claim_required,
                             ttl_seconds=route_claim_ttl_seconds,
+                            activity_feedback_enabled=activity_feedback_enabled,
                             bypass_reason=runtime_actor_bypass.get(
                                 (assignment.task_id, assignment.agent_id, assignment.generation)
                             ),
@@ -6423,6 +6566,9 @@ def _run_task_workers(
     route_claims_enabled, route_claim_required, route_claim_ttl_seconds = (
         _route_claim_settings(config)
     )
+    activity_feedback_enabled = _activity_feedback_settings(
+        config, route_claims_enabled
+    )
     route_store = policy.store
     route_roster_path = run_dir / "actors.json"
     route_roster_lock = threading.RLock()
@@ -6705,6 +6851,12 @@ def _run_task_workers(
                     route_claims_enabled=route_claims_enabled,
                     route_claim_required=route_claim_required,
                     route_claim_ttl_seconds=route_claim_ttl_seconds,
+                    concurrent_activity=_peer_activity_context(
+                        route_store,
+                        task_id=task.slug,
+                        actor_id=actor,
+                    ) if activity_feedback_enabled else "",
+                    activity_feedback_enabled=activity_feedback_enabled,
                 )
             # Snapshot the candidate entering this logical attempt.  A failed
             # process may leave a partial file; task-level refill restores the
@@ -6733,6 +6885,7 @@ def _run_task_workers(
                         route_claims_enabled=route_claims_enabled,
                         route_claim_required=route_claim_required,
                         route_claim_ttl_seconds=route_claim_ttl_seconds,
+                        activity_feedback_enabled=activity_feedback_enabled,
                         route_claim_bypass_reason=route_actor_bypass.get(
                             (task.slug, actor, episode)
                         ),
@@ -6759,6 +6912,7 @@ def _run_task_workers(
                                     enabled=route_claims_enabled,
                                     required=route_claim_required,
                                     ttl_seconds=route_claim_ttl_seconds,
+                                    activity_feedback_enabled=activity_feedback_enabled,
                                     bypass_reason=route_actor_bypass.get(
                                         (task.slug, actor, episode)
                                     ),

@@ -119,17 +119,23 @@ function enabledCapability(name, defaultValue = false) {
   return ["1", "true", "yes", "on"].includes(raw);
 }
 
+function activityFeedbackEnabled() {
+  return enabledCapability("CONTEXTSWARM_CPS_ACTIVITY_FEEDBACK_ENABLED");
+}
+
 function routeClaimCapabilityEnabled() {
   return (
     enabledCapability("CONTEXTSWARM_CPS_ROUTE_CLAIM_REQUIRED") ||
     enabledCapability("CONTEXTSWARM_CPS_ROUTE_CLAIMS") ||
-    enabledCapability("CONTEXTSWARM_ROUTE_CLAIM_REQUIRED")
+    enabledCapability("CONTEXTSWARM_ROUTE_CLAIM_REQUIRED") ||
+    activityFeedbackEnabled()
   );
 }
 
 function routeClaimSurfaceEnabled() {
   return (
     routeClaimCapabilityEnabled() ||
+    activityFeedbackEnabled() ||
     enabledCapability("CONTEXTSWARM_CPS_ROUTE_CLAIMS_ENABLED") ||
     enabledCapability("CONTEXTSWARM_CPS_ACTIVE_ROSTER_ENABLED")
   );
@@ -786,7 +792,7 @@ export default function registerContextSwarmSolverTools(pi) {
         name: "cps_active_routes",
         label: "List Active Routes",
         description:
-          "List currently active route claims for the assigned task. This is a pre-Judge coordination capability and only returns runner-owned public route summaries.",
+          "List currently active peer activity declarations for the assigned task. This is a pre-Judge coordination capability and only returns bounded runner-owned public summaries.",
         promptSnippet: "Inspect active peer routes before choosing a direction",
         parameters: objectSchema({
           task_id: stringSchema("Optional task slug; runner binds and validates this", 256),
@@ -844,12 +850,12 @@ export default function registerContextSwarmSolverTools(pi) {
         name: "cps_claim_route",
         label: "Claim Exploration Route",
         description:
-          "Atomically claim a route for this admitted actor, or declare why this is an independent verification of an existing route.",
+          "Declare this admitted actor's current exploration activity. The summary is one concise sentence visible to concurrent peers; route_key is an opaque technical handle and may overlap another actor's handle in the activity-feedback treatment. An independent-verification reason may explain an intentional repeat.",
         promptSnippet: "Claim or independently verify an exploration route",
         parameters: objectSchema(
           {
-            route_key: stringSchema("Stable concise route identifier", 512),
-            summary: stringSchema("Short public description of the route", 1_000),
+            route_key: stringSchema("Opaque technical activity handle (not a semantic uniqueness key in activity-feedback mode)", 512),
+            summary: stringSchema("One concise sentence describing what you are currently exploring or testing; visible to peers", 1_000),
             ttl_seconds: {
               type: "integer",
               minimum: 1,
@@ -998,7 +1004,7 @@ export default function registerContextSwarmSolverTools(pi) {
       {
         name: "cps_update_route",
         label: "Update Route Claim",
-        description: "Update the summary, status, independent-verification reason, or TTL of a route claim owned by this actor.",
+        description: "Update this actor's concise peer-visible activity summary, lifecycle status, independent-verification reason, or TTL.",
         promptSnippet: "Refresh the current route claim",
         parameters: objectSchema({
           claim_id: stringSchema("Runner-issued route claim id", 128),
@@ -1007,7 +1013,7 @@ export default function registerContextSwarmSolverTools(pi) {
             enum: ["active", "blocked", "done", "released"],
             description: "New lifecycle status",
           },
-          summary: stringSchema("Replacement concise public summary", 1_000),
+          summary: stringSchema("Replacement concise sentence describing current activity", 1_000),
           ttl_seconds: {
             type: "integer",
             minimum: 1,

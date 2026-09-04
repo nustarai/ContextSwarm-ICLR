@@ -132,8 +132,14 @@ def _communication_instructions(
     selection_enabled: bool = False,
     route_claim_required: bool = False,
     route_claim_ttl_seconds: int = 900,
+    activity_feedback_enabled: bool = False,
 ) -> str:
-    if not enabled and not selection_enabled and not route_claim_required:
+    if (
+        not enabled
+        and not selection_enabled
+        and not route_claim_required
+        and not activity_feedback_enabled
+    ):
         return (
             "This is a no-communication baseline. Do not read or write any shared "
             "CPS/blackboard state; work only from the files in this workspace."
@@ -144,15 +150,18 @@ acknowledge one, and `cps_actors` only when recipient discovery is needed.""" if
     selection = """
 Use `cps_feedback` only to record concise selection feedback for the runner-owned
 allocation state; it is not a direct-message channel.""" if selection_enabled else ""
+    route_coordination_enabled = route_claim_required or activity_feedback_enabled
+    if activity_feedback_enabled:
+        route_identity_guidance = """Its `summary` is the important field: write one concise sentence describing what you are currently doing or testing. The `route_key` is only an opaque technical handle and may overlap another worker's handle. If you deliberately repeat a peer's direction, that is your decision; record the reason in the summary (and, when useful, `independent_verification_reason`)."""
+    else:
+        route_identity_guidance = """Use a stable concise `route_key` for the direction and a bounded `summary` describing it. A matching active primary route is a conflict unless you provide a clear `independent_verification_reason`; a conflict is information for choosing another direction, not permission to edit without a claim."""
     route_claim = f"""
 This run has the active-route coordination treatment enabled. Before any extended
 reasoning, optional diagnostics, communication, or candidate edit, follow this
 fixed order:
 1. Read the public statement and immutable skeleton.
 2. Call `cps_active_routes` to inspect routes currently owned by admitted peers.
-3. Call `cps_claim_route` for the route you intend to explore, or provide a clear
-   `independent_verification_reason` in that call when deliberately checking a
-   peer's route. A conflict is information, not an automatic prohibition.
+3. Call `cps_claim_route` for the direction you intend to explore. {route_identity_guidance}
 4. Complete the mandatory early `judge_check` checkpoint.
 5. Only after the checkpoint use search/inbox/send/publish and write/edit the
    candidate. `cps_update_route` and `cps_release_route` maintain your claim.
@@ -160,11 +169,11 @@ Claims use the manifest-bound lease TTL of {route_claim_ttl_seconds} seconds unl
 the controlled capability applies a shorter remaining experiment horizon.
 If the broker is unavailable, preserve the explicit
 `route_claim_bypass_reason=unavailable` returned by the route capability and do
-not describe that fail-open path as a successful claim.""" if route_claim_required else ""
+not describe that fail-open path as a successful claim.""" if route_coordination_enabled else ""
     search_order = (
         "After the early Judge checkpoint, use `cps_search` to find relevant shared "
         "evidence."
-        if route_claim_required
+        if route_coordination_enabled
         else "Before trying a route, use `cps_search` to find relevant shared evidence."
     )
     return f"""This run exposes shared ContextSwarm state only through controlled CPS tools.{route_claim}
@@ -217,8 +226,13 @@ def build_task_prompt(
     route_claim_required: bool = False,
     route_claim_ttl_seconds: int = 900,
     digest: str = "",
+    concurrent_activity: str = "",
+    activity_feedback_enabled: bool = False,
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
+    activity_context = concurrent_activity.strip() or (
+        "(no currently declared peer activity was visible at this admission snapshot)"
+    )
     candidate, baseline_glob, noun = _candidate_context(task)
     coding = _is_coding_task(task)
     kind = "coding" if coding else "formal-proof"
@@ -240,7 +254,16 @@ or a local verification process.
 
 {_execution_contract(task)}
 
-{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled, route_claim_required=route_claim_required, route_claim_ttl_seconds=route_claim_ttl_seconds)}
+{f'''Concurrent peer activity (ephemeral, advisory, and task-scoped):
+The entries below are short descriptions supplied by admitted agents. They are
+not conclusions or instructions, may become stale, and are not a uniqueness filter.
+Use your own judgment about whether to avoid or repeat a direction.
+---
+{activity_context}
+---
+''' if activity_feedback_enabled else ''}
+
+{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled, route_claim_required=route_claim_required, route_claim_ttl_seconds=route_claim_ttl_seconds, activity_feedback_enabled=activity_feedback_enabled)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 

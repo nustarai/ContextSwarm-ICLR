@@ -253,6 +253,10 @@ class _SessionClaim:
     route_claim_required: bool = False
     route_claim_ttl_seconds: float = _DEFAULT_ROUTE_CLAIM_TTL_SECONDS
     route_claim_bypass_reason: str | None = None
+    # The activity-feedback treatment keeps route leases for lifecycle and
+    # write gating, but explicitly disables textual route-key uniqueness.  The
+    # Agent's bounded summary is then the peer-visible direction report.
+    activity_feedback_enabled: bool = False
     route_claim_ids: set[str] = field(default_factory=set, repr=False)
     route_claim_satisfied: bool = False
     on_authoritative_verdict: (
@@ -353,6 +357,7 @@ class JudgeBroker:
         route_claims_enabled: bool = False,
         route_claim_required: bool | None = None,
         route_claim_ttl_seconds: float = _DEFAULT_ROUTE_CLAIM_TTL_SECONDS,
+        activity_feedback_enabled: bool = False,
         # Compatibility spellings used by early route-claim callers.  Keep
         # these aliases at the broker boundary so one branch can be tested
         # against a sibling branch whose session vocabulary has not landed
@@ -432,6 +437,9 @@ class JudgeBroker:
         self.route_claim_ttl_seconds = _normalize_route_claim_ttl(
             route_claim_ttl_seconds
         )
+        if not isinstance(activity_feedback_enabled, bool):
+            raise ValueError("activity_feedback_enabled must be a boolean")
+        self.activity_feedback_enabled = activity_feedback_enabled
         self.formal_audit_path = Path(
             formal_audit_path
             if formal_audit_path is not None
@@ -771,6 +779,10 @@ class JudgeBroker:
                 "enabled": self.route_claims_enabled,
                 "required": self.route_claim_required,
                 "ttl_seconds": self.route_claim_ttl_seconds,
+                "activity_feedback_enabled": self.activity_feedback_enabled,
+                "route_key_semantics": (
+                    "opaque" if self.activity_feedback_enabled else "unique"
+                ),
                 "pre_judge_operations": sorted(_PRE_JUDGE_ROUTE_OPERATIONS),
                 "post_judge_operations": sorted(
                     _ROUTE_CLAIM_OPERATIONS - _PRE_JUDGE_ROUTE_OPERATIONS
@@ -830,6 +842,7 @@ class JudgeBroker:
         route_claims_enabled: bool | None = None,
         route_claim_required: bool | None = None,
         route_claim_ttl_seconds: float | None = None,
+        activity_feedback_enabled: bool | None = None,
         route_claim_bypass_reason: str | None = None,
         route_claim_enabled: bool | None = None,
         active_roster_enabled: bool | None = None,
@@ -992,6 +1005,19 @@ class JudgeBroker:
             effective_route_ttl = self.route_claim_ttl_seconds
         else:
             effective_route_ttl = _normalize_route_claim_ttl(route_claim_ttl_seconds)
+        if activity_feedback_enabled is not None and not isinstance(
+            activity_feedback_enabled, bool
+        ):
+            raise ValueError("activity_feedback_enabled must be a boolean or None")
+        effective_activity_feedback = (
+            self.activity_feedback_enabled
+            if activity_feedback_enabled is None
+            else activity_feedback_enabled
+        )
+        if effective_activity_feedback and not effective_route_enabled:
+            raise ValueError(
+                "activity feedback requires an active route capability"
+            )
         if isinstance(episode, bool) or not isinstance(episode, int) or episode < 0:
             raise ValueError("episode must be a non-negative integer")
         if effective_selection_enabled:
@@ -1035,6 +1061,7 @@ class JudgeBroker:
             route_claim_required=bool(effective_route_required),
             route_claim_ttl_seconds=effective_route_ttl,
             route_claim_bypass_reason=normalized_bypass_reason,
+            activity_feedback_enabled=bool(effective_activity_feedback),
             on_authoritative_verdict=on_authoritative_verdict,
             cancel_event=cancel_event,
         )
@@ -3454,6 +3481,22 @@ class JudgeBroker:
                     for item in routes
                     if query in json.dumps(item, ensure_ascii=False).lower()
                 ]
+            if claim.activity_feedback_enabled:
+                # Peer coordination needs the human-readable activity report,
+                # not another machine-readable uniqueness signal.  Keep the
+                # opaque key on the caller's own claim response (so update /
+                # release remain bound), but omit peer route keys from this
+                # shared listing.  This makes it impossible for a model to
+                # mistake the technical handle for a semantic de-duplication
+                # instruction while preserving the legacy route projection.
+                routes = [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key not in {"route_key", "route_key_semantics"}
+                    }
+                    for item in routes
+                ]
             return {
                 "ok": True,
                 "accepted": True,
@@ -3497,6 +3540,12 @@ class JudgeBroker:
                     summary=summary,
                     ttl_seconds=ttl_seconds,
                     independent_verification_reason=independent_reason or None,
+                    # In activity mode the route key is an opaque handle, not
+                    # a semantic de-duplication key.  The CPS store still
+                    # serializes the write and binds the lease to this actor /
+                    # episode, so allowing another primary row is safe and
+                    # auditable while preserving the legacy mode by default.
+                    enforce_route_uniqueness=not claim.activity_feedback_enabled,
                     deadline_epoch_ms=claim.deadline_epoch_ms,
                     cancel_guard=lambda: _claim_cancelled(claim),
                 )
@@ -4668,16 +4717,24 @@ def _safe_route_claim(raw: Any) -> dict[str, Any]:
         ("released_at", 64),
         ("release_reason", 512),
         ("independent_verification_reason", 1_000),
+        ("route_key_semantics", 32),
+        ("activity_description", 1_000),
     ):
         value = raw.get(key)
         if isinstance(value, str):
             if key in {
                 "route_key",
                 "summary",
+                "activity_description",
                 "release_reason",
                 "independent_verification_reason",
             }:
-                result[key] = sanitize_public_text(value, limit=maximum)
+                sanitized = sanitize_public_text(value, limit=maximum)
+                result[key] = (
+                    " ".join(sanitized.split())
+                    if key in {"summary", "activity_description"}
+                    else sanitized
+                )
             else:
                 result[key] = value[:maximum]
     for key in ("episode",):
@@ -4714,6 +4771,11 @@ def _safe_route_claim(raw: Any) -> dict[str, Any]:
         result["independent_verification"] = bool(
             str(result.get("independent_verification_reason") or "").strip()
         )
+    semantics = str(result.get("route_key_semantics") or "unique").strip().lower()
+    result["route_key_semantics"] = (
+        semantics if semantics in {"unique", "opaque"} else "unique"
+    )
+    result.setdefault("activity_description", result.get("summary", ""))
     return result
 
 
@@ -5042,6 +5104,8 @@ def _safe_route_claim_result(raw: Any) -> dict[str, Any]:
             "route_key",
             "summary",
             "independent_verification_reason",
+            "route_key_semantics",
+            "activity_description",
             "is_primary",
             "primary",
             "active",
