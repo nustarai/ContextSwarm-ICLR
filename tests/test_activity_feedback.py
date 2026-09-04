@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
 
 from contextswarm_mini.config import load_config
@@ -113,6 +115,37 @@ class ActivityFeedbackTests(unittest.TestCase):
             self.assertIsNotNone(index)
             assert index is not None
             self.assertIn("route_key_semantics", index[0])
+
+    def test_activity_mode_allows_concurrent_same_handle_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CPSStore(Path(temporary) / "cps.sqlite3")
+            actors = [f"activity-{index}" for index in range(6)]
+            for actor in actors:
+                store.register_actor("sample", actor, 1, now=100)
+            barrier = threading.Barrier(len(actors))
+
+            def claim(actor: str) -> dict[str, object]:
+                barrier.wait(timeout=5)
+                return store.claim_route(
+                    "sample",
+                    actor,
+                    1,
+                    "same-opaque-handle",
+                    f"Explore a distinct subcase for {actor}",
+                    enforce_route_uniqueness=False,
+                    now=101,
+                )
+
+            with ThreadPoolExecutor(max_workers=len(actors)) as pool:
+                results = list(pool.map(claim, actors))
+            self.assertEqual(sum(bool(result["acquired"]) for result in results), len(actors))
+            self.assertTrue(all(result["primary"] for result in results))
+            active = store.list_active_routes("sample", now=101)
+            self.assertEqual(len(active), len(actors))
+            self.assertEqual(
+                {row["summary"] for row in active},
+                {f"Explore a distinct subcase for {actor}" for actor in actors},
+            )
 
     def test_peer_snapshot_is_bounded_task_scoped_and_omits_route_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
