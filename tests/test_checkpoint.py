@@ -107,6 +107,49 @@ class _SkippedEvaluator:
         )
 
 
+class _FeedbackPi:
+    def run(self, **kwargs):
+        (Path(kwargs["workdir"]) / "result.lean").write_text(
+            "partial candidate\n", encoding="utf-8"
+        )
+        now = "2026-01-01T00:00:00+00:00"
+        return AgentResult(
+            agent_id=str(kwargs["actor_id"]),
+            task_id=str(kwargs["task_id"]),
+            episode=int(kwargs["episode"]),
+            returncode=0,
+            started_at=now,
+            finished_at=now,
+        )
+
+
+class _FeedbackEvaluator:
+    is_mock_evaluator = True
+
+    def expected_task_contract_sha256(self, _task) -> str:
+        return "a" * 64
+
+    def evaluate(
+        self,
+        task,
+        candidate_path: Path,
+        *,
+        deadline_monotonic=None,
+        cancel_event=None,
+        settlement_callback=None,
+    ) -> Verdict:
+        del deadline_monotonic, cancel_event, settlement_callback
+        return Verdict(
+            task.slug,
+            "VERIFY_FAIL",
+            0.0,
+            0.0,
+            {"error_message": "counterexample: reject this route", "mock": True},
+            candidate_sha256=hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
+            task_contract_sha256="a" * 64,
+        )
+
+
 class CheckpointStoreTests(unittest.TestCase):
     def test_manifest_enables_only_the_checkpoint_treatment_surface(self) -> None:
         baseline = load_config("configs/formal_1h_cps32_profiled_clean.toml", ROOT)
@@ -366,6 +409,63 @@ class CheckpointRecoveryTests(unittest.TestCase):
 
 
 class CheckpointRunnerIntegrationTests(unittest.TestCase):
+    def test_final_judge_feedback_refreshes_latest_checkpoint(self) -> None:
+        base = load_config("configs/smoke.toml", ROOT)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            initial_agents_per_task=1,
+            max_attempts_per_task=1,
+            time_limit_seconds=2,
+            checkpoint=CheckpointConfig(enabled=True, transfer=True, publish=True),
+        )
+        task = load_tasks(config)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            store = CPSStore(run_dir / "cps.sqlite3")
+            policy = make_policy(config.communication, store)
+            results = _run_elastic_cps(
+                config,
+                [task],
+                run_dir,
+                logger,
+                _FeedbackEvaluator(),
+                _FeedbackPi(),
+                policy,
+                mock_agent=False,
+                deadline=time.monotonic() + 2,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=_Broker(),
+                scheduler_result_sink=[],
+            )
+            self.assertEqual([(verdict.status) for _, verdict in results], ["VERIFY_FAIL"])
+            checkpoint_root = run_dir / "workers" / task.slug / "checkpoints"
+            latest = json.loads((checkpoint_root / "latest.json").read_text())
+            metadata = json.loads(
+                (checkpoint_root / latest["metadata"]).read_text()
+            )
+            self.assertEqual(metadata["latest_validation"]["status"], "VERIFY_FAIL")
+            self.assertIn(
+                "counterexample",
+                metadata["latest_validation"]["feedback"],
+            )
+            self.assertTrue(metadata["unverified"])
+            self.assertFalse(metadata["score_eligible"])
+            checkpoint_pieces = [
+                row
+                for row in store.progress_snapshot(
+                    [task.slug], recent_limit=20, body_chars=8_000
+                )[task.slug]["recent_pieces"]
+                if row["kind"] == "checkpoint"
+            ]
+            self.assertEqual(len(checkpoint_pieces), 1)
+            self.assertEqual(
+                json.loads(checkpoint_pieces[0]["body"])["latest_validation"]["status"],
+                "VERIFY_FAIL",
+            )
+
     def test_failed_partial_is_persisted_published_and_seen_by_refill(self) -> None:
         base = load_config("configs/smoke.toml", ROOT)
         config = replace(

@@ -5201,20 +5201,36 @@ def _run_elastic_cps(
         baseline_sha256 = hashlib.sha256(
             task.baseline_code.encode("utf-8")
         ).hexdigest()
+        last_recovery_attempt = 0
 
         def save_checkpoint_result(
             result: AgentResult,
             recovery_attempt: int,
             retry_pending: bool,
+            *,
+            feedback_override: str | None = None,
+            validation_status_override: str | None = None,
+            validation_feedback_override: str | None = None,
+            publish: bool | None = None,
         ) -> None:
             """Persist one process-result handoff before recovery/closeout."""
 
+            nonlocal last_recovery_attempt
+            last_recovery_attempt = max(last_recovery_attempt, int(recovery_attempt))
             if checkpoint_store is None:
                 return
             try:
                 with state.lock:
-                    feedback = state.last_feedback
-                    validation_status = state.last_verdict_status
+                    feedback = (
+                        state.last_feedback
+                        if feedback_override is None
+                        else str(feedback_override)
+                    )
+                    validation_status = (
+                        state.last_verdict_status
+                        if validation_status_override is None
+                        else str(validation_status_override)
+                    )
                     best_sha256 = (
                         _file_sha256(state.best_candidate)
                         if state.best_candidate
@@ -5226,23 +5242,41 @@ def _run_elastic_cps(
                     max_items=config.checkpoint.max_context_items,
                     max_chars=config.checkpoint.max_summary_chars,
                 )
-                ref = checkpoint_store.save(
+                # Keep the forced handoff cost separately visible in opt-in
+                # profiling.  The surrounding attempt/agent spans still
+                # include it in their wall time, while this narrow span lets
+                # an A/B report quantify the extra persistence work without
+                # changing the disabled fast path.
+                with logger.profile_span(
+                    "attempt.checkpoint.save",
                     task_id=task.slug,
-                    task_root=state.task_root,
-                    candidate_path=candidate_path,
-                    candidate_filename=task.candidate_filename,
-                    baseline_sha256=baseline_sha256,
                     actor_id=actor,
                     episode=assignment.generation,
-                    recovery_attempt=recovery_attempt,
-                    result=result.as_dict(),
-                    retry_pending=retry_pending,
-                    context=context,
-                    feedback=feedback,
-                    latest_validation_status=validation_status,
-                    latest_validation_feedback=feedback,
-                    best_candidate_sha256=best_sha256,
-                )
+                    component="runner_wrapper",
+                    operation="checkpoint_save",
+                    phase="termination_handoff",
+                ):
+                    ref = checkpoint_store.save(
+                        task_id=task.slug,
+                        task_root=state.task_root,
+                        candidate_path=candidate_path,
+                        candidate_filename=task.candidate_filename,
+                        baseline_sha256=baseline_sha256,
+                        actor_id=actor,
+                        episode=assignment.generation,
+                        recovery_attempt=recovery_attempt,
+                        result=result.as_dict(),
+                        retry_pending=retry_pending,
+                        context=context,
+                        feedback=feedback,
+                        latest_validation_status=validation_status,
+                        latest_validation_feedback=(
+                            feedback
+                            if validation_feedback_override is None
+                            else str(validation_feedback_override)
+                        ),
+                        best_candidate_sha256=best_sha256,
+                    )
                 with state.lock:
                     prior_checkpoint = state.latest_checkpoint
                     # A late successful/empty closeout from another worker
@@ -5291,6 +5325,22 @@ def _run_elastic_cps(
                 )
                 return
 
+            # A successful Pi return is saved before Judge evaluation, but its
+            # authoritative feedback is not known yet.  The final closeout
+            # calls this function again with ``publish=True`` after that
+            # receipt; keep the pre-evaluation copy on disk without emitting a
+            # stale duplicate CPS checkpoint piece.  Abnormal process exits
+            # publish immediately because there is no later candidate Judge
+            # phase that can provide a better handoff boundary.
+            if publish is None:
+                publish = bool(
+                    result.returncode != 0
+                    or result.timed_out
+                    or result.cancelled
+                    or result.run_horizon_reached
+                )
+            if not publish:
+                return
             if not config.checkpoint.publish or not policy.enabled:
                 if config.checkpoint.publish and not policy.enabled:
                     logger.event(
@@ -5323,26 +5373,35 @@ def _run_elastic_cps(
                 )
                 return
             try:
-                publish_payload = checkpoint_store.publish_payload(ref)
-                publish_body = json.dumps(
-                    publish_payload,
-                    ensure_ascii=True,
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                published = policy.publish(
-                    task.slug,
-                    "runner",
-                    kind="checkpoint",
-                    title=(
-                        f"checkpoint {task.slug} e{assignment.generation} "
-                        f"r{recovery_attempt}: {ref.record.get('terminal_reason')}"
-                    ),
-                    body=publish_body,
-                    tags=("runner_checkpoint", "unverified", "timeout_recovery"),
-                    deadline_epoch_ms=horizon_epoch_ms,
-                )
+                with logger.profile_span(
+                    "attempt.checkpoint.publish",
+                    task_id=task.slug,
+                    actor_id=actor,
+                    episode=assignment.generation,
+                    component="runner_wrapper",
+                    operation="checkpoint_publish",
+                    phase="termination_handoff",
+                ):
+                    publish_payload = checkpoint_store.publish_payload(ref)
+                    publish_body = json.dumps(
+                        publish_payload,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    published = policy.publish(
+                        task.slug,
+                        "runner",
+                        kind="checkpoint",
+                        title=(
+                            f"checkpoint {task.slug} e{assignment.generation} "
+                            f"r{recovery_attempt}: {ref.record.get('terminal_reason')}"
+                        ),
+                        body=publish_body,
+                        tags=("runner_checkpoint", "unverified", "timeout_recovery"),
+                        deadline_epoch_ms=horizon_epoch_ms,
+                    )
             except Exception as exc:
                 logger.event(
                     "checkpoint_publish_failed",
@@ -5364,6 +5423,25 @@ def _run_elastic_cps(
                     published.get("id") if isinstance(published, Mapping) else None
                 ),
                 unverified=True,
+            )
+
+        def save_checkpoint_closeout(
+            result: AgentResult,
+            verdict: Verdict,
+            feedback: str,
+            *,
+            publish: bool = True,
+        ) -> None:
+            """Refresh the immutable handoff with the final Judge boundary."""
+
+            save_checkpoint_result(
+                result,
+                last_recovery_attempt,
+                False,
+                feedback_override=feedback,
+                validation_status_override=verdict.status,
+                validation_feedback_override=feedback,
+                publish=publish,
             )
 
         def admit_task_proof(
@@ -5621,6 +5699,11 @@ def _run_elastic_cps(
             already_solved = state.solved
         if early_credit is not None:
             verdict = early_credit.verdict
+            save_checkpoint_closeout(
+                result,
+                verdict,
+                _allocation_feedback(verdict),
+            )
             logger.event(
                 "evaluation_finished",
                 **verdict.as_dict(),
@@ -5667,6 +5750,16 @@ def _run_elastic_cps(
                     state.last_feedback = reason
                     if status == "AGENT_FAILURE":
                         state.consecutive_failures += 1
+            # The abnormal result already emitted its checkpoint before the
+            # slot was released.  Refresh only the on-disk metadata with the
+            # runner's terminal classification; publishing a second piece
+            # would duplicate the same process-failure handoff.
+            save_checkpoint_closeout(
+                result,
+                verdict,
+                reason,
+                publish=False,
+            )
             logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
             logger.event(
                 "evaluation_finished",
@@ -5741,6 +5834,7 @@ def _run_elastic_cps(
                 complete_attempt=True,
             )
             if admitted:
+                save_checkpoint_closeout(result, verdict, feedback)
                 logger.event(
                     "evaluation_finished",
                     **verdict.as_dict(),
@@ -5771,6 +5865,11 @@ def _run_elastic_cps(
                 task_contract_sha256=verdict.task_contract_sha256,
                 judge_job_id=verdict.judge_job_id,
                 cache_reused=verdict.cache_reused,
+            )
+            save_checkpoint_closeout(
+                result,
+                verdict,
+                _allocation_feedback(verdict),
             )
             logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
             logger.event(
@@ -5865,6 +5964,10 @@ def _run_elastic_cps(
                 and normalize_verdict_status(verdict.status) != "OUT_OF_HORIZON"
             ),
         )
+        # Capture the final candidate-bound Judge status/feedback after the
+        # authoritative validation piece has been published.  The immutable
+        # snapshot is still explicitly unverified and cannot affect score.
+        save_checkpoint_closeout(result, verdict, feedback)
         return result, verdict, False
 
     # All arms receive an identical initial pool.  Only a slot released after

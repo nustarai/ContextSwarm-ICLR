@@ -51,11 +51,24 @@
 - 运行结束后再从原始目录人工重建，不能等同于当时下一 Agent 可见的状态；
 - `output_tail` 在很多 timeout 中为空，不能依赖它代替候选和交接记录。
 
-## 2. 改动合同
+## 2. 历史候选重放：覆盖能力而非得分证据
+
+为避免只凭单元测试推断“原版丢失边界已经被覆盖”，我对上面三个原始 run 做了一次只读重放：逐个读取 terminal Agent 的 `result.lean`，只挑选非成功且哈希不同于题目 baseline 的候选（206 个），交给本分支的 `CheckpointStore.save`，再用 `materialize_for_agent` 模拟下一次 assignment 的交接，并重新核对快照 SHA-256。没有调用模型、Judge 或评分器；候选正文没有写入本仓库。
+
+| run | timeout / cancelled / failure | 非成功 changed 候选 | checkpoint 保存 | 下一 assignment 交接 | hash 核对 |
+|---|---:|---:|---:|---:|---:|
+| `8c90d3f0` | 62 / 17 / 2 | 69 | 69/69 | 69/69 | 69/69 |
+| `eda06caf` | 64 / 10 / 0 | 68 | 68/68 | 68/68 | 68/68 |
+| `ecee9c07` | 64 / 15 / 1 | 69 | 69/69 | 69/69 | 69/69 |
+| 合计 | 190 / 42 / 3 | **206** | **206/206** | **206/206** | **206/206** |
+
+机器可读结果保存在本次任务的 owner-only evidence 目录 `evidence/historical-replay.json`，schema 为 `contextswarm_checkpoint_historical_replay_v1`。`candidate_missing=0`、`baseline_mismatch=0`、`capture_rate=1.0`、`handoff_rate=1.0`。这说明对原版已实际产生的局部候选，新的保存/复制/哈希链路没有再把它留在临时 Agent 目录之外；它**不能**说明候选数学上正确，也不能反事实地证明当时下一 Agent 会因此得分更高。重放没有凭空补回隐藏 reasoning；`completed_work`、`ruled_out`、`next_step` 只有在原始 CPS/message 中已有可读证据时才有意义。
+
+## 3. 改动合同
 
 ### 强制保存点
 
-在 CPS runner 的每个 Pi `AgentResult` 返回边界调用 checkpoint sink：包括 inner recovery 的失败、最终失败、取消、horizon closeout 和正常返回。保存发生在 runner 释放 solver slot、执行最终 Judge 评估和记录 closeout 之前；保存异常是 fail-open，不会改变 recovery、Judge 或 score 生命周期。
+在 CPS runner 的每个 Pi `AgentResult` 返回边界调用 checkpoint sink：包括 inner recovery 的失败、最终失败、取消、horizon closeout 和正常返回。保存发生在 runner 释放 solver slot、执行最终 Judge 评估和记录 closeout 之前；对正常返回的候选，在 Judge receipt 之后再追加一个不可变快照，把最终验证状态/反馈补齐。保存异常是 fail-open，不会改变 recovery、Judge 或 score 生命周期。
 
 每个任务的 `workers/<task>/checkpoints/` 包含：
 
@@ -75,7 +88,7 @@
 
 Runner 能强制保存已经存在于文件、CPS、Judge feedback 和可读 result/session tail 中的证据；如果整个 Python runner 被 SIGKILL，或模型从未把隐含 reasoning 写入文件/消息，事后无法凭空恢复语义证明。因而 checkpoint 的 `unverified=true` 和 `score_eligible=false` 是硬合同。若要保证模型主动写出“当前路线/阻塞/下一步”的语义摘要，还需要后续的 cooperative summary 协议；本轮不把推断当成事实。
 
-## 3. 已完成的验收
+## 4. 已完成的验收
 
 实现分支：`feat/timeout-checkpoint-20260904`（基于原版 source `33296b07634c708412326c2808d5782dab3f788e`）。
 
@@ -85,7 +98,18 @@ Runner 能强制保存已经存在于文件、CPS、Judge feedback 和可读 res
 - recovery sink 在失败尝试重试前收到记录，并在成功返回时收到最终记录；
 - message-only blocker 被加入 bounded ruled-out context，即使 direct message 已 ack；
 - mock CPS runner：两次失败写入 `partial-1`/`partial-2`，新的 assignment 读到 `checkpoint/result.lean=partial-2`，Judge 只评估第三次新候选；checkpoint piece 从未成为 proof；
-- 现有 recovery/CPS partial focused tests（含 slot refill）通过。
+- 现有 recovery/CPS partial focused tests（含 slot refill）通过；checkpoint/recovery focused 合计 28 个测试通过。
+
+另做了一次同配置的短时 mock smoke（baseline 与 treatment 各一轮，`configs/smoke.toml`、1 题、30 秒合同）：
+
+| arm | score | assignments | checkpoint saved / captured | handoff | published pieces |
+|---|---:|---:|---:|---:|---:|
+| baseline | 0/1 (`MOCK_SKIPPED`) | 2 | 0 / 0 | 0 | 0 |
+| checkpoint treatment | 0/1 (`MOCK_SKIPPED`) | 2 | 4 / 4 | 1 | 2 |
+
+完整摘要在 `evidence/mock-smoke3-comparison-1788493558.json`。treatment 每个正常 mock 返回先写一份“评估前”不可变快照，再在最终 closeout 写一份补齐验证边界的快照；两臂都没有真实证明，故该 smoke 只验证开关、写入、发布和 closeout 计数，不是质量或速度比较。
+
+另外以相同的有限 mock 合同打开 profiling（2 秒 horizon、最多 2 次 assignment）核对新增成本边界：treatment 的 4 次保存 span 合计 14.473 ms、2 次发布 span 合计 3.919 ms；baseline 没有这些 span。该数字只表示本机小候选/SQLite 的编排开销，不能外推到真实 Pi、Judge 或 32-slot 一小时运行。摘要为 `evidence/profiled-smoke3-comparison-1788493576.json`，其中每个 span 同时保留 wall/CPU 字段。
 
 建议的本地验证命令（输出目录应位于磁盘支持的 `.workspace/builds/CS-20260904/`）：
 
@@ -98,7 +122,7 @@ python3 -m compileall -q contextswarm_mini
 python3 -m unittest discover -s tests
 ```
 
-## 4. 真实 A/B 对照合同
+## 5. 真实 A/B 对照合同
 
 真实实验应以原版三次为 baseline，新增三次 treatment，顺序串行并在每轮 drain 后关闭 Judge stack。除 checkpoint treatment 外固定：12 题及顺序、3600 秒、CPS32、`uniform`/`least_active`、initial 2/task、Pi timeout 900 秒、模型/thinking、Judge/Lean profile、cache-disabled 要求、profiling 开关和资源上限。治疗 manifest 是 `configs/formal_1h_cps32_profiled_checkpoint.toml`，仅打开：
 
@@ -134,7 +158,6 @@ publish = true
 
 在真实 A/B 尚未获得授权输入前，当前结论只能是：**保留这条 fail-open、不可计分的 checkpoint 基础设施值得做；是否改善数学得分或是否应默认开启，尚无真实三次 treatment 证据。**
 
-## 5. 运行阻塞与下一步
+## 6. 运行阻塞与下一步
 
 只读预检显示本机没有 `contextswarm-iclr-mini:latest`、Judge URL/cache-health 环境变量或本机节点配置；根据 workspace contract，不能启动已停止的旧 Test Lab，也不能从 `48.3:29089` 端口推断可用的 Coordinator/Judge。要完成三次真实 treatment，需要用户/部署者提供当次 Judge/Lean 访问边界、匹配节点和可复核的 runtime 输入；收到后先做只读 preflight，再按上面的固定合同串行运行。
-
