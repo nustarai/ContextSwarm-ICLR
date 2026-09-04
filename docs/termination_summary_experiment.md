@@ -92,7 +92,10 @@ idle 的 session 真正开始 closeout turn；对仍在运行的 timeout/cancel 
 - `final.json.termination_summary`：请求数、实际送达数、完成数、实际发布 piece 数、missing/unavailable 数及事件计数。
 - `final.json.checkpoint`：本 arm 应保持 disabled/zero；若出现 checkpoint handoff，说明 manifest 或实现边界漂移，应停止比较。
 
-Agent 发布正文仍受 CPS 既有长度、标签和敏感信息过滤约束。总结 piece 的内容由 Agent 自己负责，runner 只负责触发和核验“是否确实写进 CPS”。
+Agent 发布正文受 CPS 既有长度、标签和 task-scope 约束；closeout prompt 明确禁止
+凭据、原始 endpoint、绝对主机路径和完整 transcript，runner 的诊断输出另行做脱敏。
+持久化 summary 正文不是由 runner 代写或通用重写，内容由 Agent 自己负责，runner 只负责
+触发和核验“是否确实写进 CPS”，因此正式运行前仍应按公开 artifact 规则审查正文。
 closeout mask 期间 controlled `judge_check`/`evaluate_local`/`formal_query` 也会被拒绝，
 避免总结窗口悄悄开启新的验证路线；本地文件工具仍由同一 Pi session 的 prompt 合同约束。
 
