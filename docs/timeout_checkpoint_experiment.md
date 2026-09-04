@@ -41,6 +41,19 @@
 
 原版的结构化 CPS 有价值但不完整：三次合计 197 条 Agent pieces、14 条 runner pieces、1248 条 messages。消息正文约为 pieces 正文的 2.21 倍；消息同时承载询问、代码/Lean 细节和反例，很多负面结论只停留在 message。所有 96 个首批并发启动 digest 都为空；因此第一批 Agent 没有可靠的 active-route/已做过什么视图。已有记录能证明发送、暴露或文件变化，不能证明后续 Agent 真正采用了某条路线。
 
+### 可复核的具体缺口
+
+这不是抽象的“日志少了一点”，而是信息落在了错误的生命周期层级：
+
+| 观察 | 原版证据 | 为什么会影响下一次继续 |
+|---|---|---|
+| 明确反例只在短期 message | `imo2024_p2` 的具体数值反例、`usa2024_p2` 的假下界、`uk2024_r1_p1` 的 `rfl/decide` 失败都没有对应负面 piece | message 可能只进入特定 recipient 的 inbox；ack 或 recipient 结束后，后续 assignment 的可检索摘要不再稳定包含它 |
+| 发给已结束/错误范围的对象 | 1170 条定向消息中 302 条发送时 recipient 已结束；另有 3 条跨 task、按 task 过滤后必然不可达 | “发送成功”不等于下一 Agent 收到，尤其不能作为 termination handoff |
+| 第一批没有当前方向视图 | 96/96 个首批 startup digest 为空；后续 144 个 adaptive digest 多数非空但主要是历史 pieces/messages | 同一波 Agent 在第一次 edit 前没有可靠的 active-route 或“不要重复”屏障 |
+| 候选文件与结论脱节 | 206 个非成功 terminal 尝试的 `result.lean` 与 baseline 不同，但没有统一 candidate hash、验证状态、阻塞和 next-step 指针 | 文件仍可离线找到，却不能保证当时下一 assignment 会读到、知道它未验证，或知道应从哪一步继续 |
+
+自动词法审计另外筛出 93 条负面 message（合并为约 89 组正文），其中 83 组没有找到同作者后续相似负面 piece；这 83 组是待人工复核队列，不应直接当成 83 个已确认遗漏。上表三类人工核对案例已经足以证明：原版不是没有产出，而是没有在终止边界把“候选 + 结论 + 继续位置”绑定成一个可交接对象。
+
 ### 丢失边界
 
 原版并非“所有信息都消失”：
