@@ -259,6 +259,52 @@ class CheckpointStoreTests(unittest.TestCase):
                     retry_pending=False,
                 )
 
+    def test_candidate_symlink_is_recorded_without_following_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task_root = root / "task"
+            task_root.mkdir()
+            outside = root / "outside.lean"
+            outside.write_text("private candidate\n")
+            candidate = task_root / "result.lean"
+            candidate.symlink_to(outside)
+            ref = CheckpointStore(root).save(
+                task_id="task",
+                task_root=task_root,
+                candidate_path=candidate,
+                candidate_filename="result.lean",
+                baseline_sha256="0" * 64,
+                actor_id="agent",
+                episode=1,
+                recovery_attempt=0,
+                result=_result(returncode=1).as_dict(),
+                retry_pending=False,
+            )
+            self.assertEqual(ref.record["candidate"]["status"], "not_regular")
+            self.assertIsNone(ref.candidate_path)
+            self.assertNotIn("private candidate", json.dumps(ref.record))
+
+    def test_candidate_outside_task_root_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task_root = root / "task"
+            task_root.mkdir()
+            outside = root / "outside.lean"
+            outside.write_text("candidate\n")
+            with self.assertRaises(ValueError):
+                CheckpointStore(root).save(
+                    task_id="task",
+                    task_root=task_root,
+                    candidate_path=outside,
+                    candidate_filename="result.lean",
+                    baseline_sha256="0" * 64,
+                    actor_id="agent",
+                    episode=1,
+                    recovery_attempt=0,
+                    result=_result(returncode=1).as_dict(),
+                    retry_pending=False,
+                )
+
     def test_recent_message_ledger_keeps_acknowledged_direct_findings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = CPSStore(Path(temporary) / "cps.sqlite3")

@@ -11,6 +11,7 @@ candidate even when the Pi process was killed while editing its workspace.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import errno
 import hashlib
 import json
 import os
@@ -230,6 +231,14 @@ class CheckpointStore:
         safe_task = self._safe_task_id(task_id)
         safe_actor = self._safe_actor_id(actor_id)
         safe_candidate_filename = self._safe_candidate_filename(candidate_filename)
+        # Check lexical containment without resolving the final component: a
+        # symlink candidate inside the task root must be reported as
+        # ``not_regular`` below, not followed (or rejected as an opaque path)
+        # before the store can record that safe outcome.
+        task_root_absolute = Path(os.path.abspath(os.fspath(task_root)))
+        candidate_absolute = Path(os.path.abspath(os.fspath(candidate_path)))
+        if not candidate_absolute.is_relative_to(task_root_absolute):
+            raise ValueError("checkpoint candidate must stay inside its task root")
         with self._lock_for(safe_task):
             task_checkpoint_root = Path(task_root) / "checkpoints"
             _private_dir(task_checkpoint_root)
@@ -273,19 +282,64 @@ class CheckpointStore:
                     candidate_record["status"] = "too_large"
                     candidate_record["bytes"] = int(metadata.st_size)
                 else:
-                    raw = candidate_path.read_bytes()
-                    digest = hashlib.sha256(raw).hexdigest()
-                    candidate_snapshot = directory / candidate_record["filename"]
-                    atomic_write_bytes(candidate_snapshot, raw, mode=0o600)
-                    candidate_record.update(
-                        {
-                            "status": "captured",
-                            "bytes": len(raw),
-                            "sha256": digest,
-                            "changed_from_baseline": digest != str(baseline_sha256).lower(),
-                            "relative_path": f"{sequence:06d}/{candidate_record['filename']}",
-                        }
-                    )
+                    # Read through an O_NOFOLLOW descriptor and cap the read at
+                    # max+1 bytes.  The prior lstat is only a classification;
+                    # it must not become a symlink/TOCTOU escape before the
+                    # immutable snapshot is published.
+                    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    flags |= getattr(os, "O_NOFOLLOW", 0)
+                    try:
+                        descriptor = os.open(candidate_path, flags)
+                    except OSError as exc:
+                        if exc.errno == errno.ELOOP:
+                            candidate_record["status"] = "not_regular"
+                        else:
+                            candidate_record["status"] = "read_error"
+                    else:
+                        try:
+                            opened = os.fstat(descriptor)
+                            if not stat.S_ISREG(opened.st_mode):
+                                candidate_record["status"] = "not_regular"
+                            elif opened.st_size > self.max_candidate_bytes:
+                                candidate_record["status"] = "too_large"
+                                candidate_record["bytes"] = int(opened.st_size)
+                            else:
+                                chunks: list[bytes] = []
+                                total = 0
+                                while total <= self.max_candidate_bytes:
+                                    chunk = os.read(
+                                        descriptor,
+                                        min(256 * 1024, self.max_candidate_bytes + 1 - total),
+                                    )
+                                    if not chunk:
+                                        break
+                                    chunks.append(chunk)
+                                    total += len(chunk)
+                                    if total > self.max_candidate_bytes:
+                                        break
+                                if total > self.max_candidate_bytes:
+                                    candidate_record["status"] = "too_large"
+                                    candidate_record["bytes"] = total
+                                else:
+                                    closed = os.fstat(descriptor)
+                                    if closed.st_size != opened.st_size:
+                                        candidate_record["status"] = "read_error"
+                                    else:
+                                        raw = b"".join(chunks)
+                                        digest = hashlib.sha256(raw).hexdigest()
+                                        candidate_snapshot = directory / candidate_record["filename"]
+                                        atomic_write_bytes(candidate_snapshot, raw, mode=0o600)
+                                        candidate_record.update(
+                                            {
+                                                "status": "captured",
+                                                "bytes": len(raw),
+                                                "sha256": digest,
+                                                "changed_from_baseline": digest != str(baseline_sha256).lower(),
+                                                "relative_path": f"{sequence:06d}/{candidate_record['filename']}",
+                                            }
+                                        )
+                        finally:
+                            os.close(descriptor)
             except FileNotFoundError:
                 candidate_record["status"] = "missing"
             except OSError:
