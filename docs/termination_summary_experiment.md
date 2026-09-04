@@ -231,7 +231,10 @@ horizon、CPS32、每题初始 2 个 Agent、每题 2 个 episode、Pi 900 秒 i
 上限和 profiling；使用真实 Pi 与真实 `contextswarm-lean-service`/Lean Judge，
 Judge result cache 关闭，`mock_flags=none`。唯一 treatment 是 timeout/cancel/error
 时预留 45 秒向同一 session 发起 cooperative closeout；checkpoint 的
-`enabled/transfer/publish` 均为 false。启动前通过真实 Judge/Lean preflight，结束后
+`enabled/transfer/publish` 均为 false。这里要特别区分：这不等于把原有的 Pi 进程级
+recovery 关闭；为了保持与 baseline 的既有合同一致，本 manifest 从 `base.toml` 继承了
+`[pi.recovery] enabled=true, max_restarts=1`。本轮没有新增或改变 recovery/checkpoint
+逻辑，只有 termination-summary 是 treatment 变量。启动前通过真实 Judge/Lean preflight，结束后
 独立检查确认任务端口、容器和 stack 均已清理。
 
 ### 运行结果
@@ -249,6 +252,44 @@ Judge result cache 关闭，`mock_flags=none`。唯一 treatment 是 timeout/can
 
 `DEGRADED` 及上述 Judge/进程错误意味着这次的分数只能作为该轮运行结果，不能和
 历史原版分数直接做因果归因；它不表示 closeout 本身造成了得分变化。
+
+### 为什么会出现几十次 retry
+
+这里的 retry 不是 termination-summary 自己重复发送，也不是 checkpoint 恢复实验。
+正式 arm 保留了原版已有的两层进程策略：
+
+1. `[pi.retry]` 是单个 Pi invocation 内部的 provider 重试（最多 10 次）；它不增加
+   `process_attempt`，也不单独产生一条终止总结事件。
+2. `[pi.recovery]` 是 invocation 进程级的外层重启。本轮从 `base.toml` 继承
+   `enabled=true`、`max_restarts=1`、1 秒 backoff。一个进程以非零码退出、尚未触及
+   一小时 horizon、没有被 cancel，runner 才把它判为可恢复，并用**同一逻辑
+   `actor_id/task/episode/session/workspace`**再启动一次；这条判定完全不读取
+   termination-summary 的内容。
+
+本轮的精确分解如下：
+
+| 层次 | 数量 | 含义 |
+| --- | ---: | --- |
+| logical assignment | 109 | 调度器创建的逻辑 Agent；其中初始池 32 个，horizon 内释放槽位后又自适应补了 77 个，这 77 个是新的 assignment，不是进程 retry |
+| first process attempt 可恢复 | 81 | 79 个 900 秒 Pi timeout、2 个 transport failure；都在外层 horizon 仍有余量时安排一次 restart |
+| second process attempt 启动 | 81 | 每个 logical actor 最多一次，符合 `max_restarts=1` |
+| second attempt 成功 | 3 | 恢复后的同一 session 正常返回，不产生 terminal closeout |
+| second attempt 仍失败/被终止 | 78 | 48 次再次 timeout、2 次 transport、13 次到达外层 horizon、15 次 cancel/进程终止 |
+
+因此终止总结事件才会是 `109 + 78 = 187`：每个 logical assignment 的第一次结束
+各贡献一条 attempt-0 closeout；只有那 81 个 restart 中最终失败的 78 个才再贡献
+attempt-1 closeout。3 个成功 recovery 不会再触发 terminal closeout。换句话说，187
+不是 187 个不同 Agent，也不是一个 Agent 被重试了 187 次；它是 109 个逻辑 assignment
+对应的 187 个“以终止为结局”的 process-attempt 事件。实际启动过的 process attempt
+总数是 190（109 个首次尝试 + 81 个 recovery 尝试，其中 3 个 recovery 正常成功，
+所以没有终止总结事件）。
+
+closeout 与 recovery 的顺序也不是反过来的：`run_with_recovery` 在安排 replacement
+之前先调用结果 hook，所以第一次 timeout 会先获得一次 termination-summary 机会，随后
+才判断是否启动 recovery。例如 `imo2023_p2_v2` 的一个 actor 在 14:56:27 首次 timeout，
+同一 session 的 summary 已完成并发布；1 秒后 recovery attempt-1 启动，15:11:28
+再次 timeout，第二次 summary 才记录为 missing，随后因 `restart_limit` 结束。这个
+例子说明 retry 不是 closeout 造成的，而是原有进程恢复合同独立触发的。
 
 ### 终止总结实际捕获情况
 

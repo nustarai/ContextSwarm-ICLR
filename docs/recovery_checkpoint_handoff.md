@@ -6,12 +6,19 @@
 
 两条链路必须保持分离：
 
-| 链路 | 目的 | 所有者 | 是否在本次 treatment 开启 |
+| 链路 | 目的 | 所有者 | 是否作为本次 treatment 的实验变量 |
 | --- | --- | --- | --- |
 | termination summary | Agent 即将被 timeout/cancel 时，停止当前方向，检查自己的对话，把尚未发布的可复用知识发布到 task-local CPS | 当前任务 | 是 |
-| recover/checkpoint | Agent 进程异常退出后，在有限次数内恢复同一 session/workspace，或把私有候选快照交给后续尝试 | 后续 recover Agent | 否 |
+| recover/checkpoint | Agent 进程异常退出后，在有限次数内恢复同一 session/workspace，或把私有候选快照交给后续尝试 | 后续 recover Agent | 否；保留 baseline 已有的 Pi 进程 recovery，不新增 recovery/checkpoint 变量 |
 
 终止总结发布的是共享知识（由 Agent 通过 `cps_publish` 写入）；checkpoint 是私有恢复证据（候选文件、session/workspace 元数据）。本次 treatment 不把 checkpoint 注入新 Agent 的 prompt，也不通过 `latest_checkpoint` 选择或传递 Agent 状态。既有 formal CPS 的 best-candidate 复制是独立的 baseline 行为，后续实现不能把它与 checkpoint 混为一谈。
+
+“本次不包含 recover/checkpoint”指的是没有把恢复或私有 checkpoint 作为 treatment 变量，
+不是说运行时一定没有原有的进程级 restart。正式 treatment 与 clean baseline 都从
+`configs/base.toml` 继承 `[pi.recovery] enabled=true, max_restarts=1`；因此一个 Pi
+invocation 在固定 horizon 尚有余量且以可恢复的非零结果退出时，仍可能由既有
+`run_with_recovery` 启动一次同 actor/session/workspace 的 replacement。termination
+summary 只在每个 process attempt 的结束边界回收共享知识，不决定是否 retry。
 
 ## 当前代码位置
 
