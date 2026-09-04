@@ -98,7 +98,7 @@ Runner 能强制保存已经存在于文件、CPS、Judge feedback 和可读 res
 - recovery sink 在失败尝试重试前收到记录，并在成功返回时收到最终记录；
 - message-only blocker 被加入 bounded ruled-out context，即使 direct message 已 ack；
 - mock CPS runner：两次失败写入 `partial-1`/`partial-2`，新的 assignment 读到 `checkpoint/result.lean=partial-2`，Judge 只评估第三次新候选；checkpoint piece 从未成为 proof；
-- 现有 recovery/CPS partial focused tests（含 slot refill）通过；checkpoint/recovery focused 合计 28 个测试通过。
+- 现有 recovery/CPS partial focused tests（含 slot refill）通过；checkpoint/recovery focused 合计 **29 个测试通过（29/29）**。
 
 另做了一次同配置的短时 mock smoke（baseline 与 treatment 各一轮，`configs/smoke.toml`、1 题、30 秒合同）：
 
@@ -121,6 +121,13 @@ python3 -m unittest tests.test_checkpoint tests.test_cps_recovery_partial tests.
 python3 -m compileall -q contextswarm_mini
 python3 -m unittest discover -s tests
 ```
+
+提交后的 clean-tree 全套 discovery 实际运行了 735 个测试，结果为
+`FAILED (failures=2, skipped=1)`：两个失败分别是既有的 0.05 秒短 horizon
+时序测试（evaluator backpressure 和 scheduler non-admission），不涉及 checkpoint
+代码；前者单独重跑仍会复现，后者单独重跑通过，属于环境/时序波动，不能当作本次
+功能回归。checkpoint 相关聚焦集合为 29/29，`compileall` 通过；脏树时出现的
+tracked-files 门禁失败已在 clean-tree 重跑中消失。
 
 ## 5. 真实 A/B 对照合同
 
