@@ -257,10 +257,13 @@ _CPS_FEATURE_FIELDS = frozenset(
     {
         "route_claim_required",
         "route_claim_ttl_seconds",
+        "activity_feedback_prompt_mode",
         "per_recipient_receipts",
         "knowledge_promotion",
     }
 )
+
+_ACTIVITY_FEEDBACK_PROMPT_MODES = frozenset({"advisory", "strong"})
 
 
 @dataclass(frozen=True)
@@ -278,6 +281,12 @@ class CPSFeatureConfig:
     route_claim_ttl_seconds: int = 900
     per_recipient_receipts: bool = False
     knowledge_promotion: bool = False
+    # ``advisory`` preserves the first activity-feedback treatment: the Agent
+    # sees peer descriptions and decides whether to avoid or repeat them.
+    # ``strong`` changes only the prompt policy: avoid a listed direction by
+    # default, while retaining an explicit independent-verification exception.
+    # Keep this appended after the historical fields for positional callers.
+    activity_feedback_prompt_mode: str = "advisory"
 
     @property
     def active_roster_enabled(self) -> bool:
@@ -301,6 +310,7 @@ class CPSFeatureConfig:
         return {
             "route_claim_required": self.route_claim_required,
             "route_claim_ttl_seconds": self.route_claim_ttl_seconds,
+            "activity_feedback_prompt_mode": self.activity_feedback_prompt_mode,
             "per_recipient_receipts": self.per_recipient_receipts,
             "knowledge_promotion": self.knowledge_promotion,
         }
@@ -342,9 +352,25 @@ def _parse_cps_features(value: Any, *, table_name: str = "cps_features") -> CPSF
             raise ConfigError(
                 f"{table_name}.route_claim_ttl_seconds must not exceed 86400"
             )
+    if "activity_feedback_prompt_mode" not in features:
+        prompt_mode = "advisory"
+    else:
+        raw_prompt_mode = features["activity_feedback_prompt_mode"]
+        if not isinstance(raw_prompt_mode, str) or not raw_prompt_mode.strip():
+            raise ConfigError(
+                f"{table_name}.activity_feedback_prompt_mode must be one of "
+                f"{sorted(_ACTIVITY_FEEDBACK_PROMPT_MODES)}"
+            )
+        prompt_mode = raw_prompt_mode.strip().lower()
+        if prompt_mode not in _ACTIVITY_FEEDBACK_PROMPT_MODES:
+            raise ConfigError(
+                f"{table_name}.activity_feedback_prompt_mode must be one of "
+                f"{sorted(_ACTIVITY_FEEDBACK_PROMPT_MODES)}"
+            )
     return CPSFeatureConfig(
         route_claim_required=optional_bool("route_claim_required"),
         route_claim_ttl_seconds=ttl,
+        activity_feedback_prompt_mode=prompt_mode,
         per_recipient_receipts=optional_bool("per_recipient_receipts"),
         knowledge_promotion=optional_bool("knowledge_promotion"),
     )

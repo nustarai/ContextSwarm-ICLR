@@ -202,6 +202,26 @@ class ActivityFeedbackTests(unittest.TestCase):
         self.assertIn("not a uniqueness filter", prompt)
         self.assertIn("Use your own judgment about whether to avoid or repeat", prompt)
 
+    def test_strong_prompt_prefers_new_direction_but_keeps_reasoned_exception(self) -> None:
+        prompt = build_task_prompt(
+            _task(),
+            task_workspace="tasks/sample",
+            agent_id="actor-b",
+            episode=1,
+            communication_enabled=True,
+            route_claim_required=True,
+            activity_feedback_enabled=True,
+            activity_feedback_prompt_mode="strong",
+            concurrent_activity="- actor-a (episode 1, active): Explore a valuation bound",
+        )
+        self.assertIn("Concurrent peer activity (ephemeral, task-scoped)", prompt)
+        self.assertIn("coverage constraint", prompt)
+        self.assertIn("by default choose a materially different direction", prompt)
+        self.assertIn("concrete independent verification", prompt)
+        self.assertIn("new contribution", prompt)
+        self.assertIn("Repeat\none only for a concrete", prompt)
+        self.assertNotIn("not a uniqueness filter", prompt)
+
     def test_pi_surface_and_environment_carry_activity_treatment(self) -> None:
         config = load_config("configs/route_claim_smoke.toml", ROOT)
         self.assertTrue(_activity_feedback_settings(config, True))
@@ -219,6 +239,32 @@ class ActivityFeedbackTests(unittest.TestCase):
                 workdir=Path(temporary),
             )
         self.assertEqual(environment["CONTEXTSWARM_CPS_ACTIVITY_FEEDBACK_ENABLED"], "1")
+        self.assertEqual(
+            environment["CONTEXTSWARM_CPS_ACTIVITY_FEEDBACK_PROMPT_MODE"],
+            "advisory",
+        )
+
+    def test_strong_activity_mode_reaches_pi_system_prompt_and_environment(self) -> None:
+        config = load_config(
+            "configs/formal_1h_cps32_profiled_activity_strong.toml", ROOT
+        )
+        agent = PiAgent(config)
+        command = agent.command()
+        system_prompt = command[command.index("--system-prompt") + 1]
+        self.assertIn("strong peer-activity prompt policy", system_prompt)
+        self.assertIn("default is to choose", system_prompt)
+        self.assertNotIn("Decide for yourself whether to avoid or repeat", system_prompt)
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = agent.environment(
+                task_id="sample",
+                actor_id="actor-b",
+                episode=1,
+                workdir=Path(temporary),
+            )
+        self.assertEqual(
+            environment["CONTEXTSWARM_CPS_ACTIVITY_FEEDBACK_PROMPT_MODE"],
+            "strong",
+        )
 
     def test_node_surface_can_be_enabled_by_activity_bit_alone(self) -> None:
         script = """

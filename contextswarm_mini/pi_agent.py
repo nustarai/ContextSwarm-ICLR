@@ -84,6 +84,16 @@ technical handle in this treatment and may overlap a peer's handle. Decide for
 yourself whether to avoid or repeat a peer's direction; the runner does not
 choose the mathematical route for you.
 """
+_STRONG_ACTIVITY_FEEDBACK_SYSTEM_PROMPT = """\nThe strong peer-activity prompt policy is enabled for this route-capable session.
+When the task prompt lists a peer's current direction, your default is to choose
+a materially different proof family, subproblem, or experiment. Do not repeat a
+listed direction merely because your opaque route key is different. Repetition
+remains allowed for a concrete independent verification, refinement,
+counterexample, or new lemma; state the specific new contribution in your route
+summary and independent-verification reason. This is a decision aid, not a hard
+semantic rejection: you remain responsible for judging whether a direction is
+genuinely different or whether repetition is justified.
+"""
 _SOLVER_SYSTEM_PROMPT = """You are a bounded formal-proof construction worker, not a general-purpose coding agent.
 Work only on the assigned result.lean and use only the explicitly provided tools.
 Do not execute shell commands, spawn background or parallel processes, run a local
@@ -175,6 +185,7 @@ _CPS_ENVIRONMENT_KEYS = frozenset(
         "CONTEXTSWARM_CPS_ACTIVE_ROSTER_ENABLED",
         "CONTEXTSWARM_CPS_ROUTE_CLAIM_TTL_SECONDS",
         "CONTEXTSWARM_CPS_ACTIVITY_FEEDBACK_ENABLED",
+        "CONTEXTSWARM_CPS_ACTIVITY_FEEDBACK_PROMPT_MODE",
     }
 )
 _EVALUATOR_ENVIRONMENT_KEYS = frozenset(
@@ -217,6 +228,21 @@ class PiAgent:
     trace_path: Path | None = None
     profiler: RunProfiler | None = None
     _trace_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def _activity_feedback_prompt_mode(self) -> str:
+        """Return the manifest-selected activity prompt policy.
+
+        The typed manifest loader accepts only ``advisory`` and ``strong``.
+        Keep this adapter tolerant of narrow test doubles and pre-policy
+        manifests so an absent value preserves the original behavior.
+        """
+
+        features = getattr(self.config, "cps_features", None)
+        value = getattr(features, "activity_feedback_prompt_mode", None)
+        if not isinstance(value, str):
+            value = getattr(self.config, "activity_feedback_prompt_mode", None)
+        value = value.strip().lower() if isinstance(value, str) else "advisory"
+        return value if value in {"advisory", "strong"} else "advisory"
 
     def binary(self) -> str:
         configured = self.config.pi_binary.strip() or os.environ.get("MINI_SWARM_PI_BIN", "").strip()
@@ -280,7 +306,10 @@ class PiAgent:
         if route_required and not isolated:
             system_prompt += _ROUTE_CLAIM_SYSTEM_PROMPT
         if effective_activity_feedback and not isolated:
-            system_prompt += _ACTIVITY_FEEDBACK_SYSTEM_PROMPT
+            if self._activity_feedback_prompt_mode() == "strong":
+                system_prompt += _STRONG_ACTIVITY_FEEDBACK_SYSTEM_PROMPT
+            else:
+                system_prompt += _ACTIVITY_FEEDBACK_SYSTEM_PROMPT
         command = [
             self.binary(),
             "--mode",
@@ -591,6 +620,11 @@ class PiAgent:
         env["CONTEXTSWARM_CPS_ROUTE_CLAIM_TTL_SECONDS"] = str(route_ttl)
         env["CONTEXTSWARM_CPS_ACTIVITY_FEEDBACK_ENABLED"] = (
             "1" if effective_activity_feedback else "0"
+        )
+        env["CONTEXTSWARM_CPS_ACTIVITY_FEEDBACK_PROMPT_MODE"] = (
+            self._activity_feedback_prompt_mode()
+            if effective_activity_feedback
+            else "advisory"
         )
         if bypass_reason is not None:
             env["CONTEXTSWARM_CPS_ROUTE_CLAIM_BYPASS_REASON"] = bypass_reason

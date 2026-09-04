@@ -32,6 +32,7 @@ class CPSFeatureConfigTests(unittest.TestCase):
         self.assertFalse(config.cps_features.route_claim_required)
         self.assertFalse(config.cps_features.active_roster_enabled)
         self.assertEqual(config.cps_features.route_claim_ttl_seconds, 900)
+        self.assertEqual(config.cps_features.activity_feedback_prompt_mode, "advisory")
         self.assertFalse(config.cps_features.per_recipient_receipts)
         self.assertFalse(config.cps_features.knowledge_promotion)
         self.assertEqual(
@@ -62,6 +63,7 @@ knowledge_promotion = false
             {
                 "route_claim_required": True,
                 "route_claim_ttl_seconds": 321,
+                "activity_feedback_prompt_mode": "advisory",
                 "per_recipient_receipts": False,
                 "knowledge_promotion": False,
             },
@@ -99,6 +101,10 @@ knowledge_promotion = false
     def test_feature_table_is_strict_and_route_requires_cps(self) -> None:
         with self.assertRaisesRegex(ConfigError, "unknown cps_features fields"):
             _load_manifest("[cps_features]\nunknown = true\n")
+        with self.assertRaisesRegex(ConfigError, "activity_feedback_prompt_mode"):
+            _load_manifest('[cps_features]\nactivity_feedback_prompt_mode = "force"\n')
+        with self.assertRaisesRegex(ConfigError, "activity_feedback_prompt_mode"):
+            _load_manifest('[cps_features]\nactivity_feedback_prompt_mode = true\n')
         with self.assertRaisesRegex(ConfigError, "must be a boolean"):
             _load_manifest('[cps_features]\nroute_claim_required = "true"\n')
         with self.assertRaisesRegex(ConfigError, "must be positive"):
@@ -124,6 +130,21 @@ knowledge_promotion = false
         self.assertEqual(
             config.public_dict()["cps_features"]["route_claim_required"], True
         )
+
+    def test_activity_prompt_policy_manifests_differ_only_by_name_and_mode(self) -> None:
+        advisory = load_config(
+            "configs/formal_1h_cps32_profiled_activity_advisory.toml", ROOT
+        )
+        strong = load_config(
+            "configs/formal_1h_cps32_profiled_activity_strong.toml", ROOT
+        )
+        self.assertEqual(advisory.cps_features.activity_feedback_prompt_mode, "advisory")
+        self.assertEqual(strong.cps_features.activity_feedback_prompt_mode, "strong")
+        expected = advisory.public_dict()
+        expected["name"] = strong.name
+        expected["cps_features"] = dict(expected["cps_features"])
+        expected["cps_features"]["activity_feedback_prompt_mode"] = "strong"
+        self.assertEqual(strong.public_dict(), expected)
 
     def test_pi_session_receives_controlled_route_capability_and_tools(self) -> None:
         config = _load_manifest(

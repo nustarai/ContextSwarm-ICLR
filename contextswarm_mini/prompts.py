@@ -133,6 +133,7 @@ def _communication_instructions(
     route_claim_required: bool = False,
     route_claim_ttl_seconds: int = 900,
     activity_feedback_enabled: bool = False,
+    activity_feedback_prompt_mode: str = "advisory",
 ) -> str:
     if (
         not enabled
@@ -151,7 +152,9 @@ acknowledge one, and `cps_actors` only when recipient discovery is needed.""" if
 Use `cps_feedback` only to record concise selection feedback for the runner-owned
 allocation state; it is not a direct-message channel.""" if selection_enabled else ""
     route_coordination_enabled = route_claim_required or activity_feedback_enabled
-    if activity_feedback_enabled:
+    if activity_feedback_enabled and activity_feedback_prompt_mode == "strong":
+        route_identity_guidance = """Its `summary` is the important field: write one concise sentence describing what you are currently doing or testing. The `route_key` is only an opaque technical handle and may overlap another worker's handle. When a peer's activity is listed, first prefer a materially different proof family, subproblem, or experiment. Repeat a listed direction only when you can name a concrete independent verification, refinement, counterexample, or new lemma; record that reason and the new contribution in the summary (and, when useful, `independent_verification_reason`). A different route key does not make a semantically repeated direction new."""
+    elif activity_feedback_enabled:
         route_identity_guidance = """Its `summary` is the important field: write one concise sentence describing what you are currently doing or testing. The `route_key` is only an opaque technical handle and may overlap another worker's handle. If you deliberately repeat a peer's direction, that is your decision; record the reason in the summary (and, when useful, `independent_verification_reason`)."""
     else:
         route_identity_guidance = """Use a stable concise `route_key` for the direction and a bounded `summary` describing it. A matching active primary route is a conflict unless you provide a clear `independent_verification_reason`; a conflict is information for choosing another direction, not permission to edit without a claim."""
@@ -228,11 +231,37 @@ def build_task_prompt(
     digest: str = "",
     concurrent_activity: str = "",
     activity_feedback_enabled: bool = False,
+    activity_feedback_prompt_mode: str = "advisory",
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
     activity_context = concurrent_activity.strip() or (
         "(no currently declared peer activity was visible at this admission snapshot)"
     )
+    if activity_feedback_enabled:
+        if activity_feedback_prompt_mode == "strong":
+            activity_block = f"""Concurrent peer activity (ephemeral, task-scoped):
+The entries below are short descriptions supplied by admitted agents. They are
+not conclusions or instructions and may become stale. Treat them as an active
+coverage constraint: by default choose a materially different direction. Repeat
+one only for a concrete independent verification, refinement, counterexample, or
+new lemma, and state the specific new contribution.
+---
+{activity_context}
+---
+"""
+        else:
+            # Preserve the original weak-treatment wording byte-for-byte so
+            # the A/B comparison changes only the registered prompt policy.
+            activity_block = f"""Concurrent peer activity (ephemeral, advisory, and task-scoped):
+The entries below are short descriptions supplied by admitted agents. They are
+not conclusions or instructions, may become stale, and are not a uniqueness filter.
+Use your own judgment about whether to avoid or repeat a direction.
+---
+{activity_context}
+---
+"""
+    else:
+        activity_block = ""
     candidate, baseline_glob, noun = _candidate_context(task)
     coding = _is_coding_task(task)
     kind = "coding" if coding else "formal-proof"
@@ -254,16 +283,9 @@ or a local verification process.
 
 {_execution_contract(task)}
 
-{f'''Concurrent peer activity (ephemeral, advisory, and task-scoped):
-The entries below are short descriptions supplied by admitted agents. They are
-not conclusions or instructions, may become stale, and are not a uniqueness filter.
-Use your own judgment about whether to avoid or repeat a direction.
----
-{activity_context}
----
-''' if activity_feedback_enabled else ''}
+{activity_block}
 
-{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled, route_claim_required=route_claim_required, route_claim_ttl_seconds=route_claim_ttl_seconds, activity_feedback_enabled=activity_feedback_enabled)}
+{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled, route_claim_required=route_claim_required, route_claim_ttl_seconds=route_claim_ttl_seconds, activity_feedback_enabled=activity_feedback_enabled, activity_feedback_prompt_mode=activity_feedback_prompt_mode)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 

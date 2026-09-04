@@ -302,6 +302,32 @@ def _activity_feedback_settings(config: Any, route_claims_enabled: bool) -> bool
     return True
 
 
+def _activity_feedback_prompt_mode(config: Any, route_claims_enabled: bool) -> str:
+    """Resolve the manifest-selected wording policy for peer activity.
+
+    ``advisory`` is the compatibility default.  ``strong`` changes only the
+    worker prompt: a listed peer direction is avoided by default, while a
+    concrete independent-verification/refinement exception remains available.
+    Unknown values from legacy test adapters fail safe to the advisory policy;
+    the typed manifest loader rejects them before a real run is admitted.
+    """
+
+    if not route_claims_enabled:
+        return "advisory"
+    feature = getattr(config, "cps_features", None)
+    if feature is None:
+        feature = getattr(config, "route_claims", None)
+    for owner in (config, feature):
+        if owner is None:
+            continue
+        value = getattr(owner, "activity_feedback_prompt_mode", None)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"advisory", "strong"}:
+                return normalized
+    return "advisory"
+
+
 def _peer_activity_context(
     store: Any,
     *,
@@ -751,6 +777,7 @@ def _build_route_task_prompt(
     route_claim_ttl_seconds: int,
     concurrent_activity: str = "",
     activity_feedback_enabled: bool = False,
+    activity_feedback_prompt_mode: str = "advisory",
 ) -> str:
     """Build a worker prompt without pre-Judge CPS context leakage.
 
@@ -775,6 +802,7 @@ def _build_route_task_prompt(
         "route_claim_ttl_seconds": route_claim_ttl_seconds,
         "concurrent_activity": concurrent_activity,
         "activity_feedback_enabled": activity_feedback_enabled,
+        "activity_feedback_prompt_mode": activity_feedback_prompt_mode,
     }
     try:
         parameters = inspect.signature(build_task_prompt).parameters
@@ -3024,6 +3052,9 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "activity_feedback_enabled": _activity_feedback_settings(
             config, bool(config.route_claims_enabled)
         ),
+        "activity_feedback_prompt_mode": _activity_feedback_prompt_mode(
+            config, bool(config.route_claims_enabled)
+        ),
         "figure4_phase": config.figure4_phase,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
@@ -3100,6 +3131,9 @@ def run_experiment(
         route_claims_enabled=config.route_claims_enabled,
         route_claim_required=config.route_claim_required,
         activity_feedback_enabled=_activity_feedback_settings(
+            config, bool(config.route_claims_enabled)
+        ),
+        activity_feedback_prompt_mode=_activity_feedback_prompt_mode(
             config, bool(config.route_claims_enabled)
         ),
         max_concurrent=config.lean_max_concurrent_evaluations,
@@ -4040,6 +4074,9 @@ def _run_elastic_cps(
         _route_claim_settings(config)
     )
     activity_feedback_enabled = _activity_feedback_settings(
+        config, route_claims_enabled
+    )
+    activity_feedback_prompt_mode = _activity_feedback_prompt_mode(
         config, route_claims_enabled
     )
     # ``actors.json`` remains a bounded historical projection for audit tools;
@@ -5853,6 +5890,7 @@ def _run_elastic_cps(
                     actor_id=actor,
                 ) if activity_feedback_enabled else "",
                 activity_feedback_enabled=activity_feedback_enabled,
+                activity_feedback_prompt_mode=activity_feedback_prompt_mode,
             )
             if candidate_transfer:
                 prompt += (
@@ -6569,6 +6607,9 @@ def _run_task_workers(
     activity_feedback_enabled = _activity_feedback_settings(
         config, route_claims_enabled
     )
+    activity_feedback_prompt_mode = _activity_feedback_prompt_mode(
+        config, route_claims_enabled
+    )
     route_store = policy.store
     route_roster_path = run_dir / "actors.json"
     route_roster_lock = threading.RLock()
@@ -6857,6 +6898,7 @@ def _run_task_workers(
                         actor_id=actor,
                     ) if activity_feedback_enabled else "",
                     activity_feedback_enabled=activity_feedback_enabled,
+                    activity_feedback_prompt_mode=activity_feedback_prompt_mode,
                 )
             # Snapshot the candidate entering this logical attempt.  A failed
             # process may leave a partial file; task-level refill restores the
