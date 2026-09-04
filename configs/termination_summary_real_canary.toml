@@ -1,0 +1,26 @@
+extends = ["canary.toml"]
+
+# Bounded real-Pi/real-Judge canary for the semantic termination closeout.
+# This is an execution probe, not a paper-facing score arm: one task and one
+# agent are retained, while the shorter horizon makes the timeout boundary
+# observable in a single operator run.
+[experiment]
+name = "mobench-controlled-judge-termination-summary-canary"
+time_limit_seconds = 60
+
+[pi]
+timeout_seconds = 30
+
+[formal_tools]
+# The canary still uses the real formal Judge/kernel, but does not require an
+# operator declaration-index snapshot.  The paper-facing formal manifests
+# keep the stricter revision/index contract.
+require_decl_index = false
+
+[termination_summary]
+enabled = true
+grace_seconds = 10
+on_timeout = true
+on_cancel = true
+on_error = true
+max_prompt_chars = 4000
