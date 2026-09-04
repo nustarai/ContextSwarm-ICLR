@@ -117,6 +117,12 @@ idle-session `prompt`。若某个触发开关显式关闭，runner 记录 `termi
   保持不变，不作为本 treatment；本实验只增加 termination-summary command/CPS publish；
 - baseline 不发送 closeout command；treatment 仅启用 `termination_summary`。
 
+为让尚未完成 mandatory early Judge checkpoint 的 session 仍能在 closeout 回合使用
+`cps_search`/`cps_publish`，treatment 的 worker system prompt 还包含一条只在
+`RUNNER-REQUESTED TERMINATION CLOSEOUT` 消息出现时才生效的窄例外；baseline 的历史
+prompt bytes 不变。它不会在正常结束时触发额外回合，但这点固定输入差异必须计入
+正式 A/B 的 token/成本开销，不能把 treatment 宣称为完全零 prompt 差异。
+
 建议各 arm 串行运行 3 次，使用独立 run directory，并在每轮 Judge broker drain 完成后再开始下一轮。当前分支只提供协议、mock/focused 验证和记录格式；没有在未获授权的情况下启动真实账号/远端 1 小时实验。
 
 ## 已执行的离线证据（不是数学效果结果）
