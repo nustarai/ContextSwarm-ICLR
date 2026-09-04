@@ -160,6 +160,62 @@ benchmark 数据；正式 1 小时实验仍需授权的 Judge/Lean/runtime 输�
 无效中间产物；该进程已停止，目录不纳入任何结果。后续运行改用上表两个有界 manifest，
 以避免把调度器的无限补充行为误认为实验数据。
 
+## 真实受控 canary：匹配的 baseline / treatment（非 mock）
+
+在用户要求“先做一次真实测试”后，补做了一组同条件的单题配对。这里的“真实”是指
+容器内启动真实 `pi`（`mocked=false`），并通过任务自有的 compat proxy 访问真实
+`contextswarm-lean-service`/Lean 工具链；proxy 只做 HTTP API 适配，不返回预置的
+Judge 结果。两次都没有传 `--mock-agent`、`--mock-proved` 或 `--dry-run`，也没有使用
+远端账号。两次都通过了 transport preflight（`status=ok`、Lean
+`workspace_ready=true`、Judge result-cache backend `disabled`、NuRouter enabled，Pi
+0.84.3），并在后端日志中留下真实 `POST /api/lean/jobs`（202）及轮询记录。
+
+为隔离恢复因素，两次都只运行 `imo2024_p1` 一个逻辑 assignment，120 秒 horizon，
+`pi.timeout_seconds=900`，`[pi.recovery].enabled=false`；唯一实验变量是
+`termination_summary`。两次产生的 candidate SHA-256 都是
+`cb34b023e37f808e1fa9cb9b2f2f47541e1e63122457a37f2b4bc8836cb0955f`，即没有把证明编辑
+差异误当成发布收益。
+
+| arm | artifact（相对本 worktree） | Agent / Judge 事实 | timeout | closeout request / sent / completed / published / missing | CPS pieces / messages | score |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| baseline | `runs/termination_summary_real_canary/real-progress-baseline-r3-20260904/20260904T105626Z-4e1ff7ea` | `mocked=false`；1 次 accepted `COMPILES_WITH_SORRY`，`proved=false` | 1 | 0 / 0 / 0 / 0 / 0 | 0 / 0 | 0 |
+| treatment | `runs/termination_summary_real_canary/real-progress-treatment-current-20260904/20260904T105921Z-d3241762` | `mocked=false`；1 次 accepted `COMPILES_WITH_SORRY`，`proved=false` | 1 | **1 / 1 / 1 / 1 / 0** | **1 / 0** | 0 |
+
+treatment 的 `final.json` 还记录了 `returncode=124`、`timed_out=true`、
+`termination_summary_publish_verified=true`；这表示任务确实因 timeout 终止，但在终止前
+完成了同一 Pi session 的 closeout，而不是正常完成或偷偷延长 horizon。CPS sqlite 中
+唯一的一条 `termination_summary` piece 是 Agent 自己写入的，内容留下了可继续使用的
+数学信息：
+
+- 用 floor-sum 的平均值界推出 `Sₙ = n⌊(n+1)α/2⌋`，再相邻相减得到递推；
+- 说明“取一个合适的奇数 n 让和落在 `(0,n)`”并不总可用（给出了 `β=0.9` 的反例）；
+- 明确记录 skeleton 仍是 `by sorry`、没有已验证 proof，并给出下一步要形式化的
+  `Finset.sum_le_sum`、floor 界和 Archimedean 取 n 的工作清单。
+
+匹配 baseline 在超时前也完成了同一个真实 early `judge_check`，但由于没有终止总结命令，
+其 CPS sqlite 是 0 pieces / 0 messages；运行产物里没有一条结构化的“已尝试路线、排除的
+捷径、验证反馈、下一步”记录。因而这组配对已经直接复现了本改动要解决的丢失：不是让
+baseline 得分变低，而是让同一份未完成工作在结束边界是否变成可检索共享知识。
+
+这仍然不是正式 12 题 A/B，也不能从 score=0 或一条 piece 推断证明率、后续 adoption
+或默认开启的必要性；它只证明真实运行链路和 closeout 回收目标在一题上成立。后续正式
+实验应在相同的真实 Judge/Lean 合同下扩大到预注册的 12 题、多次独立 replicate，并
+同时报告 publish capture、后续 Agent 是否采用、Judge 质量和额外时间/token 成本。
+
+### 真实 canary 的故障/参数迭代记录
+
+配对前的真实探针也保留在同一 run 根目录，不能被隐藏掉：
+
+| probe | 关键结果 | 解释 |
+| --- | --- | --- |
+| `real-20260904/20260904T101953Z-e6fc4a35`（grace 10s） | 2 次 request/sent，0 completed，0 published，2 missing | 窗口不足以让真实 Pi 完成 cooperative closeout；不是功能成功 |
+| `real-grace45-20260904/20260904T103218Z-971e5210`（旧代码） | 1 published，但 0 completed | 真实多 turn closeout 暴露了 lifecycle receipt 被 continuation `turn_start` 清零的 bug |
+| `real-grace45-r2-20260904/20260904T104235Z-1f1dcb82`（修复后） | 2/2 completed，2/2 published | 修复后 receipt 与实际 CPS 写入一致；该 run 因旧 manifest 仍启用一次 recovery |
+
+因此当前建议的下一步不是把 mock 数字写进论文，而是先固定真实 canary 的 grace/窗口
+参数，再执行正式 baseline/treatment 12 题配对；任何 hard kill、Judge 不可用或窗口不足
+都应按 `missing/unavailable` 计数，不能由 runner 事后猜正文。
+
 ## 主要指标
 
 | 指标 | 定义 | 解释 |
