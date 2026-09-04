@@ -95,7 +95,7 @@
 
 当 manifest 的 `checkpoint.transfer=true` 时，新的 workspace 收到 `checkpoint/checkpoint.json` 和经哈希核对的候选副本。普通 CPS（原版 `candidate_transfer=true`）仍把已验证 best candidate 放在活动 `result.lean`，checkpoint 候选放在独立目录并由 prompt 明确要求先检查；这样未验证内容不会静默覆盖已验证候选。新的 Agent 必须重新 `judge_check`，checkpoint 永远不计分、不直接 promote。
 
-`checkpoint.publish=true` 时，runner 还向 task-local CPS 写入 `kind=checkpoint`、`runner_checkpoint/unverified/timeout_recovery` 标签的 bounded piece。该 piece 不是 proof，也不进入普通 strategy-piece 计数；它只让后续 assignment 能从 CPS 看到 latest 交接元数据。发布失败单独记为 `checkpoint_publish_failed`，不伪装成 candidate failure。
+`checkpoint.publish=true` 时，runner 还向 task-local CPS 写入 `kind=checkpoint`、`runner_checkpoint/unverified/timeout_recovery` 标签的 bounded piece。该 piece 不是 proof，也不进入普通 strategy-piece 计数；它只让后续 assignment 能从 CPS 看到 latest 交接元数据。磁盘快照先于发布，发布在取消/整体 horizon 已关闭时可记录为 skipped；发布失败单独记为 `checkpoint_publish_failed`，不伪装成 candidate failure。
 
 ### 诚实边界
 
