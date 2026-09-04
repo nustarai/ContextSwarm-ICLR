@@ -1036,6 +1036,57 @@ class CPSStore:
             )
         return result
 
+    def recent_messages(
+        self,
+        *,
+        task_id: str,
+        limit: int = 8,
+        body_chars: int = 1_200,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded task-local message ledger for recovery evidence.
+
+        Unlike :meth:`inbox`, this read is not recipient-scoped and includes
+        acknowledged rows.  A termination checkpoint is the one runner-owned
+        boundary where that distinction matters: a message sent to an agent
+        that has already exited is still useful evidence for the next agent,
+        while it must not become part of the ordinary live inbox semantics.
+        """
+
+        limit = max(1, min(int(limit), 50))
+        body_chars = max(1, min(int(body_chars), _MAX_TEXT))
+        profiling = self._profiling_enabled
+        started = time.monotonic() if profiling else 0.0
+        with self._db(operation="recent_messages" if profiling else "generic") as db:
+            rows = db.execute(
+                """SELECT id,task_id,sender,recipient,body,created_at,acked_at
+                   FROM messages
+                   WHERE task_id=?
+                   ORDER BY rowid DESC LIMIT ?""",
+                (str(task_id), limit),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for raw in rows:
+            item = dict(raw)
+            body = str(item.get("body") or "")
+            if len(body) > body_chars:
+                body = body[:body_chars] + "…"
+            item["body"] = body
+            result.append(item)
+        if profiling:
+            self._profile_event(
+                "cps.messages_snapshot",
+                operation="recent_messages",
+                task_id=str(task_id),
+                rows_scanned=len(rows),
+                output_rows=len(result),
+                materialized_rows=len(result),
+                materialized_bytes=sum(
+                    len(str(item.get("body") or "").encode("utf-8")) for item in result
+                ),
+                wall_seconds=max(0.0, time.monotonic() - started),
+            )
+        return result
+
     def ack_message(
         self,
         message_id: str,
@@ -1381,11 +1432,11 @@ class CommunicationPolicy:
         kind: str = "handoff",
         tags: Iterable[str] = (),
         deadline_epoch_ms: int | None = None,
-    ) -> None:
+    ) -> Mapping[str, Any] | None:
         if not self.enabled:
-            return
+            return None
         assert self.store is not None
-        self.store.create_piece(
+        return self.store.create_piece(
             task_id=task_id,
             author=actor_id,
             kind=kind,

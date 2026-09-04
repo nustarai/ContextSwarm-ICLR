@@ -18,6 +18,7 @@ from .models import AgentResult
 
 RecoveryEventSink = Callable[[str, dict[str, Any]], None]
 RecoveryInvocation = Callable[[int], AgentResult]
+RecoveryResultSink = Callable[[AgentResult, int, bool], None]
 
 
 def _utc_now() -> str:
@@ -180,6 +181,7 @@ def run_with_recovery(
     max_restarts: int = 1,
     base_delay_seconds: float = 1.0,
     on_event: RecoveryEventSink | None = None,
+    on_result: RecoveryResultSink | None = None,
 ) -> AgentResult:
     """Run one logical solver actor and recover abnormal session exits.
 
@@ -215,6 +217,24 @@ def run_with_recovery(
                 },
             )
 
+    def notify_result(result: AgentResult, attempt: int, retry_pending: bool) -> None:
+        """Run the optional checkpoint hook without changing recovery fate."""
+
+        if on_result is None:
+            return
+        try:
+            on_result(result, attempt, retry_pending)
+        except Exception as exc:
+            # Checkpointing is a diagnostic/handoff side channel.  A broken
+            # filesystem or injected sink must not turn the solver attempt
+            # into a different process/retry outcome.  Emit only a bounded
+            # exception class label; never copy provider or path text.
+            emit(
+                "agent_recovery_result_callback_failed",
+                recovery_attempt=attempt,
+                callback_error=_exception_label(exc),
+            )
+
     recovery_attempt = 0
     while True:
         # A replacement can be queued while the prior attempt is draining or
@@ -243,6 +263,7 @@ def run_with_recovery(
                     else "horizon_elapsed_before_start"
                 ),
             )
+            notify_result(result, recovery_attempt, False)
             return result
         if recovery_attempt:
             emit(
@@ -280,6 +301,7 @@ def run_with_recovery(
         ):
             result.run_horizon_reached = True
         if result.returncode == 0:
+            notify_result(result, recovery_attempt, False)
             if recovery_attempt:
                 emit(
                     "agent_recovery_succeeded",
@@ -295,6 +317,18 @@ def run_with_recovery(
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
         )
+        # Determine whether this exact result will be followed by another
+        # invocation before notifying the checkpoint sink.  The sink can then
+        # mark a snapshot as an intermediate timeout versus the final
+        # terminal state without guessing from the raw return code.
+        retry_pending = False
+        if recoverable and recovery_attempt < restart_limit:
+            delay_preview = delay_base * (2**recovery_attempt)
+            retry_pending = (
+                time.monotonic() < float(deadline_monotonic)
+                and float(deadline_monotonic) - time.monotonic() > delay_preview
+                and not _event_is_set(cancel_event)
+            )
         emit(
             "agent_recovery_failure_observed",
             recovery_attempt=recovery_attempt,
@@ -310,6 +344,7 @@ def run_with_recovery(
             ),
             exception_type=invocation_exception_type,
         )
+        notify_result(result, recovery_attempt, retry_pending)
         if not recoverable or recovery_attempt >= restart_limit:
             emit(
                 "agent_recovery_exhausted",

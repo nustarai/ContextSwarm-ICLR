@@ -249,6 +249,85 @@ _SELECTION_FIELDS = frozenset(
 )
 
 
+_CHECKPOINT_FIELDS = frozenset(
+    {
+        "enabled",
+        "transfer",
+        "publish",
+        "max_candidate_bytes",
+        "max_summary_chars",
+        "max_context_items",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CheckpointConfig:
+    """Manifest-owned policy for bounded termination handoffs.
+
+    Checkpoints are recovery evidence only.  ``transfer`` controls whether a
+    later fresh assignment receives the latest unverified candidate in its
+    workspace; it never changes Judge authority or candidate promotion rules.
+    ``publish`` exposes the same bounded record through the task-local CPS
+    blackboard when that communication surface is enabled.
+    """
+
+    enabled: bool = False
+    transfer: bool = False
+    publish: bool = False
+    max_candidate_bytes: int = 2 * 1024 * 1024
+    max_summary_chars: int = 6_000
+    max_context_items: int = 6
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "transfer": self.transfer,
+            "publish": self.publish,
+            "max_candidate_bytes": self.max_candidate_bytes,
+            "max_summary_chars": self.max_summary_chars,
+            "max_context_items": self.max_context_items,
+        }
+
+
+def _parse_checkpoint(value: Any) -> CheckpointConfig:
+    table = _as_dict(value, "checkpoint")
+    unknown = set(table) - _CHECKPOINT_FIELDS
+    if unknown:
+        raise ConfigError("unknown checkpoint fields: " + ", ".join(sorted(unknown)))
+
+    def flag(key: str, default: bool) -> bool:
+        if key not in table:
+            return default
+        return _strict_bool(table[key], f"checkpoint.{key}")
+
+    enabled = flag("enabled", False)
+    transfer = flag("transfer", False)
+    publish = flag("publish", False)
+    if (transfer or publish) and not enabled:
+        raise ConfigError("checkpoint.transfer/publish require checkpoint.enabled = true")
+    return CheckpointConfig(
+        enabled=enabled,
+        transfer=transfer,
+        publish=publish,
+        max_candidate_bytes=_positive_int(
+            table.get("max_candidate_bytes"),
+            "checkpoint.max_candidate_bytes",
+            2 * 1024 * 1024,
+        ),
+        max_summary_chars=_positive_int(
+            table.get("max_summary_chars"),
+            "checkpoint.max_summary_chars",
+            6_000,
+        ),
+        max_context_items=_positive_int(
+            table.get("max_context_items"),
+            "checkpoint.max_context_items",
+            6,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class SelectionConfig:
     """Manifest-owned trace-selection policy and comparison boundary.
@@ -489,6 +568,7 @@ class ExperimentConfig:
     assignment_policy: str
     allocation: AllocationConfig
     selection: SelectionConfig
+    checkpoint: CheckpointConfig
     figure4_phase: str
     episodes_per_task: int
     max_tasks: int
@@ -605,6 +685,7 @@ class ExperimentConfig:
             "assignment_policy": self.assignment_policy,
             "allocation": self.allocation.public_dict(),
             "selection": self.selection.public_dict(),
+            "checkpoint": self.checkpoint.public_dict(),
             "figure4_phase": self.figure4_phase,
             "episodes_per_task": self.episodes_per_task,
             "max_tasks": self.max_tasks,
@@ -699,6 +780,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         allocation.get("normalization"), "allocation.normalization"
     )
     selection_config = _parse_selection(payload.get("selection"))
+    checkpoint_config = _parse_checkpoint(payload.get("checkpoint"))
 
     mode = _text(experiment.get("mode"), "cps").lower()
     if mode not in {"mono", "parallel", "cps"}:
@@ -1084,6 +1166,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         assignment_policy=assignment_policy,
         allocation=allocation_config,
         selection=selection_config,
+        checkpoint=checkpoint_config,
         figure4_phase=figure4_phase,
         episodes_per_task=episodes,
         max_tasks=max_tasks,
