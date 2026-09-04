@@ -1,0 +1,22 @@
+extends = ["canary.toml"]
+
+# Real-Pi/real-Judge canary with the per-invocation budget used by the formal
+# arm. The outer horizon stays short so this remains an operator-sized probe,
+# while the 45-second semantic closeout window can actually be exercised.
+[experiment]
+name = "mobench-controlled-judge-termination-summary-canary-grace45"
+time_limit_seconds = 60
+
+[pi]
+timeout_seconds = 900
+
+[formal_tools]
+require_decl_index = false
+
+[termination_summary]
+enabled = true
+grace_seconds = 45
+on_timeout = true
+on_cancel = true
+on_error = true
+max_prompt_chars = 4000
