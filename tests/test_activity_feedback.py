@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -73,6 +74,45 @@ class ActivityFeedbackTests(unittest.TestCase):
                 "sample", "actor-c", 1, "same-handle", "retry", now=103
             )
             self.assertEqual(conflict["status"], "conflict")
+
+    def test_semantics_aware_index_preserves_legacy_uniqueness(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "cps.sqlite3"
+            store = CPSStore(path)
+            store.register_actor("sample", "legacy-a", 1, now=100)
+            store.register_actor("sample", "legacy-b", 1, now=100)
+            store.register_actor("sample", "activity", 1, now=100)
+
+            first = store.claim_route(
+                "sample", "legacy-a", 1, "same-handle", "legacy", now=101
+            )
+            self.assertTrue(first["acquired"])
+            blocked = store.claim_route(
+                "sample", "legacy-b", 1, "same-handle", "legacy retry", now=101
+            )
+            self.assertEqual(blocked["status"], "conflict")
+
+            # An opaque activity row with the same textual handle is not
+            # treated as a legacy uniqueness owner, and the index still
+            # still rejects a second ``unique`` primary if a caller later uses
+            # the compatibility path.
+            activity = store.claim_route(
+                "sample",
+                "activity",
+                1,
+                "same-handle",
+                "activity description",
+                enforce_route_uniqueness=False,
+                now=102,
+            )
+            self.assertTrue(activity["acquired"])
+            with sqlite3.connect(path) as db:
+                index = db.execute(
+                    "SELECT sql FROM sqlite_master WHERE name='route_claims_unique_primary'"
+                ).fetchone()
+            self.assertIsNotNone(index)
+            assert index is not None
+            self.assertIn("route_key_semantics", index[0])
 
     def test_peer_snapshot_is_bounded_task_scoped_and_omits_route_key(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

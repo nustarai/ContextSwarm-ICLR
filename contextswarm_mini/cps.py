@@ -868,10 +868,10 @@ class CPSStore:
             )
             # Databases created by the first route-claim revision do not have
             # the semantics marker.  Migrate that one additive column in place
-            # and remove the old SQLite uniqueness index.  Legacy callers keep
-            # uniqueness through the ``enforce_route_uniqueness`` code path;
-            # the activity treatment can therefore admit multiple primary
-            # descriptions for the same textual key without a schema race.
+            # and replace the old all-primary index with a semantics-aware
+            # partial index.  Legacy callers retain SQLite-level uniqueness;
+            # the activity treatment can admit multiple primary descriptions
+            # for the same opaque handle without a schema race.
             columns = {
                 str(row[1])
                 for row in db.execute("PRAGMA table_info(route_claims)").fetchall()
@@ -881,6 +881,19 @@ class CPSStore:
                     "ALTER TABLE route_claims ADD COLUMN route_key_semantics TEXT NOT NULL DEFAULT 'unique'"
                 )
             db.execute("DROP INDEX IF EXISTS route_claims_one_primary")
+            # Recreate this on every schema open so a database upgraded from
+            # the first route-claim revision cannot retain an index whose
+            # predicate accidentally treats opaque activity handles as unique.
+            # Unknown/null legacy markers are treated as ``unique`` (fail
+            # closed); only an explicit ``opaque`` marker opts out.
+            db.execute("DROP INDEX IF EXISTS route_claims_unique_primary")
+            db.execute(
+                """CREATE UNIQUE INDEX route_claims_unique_primary
+                   ON route_claims(task_id, route_key)
+                   WHERE is_primary=1
+                     AND LOWER(TRIM(status)) IN ('active', 'blocked')
+                     AND COALESCE(LOWER(TRIM(route_key_semantics)), 'unique') != 'opaque'"""
+            )
 
     @classmethod
     def _begin_write(
@@ -2533,6 +2546,7 @@ class CPSStore:
                         """SELECT * FROM route_claims
                            WHERE task_id=? AND route_key=?
                              AND is_primary=1 AND LOWER(TRIM(status)) IN ('active', 'blocked')
+                             AND COALESCE(LOWER(TRIM(route_key_semantics)), 'unique') != 'opaque'
                            ORDER BY created_at ASC, claim_id ASC LIMIT 1""",
                         (task, route),
                     ).fetchone()
@@ -2821,6 +2835,7 @@ class CPSStore:
                         """SELECT * FROM route_claims
                            WHERE task_id=? AND route_key=? AND is_primary=1
                              AND LOWER(TRIM(status)) IN ('active', 'blocked')
+                             AND COALESCE(LOWER(TRIM(route_key_semantics)), 'unique') != 'opaque'
                            ORDER BY created_at ASC, claim_id ASC LIMIT 1""",
                         (before.get("task_id"), before.get("route_key")),
                     ).fetchone()
