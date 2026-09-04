@@ -216,6 +216,84 @@ baseline 得分变低，而是让同一份未完成工作在结束边界是否�
 参数，再执行正式 baseline/treatment 12 题配对；任何 hard kill、Judge 不可用或窗口不足
 都应按 `missing/unavailable` 计数，不能由 runner 事后猜正文。
 
+## 真实正式 treatment：12 题、1 小时、CPS32（2026-09-04）
+
+这次是用户要求的第一轮正式真实运行，已经实际执行完毕，不是 mock、离线回放或
+canary。使用的 manifest 是
+[`formal_1h_cps32_profiled_termination_summary.toml`](../configs/formal_1h_cps32_profiled_termination_summary.toml)，
+运行目录为
+[`20260904T144148Z-f8b61b1b`](../runs/formal_1h_cps32_profiled_termination_summary/20260904T114903Z/20260904T144148Z-f8b61b1b)。
+安全汇总副本位于任务的 owner-only build evidence 目录：
+[`formal_summary.json`](../../../../builds/timeout-checkpoint-20260904/formal-treatment/evidence/20260904T114903Z/formal_summary.json)。
+
+运行合同在启动前冻结并写入 evidence：固定 MathOlympiadBench 的 12 题、3600 秒
+horizon、CPS32、每题初始 2 个 Agent、每题 2 个 episode、Pi 900 秒 invocation
+上限和 profiling；使用真实 Pi 与真实 `contextswarm-lean-service`/Lean Judge，
+Judge result cache 关闭，`mock_flags=none`。唯一 treatment 是 timeout/cancel/error
+时预留 45 秒向同一 session 发起 cooperative closeout；checkpoint 的
+`enabled/transfer/publish` 均为 false。启动前通过真实 Judge/Lean preflight，结束后
+独立检查确认任务端口、容器和 stack 均已清理。
+
+### 运行结果
+
+| 项目 | 结果 |
+| --- | ---: |
+| 运行时段（UTC） | 14:41:47–15:44:03（含收尾） |
+| 最终状态 | `DEGRADED` |
+| Judge 得分 | **6/12**（6 `PROVED`、3 `COMPILES_WITH_SORRY`、3 `VERIFY_FAIL`） |
+| logical assignment / finished | 109 / 109 |
+| solver timeout / cancel | 81 / 23 |
+| Judge probe infrastructure error | 14 |
+| unexpected solver process error | 2 |
+| solver model sessions / tokens | 109 / 3,629,175 |
+
+`DEGRADED` 及上述 Judge/进程错误意味着这次的分数只能作为该轮运行结果，不能和
+历史原版分数直接做因果归因；它不表示 closeout 本身造成了得分变化。
+
+### 终止总结实际捕获情况
+
+runner 的终止事件是 **attempt-level** 计数：
+
+| 指标 | 数量 | 说明 |
+| --- | ---: | --- |
+| eligible termination | 187 | timeout 160、cancel 23、error 4 |
+| request / request sent | 187 / 187 | 每次都成功写入同一 session 的 closeout 命令 |
+| closeout completed | 101 | 45 秒窗口内收到完成生命周期证据（54.0%） |
+| publication events | 109 | runner 观测到 `termination_summary_published`（58.3%） |
+| missing at runner audit boundary | 78 | 事件边界当时未看到完成/发布（41.7%） |
+| communication unavailable / audit failure | 0 / 0 | 没有被归入失联或审计失败 |
+
+这里不能把 187 或 78 当成 187/78 个不同 Agent：109 个 logical assignment 中有 78 个
+经历了第二次 process attempt，retry 复用了同一个 `closeout_id`。因此正式报告同时
+保留 attempt-level 指标和 logical-closeout reconciliation，而不把 retry 产生的事件
+重复算成丢失的 Agent。
+
+在 run 结束后重新读取 task-local CPS sqlite，得到 113 条
+`kind=termination_summary` piece，覆盖全部 12 题；每条正文都包含
+`new_findings`、`counterexamples_or_ruled_out`、`validation_feedback`、`next_step`
+四个强制段落，说明确实产生了可检索的共享知识，而不是只记录“命令已发送”。抽样
+可见的语义包括部分递推/代数路线、被排除的捷径、Lean 验证反馈和可以继续形式化的
+下一步；正文仍是 Agent 自己的未验证总结，不能当成 proof 或 Judge 结论。
+
+这次还暴露了一个必须修复的证据边界问题：113 条 CPS row 中只有 83 个
+`closeout_id` 能与 109 个 logical closeout 精确匹配（76.1%），另有 1 条 tag 有一位
+字符不一致，3 条合法 summary 在 runner 的 publication 事件之后才写入 sqlite。因此
+“78 missing”是 runner 终止审计时的事件计数，不是“78 份知识永久丢失”；终局 sqlite
+重读发现了晚到/错绑 row，但当前 schema 没有把它们自动回补到原事件。后续应先修复
+closeout-id 绑定和终局 drain/reconciliation，再把 publish capture 作为正式 A/B 的主
+指标。
+
+### 这轮实验能、不能说明什么
+
+它已经在真实 12 题、真实 Judge 的负载下证明：终止边界确实可以让同一 Agent 把原本
+只停留在对话/文件中的局部成果写入共享 CPS；同时也量化了 45 秒 cooperative window
+仍有相当比例未完成的事实。它**还不能**证明证明率、后续 Agent adoption 或默认开启
+的必要性，因为目前只有 treatment 一轮，尚未有同 commit、同资源合同的正式 clean
+baseline；此外本轮 health 为 `DEGRADED`，且上述 event/CPS race 会污染简单的
+“published/missing”比较。下一步应在同一真实 Judge 合同下串行执行匹配 baseline，
+再按预注册 replicate 比较 publish capture、后续路线重复率/采用率、Judge 质量以及
+额外 wall/token/CPS 成本，而不是拿本轮 6/12 对历史 4/12 或 5/12 做结论。
+
 ## 主要指标
 
 | 指标 | 定义 | 解释 |
