@@ -1,0 +1,12 @@
+extends = ["formal_1h_cps32_profiled_agent1800.toml"]
+
+# Shared contract for the GPT-6 Astra timeout-budget A/B.  The two arm
+# manifests below must differ only in pi.timeout_seconds; their output and
+# Judge identities are supplied by the isolated batch supervisor.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-agent-timeout-gpt6-astra"
+
+[pi]
+model = "openai-codex/gpt-6-astra"
+thinking = "max"
+
