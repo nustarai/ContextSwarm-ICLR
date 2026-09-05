@@ -9,7 +9,7 @@
 这里的“超时不重试”只针对 Agent 的 outer recovery，含义是“不再对已经超时的同一个 actor/session 做第二次相同运行”。它不等于否定题目、路径或已有进展：已经结构化写入的 best candidate 和 CPS 状态仍保留，CPS 在释放 slot 后可以为该题接纳新的 assignment。它也不改变另外两层机制：
 
 - Pi/provider session 内部的请求 retry；
-- Judge/Lean 的 300 秒执行与其 retry。
+- Judge/Lean 的 300 秒执行边界；Judge broker 的既有 retry/退避契约也未改变。
 
 因此本实验要回答两个相互关联的问题：900 秒直接终止是否保持结果，以及如果不保持，差异是否来自 900 秒后同一连续 session 仍能产生有效 proof 的机会。为回答第二个问题，增加了“同一改动代码、单次连续运行 1800 秒”的对照 arm。报告只根据可观测的结构化事件和 authoritative final score 作判断；没有把未写入日志的内部推理解释成确定的永久数据损失。
 
@@ -27,7 +27,7 @@
 
 `contextswarm_mini/agent_recovery.py` 负责上述分类和同 session/workspace 的异常 recovery；`contextswarm_mini/runner.py` 将“同 actor recovery”和“释放 slot 后的新 assignment”分开。因而改动没有把与超时 actor 相关的所有方向全盘否定，只取消了超时后的第二段相同 outer 运行。
 
-以下边界保持不变：Judge/Lean 的 300 秒设置及 retry、allocator 的 900 秒 decision deadline、Pi/provider 内部 retry、CPS 的 task-local 状态、32 个并发 slot、1 小时 horizon 和最终评分规则。1800 arm 只把 `pi.timeout_seconds` 改为 1800；`allocation.agent_timeout_seconds=900` 仍是调度决策期限，不是 solver Pi 进程的 1800 秒上限。
+以下边界保持不变：Judge/Lean 的 300 秒设置、Judge broker 的既有 retry/退避契约、allocator 的 900 秒 decision deadline、Pi/provider 内部 retry、CPS 的 task-local 状态、32 个并发 slot、1 小时 horizon 和最终评分规则。1800 arm 只把 `pi.timeout_seconds` 改为 1800；`allocation.agent_timeout_seconds=900` 仍是调度决策期限，不是 solver Pi 进程的 1800 秒上限。
 
 ## 具体的实验
 
