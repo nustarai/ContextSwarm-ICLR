@@ -1,5 +1,8 @@
 # ContextSwarm ICLR Mini
 
+实验数据与代码工作树的分离方式，以及 #38/#39/Parallel 的维护与重跑入口，见
+[实验存储与启动说明](docs/experiment_storage.md)。
+
 这是一个与上游 `ContextSwarm` 隔离的研究运行时，并冻结了论文使用的六套公开题目包：USACO、ICPC、PutnamBench、MathOlympiadBench（imobench）、Clever 和 Verina。当前默认运行入口仍绑定 MathOlympiadBench latest12；其余五套用于题目定义、来源与完整性审计，不会暗中改变 Mono/Parallel/CPS 的 task/model/time/evaluator contract。当前目录的代码不会修改 sibling 上游仓库。
 
 运行形态固定为同一套 Docker + NuRouter/AISW + Pi backend：

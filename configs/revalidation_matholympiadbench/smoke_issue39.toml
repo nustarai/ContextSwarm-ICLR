@@ -1,0 +1,13 @@
+# Infrastructure check only; never include this run in paper aggregates.
+extends = ["../figure4_formal_6datasets/matholympiadbench/repeat1/trace_state.toml"]
+
+[experiment]
+name = "maintenance-smoke-issue39-matholympiadbench-trace_state"
+output_root = "runs/maintenance_smoke/issue39"
+time_limit_seconds = 180
+
+[pi]
+timeout_seconds = 180
+
+[allocation]
+agent_timeout_seconds = 180

@@ -1,0 +1,22 @@
+# Communication-free comparison for the Issue 39 MathOlympiadBench contract.
+extends = ["../figure4_formal_6datasets/_matholympiadbench.toml"]
+
+[experiment]
+name = "revalidation-matholympiadbench-r01-parallel"
+output_root = "runs/revalidation/baseline/matholympiadbench/repeat1/parallel"
+figure4_phase = ""
+mode = "parallel"
+communication = "none"
+initial_agents_per_task = 1
+episodes_per_task = 1
+max_attempts_per_task = 1
+paired_repeat_id = 1
+seed = 1729
+
+[allocation]
+policy = "uniform"
+
+[selection]
+enabled = false
+direct_messages = false
+candidate_transfer = false
