@@ -43,8 +43,7 @@ sufficient; no retired worktree is a runtime dependency.
 
 `scripts/run_revalidation.sh` defaults to the sibling experiment store. The
 generic Docker launcher retains `runs/` as its default. Keep that checkout
-directory real so relative mock manifest inheritance remains valid; optional
-links inside it may point to archived result namespaces. External output uses
+directory real so relative mock manifest inheritance remains valid. External output uses
 tracked source-tree manifests and does not relax formal launch admission.
 For direct host mocks, supply an explicit `--output` in the experiment store.
 
