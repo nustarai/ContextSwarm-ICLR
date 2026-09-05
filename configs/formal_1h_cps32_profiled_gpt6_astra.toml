@@ -1,0 +1,9 @@
+extends = ["formal_1h_cps32_profiled_clean.toml"]
+
+# Operator-local one-hour baseline contract using the newly opened Astra model.
+# Provider, NuRouter and Judge capabilities remain runtime-injected.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-gpt6-astra"
+
+[pi]
+model = "openai-codex/gpt-6-astra"
