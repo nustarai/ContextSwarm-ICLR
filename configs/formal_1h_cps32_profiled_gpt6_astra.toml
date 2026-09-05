@@ -7,3 +7,8 @@ name = "mobench-formal-1h-cps32-profiled-gpt6-astra"
 
 [pi]
 model = "openai-codex/gpt-6-astra"
+
+[docker]
+# The managed NuRouter node endpoint is host-local on this operator node.
+# Keep this identical in both arms; it is infrastructure, not treatment.
+network = "host"

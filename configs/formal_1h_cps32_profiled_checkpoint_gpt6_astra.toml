@@ -7,3 +7,7 @@ name = "mobench-formal-1h-cps32-profiled-checkpoint-gpt6-astra"
 
 [pi]
 model = "openai-codex/gpt-6-astra"
+
+[docker]
+# Match the baseline's host-local NuRouter transport.
+network = "host"
