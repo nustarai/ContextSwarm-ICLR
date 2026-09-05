@@ -84,7 +84,7 @@
 | run wall time (s) | 3732.6 | 3752.2 | 3674.7 | −57.8 | −77.5 |
 | Judge probe infrastructure errors | 20.000 | 8.333 | 14.000 | −6.000 | +5.667 |
 
-900 treatment 的 assignment 记录比 baseline 多约 72%，但 solver timeout 也约翻倍，最终分数和 nAUC 反而更低。这说明“尝试次数”这一过程层计数不等于有效 proof 或最终采用；大量较短、较浅的 fresh assignment 没有补偿被提前截断的连续 session。1800 treatment 的 assignment 反而少于 900 treatment，却取得更高的时间加权得分。
+900 treatment 的 assignment 记录比 baseline 多约 72%，但 solver timeout 也约翻倍，最终分数和 nAUC 反而更低。这说明“尝试次数”这一过程层计数不等于有效 proof 或最终采用；大量较快以 timeout 结束的 fresh assignment 没有补偿被提前截断的连续 session。1800 treatment 的 assignment 反而少于 900 treatment，却取得更高的时间加权得分。
 
 ### 每次运行的结果
 
