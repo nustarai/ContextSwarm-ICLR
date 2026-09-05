@@ -311,7 +311,28 @@ if [[ -x "${AISW_BINARY}" ]]; then
   NUROUTER_VERSION="$(${AISW_BINARY} --version 2>/dev/null | sed -n '1p' | cut -c1-120 || true)"
 fi
 
-mkdir -p "${ROOT_DIR}/runs"
+if ! RUNS_ROOT="$(python3 - "${ROOT_DIR}" "${CONTEXTSWARM_MINI_RUNS_ROOT:-${ROOT_DIR}/runs}" "${CONFIG}" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+raw = sys.argv[2]
+if any(char in raw for char in ("\n", "\r", ":")):
+    raise SystemExit("invalid experiment output directory")
+output = Path(raw).expanduser()
+if not output.is_absolute():
+    output = root / output
+output = output.resolve()
+if root.is_relative_to(output) or (output / ".git").exists():
+    raise SystemExit("experiment output directory must not expose a source checkout or its ancestors")
+if sys.argv[3].startswith("runs/") and output != (root / "runs").resolve():
+    raise SystemExit("external experiment output requires a source-tree manifest, not an operator manifest under runs/")
+print(output)
+PY
+)"; then
+  exit 2
+fi
+mkdir -p "${RUNS_ROOT}"
 
 DOCKER_ARGS=(
   --rm
@@ -327,7 +348,7 @@ DOCKER_ARGS=(
   # Code, prompts, manifests, and benchmark inputs come from the immutable
   # image built for this run.  Mount only the output subtree so a host-side
   # worktree edit cannot change later agents in the same experiment.
-  -v "${ROOT_DIR}/runs:/opt/contextswarm/runs"
+  -v "${RUNS_ROOT}:/opt/contextswarm/runs"
   -e "HOME=/run/contextswarm-mini/home"
   -e "TMPDIR=/tmp"
   -e "MINI_SWARM_NUROUTER_VERSION=${NUROUTER_VERSION}"

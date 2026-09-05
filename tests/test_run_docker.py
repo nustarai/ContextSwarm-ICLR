@@ -98,6 +98,7 @@ class RunDockerManifestTests(unittest.TestCase):
         env = os.environ.copy()
         env.pop("CONTEXTSWARM_MINI_IMAGE", None)
         env.pop("CONTEXTSWARM_MINI_MEMORY", None)
+        env.pop("CONTEXTSWARM_MINI_RUNS_ROOT", None)
         env.update(overrides)
         env.update(
             {
@@ -179,6 +180,30 @@ class RunDockerManifestTests(unittest.TestCase):
         self.assertEqual(overridden.returncode, 0, overridden.stderr)
         argv = self._captured_argv()
         self.assertEqual(argv[argv.index("--pids-limit") + 1], "3072")
+
+    def test_external_results_mount_keeps_tracked_manifest_identity(self) -> None:
+        output = self.temp / 'external results'
+        result = self._run(config=ROOT / 'configs/smoke.toml',
+                           CONTEXTSWARM_MINI_RUNS_ROOT=str(output))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self._captured_argv()
+        self.assertIn(f'{output}:/opt/contextswarm/runs', argv)
+        self.assertEqual(argv[argv.index('--config') + 1], 'configs/smoke.toml')
+
+    def test_external_results_mount_cannot_hide_operator_manifest(self) -> None:
+        result = self._run(CONTEXTSWARM_MINI_RUNS_ROOT=str(self.temp / 'external'))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('requires a source-tree manifest', result.stderr)
+        self.assertFalse(self.capture.exists())
+
+    def test_external_results_mount_rejects_source_and_ancestors(self) -> None:
+        for output in (ROOT, ROOT.parent, Path('/')):
+            with self.subTest(output=output):
+                result = self._run(config=ROOT / 'configs/smoke.toml',
+                                   CONTEXTSWARM_MINI_RUNS_ROOT=str(output))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('must not expose a source checkout', result.stderr)
+                self.assertFalse(self.capture.exists())
 
     def test_bridge_network_is_manifest_selected_with_host_gateway_alias(self) -> None:
         self._write_parent_manifest(
