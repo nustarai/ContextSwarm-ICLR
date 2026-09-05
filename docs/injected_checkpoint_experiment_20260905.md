@@ -48,7 +48,7 @@ context 是否保持可见。
 
 ## 结果
 
-原始结果在 [`comparison.json`](/home/ubuntu/workspace/.workspace/builds/CS-20260905-injected-checkpoint/results/comparison.json)，固定合同在 [`experiment_contract.json`](/home/ubuntu/workspace/.workspace/builds/CS-20260905-injected-checkpoint/results/experiment_contract.json)。
+原始结果在 [`comparison.json`](/home/ubuntu/workspace/.workspace/builds/CS-20260905-injected-checkpoint/results/comparison.json)，固定合同在 [`experiment_contract.json`](/home/ubuntu/workspace/.workspace/builds/CS-20260905-injected-checkpoint/results/experiment_contract.json)，独立 driver 保存在 [`run_experiment.py`](/home/ubuntu/workspace/.workspace/builds/CS-20260905-injected-checkpoint/run_experiment.py)。
 
 | 注入原因 | arm | pretermination callback/save | checkpoint 总保存 | fresh handoff | replacement 读到候选 | SHA-256 match | continuation prompt | CPS checkpoint pieces |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -113,4 +113,3 @@ checkpoint 提升数学性能或默认开启。
 `ruled_out` route、最终 score/12、nAUC、solver tokens、save/load/publish latency，以及
 Judge/broker drain 健康度。建议至少 3 个配对 repeat；父进程真实 `SIGKILL` 作为单独的
 不可恢复边界样本统计。
-
