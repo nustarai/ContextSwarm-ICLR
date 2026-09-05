@@ -1,6 +1,6 @@
 # 外部路线去重：GPT-6 Astra ID 请求的一小时 paired 实验记录
 
-> 运行流程完成，但 provider 没有对实际模型身份给出正向回执；因此本文不能被当作已确认的 GPT-6 Astra 结果。
+> 两个 arm 都实际使用了 `openai-codex/gpt-6-astra` 这个请求标识，并通过 NuRouter Sidecar 收到了模型响应。实验容器同时出现了 Pi 的本地 registry warning；这说明容器隔离 Home 没有该模型的本地元数据，不能单独证明服务端部署快照的具体版本。因此本文把结果标记为“GPT-6 Astra 请求标识已确认、服务端快照未从响应独立回读”，而不是把它误写成“模型不可用”。
 
 本实验只评估“运行器在 Agent 外部观察路线并主动阻止重复路线”这一层。超时前 checkpoint、终止时总结以及向 CPS 发布恢复信息属于其他任务，本记录不把它们的效果混入去重结论。
 
@@ -29,7 +29,11 @@
 - 构建镜像固定在 image digest `sha256:976aac1b3b4056b57b4e47dde16fec329c0804149a24659ea09fdf88f2b53426`，镜像 label/source commit 均回读为上述 `e4353b4`。
 - 配置要求的模型字符串为 `openai-codex/gpt-6-astra`，两个 `run_meta.json` 和每个 Agent 的启动命令都记录了该值。
 
-本次运行还记录到 Pi 警告：`Model "gpt-6-astra" not found for provider "openai-codex". Using custom model id.` control 有 30 个、treatment 有 29 个 Agent error tail 出现该警告。因此，“请求的是 GPT-6 Astra 标识”已验证，但 provider 端是否把它映射到正式模型的运行时身份没有被这次实验独立证明；后续正式比较前应先修正/验证 provider registry。
+本次运行还记录到 Pi 警告：`Model "gpt-6-astra" not found for provider "openai-codex". Using custom model id.` control 有 30 个、treatment 有 29 个 Agent error tail 出现该警告。这个 warning 的含义是 Pi 的本地模型 registry 没有对应元数据；`Using custom model id` 是继续用给定 ID 发请求的显式路径，不是静默切换到另一个模型。
+
+这与主机上的手工核对并不矛盾：主机 NuRouter 管理的 Pi Home `/home/ubuntu/.nu/router/node/pi` 有 `models-store.json`，其中登记了 `openai-codex/gpt-6-astra`，并有 `.nurouter-sidecar-provider.mjs`。实验容器按隔离合同使用私有 `HOME`，没有复制主机的持久 Pi Home；挂载的 NuRouter launcher 会在容器内创建自己的 Sidecar Home，并显式把 `openai-codex` provider 指向该 Sidecar。因而容器缺的是本地 registry 元数据，不是请求通道。
+
+运行产物进一步给出正向请求证据：control 的 6,938 条、treatment 的 6,336 条 Pi assistant 消息都记录了 `provider=openai-codex`、`api=openai-codex-responses`、`model=gpt-6-astra`；两边分别有 6,839 和 6,259 个 response ID。结合 `mocked=false`、正的 input/output token 计数和成功的 runner closeout，可以确认这不是 dry-run 或模型名解析失败后没有请求。仍未记录服务端返回的 canonical model snapshot/name，所以不能从这批日志单独确认服务端当时运行的具体 GPT-6 Astra 快照。
 
 ## 运行结果
 
@@ -81,7 +85,7 @@
 
 这次实现验证了外部去重仲裁的接口和安全边界：判断在 CPS/runner 完成，Agent 只提交观察信号；enforce 可以在路线 claim 前要求换方向，并保留独立验证的放行通道。单元测试 81 项通过，配置校验、broker envelope 和 Pi tool surface 均覆盖。
 
-这一个 GPT-6 配置的 1 小时 paired run 没有触发任何 enforce 决策，且两 arm 都是 degraded；因此不能据此宣布改动必要、有效或有害。当前最直接的工程结论是：先把在线比较从“只看 active/blocked”扩展到本次 run 内有界的历史 `released/done` claims，并为比较窗口/peer 状态写审计字段；同时验证 `openai-codex/gpt-6-astra` 的真实 provider 映射。完成后固定阈值重新跑至少 3 个 paired seeds，报告每次 claim 的 overlap rate、blocked/switch rate、独立验证放行率、重复路线的人工抽样 precision/recall、proof score/time 和 degraded/error rate。只有在这些数据稳定后，才决定是否把 enforce 作为默认策略；在此之前建议保留 advisory 或显式 opt-in enforce。
+这一个 GPT-6 Astra 请求标识的 1 小时 paired run 没有触发任何 enforce 决策，且两 arm 都是 degraded；因此不能据此宣布改动必要、有效或有害。模型 warning 的根因是实验隔离 Home 没有主机的 registry 条目，应在下一轮启动前修正为可审计的 registry/provider 预检，但它不应再被表述为“模型找不到，所以这次不是 GPT-6 实验”。当前最直接的工程结论是：先把在线比较从“只看 active/blocked”扩展到本次 run 内有界的历史 `released/done` claims，并为比较窗口/peer 状态写审计字段；同时让预检记录模型 registry 命中、provider 路由和服务端响应中的模型身份（如果 provider 提供）。完成后固定阈值重新跑至少 3 个 paired seeds，报告每次 claim 的 overlap rate、blocked/switch rate、独立验证放行率、重复路线的人工抽样 precision/recall、proof score/time 和 degraded/error rate。只有在这些数据稳定后，才决定是否把 enforce 作为默认策略；在此之前建议保留 advisory 或显式 opt-in enforce。
 
 精确运行产物位于：
 
