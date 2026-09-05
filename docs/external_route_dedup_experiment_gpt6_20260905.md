@@ -1,96 +1,95 @@
-# 外部路线去重：GPT-6 Astra ID 请求的一小时 paired 实验记录
+# MathOlympiadBench 一小时外部路线去重仲裁的 paired 实验报告
 
-> 两个 arm 都实际使用了 `openai-codex/gpt-6-astra` 这个请求标识，并通过 NuRouter Sidecar 收到了模型响应。实验容器同时出现了 Pi 的本地 registry warning；这说明容器隔离 Home 没有该模型的本地元数据，不能单独证明服务端部署快照的具体版本。因此本文把结果标记为“GPT-6 Astra 请求标识已确认、服务端快照未从响应独立回读”，而不是把它误写成“模型不可用”。
+## 背景和动机
 
-本实验只评估“运行器在 Agent 外部观察路线并主动阻止重复路线”这一层。超时前 checkpoint、终止时总结以及向 CPS 发布恢复信息属于其他任务，本记录不把它们的效果混入去重结论。
+此前原版 MathOlympiadBench 实验的 profiling 和选择记录显示，不同 Agent 经常反复尝试相近方向。重复探索会占用有限的 Agent 时隙和模型调用，却未必增加新的证明信息。这个 proposal 要验证的是：由 Agent 外部的 CPS/runner 观察路线并主动仲裁，能否在新 Agent 开始一条路线前要求它切换方向，从而减少重复尝试。
 
-## 要回答的问题
+本报告只讨论外部路线去重。超时前 checkpoint、终止时总结、恢复流程以及向 CPS 发布恢复信息属于其他改动，没有进入本次 treatment。
 
-原有实验在不同 Agent 之间出现重复探索。这里把判断移到 CPS/runner：Agent 先提交短路线摘要，外部控制器在允许其取得路线 claim 前，对同一题目的其他 Agent 路线做有界比较；高置信度重叠时要求换方向，明确声明独立验证时才放行。
+## 具体改了什么
 
-这次采用两 arm：
+Agent 在开始探索前提交一个简短的路线摘要和 route claim。CPS 在写入 claim 前，对同一题目仍处于 `active` 或 `blocked` 状态的其他路线做有界 lexical 比较：
 
-| arm | `external_dedup_mode` | 行为 |
-| --- | --- | --- |
-| control | `off` | 保留 route claim 和活动摘要，但不做外部重叠判断，不阻止 claim |
-| treatment | `enforce` | lexical overlap 达到阈值时返回 `semantic_conflict`/`switch_required=true`；给出独立验证理由可以继续 |
+- `external_dedup_mode=off`（baseline）保留路线 claim 和活动摘要，但不做重叠判断，也不阻止 Agent。
+- `external_dedup_mode=enforce`（treatment）在分数达到 `0.78` 且至少共享 3 个有效 token 时返回 `semantic_conflict` 和 `switch_required=true`，要求 Agent 换方向；Agent 明确说明是在做独立验证时可以继续。
 
-固定参数为 `external_dedup_similarity_threshold=0.78`、`external_dedup_min_shared_tokens=3`。摘要先做隐私安全的 token 化、停用词过滤和有限词形归一化，再用 containment/Jaccard 组合分数。摘要太短、太泛或共享词不足时保留 unknown 并继续。当前实现是在 claim 写入前仲裁；它不会异步杀掉一个已经运行的 Agent，也不会替 Agent 选择数学路线。
+比较器只处理隐私安全的短摘要，过滤停用词和过短、过泛的文本。判断发生在 claim 写入前；它不会异步终止已经运行的 Agent，也不会替 Agent 选择数学路线。实现提交为 `e4353b44c07515fc9e23dca9668340fa42a7678a`，相关单元测试共 81 项通过。实现入口见 [`route_dedup.py`](../contextswarm_mini/route_dedup.py) 和 [`cps.py`](../contextswarm_mini/cps.py)。
 
-实现提交为 `e4353b44c07515fc9e23dca9668340fa42a7678a`（`feat: add external route dedup controller`）。主要代码和测试见 [`route_dedup.py`](../contextswarm_mini/route_dedup.py)、[`cps.py`](../contextswarm_mini/cps.py)、[`test_route_dedup.py`](../tests/test_route_dedup.py) 和 [`test_cps_route_claims.py`](../tests/test_cps_route_claims.py)。
+## 具体的实验
 
-## 固定实验合同
+| 项目 | 设置 |
+| --- | --- |
+| 实验问题 | 外部 enforce 是否减少路线重复，并改善证明结果或单位资源产出 |
+| 任务范围 | MathOlympiadBench 的 12 道题，两个 arm 使用相同题目顺序和 seed=0 |
+| 运行时长 | 每个 arm 的 horizon 为 3,600 秒，随后完成 drain/closeout |
+| 重复次数 | 1 个 paired replicate（control 与 treatment 各 1 次）；不是多轮平均 |
+| run ID | baseline `20260905T071908Z-df7b2db9`；treatment `20260905T071908Z-e6b3eb73` |
+| baseline / treatment | 唯一变量为 `external_dedup_mode=off` 对 `enforce` |
+| 模型与版本 | `openai-codex/gpt-6-astra`；两边相同的 ContextSwarm 镜像和源码提交 |
+| 并行与调度 | 最大并行 32；每题初始 2 个 Agent；其余 allocator、Judge、通信和 timeout 合同保持一致 |
+| 真实性 | real run；非 mock、非 replay、非 canary |
+| 运行隔离 | 两边使用独立 CPS/数据库、Judge、worker workspace 和 container stack；transport preflight 为 `ok`，Judge 有 32 个 ready worker，Judge result cache disabled |
 
-- 数据集：12 道 MathOlympiadBench 题目，顺序和 seed 两 arm 相同。
-- 时限：`3600 s`；并行上限：32；每题初始 2 个 Agent；实际运行到 drain/closeout 后才结束。
-- control run：`20260905T071908Z-df7b2db9`。
-- treatment run：`20260905T071908Z-e6b3eb73`。
-- 两 arm 使用独立 CPS/数据库、Judge、worker workspace、CPU/NUMA 分区和 container stack；两 arm 的 transport preflight 均为 `status=ok`，Judge 为 32 个 ready worker，result cache 为 disabled。
-- 构建镜像固定在 image digest `sha256:976aac1b3b4056b57b4e47dde16fec329c0804149a24659ea09fdf88f2b53426`，镜像 label/source commit 均回读为上述 `e4353b4`。
-- 配置要求的模型字符串为 `openai-codex/gpt-6-astra`，两个 `run_meta.json` 和每个 Agent 的启动命令都记录了该值。
+## 结论
 
-本次运行还记录到 Pi 警告：`Model "gpt-6-astra" not found for provider "openai-codex". Using custom model id.` control 有 30 个、treatment 有 29 个 Agent error tail 出现该警告。这个 warning 的含义是 Pi 的本地模型 registry 没有对应元数据；`Using custom model id` 是继续用给定 ID 发请求的显式路径，不是静默切换到另一个模型。
+1. **机制层：** 本次真实运行没有产生任何 `external_route_dedup_decision`、`semantic_conflict` 或 `switch_required`。因此实现接口和单元测试得到验证，但真实 treatment 没有被高重叠路线触发，不能据此证明它在实际冲突中能有效切换方向。
+2. **结果层：** 在这一个 degraded paired replicate 中，treatment 得到 4/12，baseline 得到 6/12；AUC 为 0.192996 对 0.209250；首个 verified proof 为 235.65 秒对 175.86 秒。观察结果偏向 baseline，但没有足够证据把差异归因于去重，因为 treatment 没有触发仲裁，而且两边都有基础设施健康问题。
+3. **成本与可靠性：** 两边都使用满 32 个计算槽并运行到 horizon；treatment 的 Agent attempts 较少（135 对 151），但总 solver token 较高（3,120,089 对 3,039,260）。两边最终状态都是 `DEGRADED`，且 profiling 精确审计均未通过，所以本轮不能作为稳定性或成本优势的证明。
+4. **决策：** 暂不把 `enforce` 设为默认策略。保留 opt-in/advisory 形态；下一轮先让在线比较覆盖本轮有界历史中的 `released/done` claims，并加入可审计的比较窗口和决策字段，再进行至少 3 个 paired seeds 的真实比较。
 
-这与主机上的手工核对并不矛盾：主机 NuRouter 管理的 Pi Home `/home/ubuntu/.nu/router/node/pi` 有 `models-store.json`，其中登记了 `openai-codex/gpt-6-astra`，并有 `.nurouter-sidecar-provider.mjs`。实验容器按隔离合同使用私有 `HOME`，没有复制主机的持久 Pi Home；挂载的 NuRouter launcher 会在容器内创建自己的 Sidecar Home，并显式把 `openai-codex` provider 指向该 Sidecar。因而容器缺的是本地 registry 元数据，不是请求通道。
+## 支撑结论的数据和分析
 
-运行产物进一步给出正向请求证据：control 的 6,938 条、treatment 的 6,336 条 Pi assistant 消息都记录了 `provider=openai-codex`、`api=openai-codex-responses`、`model=gpt-6-astra`；两边分别有 6,839 和 6,259 个 response ID。结合 `mocked=false`、正的 input/output token 计数和成功的 runner closeout，可以确认这不是 dry-run 或模型名解析失败后没有请求。仍未记录服务端返回的 canonical model snapshot/name，所以不能从这批日志单独确认服务端当时运行的具体 GPT-6 Astra 快照。
+### 结果对比
 
-## 运行结果
-
-两边 runner 均以 `rc=0` 结束，且都完成了 3600 秒 horizon、drain 和 closeout。运行状态都是 `DEGRADED`，不是健康的 `OK`：
-
-| 指标 | control | treatment (`enforce`) |
-| --- | ---: | ---: |
-| 最终得分 / 12 | 6 | 4 |
-| `score_time.normalized_score_time_auc` | 0.209250 | 0.192996 |
-| 首个 verified proof（秒） | 175.86 | 235.65 |
-| verified proofs | 6 | 4 |
-| `COMPILES_WITH_SORRY` | 5 | 6 |
-| `VERIFY_FAIL` | 1 | 2 |
-| Agent attempts | 151 | 135 |
-| Agent timeout count | 51 | 52 |
-| CPS route claims | 179 | 156 |
-| CPS pieces | 271 | 263 |
-| CPS messages | 541 | 471 |
-
-健康状态中的共同问题包括 4 次 `judge_probe_infrastructure_error`；control 还有 1 次、treatment 还有 2 次 `unexpected_process_error`。这解释了 `DEGRADED`，也意味着单个 paired run 的得分差不能直接归因于去重。
-
-### 去重信号
-
-本次 treatment 的 CPS 中没有 `external_route_dedup_decision` 事件，也没有 `semantic_conflict` 或 `switch_required` 记录；control 也没有这类事件（control 本来就是 off）。两边收尾时 active/blocked claim 都为 0，route claim 最终分别为 `done/released = 61/118` 和 `61/95`。
-
-为了区分“没有触发”和“没有重复”，对每个 run 的全部 route claim 做了同题目、不同 Agent 的离线 lexical 复核：
-
-| 离线复核 | control | treatment |
-| --- | ---: | ---: |
-| 跨 Agent claim pairs | 1382 | 998 |
-| score ≥ 0.60 | 1（最高 0.703） | 0 |
-| score ≥ 0.78（本实验阈值） | 0 | 0 |
-| score ≥ 0.82（same_route 判定带） | 0 | 0 |
-
-因此本次实验没有观察到达到固定 lexical 阈值的候选重叠。这个结果不能证明数学语义上没有重复：当前比较器只看路线摘要的有限 lexical 信号，而且本版本只查询 claim 时仍处于 `active`/`blocked` 的 bounded peer projection；一个 Agent 结束后，后续 Agent 再重复同一路线不会被这一版的在线查询捕获。后一个边界是下一轮实验前必须明确修复或接受的设计缺口。
-
-## profiling 与证据质量
-
-两边的 profiling 文件均为 `real`，序列无 gap/duplicate/out-of-order，termination 事件显示 `profile/run/drain/horizon` 均结束，主要 coverage（agent wrapper、CPS、Judge、max_parallel）均为 covered。但精确审计返回 `exit_code=1`：
-
-| 审计 | rows | dropped fields | span_missing_end | `ok` |
+| 指标 | baseline (`off`) | treatment (`enforce`) | treatment - baseline | 分母/方向 |
 | --- | ---: | ---: | ---: | --- |
-| control | 94,497 | 120 rows / 362 fields | 1 | false |
-| treatment | 87,988 | 104 rows / 314 fields | 1 | false |
+| 最终得分 | 6/12 | 4/12 | -2 题 | 越高越好 |
+| `normalized_score_time_auc` | 0.209250 | 0.192996 | -0.016254 | 越高越好；时间加权，不等同于首个成功时间 |
+| 首个 verified proof | 175.86 s | 235.65 s | +59.79 s | 越低越好；仅在有 verified proof 时定义 |
+| verified proofs | 6 | 4 | -2 | 12 道题 |
+| `COMPILES_WITH_SORRY` | 5 | 6 | +1 | 12 道题 |
+| `VERIFY_FAIL` | 1 | 2 | +1 | 12 道题 |
+| Agent attempts | 151 | 135 | -16 | 完成的 Agent assignment |
+| Agent timeout count | 51 | 52 | +1 | runner 记录的 timeout |
 
-所以这些 profiling 可以用于规模和时序分析，但不能作为“profiling 审计完全通过”的证据。两边 runner log 还各有 closeout 阶段的 `BrokenPipeError`；最终 runner rc 仍为 0，Judge broker closeout 显示 `drained=true`、`remote_unsettled_jobs=0`，但该 closeout 噪声应在后续修复。
+只有一个 replicate，不能计算有意义的方差或显著性。AUC 是整个时间窗口的累计指标；因此它可能与“首个 proof 较早”给出不同信号，本表同时保留两者。
 
-## 结论和下一步
+### 机制与成本证据
 
-这次实现验证了外部去重仲裁的接口和安全边界：判断在 CPS/runner 完成，Agent 只提交观察信号；enforce 可以在路线 claim 前要求换方向，并保留独立验证的放行通道。单元测试 81 项通过，配置校验、broker envelope 和 Pi tool surface 均覆盖。
+| 指标 | baseline | treatment | 解释/分母 |
+| --- | ---: | ---: | --- |
+| CPS route claims | 179 | 156 | route claim 事件总数；不是不同数学路线的数量 |
+| CPS pieces | 271 | 263 | CPS piece 记录；不等于已被 Agent 采用的知识 |
+| CPS messages | 541 | 471 | 消息记录；不等于送达、阅读或采用 |
+| `external_route_dedup_decision` | 0 | 0 | treatment 没有进入实际仲裁分支 |
+| `semantic_conflict` / `switch_required` | 0 / 0 | 0 / 0 | 没有观察到阻止或切换要求 |
+| 同题不同 Agent 的离线 claim pairs | 1,382 | 998 | 全部 claim 的离线 lexical 配对复核 |
+| 离线 score ≥ 0.60 | 1（最高 0.703） | 0 | 仅作候选重叠筛查，不是语义重复证明 |
+| 离线 score ≥ 0.78 | 0 | 0 | 本轮 enforce 阈值 |
+| solver model sessions | 151 | 135 | 与 Agent attempts 相对应 |
+| solver input/output/total tokens | 2,618,979 / 420,281 / 3,039,260 | 2,668,446 / 451,643 / 3,120,089 | runner allocation summary 的总量；treatment 总 token 高 80,829（约 2.7%） |
 
-这一个 GPT-6 Astra 请求标识的 1 小时 paired run 没有触发任何 enforce 决策，且两 arm 都是 degraded；因此不能据此宣布改动必要、有效或有害。模型 warning 的根因是实验隔离 Home 没有主机的 registry 条目，应在下一轮启动前修正为可审计的 registry/provider 预检，但它不应再被表述为“模型找不到，所以这次不是 GPT-6 实验”。当前最直接的工程结论是：先把在线比较从“只看 active/blocked”扩展到本次 run 内有界的历史 `released/done` claims，并为比较窗口/peer 状态写审计字段；同时让预检记录模型 registry 命中、provider 路由和服务端响应中的模型身份（如果 provider 提供）。完成后固定阈值重新跑至少 3 个 paired seeds，报告每次 claim 的 overlap rate、blocked/switch rate、独立验证放行率、重复路线的人工抽样 precision/recall、proof score/time 和 degraded/error rate。只有在这些数据稳定后，才决定是否把 enforce 作为默认策略；在此之前建议保留 advisory 或显式 opt-in enforce。
+在线比较只读取 claim 时仍处于 `active`/`blocked` 的 bounded peer projection。两个 Agent 先后运行时，前一个 Agent 如果已经 `released` 或 `done`，后一个 Agent 的相同路线不会被这一版在线仲裁看到。离线复核也没有发现达到 `0.78` 的 lexical 候选，但 lexical 分数不能证明数学语义上的独立性或重复性。
 
-精确运行产物位于：
+### 稳定性、限制与下一步
 
-- control：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-control-20260905/runs/strong-activity-paired-20260905/control/20260905T071908Z-df7b2db9/`
-- treatment：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/strong-activity-feedback-20260905/runs/strong-activity-paired-20260905/treatment/20260905T071908Z-e6b3eb73/`
-- exact profiling audits：`/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-r3/evidence/control-profiling-audit-exact.json` 和 `treatment-profiling-audit-exact.json`
+两边 runner 都以 `rc=0` 完成 3,600 秒 horizon、drain 和 closeout；Judge broker 的 closeout 显示 `drained=true` 且没有 remote unsettled jobs。不过最终状态都是 `DEGRADED`：两边各有 4 次 `judge_probe_infrastructure_error`，baseline 另有 1 次、treatment 另有 2 次 `unexpected_process_error`。这使得本次得分差只能作为观察结果，不能作为去重的因果效果。
 
-paired-run 脚本的 treatment `run-id.txt` 曾从 worktree 中误选一个旧 run；上述 treatment 路径和本报告所有数字均按 `run_meta.json` 的精确 ID 手工复核，旧 run 没有被用于结果统计。
+profiling 文件本身是 real 记录，主要 agent wrapper、CPS、Judge 和 max-parallel coverage 均存在，事件顺序也通过了基础检查；但精确审计仍失败：baseline 为 94,497 rows、120 rows/362 fields dropped、1 个 span missing end，treatment 为 87,988 rows、104 rows/314 fields dropped、1 个 span missing end。profiling 可用于规模和时序参考，不能被称为完整通过的审计证据。
+
+下一轮最小修复和实验顺序是：
+
+1. 把在线 peer 查询扩展到本 run 内有界的 `released/done` 历史路线，并记录比较窗口、peer 状态、分数、仲裁结果和独立验证放行原因。
+2. 先用固定的合成冲突摘要做 broker/canary 验证，确认 treatment 确实产生 `semantic_conflict` 和 `switch_required`；这一步只验证机制，不纳入数学得分。
+3. 在机制预检通过后，以相同模型、Judge、并行上限和 timeout 合同至少跑 3 个 paired seeds，报告 overlap rate、blocked/switch rate、独立验证放行率、人工抽样的重复判定 precision/recall、proof score/time、token 和 degraded/error rate。
+
+在真实运行出现足够的可判定路线冲突，并且多轮结果显示机制收益没有被误拦截和基础设施波动抵消之前，不应宣布 `enforce` 有效，也不应把它设为默认开启。
+
+完整证据：
+
+- [control run_meta.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-control-20260905/runs/strong-activity-paired-20260905/control/20260905T071908Z-df7b2db9/run_meta.json)
+- [control final.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-control-20260905/runs/strong-activity-paired-20260905/control/20260905T071908Z-df7b2db9/final.json)
+- [treatment run_meta.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/strong-activity-feedback-20260905/runs/strong-activity-paired-20260905/treatment/20260905T071908Z-e6b3eb73/run_meta.json)
+- [treatment final.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/strong-activity-feedback-20260905/runs/strong-activity-paired-20260905/treatment/20260905T071908Z-e6b3eb73/final.json)
+- [control profiling exact audit](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-r3/evidence/control-profiling-audit-exact.json)
+- [treatment profiling exact audit](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-r3/evidence/treatment-profiling-audit-exact.json)
