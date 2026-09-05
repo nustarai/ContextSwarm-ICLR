@@ -90,16 +90,11 @@ pretermination capture rate。
 
 ## 正式 Astra 12 题运行状态
 
-本机已有的 Astra canary 记录见
-[`gpt6-canary-report.md`](/home/ubuntu/workspace/.workspace/builds/allocation-gpt6-profile-20260905/gpt6-canary-report.md)：两次 180 秒单题 canary 都接受了
-`openai-codex/gpt-6-astra` 并进入模型路径，但后半段遇到 provider 5xx/容量过载，
-没有有效证明。当前另有两条 32-slot formal run 正在运行；本实验没有复用它们的容器、
-Judge、Agent home 或 endpoint。
-
-本分支的真实 formal preflight 以 `rc=2` 停止，原因是当前 shell 未设置
-`CONTEXTSWARM_JUDGE_URL`；同一正式合同还要求 `CONTEXTSWARM_JUDGE_CACHE_HEALTH_URL`
-和匹配的 declaration index。因而本次正式 12 题 baseline/treatment 次数为 0，不能
-报告数学 score、nAUC、token 或 provider 成本。
+本节原本记录的是 synthetic 实验完成时的历史状态。随后已经完成了一轮真实的 12 题
+`gpt-6-astra` baseline/treatment，并在两条 arm 各注入了一个真实 Pi 中断；正式结果、
+题目级 verdict、token、slot、健康度和限制统一见
+[`injected_checkpoint_real_ab_gpt6_astra_20260905.md`](injected_checkpoint_real_ab_gpt6_astra_20260905.md)。
+不要再把本节早先的“正式运行次数为 0”作为当前结论。
 
 ## 决策与下一步
 
