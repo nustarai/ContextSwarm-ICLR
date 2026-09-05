@@ -991,6 +991,9 @@ class _ElasticTaskState:
     early_proofs: dict[str, _EarlyProofCredit] = field(default_factory=dict)
     checker_outcome_ids: set[str] = field(default_factory=set)
     latest_checkpoint: CheckpointRef | None = None
+    checkpoints_by_scope: dict[tuple[str, int], CheckpointRef] = field(
+        default_factory=dict
+    )
     checkpoint_count: int = 0
 
 
@@ -1778,6 +1781,57 @@ def _allocation_feedback(verdict: Verdict) -> str:
     return _ENDPOINT_RE.sub("<redacted-endpoint>", raw).strip()[:1_200]
 
 
+def _structured_handoff_metadata(body: str) -> dict[str, str]:
+    """Extract bounded typed handoff fields when a CPS body is JSON.
+
+    The checkpoint path must work with the existing CPS schema, where a piece
+    is still an immutable title/body row.  Some producers already encode
+    negative findings as JSON, however; recognizing their stable fields here
+    preserves the useful ``status/evidence/next_action/source`` contract for a
+    recovered Agent without requiring a broad CPS schema migration.
+    """
+
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, Mapping):
+        return {}
+
+    def text(*keys: str, maximum: int = 600) -> str:
+        for key in keys:
+            value = payload.get(key)
+            if value is None or isinstance(value, (Mapping, list, tuple)):
+                continue
+            bounded = sanitize_worker_text(value, maximum)
+            if bounded:
+                return bounded
+        return ""
+
+    result: dict[str, str] = {}
+    for output_key, keys, maximum in (
+        ("status", ("status",), 64),
+        ("claim", ("claim",), 700),
+        ("evidence", ("evidence_or_counterexample", "evidence"), 900),
+        ("preconditions", ("preconditions",), 700),
+        ("next_action", ("next_action",), 700),
+        ("relation", ("relation", "relationship"), 96),
+    ):
+        value = text(*keys, maximum=maximum)
+        if value:
+            result[output_key] = value
+    for output_key, keys in (
+        ("source_message_id", ("source_message_id",)),
+        ("route_claim_id", ("route_claim_id",)),
+    ):
+        for key in keys:
+            value = sanitize_worker_identifier(payload.get(key))
+            if value:
+                result[output_key] = value
+                break
+    return result
+
+
 def _checkpoint_context(
     store: CPSStore | None,
     task_id: str,
@@ -1858,10 +1912,22 @@ def _checkpoint_context(
         recipient = sanitize_worker_identifier(item.get("recipient"))
         if recipient:
             row["recipient"] = recipient
+        structured = _structured_handoff_metadata(row["body"])
+        row.update(structured)
         lowered = f"{row['kind']} {row['title']} {row['body']}".lower()
-        if kind in {"blocker", "correction"} or any(
-            marker in lowered
-            for marker in ("counterexample", "ruled out", "rejected", "cannot compile")
+        structured_status = structured.get("status", "").lower()
+        if (
+            kind in {"blocker", "correction"}
+            or structured_status in {"refuted", "superseded"}
+            or any(
+                marker in lowered
+                for marker in (
+                    "counterexample",
+                    "ruled out",
+                    "rejected",
+                    "cannot compile",
+                )
+            )
         ):
             ruled_out.append(row)
         else:
@@ -1887,8 +1953,10 @@ def _checkpoint_context(
         created_at = sanitize_worker_text(item.get("created_at"), 64)
         if created_at:
             row["created_at"] = created_at
+        structured = _structured_handoff_metadata(body)
+        row.update(structured)
         lowered = f"{row['title']} {body}".lower()
-        if any(
+        if structured.get("status", "").lower() in {"refuted", "superseded"} or any(
             marker in lowered
             for marker in (
                 "counterexample",
@@ -1996,14 +2064,36 @@ def _checkpoint_prompt_block(ref: CheckpointRef | None) -> str:
                 continue
             title = sanitize_worker_text(row.get("title"), 240)
             body = sanitize_worker_text(row.get("body"), 600)
-            rendered.append(f"- [{row.get('kind', 'note')}] {title}: {body}")
+            details: list[str] = []
+            for key, maximum in (
+                ("status", 64),
+                ("evidence", 420),
+                ("preconditions", 300),
+                ("next_action", 360),
+                ("source_message_id", 128),
+                ("route_claim_id", 128),
+            ):
+                value = (
+                    sanitize_worker_identifier(row.get(key))
+                    if key.endswith("_id")
+                    else sanitize_worker_text(row.get(key), maximum)
+                )
+                if value:
+                    details.append(f"{key}={value}")
+            suffix = f" ({'; '.join(details)})" if details else ""
+            rendered.append(f"- [{row.get('kind', 'note')}] {title}: {body}{suffix}")
         return "\n".join(rendered) if rendered else "(none)"
 
-    relative_candidate = candidate.get("relative_path") or "unavailable"
-    local_filename = candidate.get("filename") or "result"
-    digest = candidate.get("sha256") or "unavailable"
+    relative_candidate = (
+        sanitize_worker_text(candidate.get("relative_path"), 96) or "unavailable"
+    )
+    local_filename = sanitize_worker_text(candidate.get("filename"), 32) or "result"
+    digest = sanitize_worker_text(candidate.get("sha256"), 64) or "unavailable"
+    owner = ref.actor_id
+    episode = ref.episode
     return (
         "\n\nRunner termination checkpoint (UNVERIFIED recovery evidence; never a proof):\n"
+        f"- checkpoint scope: actor {owner}, episode {episode}\n"
         f"- immutable snapshot sequence: {relative_candidate}\n"
         f"- candidate SHA-256: {digest}\n"
         f"- terminal reason: {sanitize_worker_text(record.get('terminal_reason'), 64)}; "
@@ -2017,6 +2107,44 @@ def _checkpoint_prompt_block(ref: CheckpointRef | None) -> str:
         f"- suggested next step: {sanitize_worker_text(context.get('next_step'), 900)}\n"
         "Read checkpoint/checkpoint.json and checkpoint/" + str(local_filename)
         + " if present. Keep the active candidate unverified until a fresh judge_check."
+    )
+
+
+def _checkpoint_recovery_prompt_block(
+    ref: CheckpointRef | None,
+    recovery_attempt: int,
+) -> str:
+    """Tell a replacement process how to resume its exact prior attempt."""
+
+    attempt = max(1, int(recovery_attempt))
+    if ref is None:
+        return (
+            "\n\nRecovery continuation for process attempt "
+            f"{attempt}: no actor-scoped checkpoint was available. Inspect the "
+            "existing workspace and reconstruct only from durable files; do not "
+            "claim that hidden prior reasoning was recovered."
+        )
+    return (
+        "\n\nRecovery continuation for process attempt "
+        f"{attempt} (same actor and episode): resume from the actor-scoped "
+        "checkpoint below instead of restarting the proof from a blank state. "
+        "The snapshot is immutable recovery evidence; inspect it, preserve any "
+        "useful partial work, avoid the recorded blockers unless new evidence "
+        "justifies revisiting them, and run judge_check before relying on it."
+        + _checkpoint_prompt_block(ref)
+    )
+
+
+def _checkpoint_fresh_handoff_prompt_block(ref: CheckpointRef) -> str:
+    """Explain a task-level checkpoint handed from an earlier actor."""
+
+    return (
+        "\n\nCheckpoint continuation handoff (different process or actor): use the "
+        "immutable evidence below as the starting point for this assignment. "
+        "It may contain a peer's partial candidate, so preserve its provenance, "
+        "avoid repeating ruled-out directions without new evidence, and obtain a "
+        "fresh judge_check before treating any result as valid."
+        + _checkpoint_prompt_block(ref)
     )
 
 
@@ -5351,6 +5479,20 @@ def _run_elastic_cps(
         # ``best_candidate`` internally for final closeout and bookkeeping.
         with state.lock:
             checkpoint_ref = state.latest_checkpoint
+            if checkpoint_ref is None and checkpoint_store is not None:
+                # Rehydrate the task-wide handoff after a runner restart.  The
+                # store prefers a captured changed candidate over an empty or
+                # unchanged closeout, matching the in-memory carry-forward
+                # rule used while the run is live.
+                checkpoint_ref = checkpoint_store.load_latest(
+                    task_id=state.task.slug,
+                    task_root=state.task_root,
+                )
+                state.latest_checkpoint = checkpoint_ref
+                if checkpoint_ref is not None:
+                    state.checkpoints_by_scope[
+                        (checkpoint_ref.actor_id, checkpoint_ref.episode)
+                    ] = checkpoint_ref
             if candidate_transfer:
                 shutil.copy2(state.best_candidate, _candidate_path(workdir, state.task))
         if (
@@ -5388,6 +5530,13 @@ def _run_elastic_cps(
                 task_id=state.task.slug,
                 agent_id=assignment.agent_id,
                 episode=assignment.generation,
+                donor_actor_id=checkpoint_ref.actor_id,
+                donor_episode=checkpoint_ref.episode,
+                handoff_scope="task_latest",
+                same_actor_scope=(
+                    checkpoint_ref.actor_id == assignment.agent_id
+                    and checkpoint_ref.episode == assignment.generation
+                ),
                 sequence=checkpoint_ref.sequence,
                 candidate_sha256=checkpoint_ref.candidate_sha256,
                 candidate_bytes=checkpoint_ref.candidate_bytes,
@@ -5561,6 +5710,7 @@ def _run_elastic_cps(
                     )
                 with state.lock:
                     prior_checkpoint = state.latest_checkpoint
+                    state.checkpoints_by_scope[(actor, assignment.generation)] = ref
                     # A late successful/empty closeout from another worker
                     # must not hide the only changed candidate captured from a
                     # timed-out peer.  Keep the newest snapshot by default,
@@ -6081,7 +6231,7 @@ def _run_elastic_cps(
                     "the runner will merge the strongest verified candidate."
                 )
             if checkpoint_ref is not None:
-                prompt += _checkpoint_prompt_block(checkpoint_ref)
+                prompt += _checkpoint_fresh_handoff_prompt_block(checkpoint_ref)
         if mock_agent:
             result = _mock_result(actor, task.slug, assignment.generation)
             if checkpoint_store is not None:
@@ -6160,6 +6310,119 @@ def _run_elastic_cps(
                     phase="pretermination",
                 )
 
+            def checkpoint_for_recovery() -> CheckpointRef | None:
+                """Resolve this process's checkpoint, never a peer's snapshot."""
+
+                scope = (actor, assignment.generation)
+                with state.lock:
+                    ref = state.checkpoints_by_scope.get(scope)
+                if ref is None and checkpoint_store is not None:
+                    try:
+                        ref = checkpoint_store.load_latest(
+                            task_id=task.slug,
+                            task_root=state.task_root,
+                            actor_id=actor,
+                            episode=assignment.generation,
+                        )
+                    except Exception:
+                        ref = None
+                    if ref is not None:
+                        with state.lock:
+                            state.checkpoints_by_scope[scope] = ref
+                if ref is not None and checkpoint_store is not None:
+                    try:
+                        # A pre-termination callback writes to the durable task
+                        # ledger after the original workspace was prepared.
+                        # Materialize that exact snapshot before the replacement
+                        # process starts so the prompt's checkpoint path exists
+                        # even when the first attempt had no prior handoff.
+                        checkpoint_store.materialize_for_agent(
+                            ref,
+                            workdir / "checkpoint",
+                            candidate_filename=task.candidate_filename,
+                            transfer_candidate=True,
+                        )
+                    except Exception as exc:
+                        logger.event(
+                            "checkpoint_recovery_materialize_failed",
+                            task_id=task.slug,
+                            agent_id=actor,
+                            episode=assignment.generation,
+                            error_kind=_profile_error_kind(exc),
+                            unverified=True,
+                        )
+                return ref
+
+            def invoke_agent(recovery_attempt: int) -> AgentResult:
+                attempt_prompt = prompt
+                if recovery_attempt > 0 and checkpoint_store is not None:
+                    recovery_ref = checkpoint_for_recovery()
+                    attempt_prompt += _checkpoint_recovery_prompt_block(
+                        recovery_ref,
+                        recovery_attempt,
+                    )
+                    logger.event(
+                        "checkpoint_recovery_prompt",
+                        task_id=task.slug,
+                        agent_id=actor,
+                        episode=assignment.generation,
+                        recovery_attempt=recovery_attempt,
+                        sequence=(
+                            recovery_ref.sequence if recovery_ref is not None else None
+                        ),
+                        donor_actor_id=(
+                            recovery_ref.actor_id if recovery_ref is not None else None
+                        ),
+                        donor_episode=(
+                            recovery_ref.episode if recovery_ref is not None else None
+                        ),
+                        checkpoint_available=recovery_ref is not None,
+                        unverified=True,
+                    )
+                return pi_agent.run(
+                    task_id=task.slug,
+                    actor_id=actor,
+                    episode=assignment.generation,
+                    prompt=attempt_prompt,
+                    workdir=workdir,
+                    extra_env=broker_env,
+                    deadline_monotonic=deadline,
+                    cancel_event=assignment_cancel_event,
+                    communication_enabled=policy.enabled,
+                    direct_messages=direct_messages,
+                    selection_enabled=selection_enabled,
+                    termination_summary_prompt=termination_prompt,
+                    termination_summary_grace_seconds=(
+                        config.termination_summary.grace_seconds
+                        if termination_summary_enabled
+                        else 0.0
+                    ),
+                    termination_summary_on_timeout=(
+                        config.termination_summary.on_timeout
+                        if termination_summary_enabled
+                        else False
+                    ),
+                    termination_summary_on_cancel=(
+                        config.termination_summary.on_cancel
+                        if termination_summary_enabled
+                        else False
+                    ),
+                    termination_summary_on_error=(
+                        config.termination_summary.on_error
+                        if termination_summary_enabled
+                        else False
+                    ),
+                    on_termination_checkpoint=(
+                        (
+                            lambda reason: on_pretermination_checkpoint(
+                                reason, recovery_attempt
+                            )
+                        )
+                        if checkpoint_store is not None
+                        else None
+                    ),
+                )
+
             with judge_broker.session(
                 actor_id=actor,
                 episode=assignment.generation,
@@ -6182,49 +6445,7 @@ def _run_elastic_cps(
                 result = _run_solver_with_recovery(
                     config,
                     logger,
-                    lambda recovery_attempt: pi_agent.run(
-                        task_id=task.slug,
-                        actor_id=actor,
-                        episode=assignment.generation,
-                        prompt=prompt,
-                        workdir=workdir,
-                        extra_env=broker_env,
-                        deadline_monotonic=deadline,
-                        cancel_event=assignment_cancel_event,
-                        communication_enabled=policy.enabled,
-                        direct_messages=direct_messages,
-                        selection_enabled=selection_enabled,
-                        termination_summary_prompt=termination_prompt,
-                        termination_summary_grace_seconds=(
-                            config.termination_summary.grace_seconds
-                            if termination_summary_enabled
-                            else 0.0
-                        ),
-                        termination_summary_on_timeout=(
-                            config.termination_summary.on_timeout
-                            if termination_summary_enabled
-                            else False
-                        ),
-                        termination_summary_on_cancel=(
-                            config.termination_summary.on_cancel
-                            if termination_summary_enabled
-                            else False
-                        ),
-                        termination_summary_on_error=(
-                            config.termination_summary.on_error
-                            if termination_summary_enabled
-                            else False
-                        ),
-                        on_termination_checkpoint=(
-                            (
-                                lambda reason: on_pretermination_checkpoint(
-                                    reason, recovery_attempt
-                                )
-                            )
-                            if checkpoint_store is not None
-                            else None
-                        ),
-                    ),
+                    invoke_agent,
                     task_id=task.slug,
                     actor_id=actor,
                     episode=assignment.generation,

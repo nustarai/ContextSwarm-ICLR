@@ -56,11 +56,22 @@ class _PartialThenSuccessPi:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.handoff_seen: list[tuple[str, str]] = []
+        self.recovery_handoff_seen: list[tuple[str, str]] = []
 
     def run(self, **kwargs):
         self.calls.append(dict(kwargs))
         attempt = len(self.calls)
         workdir = Path(kwargs["workdir"])
+        if attempt == 2:
+            metadata = json.loads(
+                (workdir / "checkpoint" / "checkpoint.json").read_text()
+            )
+            self.recovery_handoff_seen.append(
+                (
+                    metadata["actor_id"],
+                    (workdir / "checkpoint" / "result.lean").read_text(),
+                )
+            )
         if attempt >= 3:
             metadata = json.loads(
                 (workdir / "checkpoint" / "checkpoint.json").read_text()
@@ -333,6 +344,77 @@ class CheckpointStoreTests(unittest.TestCase):
             self.assertEqual(ref.candidate_path.read_text(), "partial proof\n")
             self.assertEqual(second.record["retry_pending"], True)
 
+    def test_load_latest_filters_actor_episode_and_prefers_changed_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task_root = root / "workers" / "task-a"
+            task_root.mkdir(parents=True)
+            candidate = task_root / "result.lean"
+            store = CheckpointStore(root)
+
+            candidate.write_text("actor-a partial\n", encoding="utf-8")
+            actor_a = store.save(
+                task_id="task-a",
+                task_root=task_root,
+                candidate_path=candidate,
+                candidate_filename="result.lean",
+                baseline_sha256="0" * 64,
+                actor_id="worker-a",
+                episode=1,
+                recovery_attempt=0,
+                result=_result(returncode=1).as_dict(),
+                retry_pending=True,
+            )
+            candidate.write_text("actor-b partial\n", encoding="utf-8")
+            actor_b = store.save(
+                task_id="task-a",
+                task_root=task_root,
+                candidate_path=candidate,
+                candidate_filename="result.lean",
+                baseline_sha256="0" * 64,
+                actor_id="worker-b",
+                episode=2,
+                recovery_attempt=0,
+                result=_result(returncode=1).as_dict(),
+                retry_pending=True,
+            )
+            candidate.write_text("0\n", encoding="utf-8")
+            store.save(
+                task_id="task-a",
+                task_root=task_root,
+                candidate_path=candidate,
+                candidate_filename="result.lean",
+                baseline_sha256=hashlib.sha256(b"0\n").hexdigest(),
+                actor_id="worker-a",
+                episode=1,
+                recovery_attempt=1,
+                result=_result(returncode=1).as_dict(),
+                retry_pending=False,
+            )
+
+            loaded_a = store.load_latest(
+                task_id="task-a",
+                task_root=task_root,
+                actor_id="worker-a",
+                episode=1,
+            )
+            loaded_b = store.load_latest(
+                task_id="task-a",
+                task_root=task_root,
+                actor_id="worker-b",
+                episode=2,
+            )
+            self.assertIsNotNone(loaded_a)
+            self.assertIsNotNone(loaded_b)
+            assert loaded_a is not None
+            assert loaded_b is not None
+            self.assertEqual(loaded_a.actor_id, "worker-a")
+            self.assertEqual(loaded_a.episode, 1)
+            self.assertEqual(loaded_a.sequence, actor_a.sequence)
+            self.assertEqual(loaded_a.candidate_path.read_text(), "actor-a partial\n")
+            self.assertEqual(loaded_b.sequence, actor_b.sequence)
+            self.assertEqual(loaded_b.candidate_path.read_text(), "actor-b partial\n")
+
     def test_materialize_respects_transfer_flag_and_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -470,6 +552,38 @@ class CheckpointStoreTests(unittest.TestCase):
             self.assertEqual(context["source"], "cps_recent_evidence")
             self.assertTrue(any("counterexample" in row["body"] for row in context["ruled_out"]))
 
+    def test_checkpoint_context_preserves_structured_negative_handoff_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = CPSStore(Path(temporary) / "cps.sqlite3")
+            store.create_piece(
+                task_id="task-a",
+                author="agent-a",
+                kind="negative_finding",
+                title="modular route ruled out",
+                body=json.dumps(
+                    {
+                        "status": "refuted",
+                        "claim": "The modular route closes the bound.",
+                        "evidence_or_counterexample": "n=3 is a counterexample.",
+                        "preconditions": "Requires n >= 4.",
+                        "next_action": "Try the invariant route.",
+                        "source_message_id": "message-1",
+                    }
+                ),
+            )
+            context = _checkpoint_context(
+                store,
+                "task-a",
+                max_items=6,
+                max_chars=6000,
+            )
+            self.assertEqual(len(context["ruled_out"]), 1)
+            row = context["ruled_out"][0]
+            self.assertEqual(row["status"], "refuted")
+            self.assertEqual(row["evidence"], "n=3 is a counterexample.")
+            self.assertEqual(row["next_action"], "Try the invariant route.")
+            self.assertEqual(row["source_message_id"], "message-1")
+
 
 class CheckpointRecoveryTests(unittest.TestCase):
     def test_result_sink_sees_failed_attempt_before_retry_and_success(self) -> None:
@@ -599,6 +713,14 @@ class CheckpointRunnerIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(len(pi.calls), 3)
             self.assertEqual(pi.handoff_seen, [("process_failure", "partial-2\n")])
+            self.assertIn(
+                "Recovery continuation for process attempt 1",
+                str(pi.calls[1]["prompt"]),
+            )
+            self.assertEqual(
+                pi.recovery_handoff_seen,
+                [("agent-imo2024_p1-1", "partial-1\n")],
+            )
             checkpoint_root = run_dir / "workers" / task.slug / "checkpoints"
             self.assertTrue((checkpoint_root / "latest.json").is_file())
             self.assertGreaterEqual(len(list(checkpoint_root.glob("*/checkpoint.json"))), 3)
@@ -676,6 +798,9 @@ class CheckpointRunnerIntegrationTests(unittest.TestCase):
                 digest,
                 hashlib.sha256(b"partial-before-timeout\n").hexdigest(),
             )
+            recovery_prompt = str(pi.calls[1]["prompt"])
+            self.assertIn("Checkpoint continuation handoff", recovery_prompt)
+            self.assertIn(digest, recovery_prompt)
             events = [
                 json.loads(line)
                 for line in (run_dir / "events.jsonl").read_text().splitlines()
@@ -695,6 +820,13 @@ class CheckpointRunnerIntegrationTests(unittest.TestCase):
                     for row in events
                 )
             )
+            handoffs = [
+                row for row in events if row.get("event") == "checkpoint_handoff"
+            ]
+            self.assertTrue(handoffs)
+            self.assertEqual(handoffs[-1]["donor_actor_id"], "agent-imo2024_p1-1")
+            self.assertEqual(handoffs[-1]["donor_episode"], 1)
+            self.assertFalse(handoffs[-1]["same_actor_scope"])
 
     def test_checkpoint_disabled_does_not_install_pretermination_callback(self) -> None:
         base = load_config("configs/smoke.toml", ROOT)
@@ -729,6 +861,46 @@ class CheckpointRunnerIntegrationTests(unittest.TestCase):
             )
             self.assertTrue(pi.callbacks)
             self.assertTrue(all(callback is None for callback in pi.callbacks))
+
+    def test_checkpoint_disabled_recovery_keeps_prompt_unchanged(self) -> None:
+        base = load_config("configs/smoke.toml", ROOT)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            initial_agents_per_task=1,
+            max_attempts_per_task=1,
+            time_limit_seconds=2,
+            pi_recovery_enabled=True,
+            pi_recovery_max_restarts=1,
+            pi_recovery_base_delay_ms=0,
+        )
+        task = load_tasks(config)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            store = CPSStore(run_dir / "cps.sqlite3")
+            policy = make_policy(config.communication, store)
+            pi = _PartialThenSuccessPi()
+            _run_elastic_cps(
+                config,
+                [task],
+                run_dir,
+                logger,
+                _SkippedEvaluator(),
+                pi,
+                policy,
+                mock_agent=False,
+                deadline=time.monotonic() + 2,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=_Broker(),
+                scheduler_result_sink=[],
+            )
+            self.assertEqual(len(pi.calls), 2)
+            self.assertNotIn(
+                "Recovery continuation",
+                str(pi.calls[1]["prompt"]),
+            )
 
     def test_changed_checkpoint_is_carried_forward_over_unchanged_closeout(self) -> None:
         base = load_config("configs/smoke.toml", ROOT)

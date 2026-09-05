@@ -55,6 +55,42 @@ def _safe_seq(value: Any) -> int:
         return 0
 
 
+def _read_bounded_regular(path: Path, maximum_bytes: int) -> bytes | None:
+    """Read one regular file without following a symlink or exceeding a cap."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > maximum_bytes:
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while total <= maximum_bytes:
+            chunk = os.read(
+                descriptor,
+                min(256 * 1024, maximum_bytes + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                return None
+        closed = os.fstat(descriptor)
+        if closed.st_size != opened.st_size:
+            return None
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
 @dataclass(frozen=True)
 class CheckpointRef:
     """A saved immutable checkpoint and its safe public metadata."""
@@ -86,6 +122,15 @@ class CheckpointRef:
     def candidate_changed_from_baseline(self) -> bool:
         value = self.record.get("candidate", {})
         return bool(isinstance(value, Mapping) and value.get("changed_from_baseline"))
+
+    @property
+    def actor_id(self) -> str:
+        value = self.record.get("actor_id")
+        return sanitize_worker_identifier(value) or "unknown-agent"
+
+    @property
+    def episode(self) -> int:
+        return _safe_seq(self.record.get("episode"))
 
     def public_dict(self) -> dict[str, Any]:
         """Return a JSON-safe record without host paths."""
@@ -182,6 +227,21 @@ class CheckpointStore:
                     row["recipient"] = recipient
                 if created_at:
                     row["created_at"] = created_at
+                for key, maximum in (
+                    ("status", 64),
+                    ("claim", 700),
+                    ("evidence", 900),
+                    ("preconditions", 700),
+                    ("next_action", 700),
+                    ("relation", 96),
+                ):
+                    value = sanitize_worker_text(item.get(key), maximum)
+                    if value:
+                        row[key] = value
+                for key in ("source_message_id", "route_claim_id"):
+                    value = sanitize_worker_identifier(item.get(key))
+                    if value:
+                        row[key] = value
                 result.append(row)
             return result
 
@@ -448,6 +508,133 @@ class CheckpointStore:
                 record=record,
             )
 
+    def load_latest(
+        self,
+        *,
+        task_id: str,
+        task_root: Path,
+        actor_id: str | None = None,
+        episode: int | None = None,
+    ) -> CheckpointRef | None:
+        """Load the newest valid immutable snapshot for an explicit scope.
+
+        ``latest.json`` is intentionally task-wide because it is a cheap
+        publication pointer, but concurrent actors can advance it for one
+        another.  Recovery therefore scans the immutable ledger and filters on
+        ``(task_id, actor_id, episode)`` when a process-specific handoff is
+        requested.  Among matching snapshots, a captured changed candidate is
+        preferred over a later empty/unchanged closeout so a useful partial is
+        not hidden by a process that exited without editing its workspace.
+        """
+
+        safe_task = self._safe_task_id(task_id)
+        safe_actor = self._safe_actor_id(actor_id) if actor_id is not None else None
+        expected_episode = _safe_seq(episode) if episode is not None else None
+        root = Path(task_root) / "checkpoints"
+        try:
+            metadata = root.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            return None
+
+        refs: list[CheckpointRef] = []
+        try:
+            entries = sorted(
+                (
+                    item
+                    for item in root.iterdir()
+                    if item.is_dir() and not item.is_symlink() and item.name.isdigit()
+                ),
+                key=lambda item: _safe_seq(item.name),
+                reverse=True,
+            )
+        except OSError:
+            return None
+        for directory in entries:
+            sequence = _safe_seq(directory.name)
+            if sequence <= 0:
+                continue
+            metadata_path = directory / "checkpoint.json"
+            try:
+                metadata_stat = metadata_path.lstat()
+                if stat.S_ISLNK(metadata_stat.st_mode) or not stat.S_ISREG(
+                    metadata_stat.st_mode
+                ):
+                    continue
+                if metadata_stat.st_size > 1_048_576:
+                    continue
+                raw = _read_bounded_regular(metadata_path, 1_048_576)
+                if raw is None:
+                    continue
+                record = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            try:
+                record_task = self._safe_task_id(str(record.get("task_id") or ""))
+            except ValueError:
+                continue
+            if record_task != safe_task:
+                continue
+            if _safe_seq(record.get("sequence")) != sequence:
+                continue
+            record_actor = self._safe_actor_id(str(record.get("actor_id") or ""))
+            record_episode = _safe_seq(record.get("episode"))
+            if safe_actor is not None and record_actor != safe_actor:
+                continue
+            if expected_episode is not None and record_episode != expected_episode:
+                continue
+
+            candidate_path: Path | None = None
+            candidate = record.get("candidate")
+            if isinstance(candidate, Mapping) and candidate.get("status") == "captured":
+                try:
+                    filename = self._safe_candidate_filename(
+                        str(candidate.get("filename") or "")
+                    )
+                    relative_path = str(candidate.get("relative_path") or "")
+                    if relative_path != f"{sequence:06d}/{filename}":
+                        continue
+                    candidate_path = directory / filename
+                    candidate_stat = candidate_path.lstat()
+                    if stat.S_ISLNK(candidate_stat.st_mode) or not stat.S_ISREG(
+                        candidate_stat.st_mode
+                    ):
+                        candidate_path = None
+                    elif candidate_stat.st_size > self.max_candidate_bytes:
+                        candidate_path = None
+                    else:
+                        candidate_raw = _read_bounded_regular(
+                            candidate_path, self.max_candidate_bytes
+                        )
+                        if candidate_raw is None or hashlib.sha256(
+                            candidate_raw
+                        ).hexdigest() != str(candidate.get("sha256") or "").lower():
+                            candidate_path = None
+                except (OSError, ValueError):
+                    candidate_path = None
+            refs.append(
+                CheckpointRef(
+                    task_id=safe_task,
+                    sequence=sequence,
+                    directory=directory,
+                    metadata_path=metadata_path,
+                    candidate_path=candidate_path,
+                    record=record,
+                )
+            )
+
+        if not refs:
+            return None
+        changed = [
+            ref
+            for ref in refs
+            if ref.candidate_changed_from_baseline and ref.candidate_path is not None
+        ]
+        return changed[0] if changed else refs[0]
+
     def materialize_for_agent(
         self,
         ref: CheckpointRef,
@@ -516,6 +703,21 @@ class CheckpointStore:
                 piece_id = sanitize_worker_identifier(raw.get("piece_id"))
                 if piece_id:
                     row["piece_id"] = piece_id
+                for key, maximum in (
+                    ("status", 64),
+                    ("claim", 700),
+                    ("evidence", 900),
+                    ("preconditions", 700),
+                    ("next_action", 700),
+                    ("relation", 96),
+                ):
+                    value = sanitize_worker_text(raw.get(key), maximum)
+                    if value:
+                        row[key] = value
+                for key in ("source_message_id", "route_claim_id"):
+                    value = sanitize_worker_identifier(raw.get(key))
+                    if value:
+                        row[key] = value
                 rows.append(row)
             return rows
 
