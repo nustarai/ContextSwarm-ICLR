@@ -3055,6 +3055,9 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "activity_feedback_prompt_mode": _activity_feedback_prompt_mode(
             config, bool(config.route_claims_enabled)
         ),
+        "external_dedup_mode": config.external_dedup_mode,
+        "external_dedup_similarity_threshold": config.external_dedup_similarity_threshold,
+        "external_dedup_min_shared_tokens": config.external_dedup_min_shared_tokens,
         "figure4_phase": config.figure4_phase,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
@@ -3136,6 +3139,9 @@ def run_experiment(
         activity_feedback_prompt_mode=_activity_feedback_prompt_mode(
             config, bool(config.route_claims_enabled)
         ),
+        external_dedup_mode=config.external_dedup_mode,
+        external_dedup_similarity_threshold=config.external_dedup_similarity_threshold,
+        external_dedup_min_shared_tokens=config.external_dedup_min_shared_tokens,
         max_concurrent=config.lean_max_concurrent_evaluations,
     )
     if dry_run:
@@ -3313,6 +3319,9 @@ def run_experiment(
         route_claim_required=route_claim_required,
         route_claim_ttl_seconds=route_claim_ttl_seconds,
         activity_feedback_enabled=activity_feedback_enabled,
+        external_dedup_mode=config.external_dedup_mode,
+        external_dedup_similarity_threshold=config.external_dedup_similarity_threshold,
+        external_dedup_min_shared_tokens=config.external_dedup_min_shared_tokens,
     ).start()
     (run_dir / "judge_broker_policy.json").write_text(
         json.dumps(judge_broker.public_policy(), ensure_ascii=False, indent=2, sort_keys=True)
@@ -5925,6 +5934,9 @@ def _run_elastic_cps(
                 route_claim_required=route_claim_required,
                 route_claim_ttl_seconds=route_claim_ttl_seconds,
                 activity_feedback_enabled=activity_feedback_enabled,
+                external_dedup_mode=config.external_dedup_mode,
+                external_dedup_similarity_threshold=config.external_dedup_similarity_threshold,
+                external_dedup_min_shared_tokens=config.external_dedup_min_shared_tokens,
                 route_claim_bypass_reason=runtime_actor_bypass.get(
                     (assignment.task_id, assignment.agent_id, assignment.generation)
                 ),
@@ -6928,6 +6940,9 @@ def _run_task_workers(
                         route_claim_required=route_claim_required,
                         route_claim_ttl_seconds=route_claim_ttl_seconds,
                         activity_feedback_enabled=activity_feedback_enabled,
+                        external_dedup_mode=config.external_dedup_mode,
+                        external_dedup_similarity_threshold=config.external_dedup_similarity_threshold,
+                        external_dedup_min_shared_tokens=config.external_dedup_min_shared_tokens,
                         route_claim_bypass_reason=route_actor_bypass.get(
                             (task.slug, actor, episode)
                         ),

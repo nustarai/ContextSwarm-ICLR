@@ -437,6 +437,78 @@ class CPSRouteClaimTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_external_dedup_advisory_records_overlap_and_allows_claim(self) -> None:
+        temporary, store = self.make_store()
+        try:
+            store.register_actor("task", "a", 1, now=100)
+            store.register_actor("task", "b", 1, now=100)
+            first = store.claim_route(
+                "task", "a", 1, "opaque-a",
+                "induction on n with bounded recurrence for the sum", now=100,
+                enforce_route_uniqueness=False,
+            )
+            second = store.claim_route(
+                "task", "b", 1, "opaque-b",
+                "use inductive bounded recurrence for the sums", now=101,
+                enforce_route_uniqueness=False,
+                external_dedup_mode="advisory",
+                external_dedup_similarity_threshold=0.6,
+            )
+            self.assertTrue(first["acquired"])
+            self.assertTrue(second["acquired"])
+            self.assertEqual(second["dedup_mode"], "advisory")
+            self.assertEqual(second["dedup_overlaps"][0]["relation"], "same_route")
+            with sqlite3.connect(store.path) as db:
+                event = db.execute(
+                    "SELECT payload FROM events WHERE event_type='external_route_dedup_decision'"
+                ).fetchone()
+            self.assertIsNotNone(event)
+            self.assertEqual(json.loads(event[0])["action"], "advisory")
+        finally:
+            temporary.cleanup()
+
+    def test_external_dedup_enforce_requires_switch_but_reason_allows_independence(self) -> None:
+        temporary, store = self.make_store()
+        try:
+            store.register_actor("task", "a", 1, now=100)
+            store.register_actor("task", "b", 1, now=100)
+            store.claim_route(
+                "task", "a", 1, "opaque-a",
+                "induction on n with bounded recurrence for the sum", now=100,
+                enforce_route_uniqueness=False,
+            )
+            blocked = store.claim_route(
+                "task", "b", 1, "opaque-b",
+                "use inductive bounded recurrence for the sums", now=101,
+                enforce_route_uniqueness=False,
+                external_dedup_mode="enforce",
+                external_dedup_similarity_threshold=0.6,
+            )
+            self.assertFalse(blocked["acquired"])
+            self.assertEqual(blocked["status"], "semantic_conflict")
+            self.assertTrue(blocked["switch_required"])
+            independent = store.claim_route(
+                "task", "b", 1, "opaque-b",
+                "use inductive bounded recurrence for the sums", now=102,
+                enforce_route_uniqueness=False,
+                external_dedup_mode="enforce",
+                external_dedup_similarity_threshold=0.6,
+                independent_verification_reason="different invariant and an independent counterexample check",
+            )
+            self.assertTrue(independent["acquired"])
+            self.assertEqual(independent["dedup_mode"], "enforce")
+            with sqlite3.connect(store.path) as db:
+                actions = [
+                    json.loads(row[0])["action"]
+                    for row in db.execute(
+                        "SELECT payload FROM events WHERE event_type='external_route_dedup_decision'"
+                    )
+                ]
+            self.assertIn("force_switch", actions)
+            self.assertIn("continue_independent", actions)
+        finally:
+            temporary.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

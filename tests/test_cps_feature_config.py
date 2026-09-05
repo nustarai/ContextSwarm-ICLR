@@ -64,6 +64,9 @@ knowledge_promotion = false
                 "route_claim_required": True,
                 "route_claim_ttl_seconds": 321,
                 "activity_feedback_prompt_mode": "advisory",
+                "external_dedup_mode": "off",
+                "external_dedup_similarity_threshold": 0.78,
+                "external_dedup_min_shared_tokens": 3,
                 "per_recipient_receipts": False,
                 "knowledge_promotion": False,
             },
@@ -115,6 +118,18 @@ knowledge_promotion = false
             _load_manifest("[cps_features]\nroute_claim_ttl_seconds = 1.5\n")
         with self.assertRaisesRegex(ConfigError, "must not exceed 86400"):
             _load_manifest("[cps_features]\nroute_claim_ttl_seconds = 86401\n")
+        with self.assertRaisesRegex(ConfigError, "external_dedup_mode"):
+            _load_manifest('[cps_features]\nexternal_dedup_mode = "enforce"\n')
+        with self.assertRaisesRegex(ConfigError, "external_dedup_similarity_threshold"):
+            _load_manifest(
+                "[cps_features]\nroute_claim_required = true\n"
+                "external_dedup_similarity_threshold = 0\n"
+            )
+        with self.assertRaisesRegex(ConfigError, "external_dedup_min_shared_tokens"):
+            _load_manifest(
+                "[cps_features]\nroute_claim_required = true\n"
+                "external_dedup_min_shared_tokens = 33\n"
+            )
         with self.assertRaisesRegex(ConfigError, "requires experiment.mode = cps"):
             _load_manifest(
                 '[experiment]\nmode = "parallel"\ncommunication = "none"\n\n'

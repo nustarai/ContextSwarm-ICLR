@@ -193,6 +193,8 @@ const routeClaimNegativeStatuses = new Set([
   "not_admitted",
   "actor_not_admitted",
   "invalid_actor_status",
+  "semantic_conflict",
+  "semantic_route_conflict",
   "actor_finished",
   "episode_mismatch",
   "not_found",
@@ -242,6 +244,8 @@ const routeClaimKnownStatuses = new Set([
   "invalid_request",
   "invalid_task_selection",
   "invalid_actor_status",
+  "semantic_conflict",
+  "semantic_route_conflict",
   "closed",
   "finished",
   "route_claim_bypass",
@@ -280,6 +284,7 @@ function routeClaimEnvelopeMalformed(result) {
     "idempotent",
     "bypassed",
     "independent_verification_accepted",
+    "switch_required",
   ];
   if (booleanFields.some((key) => key in result && typeof result[key] !== "boolean")) {
     return true;

@@ -257,6 +257,9 @@ class _SessionClaim:
     # write gating, but explicitly disables textual route-key uniqueness.  The
     # Agent's bounded summary is then the peer-visible direction report.
     activity_feedback_enabled: bool = False
+    external_dedup_mode: str = "off"
+    external_dedup_similarity_threshold: float = 0.78
+    external_dedup_min_shared_tokens: int = 3
     route_claim_ids: set[str] = field(default_factory=set, repr=False)
     route_claim_satisfied: bool = False
     on_authoritative_verdict: (
@@ -358,6 +361,9 @@ class JudgeBroker:
         route_claim_required: bool | None = None,
         route_claim_ttl_seconds: float = _DEFAULT_ROUTE_CLAIM_TTL_SECONDS,
         activity_feedback_enabled: bool = False,
+        external_dedup_mode: str = "off",
+        external_dedup_similarity_threshold: float = 0.78,
+        external_dedup_min_shared_tokens: int = 3,
         # Compatibility spellings used by early route-claim callers.  Keep
         # these aliases at the broker boundary so one branch can be tested
         # against a sibling branch whose session vocabulary has not landed
@@ -440,6 +446,24 @@ class JudgeBroker:
         if not isinstance(activity_feedback_enabled, bool):
             raise ValueError("activity_feedback_enabled must be a boolean")
         self.activity_feedback_enabled = activity_feedback_enabled
+        normalized_dedup_mode = str(external_dedup_mode or "off").strip().lower()
+        if normalized_dedup_mode not in {"off", "advisory", "enforce"}:
+            raise ValueError("external_dedup_mode must be off, advisory, or enforce")
+        try:
+            dedup_threshold = float(external_dedup_similarity_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("external_dedup_similarity_threshold must be finite") from exc
+        if not math.isfinite(dedup_threshold) or not 0.0 < dedup_threshold <= 1.0:
+            raise ValueError("external_dedup_similarity_threshold must be in (0, 1]")
+        if isinstance(external_dedup_min_shared_tokens, bool) or not isinstance(
+            external_dedup_min_shared_tokens, int
+        ) or not 1 <= external_dedup_min_shared_tokens <= 32:
+            raise ValueError("external_dedup_min_shared_tokens must be an integer in [1, 32]")
+        if normalized_dedup_mode != "off" and not self.route_claims_enabled:
+            raise ValueError("external dedup requires route claims")
+        self.external_dedup_mode = normalized_dedup_mode
+        self.external_dedup_similarity_threshold = dedup_threshold
+        self.external_dedup_min_shared_tokens = external_dedup_min_shared_tokens
         self.formal_audit_path = Path(
             formal_audit_path
             if formal_audit_path is not None
@@ -788,6 +812,13 @@ class JudgeBroker:
                     _ROUTE_CLAIM_OPERATIONS - _PRE_JUDGE_ROUTE_OPERATIONS
                 ),
                 "failure_mode": "fail_open_with_explicit_bypass_reason",
+                "external_dedup": {
+                    "mode": self.external_dedup_mode,
+                    "similarity_threshold": self.external_dedup_similarity_threshold,
+                    "min_shared_tokens": self.external_dedup_min_shared_tokens,
+                    "decision_owner": "runner_controller",
+                    "unknown_action": "continue",
+                },
             },
         }
         formal = self.formal_policy
@@ -843,6 +874,9 @@ class JudgeBroker:
         route_claim_required: bool | None = None,
         route_claim_ttl_seconds: float | None = None,
         activity_feedback_enabled: bool | None = None,
+        external_dedup_mode: str | None = None,
+        external_dedup_similarity_threshold: float | None = None,
+        external_dedup_min_shared_tokens: int | None = None,
         route_claim_bypass_reason: str | None = None,
         route_claim_enabled: bool | None = None,
         active_roster_enabled: bool | None = None,
@@ -1018,6 +1052,25 @@ class JudgeBroker:
             raise ValueError(
                 "activity feedback requires an active route capability"
             )
+        effective_dedup_mode = self.external_dedup_mode if external_dedup_mode is None else str(external_dedup_mode).strip().lower()
+        if effective_dedup_mode not in {"off", "advisory", "enforce"}:
+            raise ValueError("external_dedup_mode must be off, advisory, or enforce")
+        if effective_dedup_mode != "off" and not effective_route_enabled:
+            raise ValueError("external dedup requires an active route capability")
+        effective_dedup_threshold = (
+            self.external_dedup_similarity_threshold
+            if external_dedup_similarity_threshold is None
+            else float(external_dedup_similarity_threshold)
+        )
+        if not math.isfinite(effective_dedup_threshold) or not 0.0 < effective_dedup_threshold <= 1.0:
+            raise ValueError("external_dedup_similarity_threshold must be in (0, 1]")
+        effective_dedup_min_shared = (
+            self.external_dedup_min_shared_tokens
+            if external_dedup_min_shared_tokens is None
+            else external_dedup_min_shared_tokens
+        )
+        if isinstance(effective_dedup_min_shared, bool) or not isinstance(effective_dedup_min_shared, int) or not 1 <= effective_dedup_min_shared <= 32:
+            raise ValueError("external_dedup_min_shared_tokens must be an integer in [1, 32]")
         if isinstance(episode, bool) or not isinstance(episode, int) or episode < 0:
             raise ValueError("episode must be a non-negative integer")
         if effective_selection_enabled:
@@ -1062,6 +1115,9 @@ class JudgeBroker:
             route_claim_ttl_seconds=effective_route_ttl,
             route_claim_bypass_reason=normalized_bypass_reason,
             activity_feedback_enabled=bool(effective_activity_feedback),
+            external_dedup_mode=effective_dedup_mode,
+            external_dedup_similarity_threshold=effective_dedup_threshold,
+            external_dedup_min_shared_tokens=effective_dedup_min_shared,
             on_authoritative_verdict=on_authoritative_verdict,
             cancel_event=cancel_event,
         )
@@ -3540,6 +3596,11 @@ class JudgeBroker:
                     summary=summary,
                     ttl_seconds=ttl_seconds,
                     independent_verification_reason=independent_reason or None,
+                    external_dedup_mode=claim.external_dedup_mode,
+                    external_dedup_similarity_threshold=(
+                        claim.external_dedup_similarity_threshold
+                    ),
+                    external_dedup_min_shared_tokens=claim.external_dedup_min_shared_tokens,
                     # In activity mode the route key is an opaque handle, not
                     # a semantic de-duplication key.  The CPS store still
                     # serializes the write and binds the lease to this actor /
@@ -4910,6 +4971,45 @@ def _route_result_has_unknown_diagnostic(result: Mapping[str, Any]) -> bool:
     return False
 
 
+def _safe_external_dedup_overlaps(raw: Any) -> list[dict[str, Any]] | None:
+    """Validate the bounded, runner-owned overlap projection."""
+
+    if not isinstance(raw, (list, tuple)):
+        return None
+    result: list[dict[str, Any]] = []
+    for item in raw[:8]:
+        if not isinstance(item, Mapping):
+            return None
+        relation = item.get("relation")
+        score = item.get("score")
+        shared = item.get("shared_tokens")
+        claim_id = item.get("compared_claim_id")
+        actor_id = item.get("compared_actor_id")
+        if (
+            not isinstance(relation, str)
+            or relation not in {"same_route", "related"}
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not math.isfinite(float(score))
+            or not 0.0 <= float(score) <= 1.0
+            or not isinstance(shared, (list, tuple))
+            or not all(isinstance(token, str) for token in shared[:12])
+            or not isinstance(claim_id, str)
+            or not isinstance(actor_id, str)
+        ):
+            return None
+        result.append(
+            {
+                "relation": relation,
+                "score": round(float(score), 6),
+                "shared_tokens": [token[:64] for token in shared[:12]],
+                "compared_claim_id": claim_id[:128],
+                "compared_actor_id": actor_id[:128],
+            }
+        )
+    return result
+
+
 def _route_rows_match_task(rows: Any, *, task_id: str) -> bool:
     """Reject a route projection that contains cross-task or sparse rows."""
 
@@ -4960,6 +5060,19 @@ def _safe_route_claim_result(raw: Any) -> dict[str, Any]:
     for key in ("status", "error", "reason", "route_claim_bypass_reason"):
         value = raw.get(key)
         if value is not None and not isinstance(value, str):
+            invalid_types = True
+    if "switch_required" in raw and not isinstance(raw.get("switch_required"), bool):
+        invalid_types = True
+    if "dedup_mode" in raw and (
+        not isinstance(raw.get("dedup_mode"), str)
+        or raw.get("dedup_mode", "").strip().lower()
+        not in {"off", "advisory", "enforce"}
+    ):
+        invalid_types = True
+    dedup_overlaps = None
+    if "dedup_overlaps" in raw:
+        dedup_overlaps = _safe_external_dedup_overlaps(raw.get("dedup_overlaps"))
+        if dedup_overlaps is None:
             invalid_types = True
     conflict_value = raw.get("conflict")
     # ``false`` is a compact compatibility spelling for "no conflict";
@@ -5037,6 +5150,7 @@ def _safe_route_claim_result(raw: Any) -> dict[str, Any]:
         "idempotent",
         "bypassed",
         "independent_verification_accepted",
+        "switch_required",
     ):
         value = raw.get(key)
         if isinstance(value, bool):
@@ -5044,6 +5158,15 @@ def _safe_route_claim_result(raw: Any) -> dict[str, Any]:
     status = raw.get("status")
     if isinstance(status, str):
         result["status"] = status[:64]
+    dedup_mode = raw.get("dedup_mode")
+    if isinstance(dedup_mode, str) and dedup_mode.strip().lower() in {
+        "off",
+        "advisory",
+        "enforce",
+    }:
+        result["dedup_mode"] = dedup_mode.strip().lower()
+    if dedup_overlaps is not None:
+        result["dedup_overlaps"] = dedup_overlaps
     raw_status = str(status or "").strip().lower()
     explicit_bypass = raw.get("bypassed") is True or raw_status in {
         "route_claim_bypass",
@@ -5168,6 +5291,8 @@ _ROUTE_CLAIM_NEGATIVE_STATUSES = frozenset(
         "invalid_task_selection",
         "actor_not_admitted",
         "invalid_actor_status",
+        "semantic_conflict",
+        "semantic_route_conflict",
         "expired",
         "released",
         "done",

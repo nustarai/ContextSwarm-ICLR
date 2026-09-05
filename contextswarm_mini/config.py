@@ -258,12 +258,16 @@ _CPS_FEATURE_FIELDS = frozenset(
         "route_claim_required",
         "route_claim_ttl_seconds",
         "activity_feedback_prompt_mode",
+        "external_dedup_mode",
+        "external_dedup_similarity_threshold",
+        "external_dedup_min_shared_tokens",
         "per_recipient_receipts",
         "knowledge_promotion",
     }
 )
 
 _ACTIVITY_FEEDBACK_PROMPT_MODES = frozenset({"advisory", "strong"})
+_EXTERNAL_DEDUP_MODES = frozenset({"off", "advisory", "enforce"})
 
 
 @dataclass(frozen=True)
@@ -287,6 +291,12 @@ class CPSFeatureConfig:
     # default, while retaining an explicit independent-verification exception.
     # Keep this appended after the historical fields for positional callers.
     activity_feedback_prompt_mode: str = "advisory"
+    # External route deduplication is intentionally separate from the prompt
+    # policy above.  ``advisory`` records runner-owned overlap decisions while
+    # ``enforce`` denies a high-confidence duplicate claim before write/edit.
+    external_dedup_mode: str = "off"
+    external_dedup_similarity_threshold: float = 0.78
+    external_dedup_min_shared_tokens: int = 3
 
     @property
     def active_roster_enabled(self) -> bool:
@@ -311,6 +321,9 @@ class CPSFeatureConfig:
             "route_claim_required": self.route_claim_required,
             "route_claim_ttl_seconds": self.route_claim_ttl_seconds,
             "activity_feedback_prompt_mode": self.activity_feedback_prompt_mode,
+            "external_dedup_mode": self.external_dedup_mode,
+            "external_dedup_similarity_threshold": self.external_dedup_similarity_threshold,
+            "external_dedup_min_shared_tokens": self.external_dedup_min_shared_tokens,
             "per_recipient_receipts": self.per_recipient_receipts,
             "knowledge_promotion": self.knowledge_promotion,
         }
@@ -367,10 +380,45 @@ def _parse_cps_features(value: Any, *, table_name: str = "cps_features") -> CPSF
                 f"{table_name}.activity_feedback_prompt_mode must be one of "
                 f"{sorted(_ACTIVITY_FEEDBACK_PROMPT_MODES)}"
             )
+    if "external_dedup_mode" not in features:
+        dedup_mode = "off"
+    else:
+        raw_dedup_mode = features["external_dedup_mode"]
+        if not isinstance(raw_dedup_mode, str) or raw_dedup_mode.strip().lower() not in _EXTERNAL_DEDUP_MODES:
+            raise ConfigError(
+                f"{table_name}.external_dedup_mode must be one of "
+                f"{sorted(_EXTERNAL_DEDUP_MODES)}"
+            )
+        dedup_mode = raw_dedup_mode.strip().lower()
+    dedup_threshold = _number(
+        features.get("external_dedup_similarity_threshold"),
+        f"{table_name}.external_dedup_similarity_threshold",
+        0.78,
+    )
+    if not 0.0 < dedup_threshold <= 1.0:
+        raise ConfigError(
+            f"{table_name}.external_dedup_similarity_threshold must be in (0, 1]"
+        )
+    dedup_min_shared = (
+        _required_positive_int(
+            features,
+            "external_dedup_min_shared_tokens",
+            table_name,
+        )
+        if "external_dedup_min_shared_tokens" in features
+        else 3
+    )
+    if dedup_min_shared > 32:
+        raise ConfigError(
+            f"{table_name}.external_dedup_min_shared_tokens must not exceed 32"
+        )
     return CPSFeatureConfig(
         route_claim_required=optional_bool("route_claim_required"),
         route_claim_ttl_seconds=ttl,
         activity_feedback_prompt_mode=prompt_mode,
+        external_dedup_mode=dedup_mode,
+        external_dedup_similarity_threshold=dedup_threshold,
+        external_dedup_min_shared_tokens=dedup_min_shared,
         per_recipient_receipts=optional_bool("per_recipient_receipts"),
         knowledge_promotion=optional_bool("knowledge_promotion"),
     )
@@ -704,6 +752,20 @@ class ExperimentConfig:
         return self.cps_features.route_claims_enabled
 
     @property
+    def external_dedup_mode(self) -> str:
+        """Runner-owned route overlap policy for the active CPS treatment."""
+
+        return self.cps_features.external_dedup_mode
+
+    @property
+    def external_dedup_similarity_threshold(self) -> float:
+        return self.cps_features.external_dedup_similarity_threshold
+
+    @property
+    def external_dedup_min_shared_tokens(self) -> int:
+        return self.cps_features.external_dedup_min_shared_tokens
+
+    @property
     def is_coding(self) -> bool:
         return self.judge_kind == "coding"
 
@@ -883,6 +945,10 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         raise ConfigError(
             "cps_features.route_claim_required requires experiment.mode = cps "
             "with a CPS communication surface"
+        )
+    if cps_features.external_dedup_mode != "off" and not cps_features.route_claim_required:
+        raise ConfigError(
+            "cps_features.external_dedup_mode requires route_claim_required = true"
         )
     if selection_config.enabled:
         if mode != "cps":

@@ -1,0 +1,20 @@
+extends = ["formal_1h_cps32_profiled_activity_advisory.toml"]
+
+# Control arm for the external route-dedup comparison. The same route claims
+# and peer-visible summaries are present, but the runner records no semantic
+# overlap decision and never blocks a claim.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-external-dedup-control-gpt6"
+
+[cps_features]
+route_claim_required = true
+route_claim_ttl_seconds = 3600
+activity_feedback_prompt_mode = "advisory"
+external_dedup_mode = "off"
+external_dedup_similarity_threshold = 0.78
+external_dedup_min_shared_tokens = 3
+per_recipient_receipts = false
+knowledge_promotion = false
+
+[pi]
+model = "openai-codex/gpt-6-astra"

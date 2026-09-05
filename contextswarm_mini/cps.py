@@ -19,6 +19,8 @@ import time
 import uuid
 from typing import Any, Callable, Iterable, Mapping
 
+from .route_dedup import find_route_overlaps
+
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_\u4e00-\u9fff]+")
 _MAX_TEXT = 8_000
@@ -2296,6 +2298,9 @@ class CPSStore:
         independent_verification_reason: str | None = None,
         independent_reason: str | None = None,
         enforce_route_uniqueness: bool = True,
+        external_dedup_mode: str = "off",
+        external_dedup_similarity_threshold: float = 0.78,
+        external_dedup_min_shared_tokens: int = 3,
         # Compatibility spelling for small adapters and experiment harnesses.
         # The canonical name above is deliberately explicit about what is
         # being disabled: only the textual route-key uniqueness check, never
@@ -2320,6 +2325,19 @@ class CPSStore:
         episode_value = self._validate_episode(episode)
         if not isinstance(enforce_route_uniqueness, bool):
             raise ValueError("enforce_route_uniqueness must be a boolean")
+        dedup_mode = str(external_dedup_mode or "off").strip().lower()
+        if dedup_mode not in {"off", "advisory", "enforce"}:
+            raise ValueError("external_dedup_mode must be off, advisory, or enforce")
+        try:
+            dedup_threshold = float(external_dedup_similarity_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("external_dedup_similarity_threshold must be finite") from exc
+        if not 0.0 < dedup_threshold <= 1.0:
+            raise ValueError("external_dedup_similarity_threshold must be in (0, 1]")
+        if isinstance(external_dedup_min_shared_tokens, bool) or not isinstance(
+            external_dedup_min_shared_tokens, int
+        ) or not 1 <= external_dedup_min_shared_tokens <= 32:
+            raise ValueError("external_dedup_min_shared_tokens must be an integer in [1, 32]")
         if enforce_uniqueness is not None:
             if not isinstance(enforce_uniqueness, bool):
                 raise ValueError("enforce_uniqueness must be a boolean or None")
@@ -2541,6 +2559,69 @@ class CPSStore:
                         actor_registered=actor_registered,
                     )
 
+                semantic_overlaps: list[dict[str, object]] = []
+                if dedup_mode != "off":
+                    peer_rows = db.execute(
+                        """SELECT * FROM route_claims
+                           WHERE task_id=? AND actor_id!=?
+                             AND LOWER(TRIM(status)) IN ('active', 'blocked')
+                           ORDER BY created_at ASC, claim_id ASC LIMIT 64""",
+                        (task, actor),
+                    ).fetchall()
+                    peer_items = [self._claim_row(row) for row in peer_rows]
+                    overlaps = find_route_overlaps(
+                        summary_value,
+                        (item for item in peer_items if item is not None),
+                        threshold=dedup_threshold,
+                        min_shared_tokens=external_dedup_min_shared_tokens,
+                    )
+                    semantic_overlaps = [item.public_dict() for item in overlaps[:8]]
+                    if semantic_overlaps:
+                        action = (
+                            "force_switch"
+                            if dedup_mode == "enforce" and not reason_value
+                            else "continue_independent"
+                            if reason_value
+                            else "advisory"
+                        )
+                        self._insert_event(
+                            db,
+                            "external_route_dedup_decision",
+                            task_id=task,
+                            actor_id=actor,
+                            payload={
+                                "task_id": task,
+                                "actor_id": actor,
+                                "route_key": route,
+                                "mode": dedup_mode,
+                                "action": action,
+                                "overlaps": semantic_overlaps,
+                                "independent_verification_provided": bool(reason_value),
+                            },
+                        )
+                        if dedup_mode == "enforce" and not reason_value:
+                            result = self._result_with_claim(
+                                None,
+                                ok=False,
+                                acquired=False,
+                                actor_registered=actor_registered,
+                            )
+                            result.update(
+                                {
+                                    "task_id": task,
+                                    "actor_id": actor,
+                                    "episode": episode_value,
+                                    "route_key": route,
+                                    "summary": summary_value,
+                                    "status": "semantic_conflict",
+                                    "error": "semantic_route_conflict",
+                                    "switch_required": True,
+                                    "dedup_mode": dedup_mode,
+                                    "dedup_overlaps": semantic_overlaps,
+                                }
+                            )
+                            return result
+
                 primary = (
                     db.execute(
                         """SELECT * FROM route_claims
@@ -2629,6 +2710,12 @@ class CPSStore:
                     ).fetchone()
                 )
                 assert claim_item is not None
+                if semantic_overlaps:
+                    claim_item["external_dedup"] = {
+                        "mode": dedup_mode,
+                        "action": "continue_independent" if reason_value else "advisory",
+                        "overlaps": semantic_overlaps,
+                    }
                 self._insert_event(
                     db,
                     "route_claim_created",
@@ -2647,13 +2734,22 @@ class CPSStore:
                         "independent_verification_reason": reason_value,
                     },
                 )
-        return self._result_with_claim(
+        result = self._result_with_claim(
             claim_item,
             ok=True,
             acquired=True,
             conflict=primary_item if primary_item is not None else None,
             actor_registered=actor_registered,
         )
+        if semantic_overlaps:
+            result.update(
+                {
+                    "dedup_mode": dedup_mode,
+                    "dedup_overlaps": semantic_overlaps,
+                    "switch_required": False,
+                }
+            )
+        return result
 
     def update_route_claim(
         self,
