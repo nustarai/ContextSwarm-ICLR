@@ -245,6 +245,16 @@ checkpoint，也不会把未验证 candidate 直接计分或自动注入另一�
 [`docs/termination_summary_experiment.md`](docs/termination_summary_experiment.md)，
 recover/checkpoint 的独立交接见 [`docs/recovery_checkpoint_handoff.md`](docs/recovery_checkpoint_handoff.md)。
 
+若要把候选文件也固定在终止边界，CPS runner 可以显式开启
+`[checkpoint] enabled=true`，并按需打开 `transfer`/`publish`。启用后，Pi 在 timeout、
+cancel 或 live RPC error 即将触发 drain 前调用 runner-owned
+`on_termination_checkpoint`；runner 立即对当前 workspace 做一次限大小、不可变、带
+SHA-256 的快照，再执行既有 closeout/recovery 流程。返回后的 attempt snapshot 和
+Judge 后的 `final_validation` snapshot 仍会分别记录，因此终止前保存不会改变 Judge
+权威性。该回调是 fail-open 的诊断/交接旁路；整个进程已被 SIGKILL，或候选/语义从未
+写入文件、CPS 或 session 时，没有可以补造的内容。具体实验合同与 continuation
+harness 见 [`docs/timeout_checkpoint_pretermination_20260905.md`](docs/timeout_checkpoint_pretermination_20260905.md)。
+
 每个 worker 的实际 Pi settings 写入其私有 `.pi/settings.json`；每次调用的原始
 session 进一步隔离在该 worker 的 `.pi/sessions/<session-id>/`，避免 CPS 高并发
 反复扫描其他 session，也不为 Mono/Parallel 增加共享通信面。它们位于 run 目录

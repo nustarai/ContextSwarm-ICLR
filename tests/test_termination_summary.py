@@ -283,6 +283,77 @@ class TerminationSummaryPromptTests(unittest.TestCase):
 
 
 class PiTerminationSummaryTests(unittest.TestCase):
+    def test_timeout_checkpoint_callback_runs_before_process_drain(self) -> None:
+        """A timeout snapshot sees the live candidate before SIGTERM/SIGKILL."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _write_fake(
+                root,
+                "import json, sys, time\n"
+                "json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'type':'response','success':True}), flush=True)\n"
+                "print(json.dumps({'type':'agent_start'}), flush=True)\n"
+                "time.sleep(10)\n",
+            )
+            candidate = root / "result.lean"
+            candidate.write_text("partial-live-candidate\n", encoding="utf-8")
+            seen: list[tuple[str, str, bool]] = []
+
+            def checkpoint(reason: str) -> None:
+                seen.append((reason, candidate.read_text(encoding="utf-8"), True))
+
+            result = PiAgent(_fake_config(fake, timeout=1)).run(
+                task_id="task",
+                actor_id="agent",
+                episode=1,
+                prompt="work",
+                workdir=root,
+                on_termination_checkpoint=checkpoint,
+            )
+            self.assertTrue(result.timed_out)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(seen, [("timeout", "partial-live-candidate\n", True)])
+
+    def test_cancel_checkpoint_callback_runs_once_before_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _write_fake(
+                root,
+                "import json, sys, time\n"
+                "json.loads(sys.stdin.readline())\n"
+                "print(json.dumps({'type':'response','success':True}), flush=True)\n"
+                "print(json.dumps({'type':'agent_start'}), flush=True)\n"
+                "time.sleep(10)\n",
+            )
+            candidate = root / "result.lean"
+            candidate.write_text("partial-cancel-candidate\n", encoding="utf-8")
+            cancel = threading.Event()
+            seen: list[tuple[str, str]] = []
+
+            def checkpoint(reason: str) -> None:
+                seen.append((reason, candidate.read_text(encoding="utf-8")))
+
+            def request_cancel() -> None:
+                time.sleep(0.15)
+                cancel.set()
+
+            thread = threading.Thread(target=request_cancel)
+            thread.start()
+            result = PiAgent(_fake_config(fake, timeout=2)).run(
+                task_id="task",
+                actor_id="agent",
+                episode=1,
+                prompt="work",
+                workdir=root,
+                cancel_event=cancel,
+                on_termination_checkpoint=checkpoint,
+            )
+            thread.join()
+            self.assertTrue(result.cancelled)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(seen, [("cancelled", "partial-cancel-candidate\n")])
+
     def test_timeout_sends_steer_and_keeps_terminal_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

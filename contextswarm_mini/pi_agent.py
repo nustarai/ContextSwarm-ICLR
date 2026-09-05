@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import urlsplit
 import uuid
 
@@ -504,6 +504,7 @@ class PiAgent:
         termination_summary_on_timeout: bool = True,
         termination_summary_on_cancel: bool = True,
         termination_summary_on_error: bool = True,
+        on_termination_checkpoint: Callable[[str], None] | None = None,
     ) -> AgentResult:
         if termination_summary_prompt is not None:
             termination_summary_prompt = str(termination_summary_prompt)
@@ -536,6 +537,10 @@ class PiAgent:
             raise ValueError("termination_summary_on_cancel must be a boolean")
         if not isinstance(termination_summary_on_error, bool):
             raise ValueError("termination_summary_on_error must be a boolean")
+        if on_termination_checkpoint is not None and not callable(
+            on_termination_checkpoint
+        ):
+            raise ValueError("on_termination_checkpoint must be callable")
         started = now_iso()
         profiler = self.profiler
         try:
@@ -592,6 +597,7 @@ class PiAgent:
         termination_summary_request_id: str | None = None
         termination_summary_closeout_deadline: float | None = None
         termination_summary_source_error = ""
+        termination_checkpoint_requested = False
         # ``steer`` is used while the original turn is still running.  A
         # provider/assistant error is reported by Pi only after
         # ``agent_settled``; at that point the session is idle and the closeout
@@ -802,6 +808,36 @@ class PiAgent:
             )
             return True
 
+        def request_termination_checkpoint(reason: str) -> None:
+            """Flush a runner-owned snapshot before the process is stopped.
+
+            The callback runs while the Pi process and its workspace are still
+            available.  It is intentionally independent from the cooperative
+            semantic summary: a summary may be disabled, rejected, or too slow
+            while the candidate file can still be copied and hashed.  A
+            callback failure is diagnostic only and must never change the
+            timeout/cancellation lifecycle.
+            """
+
+            nonlocal termination_checkpoint_requested
+            if termination_checkpoint_requested or on_termination_checkpoint is None:
+                return
+            termination_checkpoint_requested = True
+            try:
+                on_termination_checkpoint(str(reason or "termination")[:64])
+            except Exception as exc:
+                errors.append(
+                    "Pi termination checkpoint callback failed: "
+                    + _exception_label(exc)
+                )
+            profile_emit(
+                "agent.termination_checkpoint.requested",
+                task_id=task_id,
+                actor_id=actor_id,
+                episode=episode,
+                reason=str(reason or "termination")[:64],
+            )
+
         def mark_termination_summary_completed() -> None:
             """Accept settlement only after Pi consumed this exact closeout turn.
 
@@ -969,6 +1005,7 @@ class PiAgent:
                 extension_error = _text_field(payload, "error", "errorMessage")
                 if extension_error:
                     pending_assistant_error = extension_error
+                    request_termination_checkpoint("error")
                 if (
                     settled_seen
                     and not termination_summary_requested
@@ -989,6 +1026,11 @@ class PiAgent:
                 # Give that same Agent the closeout opportunity too; a clean
                 # settlement with no error keeps the zero-overhead normal
                 # path and never receives an extra steer.
+                if (
+                    not termination_summary_requested
+                    and (pending_assistant_error or retry_final_error)
+                ):
+                    request_termination_checkpoint("error")
                 if (
                     not termination_summary_requested
                     and termination_summary_prompt is not None
@@ -1016,6 +1058,7 @@ class PiAgent:
             ):
                 prompt_rejected = True
                 pending_assistant_error = _text_field(payload, "error", "message") or "Pi RPC prompt rejected"
+                request_termination_checkpoint("error")
                 if (
                     termination_summary_prompt is not None
                     and termination_summary_on_error
@@ -1245,6 +1288,7 @@ class PiAgent:
                 now = time.monotonic()
                 if not termination_summary_requested:
                     if cancellation_requested():
+                        request_termination_checkpoint("cancelled")
                         if (
                             termination_summary_prompt is not None
                             and termination_summary_on_cancel
@@ -1255,6 +1299,7 @@ class PiAgent:
                         cancelled = True
                         break
                     if now >= soft_deadline:
+                        request_termination_checkpoint("timeout")
                         if (
                             termination_summary_prompt is not None
                             and termination_summary_on_timeout
@@ -1274,6 +1319,7 @@ class PiAgent:
                     ):
                         break
                 if now >= deadline:
+                    request_termination_checkpoint("timeout")
                     timed_out = timed_out or not cancelled
                     break
                 next_boundary = deadline
@@ -1324,6 +1370,7 @@ class PiAgent:
                 errors.append(drain_error)
             returncode = process.returncode if process.returncode is not None else 1
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            request_termination_checkpoint("error")
             errors.append(_redact_sensitive_text(str(exc)))
             if process is not None:
                 try:

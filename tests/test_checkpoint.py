@@ -107,6 +107,68 @@ class _PartialThenBaselineThenSuccessPi(_PartialThenSuccessPi):
         )
 
 
+class _PreterminationThenSuccessPi:
+    """Invoke the live checkpoint hook before returning a timeout result."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.handoff_seen: list[str] = []
+
+    def run(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        attempt = len(self.calls)
+        workdir = Path(kwargs["workdir"])
+        if attempt == 1:
+            (workdir / "result.lean").write_text(
+                "partial-before-timeout\n", encoding="utf-8"
+            )
+            callback = kwargs.get("on_termination_checkpoint")
+            if callable(callback):
+                callback("timeout")
+        else:
+            metadata = json.loads(
+                (workdir / "checkpoint" / "checkpoint.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.handoff_seen.append(
+                f"{metadata['candidate']['sha256']}:{(workdir / 'checkpoint' / 'result.lean').read_text(encoding='utf-8')}"
+            )
+            (workdir / "result.lean").write_text(
+                "continued-from-checkpoint\n", encoding="utf-8"
+            )
+        now = "2026-01-01T00:00:00+00:00"
+        return AgentResult(
+            agent_id=str(kwargs["actor_id"]),
+            task_id=str(kwargs["task_id"]),
+            episode=int(kwargs["episode"]),
+            returncode=124 if attempt == 1 else 0,
+            started_at=now,
+            finished_at=now,
+            timed_out=attempt == 1,
+            error_tail="timeout" if attempt == 1 else "",
+        )
+
+
+class _CallbackCapturePi:
+    """Record whether the runner installs an optional termination hook."""
+
+    def __init__(self) -> None:
+        self.callbacks: list[object] = []
+
+    def run(self, **kwargs):
+        self.callbacks.append(kwargs.get("on_termination_checkpoint"))
+        now = "2026-01-01T00:00:00+00:00"
+        return AgentResult(
+            agent_id=str(kwargs["actor_id"]),
+            task_id=str(kwargs["task_id"]),
+            episode=int(kwargs["episode"]),
+            returncode=0,
+            started_at=now,
+            finished_at=now,
+        )
+
+
 class _SkippedEvaluator:
     is_mock_evaluator = True
 
@@ -561,6 +623,112 @@ class CheckpointRunnerIntegrationTests(unittest.TestCase):
             self.assertFalse(published_payload["score_eligible"])
             self.assertLessEqual(len(published[0]["body"].encode("utf-8")), 7_500)
             self.assertTrue(all(not verdict.status.startswith("PROVED") for _, verdict in results))
+
+    def test_pretermination_callback_persists_before_fresh_refill(self) -> None:
+        """A live timeout callback feeds the next assignment's handoff."""
+
+        base = load_config("configs/smoke.toml", ROOT)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            initial_agents_per_task=1,
+            max_attempts_per_task=2,
+            time_limit_seconds=2,
+            pi_recovery_enabled=True,
+            pi_recovery_max_restarts=0,
+            checkpoint=CheckpointConfig(
+                enabled=True,
+                transfer=True,
+                publish=True,
+                max_candidate_bytes=2 * 1024 * 1024,
+                max_summary_chars=6000,
+                max_context_items=6,
+            ),
+        )
+        task = load_tasks(config)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            store = CPSStore(run_dir / "cps.sqlite3")
+            policy = make_policy(config.communication, store)
+            pi = _PreterminationThenSuccessPi()
+            results = _run_elastic_cps(
+                config,
+                [task],
+                run_dir,
+                logger,
+                _SkippedEvaluator(),
+                pi,
+                policy,
+                mock_agent=False,
+                deadline=time.monotonic() + 2,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=_Broker(),
+                scheduler_result_sink=[],
+            )
+            self.assertEqual(len(pi.calls), 2)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(len(pi.handoff_seen), 1)
+            digest, candidate = pi.handoff_seen[0].split(":", 1)
+            self.assertEqual(candidate, "partial-before-timeout\n")
+            self.assertEqual(
+                digest,
+                hashlib.sha256(b"partial-before-timeout\n").hexdigest(),
+            )
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text().splitlines()
+            ]
+            self.assertTrue(
+                any(
+                    row.get("event") == "checkpoint_pretermination_requested"
+                    and row.get("reason") == "timeout"
+                    for row in events
+                )
+            )
+            self.assertTrue(
+                any(
+                    row.get("event") == "checkpoint_saved"
+                    and row.get("phase") == "pretermination"
+                    and row.get("candidate_sha256") == digest
+                    for row in events
+                )
+            )
+
+    def test_checkpoint_disabled_does_not_install_pretermination_callback(self) -> None:
+        base = load_config("configs/smoke.toml", ROOT)
+        config = replace(
+            base,
+            max_tasks=1,
+            max_parallel=1,
+            initial_agents_per_task=1,
+            time_limit_seconds=2,
+            pi_recovery_enabled=False,
+        )
+        task = load_tasks(config)[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            logger = RunLogger(run_dir)
+            store = CPSStore(run_dir / "cps.sqlite3")
+            policy = make_policy(config.communication, store)
+            pi = _CallbackCapturePi()
+            _run_elastic_cps(
+                config,
+                [task],
+                run_dir,
+                logger,
+                _SkippedEvaluator(),
+                pi,
+                policy,
+                mock_agent=False,
+                deadline=time.monotonic() + 2,
+                evaluator_gate=threading.BoundedSemaphore(1),
+                judge_broker=_Broker(),
+                scheduler_result_sink=[],
+            )
+            self.assertTrue(pi.callbacks)
+            self.assertTrue(all(callback is None for callback in pi.callbacks))
 
     def test_changed_checkpoint_is_carried_forward_over_unchanged_closeout(self) -> None:
         base = load_config("configs/smoke.toml", ROOT)

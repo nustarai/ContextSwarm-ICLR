@@ -3938,9 +3938,10 @@ def _run_elastic_cps(
         else None
     )
 
-    # This experiment arm is intentionally about semantic CPS closeout only.
-    # The separately owned checkpoint/recovery path may still exist in the
-    # runner for a future arm, but it is not enabled or consulted here.
+    # Semantic termination summaries and private candidate checkpoints are
+    # independently configured side channels.  A checkpoint treatment must
+    # not implicitly enable the same-session semantic closeout prompt, and a
+    # summary-only treatment must not install a filesystem snapshot callback.
     termination_summary_enabled = bool(
         config.termination_summary.enabled and policy.enabled
     )
@@ -5461,6 +5462,7 @@ def _run_elastic_cps(
             validation_status_override: str | None = None,
             validation_feedback_override: str | None = None,
             publish: bool | None = None,
+            phase: str = "attempt_result",
         ) -> None:
             """Persist one process-result handoff before recovery/closeout."""
 
@@ -5533,7 +5535,7 @@ def _run_elastic_cps(
                     episode=assignment.generation,
                     component="runner_wrapper",
                     operation="checkpoint_save",
-                    phase="termination_handoff",
+                    phase=phase,
                 ):
                     ref = checkpoint_store.save(
                         task_id=task.slug,
@@ -5591,6 +5593,7 @@ def _run_elastic_cps(
                     ),
                     best_candidate_sha256=best_sha256,
                     sequence=ref.sequence,
+                    phase=phase,
                     unverified=True,
                 )
             except Exception as exc:
@@ -5725,6 +5728,7 @@ def _run_elastic_cps(
                 validation_status_override=verdict.status,
                 validation_feedback_override=feedback,
                 publish=publish,
+                phase="final_validation",
             )
 
         termination_piece_ids_seen = set(termination_piece_ids_before)
@@ -6102,6 +6106,60 @@ def _run_elastic_cps(
                     recovery_attempt=recovery_attempt,
                 )
 
+            def on_pretermination_checkpoint(
+                reason: str,
+                recovery_attempt: int,
+            ) -> None:
+                """Capture the live workspace before Pi is terminated.
+
+                ``PiAgent`` invokes this callback at its soft timeout,
+                cancellation, or live-session error boundary.  The callback
+                receives no model text; the runner snapshots only the
+                candidate file and already durable CPS/Judge metadata.  The
+                ordinary result hook still runs after process drain and may
+                append a final validation snapshot.
+                """
+
+                if checkpoint_store is None:
+                    return
+                now = utc_now()
+                normalized_reason = str(reason or "termination").strip()[:64]
+                partial = AgentResult(
+                    agent_id=actor,
+                    task_id=task.slug,
+                    episode=assignment.generation,
+                    returncode=(
+                        124
+                        if normalized_reason == "timeout"
+                        else 130
+                        if normalized_reason == "cancelled"
+                        else 1
+                    ),
+                    started_at=now,
+                    finished_at=now,
+                    timed_out=normalized_reason == "timeout",
+                    cancelled=normalized_reason == "cancelled",
+                    run_horizon_reached=False,
+                    error_tail=(
+                        f"Pi termination checkpoint: {normalized_reason}"
+                    ),
+                )
+                logger.event(
+                    "checkpoint_pretermination_requested",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    recovery_attempt=recovery_attempt,
+                    reason=normalized_reason,
+                )
+                save_checkpoint_result(
+                    partial,
+                    recovery_attempt,
+                    True,
+                    publish=True,
+                    phase="pretermination",
+                )
+
             with judge_broker.session(
                 actor_id=actor,
                 episode=assignment.generation,
@@ -6124,7 +6182,7 @@ def _run_elastic_cps(
                 result = _run_solver_with_recovery(
                     config,
                     logger,
-                    lambda _recovery_attempt: pi_agent.run(
+                    lambda recovery_attempt: pi_agent.run(
                         task_id=task.slug,
                         actor_id=actor,
                         episode=assignment.generation,
@@ -6156,6 +6214,15 @@ def _run_elastic_cps(
                             config.termination_summary.on_error
                             if termination_summary_enabled
                             else False
+                        ),
+                        on_termination_checkpoint=(
+                            (
+                                lambda reason: on_pretermination_checkpoint(
+                                    reason, recovery_attempt
+                                )
+                            )
+                            if checkpoint_store is not None
+                            else None
                         ),
                     ),
                     task_id=task.slug,
