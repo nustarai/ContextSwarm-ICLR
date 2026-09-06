@@ -1,0 +1,9 @@
+extends = ["_matholympiadbench.toml"]
+
+[experiment]
+name = "formal-1h-6datasets-matholympiadbench-parallel"
+output_root = "runs/formal_1h_6datasets/matholympiadbench/parallel"
+mode = "parallel"
+communication = "none"
+max_parallel = 12
+episodes_per_task = 1

@@ -1,0 +1,10 @@
+extends = ["../random.toml"]
+
+[experiment]
+name = "issue38-formal-matholympiadbench-r02-random"
+output_root = "runs/issue38_formal/matholympiadbench/repeat2/random"
+seed = 1730
+
+[selection]
+seed = 1730
+

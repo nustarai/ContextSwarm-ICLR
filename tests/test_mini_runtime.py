@@ -42,6 +42,7 @@ from contextswarm_mini.pi_agent import (
     PiAgent,
     _event_text,
     _event_trace_fields,
+    _is_transport_diagnostic,
     _redact_sensitive_text,
     _usage_fields,
 )
@@ -2379,6 +2380,61 @@ class MiniRuntimeTests(unittest.TestCase):
             retry = next(row for row in rows if row["type"] == "auto_retry_start")
             self.assertEqual((retry["retry_attempt"], retry["error_category"]), (1, "timeout"))
 
+    def test_pi_rpc_marks_transport_diagnostic_recovered_after_successful_fallback(self) -> None:
+        """An intermediate provider error must not become a failed slot."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake = _write_fake_pi(
+                root,
+                "import json, sys\n"
+                "request = json.loads(sys.stdin.readline())\n"
+                "events = [\n"
+                " {'id': request['id'], 'type': 'response', 'command': 'prompt', 'success': True},\n"
+                " {'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'error', 'errorMessage': 'upstream request failed'}},\n"
+                " {'type': 'turn_end', 'message': {'role': 'assistant', 'stopReason': 'error', 'errorMessage': 'upstream request failed'}},\n"
+                " {'type': 'agent_end', 'willRetry': True},\n"
+                " {'type': 'auto_retry_start', 'attempt': 1, 'maxAttempts': 3, 'errorMessage': 'upstream request failed'},\n"
+                " {'type': 'message_start', 'message': {'role': 'assistant', 'content': []}},\n"
+                " {'type': 'message_update', 'assistantMessageEvent': {'type': 'text_delta', 'delta': 'OK'}},\n"
+                " {'type': 'message_end', 'message': {'role': 'assistant', 'stopReason': 'stop', 'content': [{'type': 'text', 'text': 'OK'}]}},\n"
+                " {'type': 'agent_end', 'willRetry': False},\n"
+                " {'type': 'agent_settled'},\n"
+                "]\n"
+                "for event in events: print(json.dumps(event), flush=True)\n"
+                "sys.stdin.read()\n",
+            )
+            result = PiAgent(_fake_pi_config(root, fake)).run(
+                task_id="task",
+                actor_id="agent",
+                episode=1,
+                prompt="hello",
+                workdir=root,
+            )
+            self.assertEqual(result.returncode, 0, result.error_tail)
+            self.assertTrue(result.settled)
+            self.assertTrue(result.assistant_success)
+            self.assertEqual(result.assistant_stop_reason, "stop")
+            self.assertTrue(result.transport_diagnostic)
+            self.assertTrue(result.transport_recovered)
+            # Keep the diagnostic for forensics while exposing the structured
+            # recovered bit to experiment-level circuit breakers.
+            self.assertIn("upstream request failed", result.error_tail)
+
+    def test_pi_rpc_classifies_provider_overload_as_transport_diagnostic(self) -> None:
+        self.assertTrue(
+            _is_transport_diagnostic(
+                "Codex error: Our servers are currently overloaded. Please try again later."
+            )
+        )
+        self.assertTrue(
+            _is_transport_diagnostic("An error occurred while processing your request...")
+        )
+        # A normal terminal candidate result must remain outside this
+        # provider classifier; the experiment-level breaker only consumes
+        # candidate-independent evidence.
+        self.assertFalse(_is_transport_diagnostic("Judge candidate failed: VERIFY_FAIL"))
+
     def test_pi_rpc_fails_closed_without_agent_settled(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2417,6 +2473,10 @@ class MiniRuntimeTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("settled with an error", result.error_tail)
+            self.assertTrue(result.settled)
+            self.assertFalse(result.assistant_success)
+            self.assertTrue(result.transport_diagnostic)
+            self.assertFalse(result.transport_recovered)
 
     def test_pi_rpc_prompt_rejection_is_immediate_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

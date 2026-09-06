@@ -1,0 +1,10 @@
+extends = ["../smoothed_popularity.toml"]
+
+[experiment]
+name = "issue38-formal-clever-r01-smoothed_popularity"
+output_root = "runs/issue38_formal/clever/repeat1/smoothed_popularity"
+seed = 1729
+
+[selection]
+seed = 1729
+

@@ -1,0 +1,10 @@
+extends = ["../random.toml"]
+
+[experiment]
+name = "issue38-formal-usaco-r01-random"
+output_root = "runs/issue38_formal/usaco/repeat1/random"
+seed = 1729
+
+[selection]
+seed = 1729
+

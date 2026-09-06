@@ -1,0 +1,25 @@
+extends = ["_base.toml"]
+
+[experiment]
+name = "issue38-formal-verina-bm25_mmr"
+output_root = "runs/issue38_formal/verina/bm25_mmr"
+
+[selection]
+selector_name = "bm25_mmr"
+
+[selection.policy_params]
+tokenizer_pattern = '[^\\W_]+'
+lowercase = true
+unicode_normalization = "NFKC"
+fields = { title = 2.0, body = 1.0, tags = 1.25 }
+bm25_k1 = 1.2
+bm25_b = 0.75
+bm25_idf = "robertson_log1p"
+candidate_depth = 64
+mmr_lambda = 0.70
+similarity = "cosine_tfidf"
+similarity_idf = "robertson_log1p"
+similarity_field_handling = "field_qualified_weighted_tf"
+score_precision = 8
+tie_break = "trace_id_asc"
+

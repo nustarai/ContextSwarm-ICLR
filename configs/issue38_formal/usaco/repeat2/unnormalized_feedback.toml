@@ -1,0 +1,10 @@
+extends = ["../unnormalized_feedback.toml"]
+
+[experiment]
+name = "issue38-formal-usaco-r02-unnormalized_feedback"
+output_root = "runs/issue38_formal/usaco/repeat2/unnormalized_feedback"
+seed = 1730
+
+[selection]
+seed = 1730
+

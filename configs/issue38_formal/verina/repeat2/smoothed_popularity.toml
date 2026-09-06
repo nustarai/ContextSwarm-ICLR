@@ -1,0 +1,10 @@
+extends = ["../smoothed_popularity.toml"]
+
+[experiment]
+name = "issue38-formal-verina-r02-smoothed_popularity"
+output_root = "runs/issue38_formal/verina/repeat2/smoothed_popularity"
+seed = 1730
+
+[selection]
+seed = 1730
+

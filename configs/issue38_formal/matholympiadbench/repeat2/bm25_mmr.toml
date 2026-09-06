@@ -1,0 +1,10 @@
+extends = ["../bm25_mmr.toml"]
+
+[experiment]
+name = "issue38-formal-matholympiadbench-r02-bm25_mmr"
+output_root = "runs/issue38_formal/matholympiadbench/repeat2/bm25_mmr"
+seed = 1730
+
+[selection]
+seed = 1730
+

@@ -1,0 +1,17 @@
+# Dataset overlay for verina; no arm-specific policy belongs here.
+extends = ["_base.toml"]
+
+[experiment]
+dataset = "verina"
+dataset_root = "benchmarks/verina"
+problem_ids = "benchmarks/verina/problem_ids.json"
+
+[judge]
+kind = "formal"
+env_id = "formal_verina"
+verification_profile = "formal_proof"
+judge_mode = "fast"
+
+[formal_tools]
+enabled = true
+require_decl_index = true

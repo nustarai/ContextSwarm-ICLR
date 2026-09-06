@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "benchmark_revision": "flt-statement-only-v1",
+  "upstream_repository": "https://github.com/anthropics/fermats-last-theorem",
+  "upstream_source_revision": "aa2d8b34692b16c70f699536de0d8e75a3a9e9ef",
+  "source_projection": "statement_only_no_solution_or_flt_source",
+  "entries": {
+    "fermat_last_theorem": {
+      "derivation_status": "statement_contract_copied_from_pinned_public_revision",
+      "baseline_sha256": "afaac6e659a5bb4c1a4ca920b440d34393155ed19f26236e5f677c7d6544e111",
+      "upstream_statement_sha256": "afaac6e659a5bb4c1a4ca920b440d34393155ed19f26236e5f677c7d6544e111"
+    }
+  }
+}

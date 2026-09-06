@@ -13,6 +13,18 @@ FORMAL_EXECUTION_CONTRACT = """Execution and verification contract (mandatory):
   surface, `python3 evaluate.py` and `./formal_query ...` are advisory diagnostics
   through the same controlled remote Judge capability; they never run Lean locally,
   select a candidate, or establish official success.
+- Internet and web access are prohibited. Do not browse the web, use a browser or
+  search engine, consult online Lean/Mathlib documentation, or use any
+  internet-connected tool.
+- Solve the task independently and answer carefully. Rely on your own mathematical
+  reasoning, the statement, the neutral baseline, and permitted Judge/CPS feedback;
+  do not copy or trust externally sourced proofs.
+- Independent construction does not prohibit Lean syntax, ordinary tactics, known
+  Mathlib APIs, or bounded declaration search such as `find`, `exact`, or `apply`.
+  Use those tools when they help. Do not inspect unrelated files, other workers,
+  host paths, or external completed FLT proofs, and do not make environment search
+  the only strategy. If a search becomes expensive, stop it and leave the strongest
+  candidate so one exploratory request does not monopolize Judge capacity.
 - The controlled Judge already owns the Lean/Mathlib toolchain, downloads,
   compilation, tests, and verification. Treat it as the only place where those
   operations may run; never reproduce any of them in the worker container.

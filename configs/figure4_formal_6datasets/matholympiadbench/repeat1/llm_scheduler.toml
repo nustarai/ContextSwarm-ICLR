@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: matholympiadbench, repeat 1, llm_scheduler.
+extends = ["../../_matholympiadbench.toml"]
+
+[experiment]
+name = "figure4-formal-matholympiadbench-r01-llm_scheduler"
+output_root = "runs/figure4_formal_6datasets/matholympiadbench/repeat-01/llm_scheduler"
+paired_repeat_id = 1
+seed = 1729
+
+[allocation]
+policy = "llm_scheduler"

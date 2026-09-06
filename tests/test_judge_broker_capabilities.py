@@ -209,6 +209,57 @@ class JudgeBrokerCapabilityTests(unittest.TestCase):
             self.assertTrue(sent["ok"])
             self.assertEqual(len(inbox["messages"]), 1)
 
+    def test_blackboard_inbox_is_task_local_and_hybrid_keeps_global_broadcasts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            broker, store, workdir, candidate = self._fixture(root)
+            store.send_message(
+                task_id="__global__",
+                sender="global-agent",
+                recipient=None,
+                body="global marker",
+            )
+            store.send_message(
+                task_id="task",
+                sender="task-agent",
+                recipient=None,
+                body="task marker",
+            )
+            try:
+                with broker.session(
+                    actor_id="agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3,
+                    cps_store=store,
+                    communication="blackboard",
+                ) as env:
+                    url = env["CONTEXTSWARM_JUDGE_URL"]
+                    self.assertEqual(_post(url, "judge_check", {})["status"], "VERIFY_FAIL")
+                    blackboard = _post(url, "cps_inbox", {})
+                with broker.session(
+                    actor_id="agent",
+                    workdir=workdir,
+                    candidates={"task": (_task(root), candidate)},
+                    deadline_monotonic=time.monotonic() + 3,
+                    cps_store=store,
+                    communication="hybrid",
+                ) as env:
+                    url = env["CONTEXTSWARM_JUDGE_URL"]
+                    self.assertEqual(_post(url, "judge_check", {})["status"], "VERIFY_FAIL")
+                    hybrid = _post(url, "cps_inbox", {})
+            finally:
+                broker.close()
+
+            self.assertEqual(
+                {item["body"] for item in blackboard["messages"]},
+                {"task marker"},
+            )
+            self.assertEqual(
+                {item["body"] for item in hybrid["messages"]},
+                {"task marker", "global marker"},
+            )
+
     def test_selection_search_callback_runs_after_checkpoint_and_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

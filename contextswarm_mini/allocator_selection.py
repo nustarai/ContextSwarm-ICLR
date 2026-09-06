@@ -42,6 +42,8 @@ DEFAULT_BOOTSTRAP_DRAWS = 10_000
 DEFAULT_BOOTSTRAP_SEED = 39039
 DEFAULT_TARGET_K = 6
 MIN_VALIDATION_REPEATS = 8
+FORMAL_MIN_VALIDATION_REPEATS = 3
+RULE_PHASES = ("development_validation", "formal_validation")
 BOOTSTRAP_METHOD = "paired_block_percentile"
 BOOTSTRAP_CONFIDENCE = 0.95
 BOOTSTRAP_QUANTILE = "linear"
@@ -590,6 +592,27 @@ def development_rule(*, validation_repeat_ids: Sequence[str] | None = None) -> d
     }
 
 
+def formal_rule(*, validation_repeat_ids: Sequence[str]) -> dict[str, Any]:
+    """Return the explicitly registered three-repeat formal rule.
+
+    The development proposal deliberately retains its eight-repeat minimum,
+    while the current operator-authorized Figure 4 run uses three paired
+    repeats per dataset.  Keeping this as a distinct phase makes the reduced
+    sample size visible in every selection artifact instead of silently
+    weakening the development rule.
+    """
+
+    ids = [str(item) for item in validation_repeat_ids]
+    if len(ids) != FORMAL_MIN_VALIDATION_REPEATS:
+        raise ValueError(
+            f"formal allocator selection requires exactly {FORMAL_MIN_VALIDATION_REPEATS} repeat IDs"
+        )
+    rule = development_rule(validation_repeat_ids=ids)
+    rule["phase"] = "formal_validation"
+    rule["minimum_validation_repeats"] = FORMAL_MIN_VALIDATION_REPEATS
+    return rule
+
+
 @dataclass(frozen=True)
 class _Cost:
     solver_calls: int
@@ -1102,9 +1125,9 @@ def parse_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
     if _text(rule.get("rule_id"), "rule_id") != RULE_ID:
         raise AllocatorSelectionError("unexpected allocator selection rule ID", code="invalid_rule")
     phase = _text(rule.get("phase", "development_validation"), "rule.phase")
-    if phase != "development_validation":
+    if phase not in RULE_PHASES:
         raise AllocatorSelectionError(
-            "rule.phase must be development_validation",
+            "rule.phase must be development_validation or formal_validation",
             code="invalid_rule",
         )
     if phase.lower() in {"posthoc", "post_hoc", "outcome_tuned"}:
@@ -1131,10 +1154,19 @@ def parse_rule(raw: Mapping[str, Any]) -> dict[str, Any]:
     ids = tuple(_pair_identity(item, "validation_split.paired_repeat_id") for item in split.get("paired_repeat_ids", ()))
     if not ids or len(set(ids)) != len(ids):
         raise AllocatorSelectionError("validation split must contain unique paired repeat IDs", code="invalid_rule")
-    minimum = _integer(rule.get("minimum_validation_repeats", MIN_VALIDATION_REPEATS), "minimum_validation_repeats", minimum=MIN_VALIDATION_REPEATS)
-    if minimum < MIN_VALIDATION_REPEATS:
+    phase_minimum = (
+        MIN_VALIDATION_REPEATS
+        if phase == "development_validation"
+        else FORMAL_MIN_VALIDATION_REPEATS
+    )
+    minimum = _integer(
+        rule.get("minimum_validation_repeats", phase_minimum),
+        "minimum_validation_repeats",
+        minimum=phase_minimum,
+    )
+    if minimum < phase_minimum:
         raise AllocatorSelectionError(
-            f"minimum_validation_repeats must be at least {MIN_VALIDATION_REPEATS}",
+            f"minimum_validation_repeats must be at least {phase_minimum} for {phase}",
             code="invalid_rule",
         )
     if len(ids) < minimum:
@@ -1467,6 +1499,7 @@ __all__ = [
     "canonical_json",
     "canonical_sha256",
     "development_rule",
+    "formal_rule",
     "load_paired_repeats",
     "load_rule",
     "parse_rule",
