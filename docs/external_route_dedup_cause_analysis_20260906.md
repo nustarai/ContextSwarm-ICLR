@@ -162,7 +162,4 @@ r2 control/treatment 的 `imo2023_p3` 分别是 `VERIFY_FAIL`/`COMPILES_WITH_SOR
 
 ## 可复核产物
 
-逐题结构化 JSON 和 episode 摘要属于实验归档中的原始证据，没有随本 PR 分发；本文已经嵌入
-了这些文件用于决策的聚合结果。对应逻辑证据 ID 为 `six-arm-detail-20260906` 和
-`six-arm-differing-tasks-20260906`。主报告位于仓库内的
-[`external_route_dedup_experiment_gpt6_20260905.md`](external_route_dedup_experiment_gpt6_20260905.md)。
+逐题结构化 JSON 和 episode 摘要属于实验归档中的原始证据，没有随本 PR 分发；本文已经嵌入了这些文件用于决策的聚合结果。对应逻辑证据 ID 为 `six-arm-detail-20260906` 和 `six-arm-differing-tasks-20260906`。主报告位于仓库内的 [`external_route_dedup_experiment_gpt6_20260905.md`](external_route_dedup_experiment_gpt6_20260905.md)。
