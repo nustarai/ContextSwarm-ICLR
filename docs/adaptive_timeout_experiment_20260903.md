@@ -50,7 +50,7 @@
 | 版本边界 | baseline 主要参考 source `33296b0`；r2/r3/r4 冻结在 `1de0079`；confirmation 启动于 `57b115e`；PR 随后同步最新 `main`，当前 head 未跑正式一小时 workload，仅通过代码门禁和 mock smoke 验证 |
 | 可比性边界 | 任务、horizon、模型和 Judge 合同保持一致，但 treatment 还伴随 recovery/cache 路径和 Agent 轨迹变化；r3/r4 并发时共享宿主机及外部 NuRouter/model capacity，因此这是方向性对照，不是严格单因素因果实验 |
 
-统计口径：`fresh` 指 accepted 且没有 completed/probe/remote cache reuse；tail share 指超过阈值的 fresh `elapsed_seconds` 总和除以全部 fresh elapsed。详细逐轮原始分母和运行身份见[详细实验记录附录](adaptive_timeout_experiment_20260903_details.md)。
+统计口径：`fresh` 指 accepted 且没有 completed/probe/remote cache reuse；tail share 指超过阈值的 fresh `elapsed_seconds` 总和除以全部 fresh elapsed。r1/r2 的历史逐轮快照见[历史实验记录附录](adaptive_timeout_experiment_20260903_details.md)；r3/r4 和 confirmation 的当前决策相关聚合已直接列于本报告，原始 JSONL 未随 PR 分发。
 
 ## 4. 结论
 
@@ -135,4 +135,4 @@ baseline 三轮的最大 fresh elapsed 分别为 603.290、602.894、602.280 秒
 
 在这两项证据完成前，建议合并代码但保持 Agent timeout capability opt-in，不把本实验升级为质量或生产性能的普遍性结论。
 
-详细逐轮数据、运行身份和原始证据索引：[详细实验记录附录](adaptive_timeout_experiment_20260903_details.md)。实现 PR：[Make Agent validation budgets config-driven and cumulative](https://github.com/nustarai/ContextSwarm-ICLR/pull/50)。
+r1/r2 历史快照和证据边界：[历史实验记录附录](adaptive_timeout_experiment_20260903_details.md)；r3/r4/confirmation 的决策相关聚合见本报告上文，原始 JSONL 未随 PR 分发。实现 PR：[Make Agent validation budgets config-driven and cumulative](https://github.com/nustarai/ContextSwarm-ICLR/pull/50)。

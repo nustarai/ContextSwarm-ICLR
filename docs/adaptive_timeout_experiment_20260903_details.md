@@ -1,13 +1,15 @@
-# Agent 提议验证超时：MathOlympiadBench 详细实验记录（附录）
+# Agent 提议验证超时：MathOlympiadBench 详细实验记录（r1/r2 历史快照）
 
 > 面向决策的结论版报告见 [`adaptive_timeout_experiment_20260903.md`](adaptive_timeout_experiment_20260903.md)。
-> 本文件保留逐轮原始分母、运行审计、实现讨论和证据边界，供复核使用；不作为主要结论入口。
+> 本文件保留 r1/r2 的逐轮原始分母、运行审计、实现讨论和证据边界，供历史复核使用；不作为
+> 当前 r2/r3/r4/confirmation 聚合的主要结论入口。当前决策以主报告第 5 节为准，原始 JSONL
+> 和运行方受控 artifact 不随 PR 分发。
 
 > **实验目的**：验证让 Agent 为 `judge_check` 和 `evaluate_local` 提议一次验证预算，
 > 同时由 broker/evaluator 做硬上限裁剪，是否能缓解少量验证长尾占用大量总时长的问题。
 >
-> **记录状态**：实现与四轮 treatment run 已完成，并补做了一轮配置驱动提示修正后的
-> confirmation run：`treatment-r1` 是旧的
+> **记录状态**：本快照记录实现早期的 r1/r2 treatment；后续 r3/r4 与配置驱动提示修正后的
+> confirmation run 已在主报告中补充。`treatment-r1` 是旧的
 > `max_retries=0` 语义，`treatment-r2/r3/r4` 使用本节所述的累计预算语义。r3/r4
 > 按用户要求并发运行，并共享宿主机的外部模型/NuRouter 容量；它们的 worktree、Judge
 > runtime、端口、容器和输出目录彼此隔离。本文的数值结论仅适用于列明的
