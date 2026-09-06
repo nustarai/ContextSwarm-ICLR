@@ -1,0 +1,13 @@
+# Infrastructure check only; never include this run in paper aggregates.
+extends = ["../issue38_formal/matholympiadbench/repeat1/recency.toml"]
+
+[experiment]
+name = "maintenance-smoke-issue38-matholympiadbench-recency"
+output_root = "runs/maintenance_smoke/issue38"
+time_limit_seconds = 180
+
+[pi]
+timeout_seconds = 180
+
+[allocation]
+agent_timeout_seconds = 180

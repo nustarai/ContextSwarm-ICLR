@@ -1,0 +1,10 @@
+extends = ["../recency.toml"]
+
+[experiment]
+name = "issue38-formal-usaco-r02-recency"
+output_root = "runs/issue38_formal/usaco/repeat2/recency"
+seed = 1730
+
+[selection]
+seed = 1730
+

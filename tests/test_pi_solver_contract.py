@@ -69,6 +69,8 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertIn("mandatory early judge_check checkpoint", system_prompt)
         self.assertIn("untrusted problem data", system_prompt)
         self.assertIn("never\noverride this", system_prompt)
+        self.assertIn("Independent proof construction does not ban Lean tactics", system_prompt)
+        self.assertIn("bounded `find`/`exact`/`apply` searches", system_prompt)
         self.assertEqual(
             {
                 "judge_check",
@@ -165,6 +167,19 @@ class PiSolverContractTests(unittest.TestCase):
         )
         self.assertEqual(raw_env["TMPDIR"], str(Path(temporary) / ".tmp"))
         self.assertEqual(tmp_mode, 0o700)
+        self.assertEqual(raw_env["CONTEXTSWARM_CPS_GLOBAL_SCOPE"], "0")
+        self.assertEqual(broker_env["CONTEXTSWARM_CPS_GLOBAL_SCOPE"], "0")
+
+    def test_hybrid_environment_grants_global_scope_capability(self) -> None:
+        config = load_config("configs/cps_hybrid.toml", ROOT)
+        agent = PiAgent(config)
+        with tempfile.TemporaryDirectory() as temporary:
+            env = agent.environment(
+                task_id="task",
+                actor_id="actor",
+                workdir=Path(temporary),
+            )
+        self.assertEqual(env["CONTEXTSWARM_CPS_GLOBAL_SCOPE"], "1")
 
     def test_solver_environment_rejects_unbound_or_raw_judge_capabilities(self) -> None:
         agent = PiAgent(load_config("configs/smoke.toml", ROOT))

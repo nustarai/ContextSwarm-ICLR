@@ -74,6 +74,16 @@ class AgentResult:
     scheduler_outcome: str | None = None
     invalid_output: bool = False
     recoverable_invocation_error: bool = False
+    # Pi may emit a provider/transport diagnostic for an intermediate retry
+    # and then complete the same logical prompt successfully (for example a
+    # WebSocket attempt followed by an SSE fallback).  Keep that lifecycle
+    # evidence separate from the final agent outcome so experiment-level
+    # recovery code cannot mistake recovered noise for a failed slot.
+    settled: bool = False
+    assistant_success: bool = False
+    assistant_stop_reason: str | None = None
+    transport_diagnostic: bool = False
+    transport_recovered: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +106,11 @@ class AgentResult:
             "scheduler_outcome": self.scheduler_outcome,
             "invalid_output": self.invalid_output,
             "recoverable_invocation_error": self.recoverable_invocation_error,
+            "settled": self.settled,
+            "assistant_success": self.assistant_success,
+            "assistant_stop_reason": self.assistant_stop_reason,
+            "transport_diagnostic": self.transport_diagnostic,
+            "transport_recovered": self.transport_recovered,
         }
 
 

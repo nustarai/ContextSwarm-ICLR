@@ -1,0 +1,10 @@
+extends = ["../unnormalized_feedback.toml"]
+
+[experiment]
+name = "issue38-formal-clever-r01-unnormalized_feedback"
+output_root = "runs/issue38_formal/clever/repeat1/unnormalized_feedback"
+seed = 1729
+
+[selection]
+seed = 1729
+

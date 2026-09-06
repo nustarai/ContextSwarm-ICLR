@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: icpc_wf_2025, repeat 2, task_state.
+extends = ["../../_icpc_wf_2025.toml"]
+
+[experiment]
+name = "figure4-formal-icpc_wf_2025-r02-task_state"
+output_root = "runs/figure4_formal_6datasets/icpc_wf_2025/repeat-02/task_state"
+paired_repeat_id = 2
+seed = 1730
+
+[allocation]
+policy = "task_state"

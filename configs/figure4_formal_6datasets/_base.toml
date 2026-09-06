@@ -1,0 +1,69 @@
+# Formal Issue #39 allocator matrix: six datasets, three paired repeats.
+#
+# The selector identity is frozen from the corrected remote Figure 3 result.
+# Every arm keeps the same selector, model, horizon, CPS capacity, evaluator,
+# and candidate-transfer boundary; only allocation.policy changes in a leaf.
+extends = ["../figure3_formal/_base.toml"]
+
+[experiment]
+name = "figure4-formal-6datasets-base"
+output_root = "runs/figure4_formal_6datasets"
+figure4_phase = "formal"
+figure3_readiness = "formal_issue39_recency_freeze_v1"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 24
+initial_agents_per_task = 2
+max_attempts_per_task = 0
+cancel_on_proved = true
+assignment_policy = "least_active"
+episodes_per_task = 2
+max_tasks = 12
+time_limit_seconds = 3600
+# Repeat leaves override only this paired-run seed.  The selector identity
+# seed remains 1729 in every leaf, as required by the formal Figure 4 bridge.
+seed = 1729
+
+[allocation]
+policy = "uniform_refill"
+piece_limit_per_task = 3
+piece_body_chars = 1200
+agent_timeout_seconds = 3600
+prompt_max_bytes = 65536
+prompt_max_tokens = 65536
+
+[aisw]
+enabled = true
+max_in_flight = 24
+
+[pi]
+timeout_seconds = 3600
+
+[judge]
+max_concurrent_evaluations = 4
+require_result_cache_disabled = true
+
+[formal_tools]
+require_decl_index = true
+
+[docker]
+image = "contextswarm-iclr-mini:formal-issue39-6x3"
+memory_mb = 16384
+network = "bridge"
+
+[selection]
+enabled = true
+selector_name = "recency"
+selector_version = "icpc_formal_v1"
+visibility = "project_shared"
+trace_slot_limit = 8
+context_token_budget = 4096
+tokenizer = "utf8_bytes_ceil_div4_v1"
+seed = 1729
+tie_break = "trace_id_asc"
+direct_messages = false
+# Formal Figure 4 intentionally preserves task-local best-candidate handoff.
+candidate_transfer = true
+
+[selection.policy_params]
+primary_sort = "commit_seq_desc"

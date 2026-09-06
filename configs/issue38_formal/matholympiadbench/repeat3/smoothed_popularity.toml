@@ -1,0 +1,10 @@
+extends = ["../smoothed_popularity.toml"]
+
+[experiment]
+name = "issue38-formal-matholympiadbench-r03-smoothed_popularity"
+output_root = "runs/issue38_formal/matholympiadbench/repeat3/smoothed_popularity"
+seed = 1731
+
+[selection]
+seed = 1731
+

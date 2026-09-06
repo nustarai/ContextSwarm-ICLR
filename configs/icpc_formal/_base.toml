@@ -33,7 +33,10 @@ agent_timeout_seconds = 3600
 [pi]
 timeout_seconds = 3600
 
-[aisw]
+[nurouter]
+# The loader accepts the historical [aisw] spelling, but formal manifests use
+# the actual provider name explicitly.  The released launcher still exports
+# AISW_* compatibility variables because that is NuRouter's wire contract.
 enabled = true
 max_in_flight = 24
 

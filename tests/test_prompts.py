@@ -81,6 +81,9 @@ class PromptContractTests(unittest.TestCase):
             "parallel processes",
             "Never call a raw Judge or evaluator HTTP endpoint",
             "Never fall back to",
+            "Independent construction does not prohibit Lean syntax",
+            "bounded declaration search such as `find`, `exact`, or `apply`",
+            "Do not inspect unrelated files",
         )
         for name, prompt in self._all_solver_prompts().items():
             with self.subTest(prompt=name):

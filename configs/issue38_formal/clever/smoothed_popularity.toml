@@ -1,0 +1,18 @@
+extends = ["_base.toml"]
+
+[experiment]
+name = "issue38-formal-clever-smoothed_popularity"
+output_root = "runs/issue38_formal/clever/smoothed_popularity"
+
+[selection]
+selector_name = "smoothed_popularity"
+
+[selection.policy_params]
+alpha = 1.0
+beta = 1.0
+positive_kinds = ["useful", "diagnostic_useful", "route_improving"]
+negative_kinds = ["not_useful", "misleading", "stale", "unsafe", "duplicate", "needs_refinement"]
+score_precision = 8
+tie_break = "trace_id_asc"
+feedback_values = { useful = 1.0, not_useful = -1.0, misleading = -2.0, stale = -1.25, unsafe = -3.0, duplicate = -0.5, diagnostic_useful = 0.75, needs_refinement = -0.25, not_used = 0.0, route_attempted = 0.0, route_improving = 2.0 }
+

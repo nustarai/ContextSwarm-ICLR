@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: matholympiadbench, repeat 1, task_state.
+extends = ["../../_matholympiadbench.toml"]
+
+[experiment]
+name = "figure4-formal-matholympiadbench-r01-task_state"
+output_root = "runs/figure4_formal_6datasets/matholympiadbench/repeat-01/task_state"
+paired_repeat_id = 1
+seed = 1729
+
+[allocation]
+policy = "task_state"

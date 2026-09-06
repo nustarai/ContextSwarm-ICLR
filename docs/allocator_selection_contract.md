@@ -7,13 +7,18 @@ not change a runner, re-run an arm, or replace the independent Figure 4 audit.
 
 ## Frozen decision order
 
-Before official repeats, the experiment owner must publish one rule artifact
-with a rule ID, at least eight validation repeat IDs, target `k`, bootstrap
-algorithm/seed, tie-break, and numeric cost thresholds.  The frozen interval
-uses exactly 10,000 paired-block percentile draws, 95% confidence, and linear
-quantiles.  The development helper emits
-`figure4_allocator_selection_v1` with explicit proposal values; those values
-are development defaults, not silently registered formal settings.
+Before repeats, the experiment owner must publish one rule artifact with a
+rule ID, validation repeat IDs, target `k`, bootstrap algorithm/seed, tie-break,
+and numeric cost thresholds.  The frozen interval uses exactly 10,000
+paired-block percentile draws, 95% confidence, and linear quantiles.
+
+There are two explicit rule phases.  `development_validation` retains the
+eight-repeat proposal in `configs/allocator_selection_rule_dev.json`.  The
+current operator-authorized six-dataset Figure 4 run uses
+`formal_validation` and exactly three paired repeats per dataset, as frozen in
+`configs/allocator_selection_rule_formal_3repeat.json`.  This is a
+small-sample engineering validation; its intervals must not be presented as
+an eight-repeat publication-strength claim.
 
 The input must contain complete paired blocks with exactly these four arms, in
 this registry order:
@@ -69,11 +74,12 @@ seeds, bootstrap metadata, all guardrail outcomes, and the paired
 `status: "no_selection"` with a bounded reason; downstream Ours must stop
 instead of guessing an allocator.
 
-This artifact is a validation/development decision.  It must not include
-formal/official repeat-control fields or be changed after formal outcomes are
-observed.  If `trace_state` is selected, a separate claim gate still requires
-nonzero same-state reallocation and a positive lower interval for
-Trace-State minus Task-State; selection alone is not a benefit claim.
+This artifact records the selected validation phase and must not be changed
+after the corresponding outcomes are observed.  If `trace_state` is selected,
+a separate claim gate still requires nonzero same-state reallocation and a
+positive lower interval for Trace-State minus Task-State; selection alone is
+not a benefit claim.  A three-repeat result must carry its small-sample caveat
+into downstream reports.
 
 ## CLI
 

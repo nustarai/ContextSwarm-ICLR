@@ -157,6 +157,45 @@ class Figure4AuditTests(unittest.TestCase):
             report = audit_figure4(paths)
             self.assertTrue(report["ok"], report)
 
+    def test_runner_prefixed_stale_disposition_is_nonadmitted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _make_fixture(Path(directory))
+            summary = _summary("trace_state")
+            summary["allocation_metrics"]["decisions"] = 2
+            _write(paths["trace_state"] / "figure4_run_summary.json", summary)
+            (paths["trace_state"] / "allocation_decisions.jsonl").write_text(
+                json.dumps({"decision_id": "d1", "policy": "trace_state", "admitted_task_id": "task-a"})
+                + "\n"
+                + json.dumps(
+                    {
+                        "decision_id": "d2",
+                        "policy": "trace_state",
+                        "disposition": "not_admitted_stale",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = audit_figure4(paths)
+            self.assertTrue(report["ok"], report)
+
+    def test_unknown_prefixed_disposition_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = _make_fixture(Path(directory))
+            (paths["trace_state"] / "allocation_decisions.jsonl").write_text(
+                json.dumps(
+                    {
+                        "decision_id": "d1",
+                        "policy": "trace_state",
+                        "disposition": "not_admitted_unknown",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            report = audit_figure4(paths)
+            self.assertFalse(report["ok"])
+
     def test_score_identity_and_argmax_are_recomputed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = _make_fixture(Path(directory))
