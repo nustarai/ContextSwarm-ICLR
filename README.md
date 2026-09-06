@@ -63,6 +63,34 @@ workers/mono/tasks/<task>/result.lean # mono
 
 `--mock-agent` 只验证编排和产物，不代表论文分数。
 
+## 可选资源 profiling（默认关闭）
+
+设置 `CONTEXTSWARM_PROFILE=1` 才会在 run 目录生成受权限保护的
+`profiling.jsonl`；默认路径不会创建 profiling 文件、sampler 线程或额外的
+profiling 写入。事件只保留低基数身份、计数器和资源标量，不写 prompt、candidate、
+secret、provider response 或主机路径。采样周期有界，artifact/JSONL 统计以低频快照
+和单行追加写入控制观测自身的开销。
+
+`resource.sample` 是包含 runner/shared 进程树的 run-level aggregate；注册的
+`resource.process` 行则按 solver/attempt 的 task 与 actor 归属，并可包含该根进程的
+descendants。两者的进程集合可能重叠，不能把 runner aggregate 与 solver rows 直接
+相加；aggregate 用于整体峰值，solver rows 用于归属分析，无法安全分摊的部分单列。
+在 cgroup v2 下优先读取当前进程 `0::` scope，只有 scope 不可用时才回退到层级根。
+
+六个主目标及独立 `record_search_lock` 诊断的事件覆盖矩阵、Agent/wrapper 分界、SQLite
+锁/WAL 解读、互斥分支和一次运行的限制见
+[`docs/profiling_metric_contract.md`](docs/profiling_metric_contract.md)；profile 结束后用
+只读的 [`scripts/audit_profiling.py`](scripts/audit_profiling.py) 检查 coverage、真实性
+等级和退出码。一次 profiling-on 真实 run 的字段清单见
+[`docs/profiling_one_run_checklist.md`](docs/profiling_one_run_checklist.md)；实际运行前的参数/证据交接约束见
+[`docs/profiling_dispatch_checklist.md`](docs/profiling_dispatch_checklist.md)。
+
+外部 formal Judge/Lean backend、router 和 worker 的宿主进程不属于 runner 的进程树，
+需要单独使用只读的 `scripts/external_resource_sampler.py` 采样。它要求操作者显式提供
+各层 root PID，输出 baseline、run-window、delta、RSS/PSS、累计及窗口 CPU、throttle、
+PID/线程和 cgroup counters；不会读取命令行/环境、发送请求或把 warm Judge 内存算到 agent。
+完整字段、边界和离线测试见 [`docs/external_resource_sampler.md`](docs/external_resource_sampler.md)。
+
 ## Docker + NuRouter/AISW Pi
 
 先构建镜像：

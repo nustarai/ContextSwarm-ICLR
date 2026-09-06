@@ -1,0 +1,15 @@
+extends = ["smoke.toml"]
+
+[experiment]
+name = "mobench-route-claim-smoke"
+max_parallel = 3
+initial_agents_per_task = 2
+episodes_per_task = 2
+max_tasks = 3
+time_limit_seconds = 3
+
+[cps_features]
+route_claim_required = true
+route_claim_ttl_seconds = 60
+per_recipient_receipts = false
+knowledge_promotion = false
