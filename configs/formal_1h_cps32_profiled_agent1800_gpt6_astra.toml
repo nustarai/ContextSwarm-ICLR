@@ -1,0 +1,6 @@
+extends = ["formal_1h_cps32_profiled_agent_timeout_gpt6_astra_base.toml"]
+
+# B: give the same logical actor one uninterrupted 1800-second Pi invocation.
+# Timeout recovery remains disabled; abnormal non-timeout recovery is unchanged.
+[pi]
+timeout_seconds = 1800

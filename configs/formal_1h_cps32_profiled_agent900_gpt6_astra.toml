@@ -1,0 +1,6 @@
+extends = ["formal_1h_cps32_profiled_agent_timeout_gpt6_astra_base.toml"]
+
+# A: terminate a timed-out logical actor after one uninterrupted 900-second
+# Pi invocation.  Abnormal non-timeout recovery remains unchanged.
+[pi]
+timeout_seconds = 900
