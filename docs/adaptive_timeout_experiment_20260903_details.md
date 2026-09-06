@@ -595,35 +595,24 @@ confirmation run 为 `5`，这是积极但非因果、非稳定的方向性信�
 
 ### 7.1 本轮可回读证据
 
-以下路径均位于本机 workspace 的 ZFS 磁盘，保留原始 JSONL 与脱敏审计报告；路径中不包含
-凭据或私有 Judge endpoint：
+原始 JSONL、审计报告和 supervisor 日志保留在运行方的受控存储中，不随 PR 分发；下面只列
+可移植的逻辑证据 ID。主报告中的聚合分母和结论不依赖这些本机路径，复核者可根据 ID 在获
+授权后回读对应 artifact：
 
-- r2 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-20260903/runs/adaptive-timeout-20260903/treatment-r2/20260903T103509Z-251d9cbe`
-- r3 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r3-launch/runs/adaptive-timeout-20260903/treatment-r3/20260903T124445Z-c244cd48`
-- r4 run：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-r4-launch/runs/adaptive-timeout-20260903/treatment-r4/20260903T124445Z-bacd88ea`
-- confirmation run（primary-fix image）：`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/adaptive-timeout-20260903/runs/adaptive-timeout-20260904-confirm/20260903T205925Z-12d09a89`
-- pre-merge HEAD host mock smoke：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-final-smoke/output/20260903T220703Z-ce533f47`（exit 0）
-- canonical-main merge 后、文档收尾 commit 之前的 merged-code image mock smoke：
-  `runs/adaptive-timeout-final-merged-image-smoke/20260903T222645Z-018be183`（相对路径相对于本
-  worktree）。该 run 使用 `configs/3min_cps.toml`、`--mock-agent`，`status=COMPLETED`、
-  `score=0/12`（12 个 `MOCK_SKIPPED`，不是正式 Judge 质量结果），
-  `judge_broker_closeout={active_handlers:0, drained:true, remote_unsettled_jobs:0}`；镜像
-  `sha256:cdaca50697e7903b92822af31fa07e55c3f5ed32b5268dc3210ab32815d6055d` 的 OCI
-  revision label 与当时的 code merge head `40d1b71f19326c980ce5b0621b11e0b8727b4186` 一致；
-  随后的提交只更新本报告，不改变 runtime code。
-- profiling audit：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r2/profiling-audit.json`、
-  `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/profiling-audit.json`、
-  `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r4/profiling-audit.json`、
-  `/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260904-confirm/profiling-audit.json`；四份均
-  `exit_code=1`，原因是上文列出的 dropped fields/未闭合 span，而不是敏感字段或 termination 缺失。
-- Judge supervisor logs：`/home/ubuntu/workspace/.workspace/builds/adaptive-timeout-20260903-r3/judge/supervisor.log`
-  和 `...-r4/judge/supervisor.log` 均记录 `supervisor_exit=0`；对应容器、backend/proxy
-  进程和本轮端口在 closeout 后均已退出。
-- 代码 hardening commit `5865956`（随后由独立文档 commit 记录）的 timeout/formal focused tests 为 `134 passed, 1 skipped`；
-  merge 后新增/回归的 adaptive-timeout focused set 为 `27 passed`，3 个 launch-contract
-  tests 也通过。`compileall`、`node --check` 和 `git diff --check` 均通过；在 clean
-  worktree、`PYTHONWARNINGS=ignore::ResourceWarning`（只隐藏既有资源告警）下完整
-  `python3 -m unittest discover -s tests -p 'test_*.py'` 为 `796 tests, OK (skipped=1)`。
-  未抑制告警的完整 discovery 曾分别触发两个使用极短 horizon 的顺序/调度敏感断言，单测
-  重复均通过；它们不是 timeout 合同断言，也没有在最终带告警抑制的完整复跑中重现，故不把
-  这类环境性波动写成 timeout 实现回归。
+- `treatment-r2/20260903T103509Z-251d9cbe`
+- `treatment-r3/20260903T124445Z-c244cd48`
+- `treatment-r4/20260903T124445Z-bacd88ea`
+- `confirmation/20260903T205925Z-12d09a89`
+- `pre-merge-head-host-mock/20260903T220703Z-ce533f47`（exit 0）
+- `merged-main-image-mock/20260903T222645Z-018be183`：`status=COMPLETED`、`score=0/12`
+  （12 个 `MOCK_SKIPPED`，不是正式 Judge 质量结果），`active_handlers=0`、`drained=true`、
+  `remote_unsettled_jobs=0`。
+- `profiling-audit/{r2,r3,r4,confirmation}`：四份均 `exit_code=1`，原因是上文列出的
+  dropped fields/未闭合 span，而不是敏感字段或 termination 缺失。
+- `judge-supervisor/{r3,r4}`：`supervisor_exit=0`；对应容器、backend/proxy 进程和本轮
+  端口在 closeout 后均已退出。
+- `validation-gates`：timeout/formal focused tests `134 passed, 1 skipped`；merge 后
+  adaptive-timeout focused set `27 passed`，3 个 launch-contract tests 也通过；
+  `compileall`、`node --check` 和 `git diff --check` 均通过；完整 discovery 为
+  `796 tests, OK (skipped=1)`。未抑制告警时曾有两个极短 horizon 的顺序/调度敏感断言，
+  重复单测均通过，最终带告警抑制的复跑未重现，故不把它们写成 timeout 实现回归。
