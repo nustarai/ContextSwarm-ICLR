@@ -430,7 +430,7 @@ scripts/run_docker.sh --config configs/formal_1h_cps32_profiled_route_claim.toml
 
 三条真实命令由 supervisor 同时后台启动；这里省略了只存在于 operator 环境的 Judge loopback 注入和 NuRouter capability 参数，避免把机器路径/凭据写入文档。变量和 output 必须指向 owner-only、磁盘支持的目录；这段命令不能复现第 13 节的隔离协议。
 
-历史并行尝试的脱敏汇总产物：`/home/ubuntu/workspace/.workspace/builds/CS-20260904-route-claims-real3/evidence/route-claim-real3-summary.json`；每个 run 的原始 profiling/Judge/CPS 文件保留在 `runs/route-claim-real3/run{1,2,3}/<run-id>/`，不在报告中展开 prompt、response、route summary 或凭据。
+历史并行尝试的脱敏汇总产物以逻辑证据 ID `route-claim-real3-summary` 标识；每个 run 的原始 profiling、Judge、CPS 文件保留在受限实验归档中，不在报告中展开 prompt、response、route summary 或凭据。
 
 ## 13. 用户纠正后的严格顺序、独立 Judge 三轮真实运行
 
@@ -547,14 +547,14 @@ run1 的 final Judge health snapshot 因首次 harness 的收尾实现缺陷没�
 
 ### 13.7 脱敏产物与复现边界
 
-本次顺序三轮的脱敏汇总为：`/home/ubuntu/workspace/.workspace/builds/CS-20260904-route-claims-seq-isolated/evidence/sequential_isolated_summary.json`（schema `contextswarm_sequential_isolated_experiment_v1`）。其中只保存 provenance、时间窗口、计数、健康摘要、协议顺序和 profiling audit 摘要，不保存原始 prompt、model response、route summary、账号、token 或节点配置。
+本次顺序三轮的脱敏汇总以逻辑证据 ID `sequential-isolated-summary` 标识（schema `contextswarm_sequential_isolated_experiment_v1`）。其中只保存 provenance、时间窗口、计数、健康摘要、协议顺序和 profiling audit 摘要，不保存原始 prompt、model response、route summary、账号、token 或节点配置。
 
 逐轮原始证据位于：
 
-`/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/route-claims-profiled-20260903/runs/route-claims-seq-isolated/run{1,2,3}/<run-id>/`
+对应的原始 run 目录属于受限实验归档，不随 PR 分发。
 
 operator 侧的顺序 harness 和 bounded evidence 位于：
 
-`/home/ubuntu/workspace/.workspace/builds/CS-20260904-route-claims-seq-isolated/`
+对应的实验归档属于 owner-only 存储，不随 PR 分发。
 
 真实入口脚本是 `run_sequential_isolated.sh`；它的关键合同是“一个 run 完成后才 teardown，再启动下一个”，不是把三条 runner 命令放到后台并行。该目录位于 workspace ZFS 磁盘支持的 owner-only build root；实验结束时任务端口已释放，未执行远端部署、生产写入或不可逆清理。
