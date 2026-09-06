@@ -133,11 +133,11 @@ Runner 能强制保存已经存在于文件、CPS、Judge feedback 和可读 res
 
 另外以相同的有限 mock 合同打开 profiling（2 秒 horizon、最多 2 次 assignment）核对新增成本边界：treatment 的 4 次保存 span 合计 14.473 ms、2 次发布 span 合计 3.919 ms；baseline 没有这些 span。该数字只表示本机小候选/SQLite 的编排开销，不能外推到真实 Pi、Judge 或 32-slot 一小时运行。摘要为 `evidence/profiled-smoke3-comparison-1788493576.json`，其中每个 span 同时保留 wall/CPU 字段。
 
-建议的本地验证命令（输出目录应位于磁盘支持的 `.workspace/builds/CS-20260904/`）：
+建议的本地验证命令（输出目录应位于任务私有、磁盘支持的 build 根目录）：
 
 ```bash
 umask 0022
-TMPDIR=/home/ubuntu/workspace/.workspace/builds/CS-20260904/tmp \
+TMPDIR="${TASK_BUILD_ROOT}/tmp" \
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. \
 python3 -m unittest tests.test_checkpoint tests.test_cps_recovery_partial tests.test_agent_recovery
 python3 -m compileall -q contextswarm_mini
@@ -192,4 +192,4 @@ publish = true
 
 ## 6. 运行阻塞与下一步
 
-只读预检显示本机没有 `contextswarm-iclr-mini:latest`、Judge URL/cache-health 环境变量或本机节点配置；根据 workspace contract，不能启动已停止的旧 Test Lab，也不能从 `48.3:29089` 端口推断可用的 Coordinator/Judge。要完成三次真实 treatment，需要用户/部署者提供当次 Judge/Lean 访问边界、匹配节点和可复核的 runtime 输入；收到后先做只读 preflight，再按上面的固定合同串行运行。
+只读预检显示当前执行环境没有目标容器镜像、Judge URL/cache-health 环境变量或节点配置；根据 workspace contract，不能启动已停止的旧 Test Lab，也不能从一个远端入口地址推断可用的 Coordinator/Judge。要完成三次真实 treatment，需要用户/部署者提供当次 Judge/Lean 访问边界、匹配节点和可复核的 runtime 输入；收到后先做只读 preflight，再按上面的固定合同串行运行。

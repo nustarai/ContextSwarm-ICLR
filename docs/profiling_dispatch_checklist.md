@@ -10,7 +10,7 @@
 | 项目 | 值 |
 | --- | --- |
 | 仓库 | `ContextSwarm-ICLR` |
-| 隔离 worktree | `/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/profiling-capacity-20260828` |
+| 隔离 worktree | `<task-private-worktree>/profiling-capacity-20260828` |
 | 分支 | `profiling-capacity-20260828` |
 | 本轮起点 | `6f49b4e` |
 | Herd workspace | `w8`（`ContextSwarm`） |
@@ -71,7 +71,7 @@ coding canary 的本地前置材料已经具备：Judge bundle 来源 commit
   `Imo2024P1`）已经绑定；Lean `4.9.0`、Mathlib `v4.9.0`、REPL、SafeVerify
   workspace 均已就绪。declaration index 为 `decl_index_v1`，`153,467` 行，
   `PRAGMA quick_check=ok`，operator-local 产物在
-  `/home/ubuntu/workspace/.workspace/builds/formal-runtime-1x1-20260829/`。
+  `<task-private-build-root>/formal-runtime-1x1-20260829/`。
 - **Judge runtime**：direct/group kernel smoke 均返回 `PROVED`；corrected 1×1
   通过 task-local observe-only compatibility route `28201 → 28149` 完成真实
   evaluator closeout（health `ok=true`）。Judge/Lean 常驻 worker 属于外部服务
@@ -127,7 +127,7 @@ coding canary 的本地前置材料已经具备：Judge bundle 来源 commit
 | PF-012 | P1：最终验证编排：compileall、focused suites、串行 full unittest、mock smoke、audit、diff/hygiene | `profiling-final-validation` `w8:tF/pM` `final_validation` | 只读验证和报告 | 依赖 PF-001~011；不得真实网络 | done（有 3 个预期 dirty-worktree 合同失败） | 最新 worktree 全套串行 `694 tests`：仅 3 个正式 launch/container contract 测试因当前 worktree 有意存在 tracked profiling 修改而拒绝启动；同三项在干净基线 worktree 单独通过。它们是 dirty-worktree 前置合同失败，不是 profiling 运行时失败，也不能计作 CI 通过。Figure4 极短 50ms 测试在整套中本次通过；独立基线曾同样出现调度抖动失败。未触发真实网络。专项最新结果：profiling/audit/trace 36+81、CPS/evaluator/Judge 147、runner/recovery 47、selection contracts 88；manifest 45 中 1 个环境抖动失败，其他通过。最新 off/on mock 与审计仍通过。 |
 | PF-013 | P1：Pi 侧可选 hook 评估，确认现有 `pi_agent.py` heartbeat/usage/process 指标是否足够 | `profiling-pi` `w8:tD/pH` `pi_profile_agent` | 优先只读；不得改持久 home | 依赖 PF-002/PF-006 | done/conditional | 已完成 binary/launcher/extension/config 与启动前置 bounded 检查；独立 faithful formal 1×1 已证明真实 non-root Pi 可持续运行并产生 720 条 Pi event、token usage 和正式工具调用。当前原版 run 未生成 `profiling.jsonl`；不要把外部运行采样冒充 instrumentation 结果 |
 | PF-014 | P1：维护本清单，记录每次派发、状态变化、测试证据、阻断和交接项 | 中央调度 agent（本线程） | `docs/profiling_dispatch_checklist.md` | 每个里程碑回写 | done（本轮收口） | 已回写所有 visible Herd Tab、依赖、验收证据、阻断、远端 artifact intake 和最终 off/on smoke；后续真实 run 仍需按本表逐项更新 |
-| PF-015 | P0：算法侧 profiling 复现包 intake：精确下载、checksum、成员安全检查、公开契约/缺失项盘点和 ≤30s 离线前置验证 | `profiling-artifact-intake` `w8:tG/pN` `artifact_intake` | `/home/ubuntu/workspace/.workspace/artifacts/contextswarm-profiling-repro-20260829`（不改源码） | 精确 URL 下载；`sha256sum -c`；安全 `tar -tf`/解包；README/report/manifest 只读核对；不启动服务/完整实验 | done（下载、阅读/完整性核对、离线尝试均完成；真实 run 未执行） | 外层 SHA `d58cc11f…eba4ef`；外层 386 entries；包内 checksum 340/340；4 source archives 成员 10433/763/603/599；Judge `packages/**`=0；offline smoke 约 1.2s 返回 0。`configs/smoke.toml` 不在包内但有 `configs/iclr/figure3_3min_smoke.toml`；正式 run 仍需 operator 私下补 Judge packages、Lean/runtime/NuRouter/凭据。详见 `docs/profiling_artifact_intake_20260829.md` |
+| PF-015 | P0：算法侧 profiling 复现包 intake：精确下载、checksum、成员安全检查、公开契约/缺失项盘点和 ≤30s 离线前置验证 | `profiling-artifact-intake` `w8:tG/pN` `artifact_intake` | `<task-private-artifact-root>/contextswarm-profiling-repro-20260829`（不改源码） | 精确 URL 下载；`sha256sum -c`；安全 `tar -tf`/解包；README/report/manifest 只读核对；不启动服务/完整实验 | done（下载、阅读/完整性核对、离线尝试均完成；真实 run 未执行） | 外层 SHA `d58cc11f…eba4ef`；外层 386 entries；包内 checksum 340/340；4 source archives 成员 10433/763/603/599；Judge `packages/**`=0；offline smoke 约 1.2s 返回 0。`configs/smoke.toml` 不在包内但有 `configs/iclr/figure3_3min_smoke.toml`；正式 run 仍需 operator 私下补 Judge packages、Lean/runtime/NuRouter/凭据。详见 `docs/profiling_artifact_intake_20260829.md` |
 | PF-016 | P0：修复真实 mock smoke 审计暴露的正常事件字段丢弃和 closeout span orphan，保证一次采集可审计且不放宽敏感字段 | `profiling-event-sanitize` `w8:tH/pP` `event_sanitize` | `profiling.py`、必要时 `runner.py`、`tests/test_profiling.py` | 复现 profile 109 rows；当前 `dropped_fields=70`、`span_orphan_end=1`；focused tests + 新 mock smoke + audit | done（中央复核通过） | logger mapping 已过滤 command/error/output/response 等 raw payload，同时保留受控布尔/计数；`agent_id` 只作为 actor identity；closeout 使用 `closeout.evaluation_call.start/end`，结果用 receipt；最终 111 rows 的 dropped/sensitive/orphan 均为 0 |
 | PF-017 | P1：aggregate roots 修复，统一 run/runner/cgroup 与 Pi process-tree 汇总根的边界和去重语义 | 中央调度；aggregate owner | `profiling.py` 及对应审计/测试 | 依赖 PF-001/PF-002/PF-011；需静态 root 映射、重叠计数和 focused/full 回归 | done（focused 22 tests、compile、diff-check 已通过） | 已完成 runner root 与 registered/Pi process-tree root 的去重边界修复，并保留不可相加的重叠语义；真实 baseline 证据单独登记在 PF-018，不与 instrumentation smoke 混淆 |
 | PF-018 | P0：忠实原版 formal 1×1 baseline（只降低规模，真实 Pi/NuRouter/模型/Lean Judge） | `pi_judge_1x1_preflight`、`one_x_one_monitor` | 独立 operator build：`original-formal-1x1-20260829`（不改本 worktree 源码） | 固定 source/image/manifest provenance；核对 horizon、Pi/Judge/Lean 活性、最终 artifacts；依赖 PF-015 与 formal assets | done（运行闭环；solver 未解出） | 修正版 run `20260829T070759Z-35782fe7`（source/image `e999929…`）启动→结束 `07:07:59–07:13:02Z`，horizon 300s，container/launcher rc=0；Pi events=2,404、formal calls=19、Judge checks=6，资源采样峰值约 269.4 MiB、CPU 6.47%、17 PIDs；closeout 约 1.02s、`COMPILES_WITH_SORRY`/`correct=false`、run `COMPLETED`/score 0。旧 f2eda9 run 的 lifecycle 错误已由 cap 对齐修正；原版 source 仍无 `profiling.jsonl` |
