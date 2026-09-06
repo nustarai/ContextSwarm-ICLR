@@ -142,6 +142,7 @@ def _communication_instructions(
     *,
     direct_messages: bool = True,
     selection_enabled: bool = False,
+    negative_piece_prompt: bool = False,
 ) -> str:
     if not enabled and not selection_enabled:
         return (
@@ -154,10 +155,39 @@ acknowledge one, and `cps_actors` only when recipient discovery is needed.""" if
     selection = """
 Use `cps_feedback` only to record concise selection feedback for the runner-owned
 allocation state; it is not a direct-message channel.""" if selection_enabled else ""
+    if negative_piece_prompt:
+        if direct_messages:
+            knowledge = """
+Use the two communication channels deliberately:
+- Use `cps_send` for immediate coordination when a particular active peer (or all
+  current peers) needs to act now: requests, warnings, and short status updates.
+- Use `cps_publish` for durable task-shared knowledge that a later Agent should be
+  able to find with `cps_search`. Do not turn every transient message into a piece.
+- If a finding is both urgent and reusable, do both: send the message and publish
+  the piece.
+
+A reproducible counterexample, a route that you tested and ruled out, or a blocker
+that can prevent repeated work is a reusable negative finding and must be published
+just like a positive lemma or strategy. Use kind `counterexample`, `failed_route`,
+or `negative_finding`; include the claim, evidence or counterexample, applicable
+scope/preconditions, and consequence or next action. Mark guesses as tentative and
+do not present them as verified facts."""
+        else:
+            knowledge = """
+Use `cps_publish` for durable task-shared knowledge that a later Agent should be
+able to find with `cps_search`; do not turn every transient thought into a piece.
+A reproducible counterexample, a route that you tested and ruled out, or a blocker
+that can prevent repeated work is a reusable negative finding and must be published
+just like a positive lemma or strategy. Use kind `counterexample`, `failed_route`,
+or `negative_finding`; include the claim, evidence or counterexample, applicable
+scope/preconditions, and consequence or next action. Mark guesses as tentative and
+do not present them as verified facts."""
+    else:
+        knowledge = ""
     return f"""This run exposes shared ContextSwarm state only through controlled CPS tools.
 Before trying a route, use `cps_search` to find relevant shared evidence. After a
 meaningful discovery, use `cps_publish` to leave a concise typed handoff. Use
-{direct}{selection}
+{direct}{selection}{knowledge}
 Do not access CPS through a local CLI, database, filesystem search, or custom
 script. Never include credentials, absolute host paths, or full transcripts in a
 piece or message."""
@@ -201,6 +231,7 @@ def build_task_prompt(
     formal_tools_enabled: bool = False,
     direct_messages: bool = True,
     selection_enabled: bool = False,
+    negative_piece_prompt: bool = False,
     digest: str = "",
 ) -> str:
     context = digest.strip() or "(no prior shared context for this task)"
@@ -225,7 +256,7 @@ or a local verification process.
 
 {_execution_contract(task)}
 
-{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
+{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled, negative_piece_prompt=negative_piece_prompt)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 
@@ -248,6 +279,7 @@ def build_mono_prompt(
     formal_tools_enabled: bool = False,
     direct_messages: bool = True,
     selection_enabled: bool = False,
+    negative_piece_prompt: bool = False,
 ) -> str:
     task_list = list(tasks)
     if not task_list:
@@ -279,7 +311,7 @@ Mono task-selection rule: this session owns multiple task directories. For every
 `{{"task_id": "<slug>"}}`; never make a no-argument call. A single-task
 Parallel worker may omit `task_id`, but Mono may not.
 
-{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled)}
+{_communication_instructions(communication_enabled, direct_messages=direct_messages, selection_enabled=selection_enabled, negative_piece_prompt=negative_piece_prompt)}
 
 {_formal_tools_instructions(formal_tools_enabled and not coding)}
 

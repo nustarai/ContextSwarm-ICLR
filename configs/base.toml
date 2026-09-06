@@ -8,6 +8,9 @@ problem_ids = "benchmarks/matholympiadbench/problem_ids.json"
 output_root = "runs"
 mode = "cps"
 communication = "blackboard"
+# Keep the historical prompt as the control arm.  Treatment manifests enable
+# the explicit rule for publishing reusable negative findings as pieces.
+negative_piece_prompt = false
 max_parallel = 24
 initial_agents_per_task = 2
 max_attempts_per_task = 0

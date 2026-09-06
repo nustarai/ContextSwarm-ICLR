@@ -2188,6 +2188,7 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "name": config.name,
         "mode": config.mode,
         "communication": config.communication,
+        "negative_piece_prompt": config.negative_piece_prompt,
         "tasks": [task.slug for task in task_list],
         "task_count": len(task_list),
         "episodes_per_task": config.episodes_per_task,
@@ -2817,6 +2818,7 @@ def _run_mono(
         workspace=str(worker_dir),
         communication_enabled=False,
         formal_tools_enabled=config.formal_tools_enabled,
+        negative_piece_prompt=config.negative_piece_prompt,
     )
     early_lock = threading.RLock()
     early_proofs: dict[str, _EarlyProofCredit] = {}
@@ -4497,6 +4499,7 @@ def _run_elastic_cps(
             formal_tools_enabled=config.formal_tools_enabled,
             direct_messages=direct_messages,
             selection_enabled=selection_enabled,
+            negative_piece_prompt=config.negative_piece_prompt,
             digest=digest,
         )
         if candidate_transfer:
@@ -5216,6 +5219,7 @@ def _run_task_workers(
                 formal_tools_enabled=config.formal_tools_enabled,
                 direct_messages=direct_messages,
                 selection_enabled=selection_enabled,
+                negative_piece_prompt=config.negative_piece_prompt,
                 digest=digest,
             )
             # Snapshot the candidate entering this logical attempt.  A failed

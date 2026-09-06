@@ -1,0 +1,7 @@
+extends = ["smoke.toml"]
+
+# Prompt-only treatment: keep the CPS store and tool surface unchanged while
+# explicitly telling the worker to publish reusable negative findings.
+[experiment]
+name = "mobench-mini-smoke-negative-piece"
+negative_piece_prompt = true

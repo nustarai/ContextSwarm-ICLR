@@ -1,0 +1,7 @@
+extends = ["formal_1h_cps32_negative_piece_control.toml"]
+
+# The only behavioral difference from the paired control is the worker prompt.
+[experiment]
+name = "mobench-formal-1h-cps32-negative-piece-treatment"
+output_root = "runs/formal_1h_cps32_negative_piece/treatment"
+negative_piece_prompt = true

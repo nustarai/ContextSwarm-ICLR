@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PromptConfigTests(unittest.TestCase):
-    def _load(self, allocation: str = ""):
+    def _load(self, allocation: str = "", experiment: str = ""):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "prompt.toml"
             path.write_text(
@@ -22,7 +22,8 @@ class PromptConfigTests(unittest.TestCase):
                 "\n[experiment]\nmode = \"cps\"\ncommunication = \"blackboard\"\n"
                 "max_parallel = 1\ninitial_agents_per_task = 1\nmax_tasks = 1\n"
                 "episodes_per_task = 1\ntime_limit_seconds = 1\n"
-                "\n[allocation]\npolicy = \"llm_scheduler\"\n"
+                + experiment
+                + "\n[allocation]\npolicy = \"llm_scheduler\"\n"
                 + allocation,
                 encoding="utf-8",
             )
@@ -42,6 +43,45 @@ class PromptConfigTests(unittest.TestCase):
         config = self._load()
         self.assertEqual(config.allocation.prompt_max_bytes, 64 * 1024)
         self.assertEqual(config.allocation.prompt_max_tokens, 64 * 1024)
+
+    def test_negative_piece_prompt_is_explicit_and_public(self) -> None:
+        control = self._load()
+        self.assertFalse(control.negative_piece_prompt)
+        self.assertFalse(control.public_dict()["negative_piece_prompt"])
+
+        treatment = self._load(experiment="negative_piece_prompt = true\n")
+        self.assertTrue(treatment.negative_piece_prompt)
+        self.assertTrue(treatment.public_dict()["negative_piece_prompt"])
+
+    def test_negative_piece_prompt_must_be_boolean(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "experiment.negative_piece_prompt"):
+            self._load(experiment="negative_piece_prompt = 1\n")
+
+    def test_paired_negative_piece_manifests_only_change_arm_prompt(self) -> None:
+        control = load_config(
+            ROOT / "configs" / "formal_1h_cps32_negative_piece_control.toml",
+            ROOT,
+        )
+        treatment = load_config(
+            ROOT / "configs" / "formal_1h_cps32_negative_piece_treatment.toml",
+            ROOT,
+        )
+        control_public = control.public_dict()
+        treatment_public = treatment.public_dict()
+        self.assertFalse(control.negative_piece_prompt)
+        self.assertTrue(treatment.negative_piece_prompt)
+        self.assertEqual(
+            {
+                key: value
+                for key, value in control_public.items()
+                if key not in {"name", "negative_piece_prompt"}
+            },
+            {
+                key: value
+                for key, value in treatment_public.items()
+                if key not in {"name", "negative_piece_prompt"}
+            },
+        )
 
     def test_prompt_bounds_must_be_positive(self) -> None:
         for key in ("prompt_max_bytes", "prompt_max_tokens"):

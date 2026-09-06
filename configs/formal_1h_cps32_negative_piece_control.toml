@@ -1,0 +1,8 @@
+extends = ["1h_cps.toml"]
+
+# Paired control for the prompt-only negative-knowledge experiment.
+[experiment]
+name = "mobench-formal-1h-cps32-negative-piece-control"
+max_parallel = 32
+output_root = "runs/formal_1h_cps32_negative_piece/control"
+negative_piece_prompt = false
