@@ -1325,6 +1325,19 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertFalse(proved)
         self.assertIsNone(error)
 
+    def test_kernel_verification_failure_is_a_candidate_failure(self) -> None:
+        status, proved, error = _settled_outcome(
+            {
+                "status": "failed",
+                "terminal_reason": "verification_failed",
+                "error_kind": "verification_failed",
+            }
+        )
+
+        self.assertEqual(status, "VERIFY_FAIL")
+        self.assertFalse(proved)
+        self.assertIsNone(error)
+
     def test_nonterminal_admission_without_job_id_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

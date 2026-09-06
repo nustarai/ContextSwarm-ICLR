@@ -3080,6 +3080,19 @@ def _settled_outcome(
         and _nested_value(payload, "is_valid_no_sorry") is not True
     ):
         return "COMPILES_WITH_SORRY", False, None
+    # A kernel rejection is a normal candidate outcome.  The Lean service
+    # reports it as a failed lifecycle with a verification_failed terminal
+    # reason; preserve that distinction from transport/evaluator failures so
+    # scheduler feedback and final metrics count the attempt correctly.
+    terminal_reason = str(
+        _nested_value(payload, "terminal_reason") or ""
+    ).strip().lower()
+    error_kind = str(_nested_value(payload, "error_kind") or "").strip().lower()
+    if status in {"FAILED", "ERROR"} and (
+        terminal_reason in {"verification_failed", "verifier_failed"}
+        or error_kind in {"verification_failed", "verifier_failed"}
+    ):
+        return "VERIFY_FAIL", False, None
     if status in {"SUCCEEDED", "COMPLETED", "FAILED", "ERROR", "UNKNOWN"}:
         return (
             "EVALUATOR_ERROR",
