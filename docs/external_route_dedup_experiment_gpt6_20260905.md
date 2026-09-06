@@ -135,6 +135,8 @@ profiling 文件本身是 real 记录，主要 agent wrapper、CPS、Judge 和 m
 
 完整证据：
 
+- [逐题原因分析附录](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/strong-activity-feedback-20260905/docs/external_route_dedup_cause_analysis_20260906.md)
+- [六个 run 的逐题结构化分析 JSON](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-detail-20260906.json)
 - [control run_meta.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-control-20260905/runs/strong-activity-paired-20260905/control/20260905T071908Z-df7b2db9/run_meta.json)
 - [control final.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-control-20260905/runs/strong-activity-paired-20260905/control/20260905T071908Z-df7b2db9/final.json)
 - [treatment run_meta.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/strong-activity-feedback-20260905/runs/strong-activity-paired-20260905/treatment/20260905T071908Z-e6b3eb73/run_meta.json)
