@@ -119,7 +119,7 @@ selection-specific 测试的通过说明目标代码、迁移和离线行为满�
 - [`selection_artifacts.py`](https://github.com/nustarai/ContextSwarm-ICLR/blob/8432d83b9b3f14f0a7367c47557826a3941269bc/contextswarm_mini/selection_artifacts.py)
 - [`test_selection_store_candidates.py`](https://github.com/nustarai/ContextSwarm-ICLR/blob/8432d83b9b3f14f0a7367c47557826a3941269bc/tests/test_selection_store_candidates.py)
 - [`test_selection_artifacts_trace.py`](https://github.com/nustarai/ContextSwarm-ICLR/blob/8432d83b9b3f14f0a7367c47557826a3941269bc/tests/test_selection_artifacts_trace.py)
-- [脱敏证据摘要](https://github.com/nustarai/ContextSwarm-ICLR/blob/2d1e50c514f25de9061f54c00ae10cecb827fc00/docs/selection_snapshot_dedup_evidence.json)
+- [脱敏证据摘要](https://github.com/nustarai/ContextSwarm-ICLR/blob/bfd3097de885486d0b58a06ca4d1dd53cd74b3ed/docs/selection_snapshot_dedup_evidence.json)
 
 脱敏 owner-only 原始证据（仅在实验工作站可访问，不复制到仓库）：
 
