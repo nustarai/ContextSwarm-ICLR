@@ -13,7 +13,7 @@ Agent 在开始探索前提交一个简短的路线摘要和 route claim。CPS �
 - `external_dedup_mode=off`（baseline）保留路线 claim 和活动摘要，但不做重叠判断，也不阻止 Agent。
 - `external_dedup_mode=enforce`（treatment）在分数达到 `0.78` 且至少共享 3 个有效 token 时返回 `semantic_conflict` 和 `switch_required=true`，要求 Agent 换方向；Agent 明确说明是在做独立验证时可以继续。
 
-比较器只处理隐私安全的短摘要，过滤停用词和过短、过泛的文本。判断发生在 claim 写入前；它不会异步终止已经运行的 Agent，也不会替 Agent 选择数学路线。实现提交为 `e4353b44c07515fc9e23dca9668340fa42a7678a`，相关单元测试共 81 项通过。实现入口见 [`route_dedup.py`](../contextswarm_mini/route_dedup.py) 和 [`cps.py`](../contextswarm_mini/cps.py)。
+比较器只处理隐私安全的短摘要，过滤停用词和过短、过泛的文本。判断发生在 claim 写入前；它不会异步终止已经运行的 Agent，也不会替 Agent 选择数学路线。实现提交为 `e4353b44c07515fc9e23dca9668340fa42a7678a`，相关单元测试共 81 项通过。实现入口见 [`route_dedup.py`](contextswarm_mini/route_dedup.py) 和 [`cps.py`](contextswarm_mini/cps.py)。
 
 ## 具体的实验
 
@@ -137,10 +137,4 @@ profiling 文件本身是 real 记录，主要 agent wrapper、CPS、Judge 和 m
 
 - [逐题原因分析附录](external_route_dedup_cause_analysis_20260906.md)
 
-六个 arm 的原始 `run_meta.json`、`final.json`、profiling audit、四臂汇总、批次合同以及
-quiet-gate 记录保存在实验归档中，但没有随本 PR 分发。为避免把本机路径或原始运行数据写入
-公共描述，本文直接嵌入了决策所需的聚合指标、run ID、逐题结果和审计限制；逐题解释见上面的
-仓库内附录。可用的逻辑证据 ID 为 `r0-control-final`、`r0-treatment-final`、
-`r1-control-final`、`r1-treatment-final`、`r2-control-final`、`r2-treatment-final`、
-`six-arm-detail-20260906`、`rerun-batch-contract-20260905` 和
-`rerun-quiet-gate-bypass-20260905`。
+六个 arm 的原始 `run_meta.json`、`final.json`、profiling audit、四臂汇总、批次合同以及 quiet-gate 记录保存在实验归档中，但没有随本 PR 分发。为避免把本机路径或原始运行数据写入公共描述，本文直接嵌入了决策所需的聚合指标、run ID、逐题结果和审计限制；逐题解释见上面的仓库内附录。可用的逻辑证据 ID 为 `r0-control-final`、`r0-treatment-final`、`r1-control-final`、`r1-treatment-final`、`r2-control-final`、`r2-treatment-final`、`six-arm-detail-20260906`、`rerun-batch-contract-20260905` 和 `rerun-quiet-gate-bypass-20260905`。
