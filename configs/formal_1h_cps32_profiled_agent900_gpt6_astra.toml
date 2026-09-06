@@ -4,4 +4,3 @@ extends = ["formal_1h_cps32_profiled_agent_timeout_gpt6_astra_base.toml"]
 # Pi invocation.  Abnormal non-timeout recovery remains unchanged.
 [pi]
 timeout_seconds = 900
-

@@ -9,4 +9,3 @@ name = "mobench-formal-1h-cps32-profiled-agent-timeout-gpt6-astra"
 [pi]
 model = "openai-codex/gpt-6-astra"
 thinking = "max"
-
