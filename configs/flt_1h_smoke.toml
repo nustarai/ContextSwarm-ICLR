@@ -8,8 +8,8 @@ problem_ids = "benchmarks/fermat_last_theorem/problem_ids.json"
 output_root = "runs/flt_1h_smoke"
 mode = "cps"
 communication = "blackboard"
-max_parallel = 4
-initial_agents_per_task = 4
+max_parallel = 32
+initial_agents_per_task = 32
 max_attempts_per_task = 0
 cancel_on_proved = true
 assignment_policy = "least_active"
@@ -19,7 +19,7 @@ time_limit_seconds = 3600
 seed = 0
 
 [aisw]
-max_in_flight = 4
+max_in_flight = 32
 
 [lean]
 env_id = "formal_flt"
