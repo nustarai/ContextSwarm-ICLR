@@ -33,3 +33,12 @@ python3 scripts/sync_benchmark_bundles.py /path/to/ContextSwarm --check
 The default experiment manifests remain bound to MathOlympiadBench. Adding a
 bundle here does not silently change the task/model/time/evaluator contract of
 Mono, Parallel, or CPS experiments.
+
+## Experimental FLT bundle
+
+`fermat_last_theorem/` is an experimental, statement-only task. It is not part
+of the six paper-facing formal matrix datasets. The Agent-visible bundle contains
+only the theorem contract and the standard Mathlib import; the FLT repository's
+completed source, proof modules, compiled artifacts, and comparator outputs are
+not copied. Its one-hour CPS smoke configuration is
+`configs/flt_1h_smoke.toml` and uses the dedicated `formal_flt` Judge environment.

@@ -15,6 +15,7 @@ FORMAL_BUNDLES = {
     "clever": "formal_clever",
     "verina": "formal_verina",
 }
+EXPERIMENTAL_BUNDLES = {"fermat_last_theorem"}
 
 
 def _load_json(path: Path):
@@ -30,8 +31,9 @@ class BenchmarkBundleTests(unittest.TestCase):
         }
 
     def test_catalog_pins_the_six_audited_bundles(self) -> None:
+        audited_entries = set(self.entries) - EXPERIMENTAL_BUNDLES
         self.assertEqual(
-            set(self.entries),
+            audited_entries,
             {
                 "usaco",
                 "icpc_wf_2025",
@@ -51,12 +53,15 @@ class BenchmarkBundleTests(unittest.TestCase):
         runnable = {
             name
             for name, entry in self.entries.items()
+            if name not in EXPERIMENTAL_BUNDLES
             if entry["runnable_with_contextswarm_mini"]
         }
         self.assertEqual(runnable, {"matholympiadbench"})
 
     def test_manifests_select_twelve_complete_public_tasks(self) -> None:
         for dataset, catalog_entry in self.entries.items():
+            if dataset in EXPERIMENTAL_BUNDLES:
+                continue
             root = BENCHMARK_ROOT / catalog_entry["path"]
             manifest = _load_json(root / "manifest.json")
             problem_ids = _load_json(root / "problem_ids.json")
