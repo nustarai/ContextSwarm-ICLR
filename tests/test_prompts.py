@@ -99,6 +99,66 @@ class PromptContractTests(unittest.TestCase):
             prompt.index("Before trying a route, use `cps_search`"),
         )
 
+    def test_negative_piece_treatment_spells_out_channel_rules(self) -> None:
+        task = _task()
+        control = build_task_prompt(
+            task,
+            task_workspace="tasks/sample",
+            agent_id="worker-sample-e1",
+            episode=1,
+            communication_enabled=True,
+        )
+        treatment = build_task_prompt(
+            task,
+            task_workspace="tasks/sample",
+            agent_id="worker-sample-e1",
+            episode=1,
+            communication_enabled=True,
+            negative_piece_prompt=True,
+        )
+        self.assertNotIn("reusable negative finding", control)
+        for phrase in (
+            "Use `cps_send` for immediate coordination",
+            "Use `cps_publish` for durable task-shared knowledge",
+            "If a finding is both urgent and reusable, do both",
+            "reproducible counterexample",
+            "tested and ruled out",
+            "kind `counterexample`",
+            "scope/preconditions",
+            "Mark guesses as tentative",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, treatment)
+        self.assertLess(
+            treatment.index("Use `cps_send` for immediate coordination"),
+            treatment.index("Use `cps_publish` for durable task-shared knowledge"),
+        )
+
+    def test_negative_piece_treatment_without_direct_messages_is_piece_only(self) -> None:
+        prompt = build_task_prompt(
+            _task(),
+            task_workspace="tasks/sample",
+            agent_id="worker-sample-e1",
+            episode=1,
+            communication_enabled=True,
+            direct_messages=False,
+            negative_piece_prompt=True,
+        )
+        self.assertIn("Use `cps_publish` for durable task-shared knowledge", prompt)
+        self.assertNotIn("Use `cps_send` for immediate coordination", prompt)
+
+    def test_negative_piece_prompt_is_ignored_for_no_communication(self) -> None:
+        prompt = build_task_prompt(
+            _task(),
+            task_workspace="tasks/sample",
+            agent_id="worker-sample-e1",
+            episode=1,
+            communication_enabled=False,
+            negative_piece_prompt=True,
+        )
+        self.assertIn("no-communication baseline", prompt)
+        self.assertNotIn("reusable negative finding", prompt)
+
     def test_only_cps_prompt_exposes_controlled_communication_tools(self) -> None:
         prompts = self._all_solver_prompts()
         for tool in CPS_TOOLS:

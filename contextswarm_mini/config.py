@@ -543,7 +543,12 @@ class ExperimentConfig:
     docker_memory_mb: int
     docker_internet: str
     docker_network: str
+    # Keep ``extra`` in its historical positional slot for lightweight callers
+    # that construct this dataclass directly.
     extra: dict[str, Any] = field(default_factory=dict)
+    # Treatment-only prompt switch for the negative-knowledge experiment.  It
+    # changes agent instructions, not the CPS schema or communication tools.
+    negative_piece_prompt: bool = False
 
     @property
     def uses_cps(self) -> bool:
@@ -595,6 +600,7 @@ class ExperimentConfig:
             "name": self.name,
             "mode": self.mode,
             "communication": self.communication,
+            "negative_piece_prompt": self.negative_piece_prompt,
             "dataset_root": str(self.dataset_root),
             "dataset": self.dataset_name,
             "problem_ids_path": str(self.problem_ids_path),
@@ -724,6 +730,14 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     allowed_communication = {"none", "blackboard", "direct", "hybrid", "simple"}
     if communication not in allowed_communication:
         raise ConfigError(f"experiment.communication must be one of {sorted(allowed_communication)}")
+    negative_piece_prompt = (
+        _strict_bool(
+            experiment["negative_piece_prompt"],
+            "experiment.negative_piece_prompt",
+        )
+        if "negative_piece_prompt" in experiment
+        else False
+    )
     if mode in {"mono", "parallel"} and communication != "none":
         raise ConfigError("mono and parallel baselines must run with communication = none")
     if selection_config.enabled:
@@ -1091,6 +1105,7 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
         name=_text(experiment.get("name"), manifest_path.stem),
         mode=mode,
         communication=communication,
+        negative_piece_prompt=negative_piece_prompt,
         dataset_root=dataset_root,
         problem_ids_path=problem_ids_path,
         output_root=output_root,
