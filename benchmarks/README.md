@@ -42,3 +42,7 @@ only the theorem contract and the standard Mathlib import; the FLT repository's
 completed source, proof modules, compiled artifacts, and comparator outputs are
 not copied. Its one-hour CPS smoke configuration is
 `configs/flt_1h_smoke.toml` and uses the dedicated `formal_flt` Judge environment.
+The first real one-hour run, including its zero-score result, candidate audit,
+and transport/scheduling findings, is recorded in
+`fermat_last_theorem/EXPERIMENT_REPORT.md`. The report does not change the
+benchmark contract or claim that the FLT proof was completed.
