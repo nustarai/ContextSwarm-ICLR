@@ -2,6 +2,8 @@
 
 日期：2026-09-05（Asia/Shanghai）
 
+报告修订：activity-feedback-pr-20260907
+
 实验对象：12 道 MathOlympiadBench 数学奥林匹克竞赛题；CPS；每臂 1 小时
 
 文档状态：按 `decision-oriented-experiment-report` 结构整理的最终主报告。本报告的主效果实验冻结在 source commit `7ef68a2c6f7ec53791b7f269d2fd0ebe8c58b827`；后续另行加入的 external-dedup/GPT-6 实验不并入本报告的 A/B 分母或分数。
@@ -16,7 +18,7 @@
 
 由此采用的主指标只统计 admission 时 prompt 中确实列出至少一个同题 peer 方向的 actor-episode。没有 peer 的空 snapshot 不进入分母，因为这些样本没有受到本次反馈信息的影响。语义复核使用四类标签：
 
-- `repeat`：核心证明族/子问题/实验路线实质相同，且没有明确独立贡献；
+- `repeat`：核心证明族、子问题或实验路线实质相同，且没有明确独立贡献；
 - `repeat_justified`：有重叠，但声明了独立验证、细化、反例或新 lemma；
 - `different`：核心证明族、子问题或实验对象明显不同；
 - `uncertain`：信息不足时保留不确定，不强行算作不同。
@@ -67,10 +69,10 @@ Agent 现在需要用一句短的自然语言 `summary` 说明“当前正在做
 | 任务范围 | 12 道 MathOlympiadBench 题 |
 | 运行时长 | 每臂 `3600 s` |
 | 重复次数 | 1 个 paired replicate（advisory vs strong） |
-| baseline / treatment | baseline=`advisory`，treatment=`strong`；两臂都启用 active roster、自然语言 summary 和 route claim，唯一设计变量是 prompt wording |
+| baseline 与 treatment | baseline=`advisory`，treatment=`strong`；两臂都启用 active roster、自然语言 summary 和 route claim，唯一设计变量是 prompt wording |
 | 模型 | `openai-codex/gpt-5.6-sol` |
-| source / image | source=`7ef68a2c6f7ec53791b7f269d2fd0ebe8c58b827`；同一 Docker image digest `sha256:5153ec9f5e56cf7d2d0c5ff960ea6a21ac1733b2f36ce651c9c618a15668ac75` |
-| 固定并发条件 | `max_parallel=32`、每题初始 2 个 Agent、每题 2 episodes、相同题目/模型/horizon/CPS capacity |
+| source 与 image | source=`7ef68a2c6f7ec53791b7f269d2fd0ebe8c58b827`；同一 Docker image digest `sha256:5153ec9f5e56cf7d2d0c5ff960ea6a21ac1733b2f36ce651c9c618a15668ac75` |
+| 固定并发条件 | `max_parallel=32`、每题初始 2 个 Agent、每题 2 episodes、相同题目、模型、horizon 与 CPS capacity |
 | 真实性 | 两臂均为 real Pi/Judge/Lean/Prover/NuRouter workload；A/B 统计不包含 mock Agent、mock Judge 或 mock evaluator |
 | 隔离 | 两臂使用独立 Judge、Prover、worker workspace、CPS SQLite 和 CPU/NUMA 分区；NuRouter 是按设计唯一共享的长期服务 |
 
@@ -99,11 +101,11 @@ Agent 现在需要用一句短的自然语言 `summary` 说明“当前正在做
 
 1. **机制层：已验证可行。** active roster、自然语言 summary、后续 prompt 注入、route claim 生命周期和 write/edit gate 已在真实 workload 中运行闭环。summary 不是 mock 字段，且 runner 没有替 Agent 指定数学路线。
 
-2. **方向选择层：支持采用更强的软提示。** 在真正看到同期方向的样本中，主实验观察到 strong 的语义重复率低于 advisory；同时，剩余重叠中带明确独立验证/细化/反例/new lemma 理由的比例更高。详细分子、分母和标签见“支撑结论的数据和分析”。这支持“默认先找不同方向，但允许有理由地重复”的产品决策。
+2. **方向选择层：支持采用更强的软提示。** 在真正看到同期方向的样本中，主实验观察到 strong 的语义重复率低于 advisory；同时，剩余重叠中带明确独立验证、细化、反例或 new lemma 理由的比例更高。详细分子、分母和标签见“支撑结论的数据和分析”。这支持“默认先找不同方向，但允许有理由地重复”的产品决策。
 
 3. **结果质量层：尚未证明数学得分或搜索效率提高。** 主实验 strong 最终分数高 1 个 task，但只有一个 replicate，两臂都是 `DEGRADED`；首个 proof 和 score-time AUC 没有形成一致优势。原版、弱提示词 paired 和主实验使用的 source/runtime/健康状态也不完全相同，不能把它们拼成总体收益。
 
-4. **成本与可靠性层：协议开销可以观测，但当前 profiling/health 还不够干净。** 两臂均有 Judge/prover 错误，profiling 有 dropped fields 和 open spans；因此当前数据适合回答方向选择是否改变，不适合发布无损性能基准。
+4. **成本与可靠性层：协议开销可以观测，但当前 profiling 与 health 还不够干净。** 两臂均有 Judge 与 prover 错误，profiling 有 dropped fields 和 open spans；因此当前数据适合回答方向选择是否改变，不适合发布无损性能基准。
 
 5. **决策：保留 strong 软策略，不做语义硬过滤。** 下一轮默认候选应是 strong prompt + 自然语言 summary + Agent 自主判断；`route_key` 继续作为技术 lease，不作为数学去重器。只有在多轮干净 paired replication 和盲审语义指标稳定后，才考虑扩大默认启用范围。
 
@@ -131,7 +133,7 @@ Agent 现在需要用一句短的自然语言 `summary` 说明“当前正在做
 
 | 指标 | advisory | strong | 解释 |
 |---|---:|---:|---|
-| admitted actors / result rows | 86 / 86 | 85 / 85 | 逻辑 Agent/结果记录 |
+| admitted actors 与 result rows | 86 / 86 | 85 / 85 | 逻辑 Agent 与结果记录 |
 | Pi Agent starts | 86 | 85 | 每条 A/B 结果都有真实 Pi 启动 |
 | `mocked=false` | 86/86 | 85/85 | mock smoke 未混入主统计 |
 | prompt-exposed actor-episodes | 50 | 53 | 主重复率分母 |
@@ -142,7 +144,7 @@ Agent 现在需要用一句短的自然语言 `summary` 说明“当前正在做
 | `independent_verification_reason` 有值 | 99 | 98 | Agent 声明，不是语义金标准 |
 | 最终释放 | 125 released | 118 released + 1 done | lifecycle 收尾 |
 | active 残留 | 0 | 0 | closeout 后无 active claim |
-| route conflict / bypass event | 0 / 0 | 0 / 0 | 本轮未触发技术冲突或 fail-open |
+| route conflict 与 bypass event | 0 / 0 | 0 / 0 | 本轮未触发技术冲突或 fail-open |
 
 最新两臂各有一个重复技术 route handle 的额外行，但没有把它计作语义重复。相反，summary 的后验语义标签能识别“不同 key 但同一证明家族”的情况。这是保留 key 作为技术身份、把语义判断交给 Agent/分析流程的直接依据。
 
@@ -165,7 +167,7 @@ strong 的最终分数多 `1/12`，但首个 proof 更晚，AUC 略低；在一�
 
 #### 3.2 与原版和弱提示词 paired 的分数对照
 
-| 实验家族 | control / baseline | treatment | 合计或差值 | 解释 |
+| 实验家族 | control 或 baseline | treatment | 合计或差值 | 解释 |
 |---|---:|---:|---:|---|
 | 原版三次 baseline | `5/12、4/12、5/12` | — | `14/36` | 历史背景，无 peer-feedback 分母 |
 | 弱提示词三组 paired | `6/12、6/12、6/12` | advisory `6/12、6/12、5/12` | `18/36` vs `17/36` | 通道已工作，但无稳定得分优势 |
@@ -229,13 +231,12 @@ strong 的最终分数多 `1/12`，但首个 proof 更晚，AUC 略低；在一�
 
 本次主实验的详细报告和脱敏证据：
 
-- [最新强提示词详细报告](/home/ubuntu/workspace/.workspace/builds/CS-20260905-strong-activity-feedback/STRONG_ACTIVITY_PROMPT_REPORT.md)
-- [activity audit](/home/ubuntu/workspace/.workspace/builds/CS-20260905-strong-activity-feedback/evidence/activity-audit.json)
-- [protocol audit](/home/ubuntu/workspace/.workspace/builds/CS-20260905-strong-activity-feedback/evidence/protocol-audit.json)
-- [advisory profiling audit](/home/ubuntu/workspace/.workspace/builds/CS-20260905-strong-activity-feedback/evidence/control-profiling-audit.json)
-- [strong profiling audit](/home/ubuntu/workspace/.workspace/builds/CS-20260905-strong-activity-feedback/evidence/treatment-profiling-audit.json)
-- [CPU/NUMA 隔离审计](/home/ubuntu/workspace/.workspace/builds/CS-20260905-strong-activity-feedback/evidence/cpu-numa-partition.json)
-- [历史三组 activity-feedback 真实报告](/home/ubuntu/workspace/.workspace/builds/CS-20260904-activity-feedback-real/REAL_ACTIVITY_FEEDBACK_REPORT.md)
+主实验的原始 run 元数据、逐事件 activity audit、协议 audit、两臂 profiling audit、CPU 与 NUMA 隔离审计，以及历史三组运行报告保存在 owner-only 实验归档中，没有随 PR 分发。为避免把本机路径或原始运行数据写入公共描述，本文保留决策所需的聚合指标、运行 ID 和审计限制；对应逻辑证据 ID 为 `strong-prompt-run-report`、`strong-prompt-activity-audit`、`strong-prompt-protocol-audit`、`strong-prompt-control-profile`、`strong-prompt-treatment-profile`、`strong-prompt-cpu-numa` 和 `activity-feedback-history`。
+
+仓库内可随 PR 复核的相关附录：
+
+- [active route claim 实验记录](active_route_claim_experiment_20260904.md)
+- [GPT-6 external-dedup 实验记录](external_route_dedup_experiment_gpt6_20260905.md)
 
 代码与文档验证：
 
