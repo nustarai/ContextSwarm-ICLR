@@ -1,0 +1,51 @@
+# Shared contract for the six-dataset, one-hour Mono/Parallel formal matrix.
+# Operator-private Judge and NuRouter capabilities enter through the launcher;
+# never add endpoints, credentials, or node configuration to this closure.
+extends = ["../formal_1h_bridge.toml"]
+
+[experiment]
+name = "formal-1h-6datasets-base"
+output_root = "runs/formal_1h_6datasets"
+mode = "parallel"
+communication = "none"
+max_parallel = 12
+initial_agents_per_task = 1
+# A failed candidate attempt is feedback, not an arm-level stop condition.
+# The runner refills released slots while the fixed horizon remains.
+max_attempts_per_task = 0
+cancel_on_proved = true
+episodes_per_task = 1
+max_tasks = 12
+time_limit_seconds = 3600
+seed = 0
+
+[pi]
+model = "openai-codex/gpt-5.6-sol"
+thinking = "max"
+fast_mode = false
+timeout_seconds = 3600
+http_idle_timeout_ms = 600000
+
+[aisw]
+# Keep the admission ceiling identical for Mono and Parallel. Mono uses one
+# solver session; Parallel may use all twelve independent sessions.
+max_in_flight = 12
+
+[allocation]
+# Do not revoke a live solver/Judge lifecycle before the one-hour arm horizon.
+agent_timeout_seconds = 3600
+
+[judge]
+timeout_seconds = 300
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 4
+require_result_cache_disabled = true
+
+[formal_tools]
+# Formal arms fail closed unless the operator supplies a revision-matched,
+# SHA-256-bound declaration index through the runtime environment.
+require_decl_index = true
+
+[docker]
+memory_mb = 16384
+network = "bridge"

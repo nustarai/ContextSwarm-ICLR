@@ -54,6 +54,14 @@
       "runnable_with_contextswarm_mini": false,
       "subset": "hard12",
       "task_count": 12
+    },
+    {
+      "benchmark_revision": "flt-statement-only-v1",
+      "dataset": "fermat_last_theorem",
+      "path": "fermat_last_theorem",
+      "runnable_with_contextswarm_mini": true,
+      "subset": "full",
+      "task_count": 1
     }
   ],
   "contextswarm_source": {
