@@ -8,8 +8,6 @@
 
 这些字段的含义不同：Agent timeout 是 runner 终止一个 Agent，provider retry 是 Pi 记录的服务重试，Lean `RESOURCE_LIMIT`/`EXECUTION_TIMEOUT` 是 Judge 对候选检查的反馈，route claim 是 Agent 声明的方向。它们不能互相替代，也不能只凭其中一个字段断言根因。
 
-此外，所有 arm 的 Agent 日志中都出现过 `Model "gpt-6-astra" not found ... Using custom model id` 这类启动 warning，但模型请求、Judge 检查和最终证明都实际发生了。它在 control/treatment 两边共同出现，因此没有把它计入本分析的差异原因。
-
 ## 六个 arm 的任务结果矩阵
 
 符号含义：`P` 是 `PROVED`，`S` 是 `COMPILES_WITH_SORRY`，`V` 是 `VERIFY_FAIL`。括号内是 `attempts/timeouts`；证明时间只对 `P` 显示。
