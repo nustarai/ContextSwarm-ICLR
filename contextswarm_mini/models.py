@@ -84,6 +84,14 @@ class AgentResult:
     termination_summary_reason: str | None = None
     termination_summary_publish_count: int = 0
     termination_summary_publish_verified: bool = False
+    # Pi may emit a provider/transport diagnostic for an intermediate retry
+    # and then complete the same logical prompt successfully. Keep that
+    # lifecycle evidence separate from the final agent outcome.
+    settled: bool = False
+    assistant_success: bool = False
+    assistant_stop_reason: str | None = None
+    transport_diagnostic: bool = False
+    transport_recovered: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -112,6 +120,11 @@ class AgentResult:
             "termination_summary_reason": self.termination_summary_reason,
             "termination_summary_publish_count": self.termination_summary_publish_count,
             "termination_summary_publish_verified": self.termination_summary_publish_verified,
+            "settled": self.settled,
+            "assistant_success": self.assistant_success,
+            "assistant_stop_reason": self.assistant_stop_reason,
+            "transport_diagnostic": self.transport_diagnostic,
+            "transport_recovered": self.transport_recovered,
         }
 
 

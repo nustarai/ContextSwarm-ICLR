@@ -1,0 +1,14 @@
+extends = ["_base.toml"]
+
+[experiment]
+dataset_root = "benchmarks/verina"
+problem_ids = "benchmarks/verina/problem_ids.json"
+
+[judge]
+kind = "formal"
+env_id = "formal_verina"
+verification_profile = "formal_proof"
+judge_mode = "fast"
+
+[formal_tools]
+enabled = true

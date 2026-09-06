@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: verina, repeat 3, trace_state.
+extends = ["../../_verina.toml"]
+
+[experiment]
+name = "figure4-formal-verina-r03-trace_state"
+output_root = "runs/figure4_formal_6datasets/verina/repeat-03/trace_state"
+paired_repeat_id = 3
+seed = 1731
+
+[allocation]
+policy = "trace_state"

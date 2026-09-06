@@ -85,7 +85,7 @@ def run_preflight(
     binary = Path(agent.binary())
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise PreflightError("NuRouter/AISW Pi executable is not available")
-    report["aisw"] = {
+    provider_report = {
         "enabled": bool(config.aisw_enabled),
         "binary_sha256": _sha256(binary),
         "nurouter_version": sanitize_worker_text(
@@ -93,6 +93,10 @@ def run_preflight(
         ),
         "pi_binary_version": _version(binary),
     }
+    # Emit the provider-facing spelling while retaining ``aisw`` as a bounded
+    # compatibility alias in existing run artifacts.
+    report["nurouter"] = provider_report
+    report["aisw"] = dict(provider_report)
 
     if config.aisw_enabled:
         node_config = os.environ.get("MINI_SWARM_AISW_NODE_CONFIG", "").strip()
@@ -102,10 +106,13 @@ def run_preflight(
         coordinator = config.aisw_coordinator_url.strip() or str(node_payload.get("coordinator_url") or "").strip()
         if not coordinator:
             raise PreflightError("AISW is enabled but no coordinator_url is configured")
+        report["nurouter"]["node_config_present"] = True
+        report["nurouter"]["coordinator_configured"] = True
         report["aisw"]["node_config_present"] = True
         report["aisw"]["coordinator_configured"] = True
         if config.fast_mode:
             policy = _runtime_policy(coordinator, str(node_payload.get("token") or ""))
+            report["nurouter"]["fast_mode_policy"] = policy
             report["aisw"]["fast_mode_policy"] = policy
             if policy.get("allow_codex_fast_mode") is not True:
                 raise PreflightError("NuRouter runtime policy did not explicitly allow fast mode")
@@ -876,7 +883,13 @@ def _safe_health(payload: dict[str, Any], requested_env: str) -> dict[str, Any]:
         group_admission.get("enabled"), bool
     ):
         result["group_admission_enabled"] = bool(group_admission["enabled"])
+    # Routers advertise the routed environment set as ``accepted_*`` while a
+    # direct, dataset-pinned Lean backend uses the older
+    # ``supported_lean_env_ids`` spelling.  Both are explicit admission
+    # contracts; normalize them to one bounded field before validation.
     accepted = payload.get("accepted_lean_env_ids")
+    if not isinstance(accepted, list):
+        accepted = payload.get("supported_lean_env_ids")
     if isinstance(accepted, list):
         safe_accepted = [value for value in accepted if isinstance(value, str)]
         result["accepted_lean_env_ids"] = safe_accepted

@@ -1,0 +1,10 @@
+extends = ["../nustigmergy.toml"]
+
+[experiment]
+name = "issue38-formal-verina-r01-nustigmergy"
+output_root = "runs/issue38_formal/verina/repeat1/nustigmergy"
+seed = 1729
+
+[selection]
+seed = 1729
+

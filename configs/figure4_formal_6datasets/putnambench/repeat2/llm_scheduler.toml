@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: putnambench, repeat 2, llm_scheduler.
+extends = ["../../_putnambench.toml"]
+
+[experiment]
+name = "figure4-formal-putnambench-r02-llm_scheduler"
+output_root = "runs/figure4_formal_6datasets/putnambench/repeat-02/llm_scheduler"
+paired_repeat_id = 2
+seed = 1730
+
+[allocation]
+policy = "llm_scheduler"

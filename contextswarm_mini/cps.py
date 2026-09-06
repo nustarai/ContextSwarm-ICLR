@@ -1095,7 +1095,14 @@ class CPSStore:
             )
         return message
 
-    def inbox(self, *, task_id: str, recipient: str, limit: int = 8) -> list[dict[str, Any]]:
+    def inbox(
+        self,
+        *,
+        task_id: str,
+        recipient: str,
+        limit: int = 8,
+        include_global: bool = False,
+    ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 50))
         profiling = self._profiling_enabled
         started = time.monotonic() if profiling else 0.0
@@ -1104,13 +1111,22 @@ class CPSStore:
         read_scope_seconds = 0.0
         with self._db(operation="inbox" if profiling else "generic") as db:
             query_started = time.monotonic() if profiling else 0.0
-            cursor = db.execute(
-                """SELECT * FROM messages
-                   WHERE task_id IN (?, '__global__') AND acked_at IS NULL
-                     AND (recipient IS NULL OR recipient=? OR recipient='*')
-                   ORDER BY created_at DESC LIMIT ?""",
-                (task_id, recipient, limit),
-            )
+            if include_global:
+                cursor = db.execute(
+                    """SELECT * FROM messages
+                       WHERE task_id IN (?, '__global__') AND acked_at IS NULL
+                         AND (recipient IS NULL OR recipient=? OR recipient='*')
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (task_id, recipient, limit),
+                )
+            else:
+                cursor = db.execute(
+                    """SELECT * FROM messages
+                       WHERE task_id=? AND acked_at IS NULL
+                         AND (recipient IS NULL OR recipient=? OR recipient='*')
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (task_id, recipient, limit),
+                )
             if profiling:
                 query_seconds = max(0.0, time.monotonic() - query_started)
                 fetch_started = time.monotonic()
@@ -1247,7 +1263,12 @@ class CPSStore:
         profiling = self._profiling_enabled
         if not profiling:
             pieces = self.search(task_id=task_id, query=query, limit=limit, include_global=include_global)
-            messages = self.inbox(task_id=task_id, recipient=actor_id, limit=limit)
+            messages = self.inbox(
+                task_id=task_id,
+                recipient=actor_id,
+                limit=limit,
+                include_global=include_global,
+            )
             return {"pieces": pieces, "messages": messages}
         started = time.monotonic()
         with self._profile_span(
@@ -1262,7 +1283,12 @@ class CPSStore:
                 limit=limit,
                 include_global=include_global,
             )
-            messages = self.inbox(task_id=task_id, recipient=actor_id, limit=limit)
+            messages = self.inbox(
+                task_id=task_id,
+                recipient=actor_id,
+                limit=limit,
+                include_global=include_global,
+            )
         self._profile_event(
             "cps.digest.summary",
             operation="worker_context_digest",

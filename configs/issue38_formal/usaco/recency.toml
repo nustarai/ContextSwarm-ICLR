@@ -1,0 +1,12 @@
+extends = ["_base.toml"]
+
+[experiment]
+name = "issue38-formal-usaco-recency"
+output_root = "runs/issue38_formal/usaco/recency"
+
+[selection]
+selector_name = "recency"
+
+[selection.policy_params]
+primary_sort = "commit_seq_desc"
+

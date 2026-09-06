@@ -18,7 +18,9 @@ ROOT = Path(__file__).resolve().parents[1]
 _DIRECT = {"cps_inbox", "cps_send", "cps_ack", "cps_actors"}
 
 
-def _registered_tools(*, direct_messages: bool, selection_enabled: bool) -> dict[str, dict]:
+def _registered_tools(
+    *, direct_messages: bool, selection_enabled: bool, global_scope: bool = False
+) -> dict[str, dict]:
     script = """
 const { default: register } = await import(process.argv[1]);
 const tools = {};
@@ -28,6 +30,7 @@ console.log(JSON.stringify(tools));
     environment = os.environ | {
         "CONTEXTSWARM_CPS_DIRECT_MESSAGES": "1" if direct_messages else "0",
         "CONTEXTSWARM_CPS_SELECTION_ENABLED": "1" if selection_enabled else "0",
+        "CONTEXTSWARM_CPS_GLOBAL_SCOPE": "1" if global_scope else "0",
     }
     result = subprocess.run(
         ["node", "--input-type=module", "--eval", script, str(ROOT / "contextswarm_mini/pi_solver_tools.mjs")],
@@ -59,6 +62,29 @@ class ToolCapabilityGateTests(unittest.TestCase):
         tools = _registered_tools(direct_messages=True, selection_enabled=False)
         self.assertTrue({"cps_search", "cps_publish"} | _DIRECT <= tools.keys())
         self.assertNotIn("cps_feedback", tools)
+        self.assertNotIn(
+            "scope", tools["cps_publish"]["parameters"]["properties"]
+        )
+        self.assertNotIn("scope", tools["cps_send"]["parameters"]["properties"])
+
+    def test_hybrid_surface_is_the_only_worker_surface_with_global_scope(self) -> None:
+        tools = _registered_tools(
+            direct_messages=True,
+            selection_enabled=False,
+            global_scope=True,
+        )
+        for name in ("cps_publish", "cps_send"):
+            scope = tools[name]["parameters"]["properties"]["scope"]
+            self.assertEqual(scope["enum"], ["task", "global"])
+
+        selection_tools = _registered_tools(
+            direct_messages=False,
+            selection_enabled=True,
+            global_scope=True,
+        )
+        self.assertNotIn(
+            "scope", selection_tools["cps_publish"]["parameters"]["properties"]
+        )
 
     def test_runner_facing_allowlist_and_prompt_match_selection_surface(self) -> None:
         agent = PiAgent(load_config("configs/smoke.toml", ROOT))

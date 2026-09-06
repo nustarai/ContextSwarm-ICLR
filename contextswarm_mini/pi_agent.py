@@ -23,6 +23,7 @@ import uuid
 
 from .config import ExperimentConfig
 from .models import AgentResult
+from .provider_diagnostics import is_provider_diagnostic
 from .profiling import RunProfiler
 
 
@@ -70,6 +71,11 @@ Complete a mandatory early Judge checkpoint after initial file inspection and be
 extended proof search or CPS communication; do not wait for a polished proof. Any
 job-bound terminal candidate feedback, including a bounded resource or execution
 failure, is useful feedback even when it is not a proof.
+Independent proof construction does not ban Lean tactics, known Mathlib APIs, or
+bounded `find`/`exact`/`apply` searches. Do not inspect unrelated files, host paths,
+other workers, or external completed proofs. If an environment search becomes
+expensive, stop it and leave the strongest candidate so it does not monopolize Judge
+capacity.
 If that tool is busy or unavailable, continue static proof reasoning or leave the best
 candidate for the runner; never create a local or raw-network fallback. The user prompt
 defines the assigned proof task and, when present, the controlled CPS protocol."""
@@ -115,6 +121,11 @@ Complete a mandatory early judge_check checkpoint after initial file inspection 
 before helper diagnostics, extended proof search, or CPS communication; do not wait
 for a polished proof. Any job-bound terminal candidate feedback, including a bounded
 resource or execution failure, is useful feedback even when it is not a proof.
+Independent proof construction does not ban Lean tactics, known Mathlib APIs, or
+bounded `find`/`exact`/`apply` searches. Do not inspect unrelated files, host paths,
+other workers, or external completed proofs. If an environment search becomes
+expensive, stop it and leave the strongest candidate so it does not monopolize Judge
+capacity.
 If a controlled tool is busy or unavailable, continue static proof reasoning or leave
 the best candidate for the runner; never create a local or raw-network fallback. The
 user prompt defines the assigned proof task and, when present, the controlled CPS
@@ -424,6 +435,11 @@ class PiAgent:
         # direct-message CPS surface for existing runner call sites.
         env["CONTEXTSWARM_CPS_DIRECT_MESSAGES"] = "1" if direct_messages else "0"
         env["CONTEXTSWARM_CPS_SELECTION_ENABLED"] = "1" if selection_enabled else "0"
+        env["CONTEXTSWARM_CPS_GLOBAL_SCOPE"] = (
+            "1"
+            if self.config.communication == "hybrid" and not selection_enabled
+            else "0"
+        )
         # Do not append an operator-supplied PYTHONPATH.  The runner package is
         # the only import root required by the controlled helper/client path.
         env["PYTHONPATH"] = str(self.config.repo_root)
@@ -590,6 +606,9 @@ class PiAgent:
         pending_assistant_error = ""
         retry_final_error = ""
         assistant_streamed = False
+        assistant_stop_reason = ""
+        assistant_success = False
+        transport_diagnostic_seen = False
         termination_summary_requested = False
         termination_summary_request_sent = False
         termination_summary_completed = False
@@ -902,6 +921,9 @@ class PiAgent:
             nonlocal pending_assistant_error
             nonlocal retry_final_error
             nonlocal assistant_streamed
+            nonlocal assistant_stop_reason
+            nonlocal assistant_success
+            nonlocal transport_diagnostic_seen
             nonlocal termination_summary_completed
             nonlocal termination_summary_request_sent
             nonlocal termination_summary_acknowledged
@@ -915,6 +937,8 @@ class PiAgent:
             if payload is None:
                 value = line.strip()
                 if value:
+                    if _is_transport_diagnostic(value):
+                        transport_diagnostic_seen = True
                     errors.append(f"Pi emitted non-JSON RPC output: {_redact_sensitive_text(value)}")
                 return
             events += 1
@@ -984,9 +1008,12 @@ class PiAgent:
             outcome = _assistant_outcome(payload)
             if outcome is not None:
                 stop_reason, error_message = outcome
+                assistant_stop_reason = stop_reason
                 if stop_reason == "error":
+                    assistant_success = False
                     pending_assistant_error = error_message or "Pi assistant stopped with an error"
                 elif stop_reason in {"stop", "toolUse"}:
+                    assistant_success = True
                     pending_assistant_error = ""
                     retry_final_error = ""
 
@@ -1083,6 +1110,8 @@ class PiAgent:
 
             diagnostic = _event_error(payload)
             if diagnostic:
+                if _is_transport_diagnostic(diagnostic):
+                    transport_diagnostic_seen = True
                 errors.append(f"{event_type}: {_redact_sensitive_text(diagnostic)}")
             if trace_handle is not None:
                 row = {
@@ -1116,8 +1145,11 @@ class PiAgent:
                 consume_stdout_line(raw.decode("utf-8", errors="replace"))
 
         def consume_stderr_line(raw: bytes) -> None:
+            nonlocal transport_diagnostic_seen
             value = raw.decode("utf-8", errors="replace").rstrip("\r")
             if value:
+                if _is_transport_diagnostic(value):
+                    transport_diagnostic_seen = True
                 errors.append(_redact_sensitive_text(value))
 
         def consume_stderr_bytes(chunk: bytes, *, final: bool = False) -> None:
@@ -1531,6 +1563,19 @@ class PiAgent:
             termination_summary_request_sent=termination_summary_request_sent,
             termination_summary_completed=termination_summary_completed,
             termination_summary_reason=termination_summary_reason,
+            settled=settled_seen,
+            assistant_success=assistant_success,
+            assistant_stop_reason=assistant_stop_reason or None,
+            transport_diagnostic=transport_diagnostic_seen,
+            transport_recovered=bool(
+                transport_diagnostic_seen
+                and settled_seen
+                and assistant_success
+                and not timed_out
+                and not cancelled
+                and not prompt_rejected
+                and returncode == 0
+            ),
         )
 
 
@@ -1778,6 +1823,35 @@ def _error_category(value: str) -> str:
         if any(needle in lowered for needle in needles):
             return category
     return "other"
+
+
+def _is_transport_diagnostic(value: str) -> bool:
+    """Classify provider transport/retry noise separately from final outcome."""
+
+    lowered = str(value or "").lower()
+    return is_provider_diagnostic(value) or any(
+        marker in lowered
+        for marker in (
+            "upstream request failed",
+            "upstream connect error",
+            "websocket",
+            "connection reset",
+            "connection refused",
+            "connection timeout",
+            "connection termination",
+            "network error",
+            "fetch failed",
+            "transport failure",
+            "transport error",
+            "request timed out",
+            "request timeout",
+            "timed out",
+            "timeout",
+            "oauth",
+            "rate limit",
+            "too many requests",
+        )
+    )
 
 
 _URL_PATTERN = re.compile(r"\b(?:https?|wss?)://[^\s<>'\"]+", re.IGNORECASE)

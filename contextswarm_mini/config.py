@@ -808,6 +808,13 @@ class ExperimentConfig:
             "pi_recovery_max_restarts": self.pi_recovery_max_restarts,
             "pi_recovery_base_delay_ms": self.pi_recovery_base_delay_ms,
             "pi_binary_configured": bool(self.pi_binary),
+            # Public spelling follows the actual provider.  Keep the AISW
+            # fields below for replaying older run metadata and fixtures.
+            "provider_backend": "nurouter" if self.aisw_enabled else "pi",
+            "nurouter_enabled": self.aisw_enabled,
+            "nurouter_binary_configured": bool(self.aisw_binary),
+            "nurouter_node_config_configured": bool(self.aisw_node_config),
+            "nurouter_max_in_flight": self.aisw_max_in_flight,
             "aisw_enabled": self.aisw_enabled,
             "aisw_binary_configured": bool(self.aisw_binary),
             "aisw_node_config_configured": bool(self.aisw_node_config),
@@ -863,10 +870,20 @@ def load_config(raw: str | Path, repo_root: Path | None = None) -> ExperimentCon
     payload = _load_mapping(manifest_path)
     experiment = _as_dict(payload.get("experiment"), "experiment")
     pi = _as_dict(payload.get("pi"), "pi")
-    aisw_payload = payload.get("aisw")
-    if aisw_payload is None:
-        aisw_payload = payload.get("nurouter")
-    aisw = _as_dict(aisw_payload, "aisw")
+    # ``nurouter`` is the paper-facing spelling.  ``aisw`` is retained as a
+    # compatibility alias for older manifests and for the on-wire environment
+    # variables used by the released NuRouter launcher.  Prefer the explicit
+    # NuRouter table when both are present (the inherited development bases
+    # still carry the legacy table).
+    legacy_aisw = _as_dict(payload.get("aisw"), "aisw")
+    explicit_nurouter = payload.get("nurouter")
+    if explicit_nurouter is None:
+        aisw = legacy_aisw
+    else:
+        # Merge the alias first so a short [nurouter] override in a child
+        # manifest does not discard private launcher defaults inherited from an
+        # older base; explicit NuRouter keys always win.
+        aisw = _deep_merge(legacy_aisw, _as_dict(explicit_nurouter, "nurouter"))
     lean = _as_dict(payload.get("lean"), "lean")
     judge = _as_dict(payload.get("judge"), "judge")
     formal_tools = _as_dict(payload.get("formal_tools"), "formal_tools")

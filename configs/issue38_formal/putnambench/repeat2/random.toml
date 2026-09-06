@@ -1,0 +1,10 @@
+extends = ["../random.toml"]
+
+[experiment]
+name = "issue38-formal-putnambench-r02-random"
+output_root = "runs/issue38_formal/putnambench/repeat2/random"
+seed = 1730
+
+[selection]
+seed = 1730
+

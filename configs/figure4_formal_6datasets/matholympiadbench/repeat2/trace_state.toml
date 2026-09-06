@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: matholympiadbench, repeat 2, trace_state.
+extends = ["../../_matholympiadbench.toml"]
+
+[experiment]
+name = "figure4-formal-matholympiadbench-r02-trace_state"
+output_root = "runs/figure4_formal_6datasets/matholympiadbench/repeat-02/trace_state"
+paired_repeat_id = 2
+seed = 1730
+
+[allocation]
+policy = "trace_state"

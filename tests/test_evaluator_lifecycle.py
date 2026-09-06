@@ -11,9 +11,11 @@ import unittest
 from unittest.mock import patch
 
 from contextswarm_mini.evaluator import (
+    CodingEvaluator,
     EvaluatorError,
     LeanEvaluator,
     _safe_response,
+    _settled_outcome,
     _terminal,
     safe_worker_response,
 )
@@ -963,6 +965,61 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["failure_category"], "cancel_settlement_deferred")
         self.assertEqual(evaluator.remote_unsettled_jobs, 0)
 
+    def test_full_score_cancel_defers_with_legacy_coding_receipt(self) -> None:
+        """A bound runner stop is recoverable without a retryable marker."""
+
+        evaluator = CodingEvaluator(
+            "https://judge.invalid",
+            poll_interval_seconds=0.01,
+            cancel_grace_seconds=0.02,
+        )
+        response = {
+            "job_id": "job-1",
+            "status": "running",
+            "status_endpoint": "/api/judge/jobs/job-1",
+            "cancel_endpoint": "/api/judge/jobs/job-1",
+        }
+
+        def request(
+            method: str,
+            _path: str,
+            *_args: object,
+            **_kwargs: object,
+        ) -> dict[str, object]:
+            if method == "DELETE":
+                return {
+                    "job_id": "job-1",
+                    "status": "cancel_requested",
+                    "status_endpoint": "/api/judge/jobs/job-1",
+                    "cancel_endpoint": "/api/judge/jobs/job-1",
+                }
+            return {
+                "job_id": "job-1",
+                "status": "cancel_requested",
+                "status_endpoint": "/api/judge/jobs/job-1",
+                "cancel_endpoint": "/api/judge/jobs/job-1",
+            }
+
+        with (
+            patch.object(evaluator, "_request", side_effect=request),
+            patch.object(
+                evaluator,
+                "_start_settlement_watcher",
+                return_value=True,
+            ) as watcher,
+        ):
+            summary = evaluator._cancel_submitted_job(  # noqa: SLF001
+                "job-1",
+                response=response,
+                cancellation_reason="full_score",
+            )
+
+        watcher.assert_called_once()
+        self.assertTrue(summary["deferred"])
+        self.assertFalse(summary["unconfirmed"])
+        self.assertEqual(summary["failure_category"], "cancel_settlement_deferred")
+        self.assertEqual(evaluator.remote_unsettled_jobs, 0)
+
     def test_peer_cancel_watcher_callback_failure_latches_remote_work(self) -> None:
         evaluator = LeanEvaluator(
             "https://judge.invalid",
@@ -1253,6 +1310,33 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(verdict.status, "EVALUATOR_ERROR")
         self.assertEqual(verdict.score, 0.0)
         self.assertIn("lacks an authoritative verdict", verdict.error or "")
+
+    def test_success_with_sorry_is_a_scoreless_elaboration(self) -> None:
+        status, proved, error = _settled_outcome(
+            {
+                "status": "succeeded",
+                "terminal_reason": "verified_with_sorry",
+                "is_valid_with_sorry": True,
+                "is_valid_no_sorry": False,
+            }
+        )
+
+        self.assertEqual(status, "COMPILES_WITH_SORRY")
+        self.assertFalse(proved)
+        self.assertIsNone(error)
+
+    def test_kernel_verification_failure_is_a_candidate_failure(self) -> None:
+        status, proved, error = _settled_outcome(
+            {
+                "status": "failed",
+                "terminal_reason": "verification_failed",
+                "error_kind": "verification_failed",
+            }
+        )
+
+        self.assertEqual(status, "VERIFY_FAIL")
+        self.assertFalse(proved)
+        self.assertIsNone(error)
 
     def test_nonterminal_admission_without_job_id_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -1,0 +1,10 @@
+extends = ["../nustigmergy.toml"]
+
+[experiment]
+name = "issue38-formal-clever-r02-nustigmergy"
+output_root = "runs/issue38_formal/clever/repeat2/nustigmergy"
+seed = 1730
+
+[selection]
+seed = 1730
+

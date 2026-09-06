@@ -1,0 +1,11 @@
+# Generated formal Figure 4 leaf: usaco, repeat 2, uniform_refill.
+extends = ["../../_usaco.toml"]
+
+[experiment]
+name = "figure4-formal-usaco-r02-uniform_refill"
+output_root = "runs/figure4_formal_6datasets/usaco/repeat-02/uniform_refill"
+paired_repeat_id = 2
+seed = 1730
+
+[allocation]
+policy = "uniform_refill"

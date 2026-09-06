@@ -1,0 +1,9 @@
+extends = ["_usaco.toml"]
+
+[experiment]
+name = "formal-1h-6datasets-usaco-parallel"
+output_root = "runs/formal_1h_6datasets/usaco/parallel"
+mode = "parallel"
+communication = "none"
+max_parallel = 12
+episodes_per_task = 1

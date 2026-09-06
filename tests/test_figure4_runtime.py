@@ -18,7 +18,7 @@ from contextswarm_mini.allocation_audit import AllocationAuditRecord
 from contextswarm_mini.allocator_selection import _extract_cost
 from contextswarm_mini.config import load_config
 from contextswarm_mini.elastic_scheduler import ElasticScheduler
-from contextswarm_mini.runner import run_experiment
+from contextswarm_mini.runner import _write_figure4_summary, run_experiment
 import contextswarm_mini.runner as runner_module
 from contextswarm_mini.models import Verdict
 
@@ -44,6 +44,62 @@ def _config(policy: str, *, attempts: int = 3):
 
 
 class Figure4RuntimeTests(unittest.TestCase):
+    def test_summary_uses_registered_tasks_when_verdict_snapshot_lags(self) -> None:
+        """A closeout race must not reject already-recorded positive receipts.
+
+        The scoreboard can contain a proof for every registered task while the
+        in-memory final-verdict map is still one row short.  The summary's
+        fixed maximum is the manifest task boundary, not that transient map.
+        """
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            task_ids = ["verina_advanced_7", "verina_advanced_40"]
+            (run_dir / "run_meta.json").write_text(
+                json.dumps(
+                    {
+                        "run_id": "summary-race",
+                        "ordered_task_ids": task_ids,
+                        "effective_runtime_limits": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "scoreboard_history.jsonl").write_text(
+                "".join(
+                    json.dumps(
+                        {
+                            "source": "judge_check",
+                            "task_id": task_id,
+                            "score": 1.0,
+                            "horizon_elapsed_seconds": elapsed,
+                        }
+                    )
+                    + "\n"
+                    for task_id, elapsed in zip(task_ids, (10.0, 20.0))
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "allocation_summary.json").write_text("{}", encoding="utf-8")
+            config = load_config(
+                "configs/figure4_formal_6datasets/verina/repeat1/task_state.toml",
+                ROOT,
+            )
+            # Deliberately omit the second task from the transient verdict map.
+            _write_figure4_summary(
+                run_dir,
+                config,
+                {task_ids[0]: {"score": 1.0}},
+                [],
+                {},
+            )
+            summary = json.loads(
+                (run_dir / "figure4_run_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["task_order"], task_ids)
+            self.assertEqual(summary["max_score"], 2.0)
+            self.assertEqual(summary["final_accepted_score"], 2.0)
+
     def assert_scheduler_summary_is_selectable(
         self,
         run_dir: Path,

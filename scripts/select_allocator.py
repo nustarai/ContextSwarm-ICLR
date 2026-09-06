@@ -20,6 +20,11 @@ import json
 from pathlib import Path
 import sys
 
+# Make the documented direct invocation resolve the local package just like
+# ``python -m scripts.select_allocator`` does.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from contextswarm_mini.allocator_selection import (
     AllocatorSelectionError,
     SELECTION_SCHEMA,
