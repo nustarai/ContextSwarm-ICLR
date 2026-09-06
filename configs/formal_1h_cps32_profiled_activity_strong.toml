@@ -1,0 +1,15 @@
+extends = ["formal_1h_cps32_profiled_route_claim.toml"]
+
+# Strong/treatment arm for the prompt-policy experiment.  The Agent still owns
+# the semantic decision and may repeat a direction, but the prompt makes
+# materially different exploration the default and requires a concrete reason
+# plus new contribution for an intentional repeat.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-activity-strong"
+
+[cps_features]
+route_claim_required = true
+route_claim_ttl_seconds = 3600
+activity_feedback_prompt_mode = "strong"
+per_recipient_receipts = false
+knowledge_promotion = false

@@ -1,0 +1,10 @@
+extends = ["formal_1h_cps32_profiled_route_control.toml"]
+
+# Treatment changes only the mandatory active-roster/route-claim capability.
+# Worker heartbeats do not yet renew claims, so the TTL spans the fixed outer
+# horizon; normal finish/cancel/recovery closeout releases the lease earlier.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-route-claim"
+
+[cps_features]
+route_claim_required = true

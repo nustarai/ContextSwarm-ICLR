@@ -1,0 +1,14 @@
+extends = ["formal_1h_cps32_profiled_clean.toml"]
+
+# Contemporaneous control for the route-coordination experiment.  It preserves
+# the historical profiled CPS32 contract while making every feature identity
+# field explicit.  Run this control from the same source/image as the treatment
+# before interpreting score or route-overlap changes causally.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-route-control"
+
+[cps_features]
+route_claim_required = false
+route_claim_ttl_seconds = 3600
+per_recipient_receipts = false
+knowledge_promotion = false

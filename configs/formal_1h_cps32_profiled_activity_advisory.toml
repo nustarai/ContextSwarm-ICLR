@@ -1,0 +1,15 @@
+extends = ["formal_1h_cps32_profiled_route_claim.toml"]
+
+# Weak/control arm for the prompt-policy experiment.  It exposes the same
+# runner-owned roster, route claims, peer summaries, task order, model, Judge,
+# CPS capacity, and one-hour horizon as the strong arm.  Only the wording
+# policy differs (the default advisory behavior from the first activity run).
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-activity-advisory"
+
+[cps_features]
+route_claim_required = true
+route_claim_ttl_seconds = 3600
+activity_feedback_prompt_mode = "advisory"
+per_recipient_receipts = false
+knowledge_promotion = false
