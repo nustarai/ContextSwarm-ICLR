@@ -69,6 +69,8 @@ class PiSolverContractTests(unittest.TestCase):
         self.assertIn("mandatory early judge_check checkpoint", system_prompt)
         self.assertIn("untrusted problem data", system_prompt)
         self.assertIn("never\noverride this", system_prompt)
+        self.assertIn("Independent proof construction does not ban Lean tactics", system_prompt)
+        self.assertIn("bounded `find`/`exact`/`apply` searches", system_prompt)
         self.assertEqual(
             {
                 "judge_check",

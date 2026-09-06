@@ -3068,6 +3068,31 @@ def _settled_outcome(
     proved = _is_proved(payload)
     if proved:
         return "PROVED", True, None
+    # The Lean service uses a successful lifecycle status for candidates that
+    # elaborate only because they still contain `sorry`.  That is useful
+    # solver feedback, but it is not a proof and must remain scoreless.  Keep
+    # this distinct from an ambiguous success envelope so the CPS scheduler
+    # can learn from a real kernel elaboration instead of treating every
+    # placeholder candidate as an infrastructure failure.
+    if (
+        status in {"SUCCEEDED", "COMPLETED"}
+        and _nested_value(payload, "is_valid_with_sorry") is True
+        and _nested_value(payload, "is_valid_no_sorry") is not True
+    ):
+        return "COMPILES_WITH_SORRY", False, None
+    # A kernel rejection is a normal candidate outcome.  The Lean service
+    # reports it as a failed lifecycle with a verification_failed terminal
+    # reason; preserve that distinction from transport/evaluator failures so
+    # scheduler feedback and final metrics count the attempt correctly.
+    terminal_reason = str(
+        _nested_value(payload, "terminal_reason") or ""
+    ).strip().lower()
+    error_kind = str(_nested_value(payload, "error_kind") or "").strip().lower()
+    if status in {"FAILED", "ERROR"} and (
+        terminal_reason in {"verification_failed", "verifier_failed"}
+        or error_kind in {"verification_failed", "verifier_failed"}
+    ):
+        return "VERIFY_FAIL", False, None
     if status in {"SUCCEEDED", "COMPLETED", "FAILED", "ERROR", "UNKNOWN"}:
         return (
             "EVALUATOR_ERROR",

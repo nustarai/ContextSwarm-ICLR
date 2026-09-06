@@ -1,0 +1,48 @@
+extends = ["formal_1h_bridge.toml"]
+
+[experiment]
+name = "flt-1h-cps-smoke"
+dataset = "fermat_last_theorem"
+dataset_root = "benchmarks/fermat_last_theorem"
+problem_ids = "benchmarks/fermat_last_theorem/problem_ids.json"
+output_root = "runs/flt_1h_smoke"
+mode = "cps"
+communication = "blackboard"
+max_parallel = 32
+initial_agents_per_task = 32
+max_attempts_per_task = 0
+cancel_on_proved = true
+assignment_policy = "least_active"
+episodes_per_task = 1
+max_tasks = 1
+time_limit_seconds = 3600
+seed = 0
+
+[aisw]
+max_in_flight = 32
+
+[lean]
+env_id = "formal_flt"
+timeout_seconds = 3600
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 1
+verification_profile = "formal_flt"
+judge_mode = "fast"
+require_result_cache_disabled = false
+
+[judge]
+kind = "formal"
+env_id = "formal_flt"
+verification_profile = "formal_flt"
+judge_mode = "fast"
+timeout_seconds = 3600
+max_lifecycle_seconds = 3600
+max_concurrent_evaluations = 1
+require_result_cache_disabled = false
+
+[formal_tools]
+enabled = false
+require_decl_index = false
+
+[docker]
+network = "bridge"

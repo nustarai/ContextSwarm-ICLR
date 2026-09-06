@@ -1,0 +1,24 @@
+{
+  "dataset": "fermat_last_theorem",
+  "problem_id": "fermat_last_theorem",
+  "slug": "fermat_last_theorem",
+  "subset": "full",
+  "namespace": null,
+  "theorem_name": "fermat_last_theorem",
+  "theorem_names": [
+    "fermat_last_theorem"
+  ],
+  "imports": [
+    "Mathlib"
+  ],
+  "lean_env_id": "formal_flt",
+  "verification_profile": "formal_flt",
+  "source_kind": "flt_statement_only",
+  "source_repository": "https://github.com/anthropics/fermats-last-theorem",
+  "source_revision": "aa2d8b34692b16c70f699536de0d8e75a3e9ef",
+  "lean_toolchain": "leanprover/lean4:v4.33.1",
+  "mathlib_revision": "db584cd6d46c92f209a44c0f1c829460d327499d",
+  "strict_from_scratch": true,
+  "solved": false,
+  "benchmark_revision": "flt-statement-only-v1"
+}
