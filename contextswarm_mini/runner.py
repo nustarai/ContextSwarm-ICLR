@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import datetime as dt
 import hashlib
@@ -15,6 +16,7 @@ from queue import Empty, Queue
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import sys
 import threading
 import time
 import traceback
@@ -37,7 +39,7 @@ from .agent_recovery import (
     recovery_settings,
     run_with_recovery,
 )
-from .artifacts import atomic_write_json
+from .artifacts import atomic_write_bytes, atomic_write_json
 from .allocation_core import (
     AllocationStateSnapshot,
     LLMSchedulerResponse,
@@ -63,6 +65,7 @@ from .allocation_trace_bridge import (
 )
 from .config import ConfigError, ExperimentConfig
 from .cps import CPSStore, CommunicationPolicy, make_policy
+from .checkpoint import CheckpointRef, CheckpointStore
 from .evaluator import (
     CodingEvaluator,
     LeanEvaluator,
@@ -84,7 +87,12 @@ from .launch_contract import LaunchContractError, verify_manifest_binding
 from .models import AgentResult, Task, Verdict
 from .pi_agent import PiAgent
 from .preflight import PreflightError, run_preflight
-from .prompts import build_mono_prompt, build_task_prompt
+from .prompts import (
+    build_mono_prompt,
+    build_task_prompt,
+    build_termination_summary_prompt,
+)
+from .profiling import RunProfiler
 from .selection_runtime import SelectionRuntime
 from .selection_store import EXPORT_SCHEMA_VERSION, SelectionStore
 
@@ -227,7 +235,10 @@ def _initialize_selection_runtime(
             "the shared selection runtime requires a CPS store"
         )
     selection = config.selection
-    store = SelectionStore(run_dir / "selection.sqlite3")
+    store = SelectionStore(
+        run_dir / "selection.sqlite3",
+        profiler=getattr(logger, "profiler", None),
+    )
     runtime = SelectionRuntime(
         cps_store,
         store,
@@ -235,6 +246,7 @@ def _initialize_selection_runtime(
         run_id=run_id or run_dir.name,
         paired_seed=config.seed,
         comparison_contract_id=_selection_comparison_contract_id(config),
+        profiler=getattr(logger, "profiler", None),
     )
     metadata = {
         "schema_version": "contextswarm_runner_selection_v1",
@@ -443,11 +455,42 @@ def _exception_artifact_fields(
 class RunLogger:
     output_dir: Path
     lock: threading.Lock
+    run_id: str | None = None
+    profiler: RunProfiler = field(init=False, repr=False)
 
-    def __init__(self, output_dir: Path):
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        profiler: RunProfiler | None = None,
+        run_id: str | None = None,
+    ):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
+        self.run_id = run_id
+        # Do not use truthiness here: an injected diagnostic adapter may be
+        # deliberately false-y, and evaluating its ``__bool__`` is itself
+        # outside the runner's business contract.  ``None`` is the only value
+        # that requests construction of the environment-selected profiler.
+        self.profiler = (
+            profiler
+            if profiler is not None
+            else RunProfiler.from_environment(self.output_dir, run_id=run_id)
+        )
+        try:
+            self._profiling_enabled = bool(getattr(self.profiler, "enabled", False))
+        except BaseException:
+            self._profiling_enabled = False
+        # ``RunProfiler`` is intentionally duck-typed at this boundary so
+        # narrow test sinks and downstream adapters remain compatible.
+        if self._profiling_enabled:
+            try:
+                start = getattr(self.profiler, "start", None)
+                if callable(start):
+                    start(run_id=run_id, root_pid=os.getpid())
+            except BaseException:
+                pass
         self._horizon_started_monotonic: float | None = None
 
     def start_horizon(self, started_monotonic: float | None = None) -> float:
@@ -462,9 +505,37 @@ class RunLogger:
 
     def event(self, event_type: str, **payload: Any) -> None:
         row = {"at": utc_now(), "event": event_type, **payload}
+        profiling_enabled = self._profiling_enabled
+        # The ordinary event log is part of the runner contract.  When the
+        # optional profiler is off, keep this path to one serialization/write
+        # and avoid profiling-only clock and UTF-8 byte-count work.
+        started = time.monotonic() if profiling_enabled else 0.0
+        encoded_bytes = 0
         with self.lock:
             with (self.output_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                encoded = json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                if profiling_enabled:
+                    encoded_bytes = len(encoded.encode("utf-8"))
+                handle.write(encoded)
+        if not profiling_enabled:
+            return
+        try:
+            self.profiler.emit(
+                "artifact.write",
+                event_type="runner_event",
+                source="events.jsonl",
+                bytes=encoded_bytes,
+                flush_seconds=time.monotonic() - started,
+            )
+        except BaseException:
+            pass
+        # Profiling is observational and must never be allowed to alter the
+        # runner's event/audit contract.  RunProfiler itself is defensive, but
+        # keep this boundary fail-open in case a future sink is injected.
+        try:
+            self.profiler.observe_logger_event(event_type, payload)
+        except BaseException:
+            pass
 
     def scoreboard(
         self,
@@ -492,6 +563,123 @@ class RunLogger:
         with self.lock:
             with (self.output_dir / "scoreboard_history.jsonl").open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        if self._profiling_enabled:
+            try:
+                self.profiler.emit(
+                    "scoreboard.record",
+                    task_id=verdict.task_id,
+                    actor_id=agent_id,
+                    episode=episode,
+                    source=source,
+                    status=verdict.status,
+                    score=verdict.score,
+                    elapsed_seconds=verdict.elapsed_seconds,
+                    candidate_sha256=verdict.candidate_sha256,
+                    cache_reused=verdict.cache_reused,
+                )
+            except BaseException:
+                pass
+
+    def close(self) -> None:
+        """Close the optional profile sink without affecting run artifacts."""
+
+        if not self._profiling_enabled:
+            return
+        try:
+            self.profiler.close()
+        except BaseException:
+            pass
+
+    @contextmanager
+    def profile_span(self, name: str, **fields: Any):
+        """Yield an optional profiler span without coupling runner semantics."""
+
+        if not self._profiling_enabled:
+            yield
+            return
+        profiler = self.profiler
+        try:
+            span = getattr(profiler, "span", None)
+        except BaseException:
+            span = None
+        if not callable(span):
+            yield
+            return
+        try:
+            context = span(name, **fields)
+        except BaseException:
+            context = None
+        if context is None:
+            yield
+            return
+        # Do not use ``with context`` directly here.  A test or downstream
+        # diagnostic sink is allowed to be arbitrary code, and an exception in
+        # ``__enter__``/``__exit__`` must never mask the runner operation (or
+        # alter the AgentResult it is about to return).  Drive the context
+        # protocol explicitly so a body exception remains the primary error.
+        try:
+            context.__enter__()
+        except BaseException:
+            yield
+            return
+        try:
+            yield
+        except BaseException:
+            try:
+                context.__exit__(*sys.exc_info())
+            except BaseException:
+                pass
+            raise
+        else:
+            try:
+                context.__exit__(None, None, None)
+            except BaseException:
+                pass
+
+    def profile_event(self, event: str, **fields: Any) -> None:
+        """Emit a bounded diagnostic event through the fail-open sink."""
+
+        try:
+            if self._profiling_enabled:
+                self.profiler.emit(event, **fields)
+        except BaseException:
+            pass
+
+
+def _logger_profile_enabled(logger: Any) -> bool:
+    """Read the immutable profiling switch without touching the sink clock."""
+
+    try:
+        return bool(getattr(logger, "_profiling_enabled", False))
+    except BaseException:
+        return False
+
+
+def _profile_elapsed(started: float) -> float:
+    """Best-effort elapsed value for an already-enabled diagnostic event."""
+
+    try:
+        return max(0.0, time.monotonic() - started)
+    except BaseException:
+        return 0.0
+
+
+def _profile_error_kind(exc: BaseException) -> str:
+    """Collapse implementation-specific exception names to stable labels."""
+
+    try:
+        name = type(exc).__name__.casefold()
+    except BaseException:
+        return "exception"
+    if "timeout" in name:
+        return "timeout"
+    if "cancel" in name:
+        return "cancelled"
+    if any(token in name for token in ("connection", "network", "url", "socket")):
+        return "network_error"
+    if any(token in name for token in ("value", "type", "key", "attribute")):
+        return "invalid_request"
+    return "exception"
 
 
 @dataclass(frozen=True)
@@ -591,6 +779,65 @@ class _AnyCancelEvent:
         return None
 
 
+class _TerminationSummaryCancelEvent:
+    """Two-phase cancellation view used during cooperative closeout.
+
+    The scheduler's source event remains authoritative, but a live Agent must
+    get a short opportunity to call ``cps_publish`` after that event is set.
+    While the Pi RPC is handling the runner's steer message, this adapter masks
+    the source from the broker's write guard.  Once PiAgent returns, the mask is
+    removed and normal cancellation/revocation is visible again.  The
+    ``requested`` method lets PiAgent observe the source without weakening the
+    hard cancellation checks used everywhere else.
+    """
+
+    def __init__(self, source: Any):
+        self._source = source
+        self._closeout_active = threading.Event()
+
+    def requested(self) -> bool:
+        try:
+            return bool(self._source.is_set())
+        except Exception:
+            return True
+
+    def begin_termination_summary(self) -> None:
+        self._closeout_active.set()
+
+    def finish_termination_summary(self) -> None:
+        self._closeout_active.clear()
+
+    def termination_summary_active(self) -> bool:
+        return self._closeout_active.is_set()
+
+    def is_set(self) -> bool:
+        return self.requested() and not self._closeout_active.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while not self.is_set():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                delay = min(remaining, 0.02)
+            else:
+                delay = 0.02
+            threading.Event().wait(delay)
+        return True
+
+    def cancellation_reason(self) -> str | None:
+        getter = getattr(self._source, "cancellation_reason", None)
+        if callable(getter):
+            try:
+                reason = getter()
+            except Exception:
+                reason = None
+            if isinstance(reason, str) and reason:
+                return reason
+        return None
+
+
 class RemoteJudgeSettlementError(RuntimeError):
     """The run cannot safely admit work while a remote job is unaccounted for."""
 
@@ -605,21 +852,75 @@ def _run_solver_with_recovery(
     episode: int,
     deadline: float,
     cancel_event: Any | None,
+    on_result: Any | None = None,
 ) -> AgentResult:
     """Apply the common persisted-session recovery contract to a solver."""
 
     max_restarts, delay_seconds = recovery_settings(config)
-    return run_with_recovery(
-        invoke,
+    # This is the per-attempt wrapper boundary: it includes recovery/session
+    # supervision and runner bookkeeping around the Pi call, while the
+    # profiler's registered solver root reports the child process tree itself.
+    # Keeping both rows lets a report distinguish wrapper wall/CPU from solver
+    # residency without subtracting overlapping concurrent wall times.
+    with logger.profile_span(
+        "attempt.lifecycle",
         task_id=task_id,
         actor_id=actor_id,
         episode=episode,
-        deadline_monotonic=deadline,
-        cancel_event=cancel_event,
+        operation="solver_with_recovery",
+        component="runner_wrapper",
         max_restarts=max_restarts,
-        base_delay_seconds=delay_seconds,
-        on_event=lambda event, payload: logger.event(event, **payload),
+    ):
+        with logger.profile_span(
+            "attempt.agent.invoke",
+            task_id=task_id,
+            actor_id=actor_id,
+            episode=episode,
+            component="agent_supervision",
+            operation="run_with_recovery",
+            max_restarts=max_restarts,
+        ):
+            result = run_with_recovery(
+                invoke,
+                task_id=task_id,
+                actor_id=actor_id,
+                episode=episode,
+                deadline_monotonic=deadline,
+                cancel_event=cancel_event,
+                max_restarts=max_restarts,
+                base_delay_seconds=delay_seconds,
+                on_event=lambda event, payload: logger.event(event, **payload),
+                on_result=on_result,
+            )
+    logger.profile_event(
+        "attempt.result",
+        task_id=task_id,
+        actor_id=actor_id,
+        episode=episode,
+        returncode=result.returncode,
+        events=result.events,
+        timed_out=result.timed_out,
+        cancelled=result.cancelled,
+        settled=result.returncode == 0,
+        agent_run_horizon_reached=result.run_horizon_reached,
+        recoverable_invocation_error=result.recoverable_invocation_error,
+        termination_summary_requested=bool(
+            getattr(result, "termination_summary_requested", False)
+        ),
+        termination_summary_request_sent=bool(
+            getattr(result, "termination_summary_request_sent", False)
+        ),
+        termination_summary_completed=bool(
+            getattr(result, "termination_summary_completed", False)
+        ),
+        termination_summary_publish_count=int(
+            getattr(result, "termination_summary_publish_count", 0) or 0
+        ),
+        termination_summary_publish_verified=bool(
+            getattr(result, "termination_summary_publish_verified", False)
+        ),
     )
+    return result
 
 
 def _agent_result_can_refill(
@@ -689,6 +990,11 @@ class _ElasticTaskState:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     early_proofs: dict[str, _EarlyProofCredit] = field(default_factory=dict)
     checker_outcome_ids: set[str] = field(default_factory=set)
+    latest_checkpoint: CheckpointRef | None = None
+    checkpoints_by_scope: dict[tuple[str, int], CheckpointRef] = field(
+        default_factory=dict
+    )
+    checkpoint_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1475,6 +1781,511 @@ def _allocation_feedback(verdict: Verdict) -> str:
     return _ENDPOINT_RE.sub("<redacted-endpoint>", raw).strip()[:1_200]
 
 
+def _structured_handoff_metadata(body: str) -> dict[str, str]:
+    """Extract bounded typed handoff fields when a CPS body is JSON.
+
+    The checkpoint path must work with the existing CPS schema, where a piece
+    is still an immutable title/body row.  Some producers already encode
+    negative findings as JSON, however; recognizing their stable fields here
+    preserves the useful ``status/evidence/next_action/source`` contract for a
+    recovered Agent without requiring a broad CPS schema migration.
+    """
+
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, Mapping):
+        return {}
+
+    def text(*keys: str, maximum: int = 600) -> str:
+        for key in keys:
+            value = payload.get(key)
+            if value is None or isinstance(value, (Mapping, list, tuple)):
+                continue
+            bounded = sanitize_worker_text(value, maximum)
+            if bounded:
+                return bounded
+        return ""
+
+    result: dict[str, str] = {}
+    for output_key, keys, maximum in (
+        ("status", ("status",), 64),
+        ("claim", ("claim",), 700),
+        ("evidence", ("evidence_or_counterexample", "evidence"), 900),
+        ("preconditions", ("preconditions",), 700),
+        ("next_action", ("next_action",), 700),
+        ("relation", ("relation", "relationship"), 96),
+    ):
+        value = text(*keys, maximum=maximum)
+        if value:
+            result[output_key] = value
+    for output_key, keys in (
+        ("source_message_id", ("source_message_id",)),
+        ("route_claim_id", ("route_claim_id",)),
+    ):
+        for key in keys:
+            value = sanitize_worker_identifier(payload.get(key))
+            if value:
+                result[output_key] = value
+                break
+    return result
+
+
+def _checkpoint_context(
+    store: CPSStore | None,
+    task_id: str,
+    *,
+    max_items: int,
+    max_chars: int,
+) -> dict[str, Any]:
+    """Build a bounded, redacted progress summary for a checkpoint.
+
+    The summary is intentionally derived from already-published CPS pieces;
+    it is not a transcript or a claim that any candidate is valid.  Blocker /
+    correction pieces become ``ruled_out`` evidence, while the remaining
+    typed pieces describe work that a later agent should inspect before
+    choosing its next route.
+    """
+
+    if store is None:
+        return {
+            "completed_work": [],
+            "ruled_out": [],
+            "next_step": (
+                "Inspect the unverified candidate and run judge_check before "
+                "continuing; no shared CPS summary is available."
+            ),
+            "source": "no_cps",
+        }
+    try:
+        projection = store.progress_snapshot(
+            [task_id],
+            recent_limit=max(1, min(int(max_items) * 2, 20)),
+            body_chars=max(128, min(int(max_chars) // 4, 1_200)),
+        ).get(task_id, {})
+        recent_messages = store.recent_messages(
+            task_id=task_id,
+            limit=max(1, min(int(max_items) * 2, 20)),
+            body_chars=max(128, min(int(max_chars) // 4, 1_200)),
+        )
+    except Exception:
+        # Checkpointing must remain fail-open if a concurrent CPS read is
+        # unavailable; the candidate and scalar result are still valuable.
+        return {
+            "completed_work": [],
+            "ruled_out": [],
+            "next_step": (
+                "Inspect the unverified candidate and run judge_check before "
+                "continuing; CPS summary read failed."
+            ),
+            "source": "cps_read_failed",
+        }
+    recent = projection.get("recent_pieces", [])
+    if not isinstance(recent, list):
+        recent = []
+    completed: list[dict[str, Any]] = []
+    ruled_out: list[dict[str, Any]] = []
+    body_limit = max(128, min(int(max_chars) // 4, 1_200))
+    for item in recent:
+        if not isinstance(item, Mapping):
+            continue
+        kind = sanitize_worker_text(item.get("kind"), 64)
+        # Do not recursively copy a prior runner checkpoint into every later
+        # checkpoint.  Its immutable record remains available on disk.
+        if kind == "checkpoint":
+            continue
+        row: dict[str, Any] = {
+            "kind": kind or "note",
+            "title": sanitize_worker_text(item.get("title"), 300),
+            "body": sanitize_worker_text(item.get("body"), body_limit),
+        }
+        piece_id = sanitize_worker_identifier(item.get("piece_id"))
+        if piece_id:
+            row["piece_id"] = piece_id
+        created_at = sanitize_worker_text(item.get("created_at"), 64)
+        if created_at:
+            row["created_at"] = created_at
+        author = sanitize_worker_identifier(item.get("author"))
+        if author:
+            row["author"] = author
+        recipient = sanitize_worker_identifier(item.get("recipient"))
+        if recipient:
+            row["recipient"] = recipient
+        structured = _structured_handoff_metadata(row["body"])
+        row.update(structured)
+        lowered = f"{row['kind']} {row['title']} {row['body']}".lower()
+        structured_status = structured.get("status", "").lower()
+        if (
+            kind in {"blocker", "correction"}
+            or structured_status in {"refuted", "superseded"}
+            or any(
+                marker in lowered
+                for marker in (
+                    "counterexample",
+                    "ruled out",
+                    "rejected",
+                    "cannot compile",
+                )
+            )
+        ):
+            ruled_out.append(row)
+        else:
+            completed.append(row)
+    # A direct message can be the only durable trace of a counterexample or a
+    # failed route.  Include a bounded task-local ledger even when the
+    # recipient has already exited; this is intentionally separate from the
+    # live inbox and is never fed back into ordinary allocation counts.
+    for item in recent_messages:
+        if not isinstance(item, Mapping):
+            continue
+        body = sanitize_worker_text(item.get("body"), body_limit)
+        sender = sanitize_worker_identifier(item.get("sender")) or "unknown"
+        recipient = sanitize_worker_identifier(item.get("recipient")) or "broadcast"
+        row = {
+            "kind": "message",
+            "title": f"{sender} -> {recipient}",
+            "body": body,
+        }
+        message_id = sanitize_worker_identifier(item.get("id"))
+        if message_id:
+            row["piece_id"] = message_id
+        created_at = sanitize_worker_text(item.get("created_at"), 64)
+        if created_at:
+            row["created_at"] = created_at
+        structured = _structured_handoff_metadata(body)
+        row.update(structured)
+        lowered = f"{row['title']} {body}".lower()
+        if structured.get("status", "").lower() in {"refuted", "superseded"} or any(
+            marker in lowered
+            for marker in (
+                "counterexample",
+                "ruled out",
+                "rejected",
+                "cannot compile",
+                "blocker",
+                "no concrete proof",
+            )
+        ):
+            ruled_out.append(row)
+        else:
+            completed.append(row)
+    completed = completed[: max(1, int(max_items))]
+    ruled_out = ruled_out[: max(1, int(max_items))]
+    if ruled_out:
+        next_step = (
+            "Do not repeat the recorded blocker/correction route. Inspect the "
+            "unverified candidate, select a continuation, and run judge_check."
+        )
+    elif completed:
+        next_step = (
+            "Continue from the recorded construction after inspecting the "
+            "unverified candidate; run judge_check before treating it as valid."
+        )
+    else:
+        next_step = (
+            "Inspect the unverified candidate and run judge_check before "
+            "continuing; no typed CPS progress was available."
+        )
+    return {
+        "completed_work": completed,
+        "ruled_out": ruled_out,
+        "next_step": next_step,
+        "source": "cps_recent_evidence",
+    }
+
+
+def _checkpoint_final_evidence(
+    run_dir: Path,
+    config: ExperimentConfig,
+) -> dict[str, Any]:
+    """Summarize checkpoint lifecycle events without reading candidate bodies."""
+
+    counts: Counter[str] = Counter()
+    captured = changed = transferred = 0
+    try:
+        handle = (run_dir / "events.jsonl").open(encoding="utf-8")
+    except OSError:
+        handle = None
+    if handle is not None:
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event = str(row.get("event") or "")
+                if not event.startswith("checkpoint_"):
+                    continue
+                counts[event] += 1
+                if event == "checkpoint_saved":
+                    candidate_status = str(row.get("candidate_status") or "")
+                    captured += int(candidate_status == "captured")
+                    changed += int(bool(row.get("candidate_changed_from_baseline")))
+                elif event == "checkpoint_handoff":
+                    transferred += 1
+    return {
+        "schema_version": "contextswarm_checkpoint_evidence_v1",
+        "enabled": bool(config.checkpoint.enabled),
+        "transfer": bool(config.checkpoint.transfer),
+        "publish": bool(config.checkpoint.publish),
+        "saved": int(counts.get("checkpoint_saved", 0)),
+        "candidate_captured": captured,
+        "candidate_changed_from_baseline": changed,
+        "handoffs": transferred,
+        "published": int(counts.get("checkpoint_published", 0)),
+        "publish_skipped": int(counts.get("checkpoint_publish_skipped", 0)),
+        "save_failures": int(counts.get("checkpoint_save_failed", 0)),
+        "publish_failures": int(counts.get("checkpoint_publish_failed", 0)),
+        "events": dict(sorted(counts.items())),
+    }
+
+
+def _checkpoint_prompt_block(ref: CheckpointRef | None) -> str:
+    """Render only bounded checkpoint metadata into a fresh worker prompt."""
+
+    if ref is None:
+        return ""
+    record = ref.public_dict()
+    candidate = record.get("candidate")
+    candidate = candidate if isinstance(candidate, Mapping) else {}
+    context = record.get("context")
+    context = context if isinstance(context, Mapping) else {}
+    validation = record.get("latest_validation")
+    validation = validation if isinstance(validation, Mapping) else {}
+
+    def render_rows(name: str) -> str:
+        rows = context.get(name, [])
+        if not isinstance(rows, list):
+            return "(none)"
+        rendered: list[str] = []
+        for row in rows[:6]:
+            if not isinstance(row, Mapping):
+                continue
+            title = sanitize_worker_text(row.get("title"), 240)
+            body = sanitize_worker_text(row.get("body"), 600)
+            details: list[str] = []
+            for key, maximum in (
+                ("status", 64),
+                ("evidence", 420),
+                ("preconditions", 300),
+                ("next_action", 360),
+                ("source_message_id", 128),
+                ("route_claim_id", 128),
+            ):
+                value = (
+                    sanitize_worker_identifier(row.get(key))
+                    if key.endswith("_id")
+                    else sanitize_worker_text(row.get(key), maximum)
+                )
+                if value:
+                    details.append(f"{key}={value}")
+            suffix = f" ({'; '.join(details)})" if details else ""
+            rendered.append(f"- [{row.get('kind', 'note')}] {title}: {body}{suffix}")
+        return "\n".join(rendered) if rendered else "(none)"
+
+    relative_candidate = (
+        sanitize_worker_text(candidate.get("relative_path"), 96) or "unavailable"
+    )
+    local_filename = sanitize_worker_text(candidate.get("filename"), 32) or "result"
+    digest = sanitize_worker_text(candidate.get("sha256"), 64) or "unavailable"
+    owner = ref.actor_id
+    episode = ref.episode
+    return (
+        "\n\nRunner termination checkpoint (UNVERIFIED recovery evidence; never a proof):\n"
+        f"- checkpoint scope: actor {owner}, episode {episode}\n"
+        f"- immutable snapshot sequence: {relative_candidate}\n"
+        f"- candidate SHA-256: {digest}\n"
+        f"- terminal reason: {sanitize_worker_text(record.get('terminal_reason'), 64)}; "
+        f"retry pending: {bool(record.get('retry_pending'))}\n"
+        f"- latest validation status (may be stale): "
+        f"{sanitize_worker_text(validation.get('status'), 96) or 'none'}\n"
+        "- completed/attempted work (inspect, do not blindly trust):\n"
+        f"{render_rows('completed_work')}\n"
+        "- ruled-out/blocker directions (do not repeat without new evidence):\n"
+        f"{render_rows('ruled_out')}\n"
+        f"- suggested next step: {sanitize_worker_text(context.get('next_step'), 900)}\n"
+        "Read checkpoint/checkpoint.json and checkpoint/" + str(local_filename)
+        + " if present. Keep the active candidate unverified until a fresh judge_check."
+    )
+
+
+def _checkpoint_recovery_prompt_block(
+    ref: CheckpointRef | None,
+    recovery_attempt: int,
+) -> str:
+    """Tell a replacement process how to resume its exact prior attempt."""
+
+    attempt = max(1, int(recovery_attempt))
+    if ref is None:
+        return (
+            "\n\nRecovery continuation for process attempt "
+            f"{attempt}: no actor-scoped checkpoint was available. Inspect the "
+            "existing workspace and reconstruct only from durable files; do not "
+            "claim that hidden prior reasoning was recovered."
+        )
+    return (
+        "\n\nRecovery continuation for process attempt "
+        f"{attempt} (same actor and episode): resume from the actor-scoped "
+        "checkpoint below instead of restarting the proof from a blank state. "
+        "The snapshot is immutable recovery evidence; inspect it, preserve any "
+        "useful partial work, avoid the recorded blockers unless new evidence "
+        "justifies revisiting them, and run judge_check before relying on it."
+        + _checkpoint_prompt_block(ref)
+    )
+
+
+def _checkpoint_fresh_handoff_prompt_block(ref: CheckpointRef) -> str:
+    """Explain a task-level checkpoint handed from an earlier actor."""
+
+    return (
+        "\n\nCheckpoint continuation handoff (different process or actor): use the "
+        "immutable evidence below as the starting point for this assignment. "
+        "It may contain a peer's partial candidate, so preserve its provenance, "
+        "avoid repeating ruled-out directions without new evidence, and obtain a "
+        "fresh judge_check before treating any result as valid."
+        + _checkpoint_prompt_block(ref)
+    )
+
+
+def _termination_summary_piece_ids(
+    store: CPSStore | None,
+    *,
+    task_id: str,
+    actor_id: str,
+) -> set[str]:
+    """Read only the ending actor's summary ids for publication accounting."""
+
+    if store is None:
+        return set()
+    try:
+        rows = store.piece_headers_by_actor(
+            task_id=task_id,
+            author=actor_id,
+            kind="termination_summary",
+            limit=500,
+        )
+    except Exception:
+        return set()
+    return {
+        str(row.get("id") or "")
+        for row in rows
+        if isinstance(row, Mapping) and str(row.get("id") or "")
+    }
+
+
+def _termination_summary_piece_matches(
+    row: Mapping[str, Any],
+    *,
+    closeout_id: str,
+) -> bool:
+    """Check the bounded receipt contract without reading the piece body."""
+
+    if str(row.get("kind") or "") != "termination_summary":
+        return False
+    if not str(row.get("title") or "").casefold().startswith(
+        "termination_summary"
+    ):
+        return False
+    tags = row.get("tags")
+    if not isinstance(tags, list):
+        return False
+    expected = f"forced_closeout:{closeout_id}".casefold()
+    return any(str(tag).casefold() == expected for tag in tags)
+
+
+def _termination_summary_final_evidence(
+    run_dir: Path,
+    config: ExperimentConfig,
+) -> dict[str, Any]:
+    """Summarize cooperative closeout lifecycle without copying message text."""
+
+    counts: Counter[str] = Counter()
+    requested = request_sent = completed = verified = missing = unavailable = audit_failed = 0
+    eligible_terminations = 0
+    requested_keys: set[tuple[str, str, str, str, str]] = set()
+
+    def event_key(row: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
+        """Join lifecycle rows without relying on event ordering alone."""
+
+        def field_text(name: str) -> str:
+            value = row.get(name)
+            return "" if value is None else str(value)
+
+        return (
+            field_text("task_id"),
+            field_text("agent_id"),
+            # Preserve episode 0; ``or ""`` would merge it with a missing
+            # episode and could under-count the first assignment's lifecycle.
+            field_text("episode"),
+            field_text("closeout_id"),
+            # A single logical actor can have several process attempts under
+            # the independent recovery policy.  Keep each closeout lifecycle
+            # distinct while accepting old rows that lack this optional key.
+            field_text("process_attempt")
+            or field_text("recovery_attempt"),
+        )
+
+    try:
+        handle = (run_dir / "events.jsonl").open(encoding="utf-8")
+    except OSError:
+        handle = None
+    if handle is not None:
+        with handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event = str(row.get("event") or "")
+                if not event.startswith("termination_summary_"):
+                    continue
+                counts[event] += 1
+                if event == "termination_summary_requested":
+                    requested += 1
+                    request_sent += int(row.get("request_sent") is True)
+                    key = event_key(row)
+                    if key not in requested_keys:
+                        requested_keys.add(key)
+                        eligible_terminations += 1
+                elif event == "termination_summary_completed":
+                    completed += 1
+                elif event == "termination_summary_missing":
+                    missing += 1
+                elif event == "termination_summary_unavailable":
+                    unavailable += 1
+                    # A write failure emits both requested and unavailable;
+                    # count that closeout once.  A process that dies before a
+                    # steer emits only unavailable/missing and still counts
+                    # as one eligible termination.
+                    if row.get("request_sent") is False:
+                        key = event_key(row)
+                        if key not in requested_keys:
+                            requested_keys.add(key)
+                            eligible_terminations += 1
+                elif event == "termination_summary_audit_failed":
+                    audit_failed += 1
+                elif event == "termination_summary_published":
+                    verified += int(row.get("publish_count", 0) or 0)
+    return {
+        "schema_version": "contextswarm_termination_summary_evidence_v1",
+        "enabled": bool(config.termination_summary.enabled),
+        "grace_seconds": config.termination_summary.grace_seconds,
+        "on_timeout": bool(config.termination_summary.on_timeout),
+        "on_cancel": bool(config.termination_summary.on_cancel),
+        "on_error": bool(config.termination_summary.on_error),
+        "requests": requested,
+        "request_sent": request_sent,
+        "eligible_terminations": eligible_terminations,
+        "agent_closeouts_completed": completed,
+        "published_piece_count": verified,
+        "missing_publication": missing,
+        "communication_unavailable": unavailable,
+        "audit_failures": audit_failed,
+        "events": dict(sorted(counts.items())),
+    }
+
+
 def _seconds_since_cps_timestamp(raw: str) -> float | None:
     value = str(raw or "").strip()
     if not value:
@@ -2197,6 +3008,8 @@ def plan(config: ExperimentConfig, tasks: Iterable[Task]) -> dict[str, Any]:
         "assignment_policy": config.assignment_policy,
         "allocation": config.allocation.public_dict(),
         "selection": config.selection.public_dict(),
+        "checkpoint": config.checkpoint.public_dict(),
+        "termination_summary": config.termination_summary.public_dict(),
         "figure4_phase": config.figure4_phase,
         "planned_agent_sessions": sessions,
         "backend": "nurouter_pi" if config.aisw_enabled else "pi",
@@ -2231,7 +3044,7 @@ def run_experiment(
     output_root = output_override or config.resolved_output_root
     run_dir = Path(output_root).resolve() / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
-    logger = RunLogger(run_dir)
+    logger = RunLogger(run_dir, run_id=run_id)
     manifest_snapshot = config.public_dict()
     manifest_snapshot["run_id"] = run_id
     # Preserve benchmark order as an explicit comparison input.  Sorting task
@@ -2256,6 +3069,21 @@ def run_experiment(
         encoding="utf-8",
     )
     logger.event("run_started", run_id=run_id, **plan(config, tasks))
+    logger.profile_event(
+        "run.configuration",
+        mode=config.mode,
+        allocation_policy=config.allocation.policy,
+        max_parallel=config.max_parallel,
+        worker_count=(
+            1
+            if config.mode == "mono"
+            else max(1, min(config.max_parallel, len(tasks)))
+        ),
+        task_count=len(tasks),
+        selection_enabled=config.selection.enabled,
+        communication_enabled=config.communication != "none",
+        max_concurrent=config.lean_max_concurrent_evaluations,
+    )
     if dry_run:
         (run_dir / "dry_run.json").write_text(
             json.dumps(plan(config, tasks), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -2288,6 +3116,7 @@ def run_experiment(
                 status="PREFLIGHT_FAILED",
                 cps_summary=None,
             )
+            logger.close()
             raise error from exc
     else:
         declaration_index = DeclarationIndex(None)
@@ -2314,6 +3143,7 @@ def run_experiment(
                 **_exception_artifact_fields(exc, config),
             )
             _write_final(run_dir, config, {}, [], status="PREFLIGHT_FAILED", cps_summary=None)
+            logger.close()
             raise
 
     # Preflight is an admission check, not experiment compute.  Bind both the
@@ -2331,7 +3161,11 @@ def run_experiment(
     )
     run_deadline = horizon_started_monotonic + config.time_limit_seconds
 
-    store = CPSStore(run_dir / "cps.sqlite3") if config.uses_cps else None
+    store = (
+        CPSStore(run_dir / "cps.sqlite3", profiler=getattr(logger, "profiler", None))
+        if config.uses_cps
+        else None
+    )
     selection_runtime = _initialize_selection_runtime(
         config,
         run_dir,
@@ -2366,6 +3200,7 @@ def run_experiment(
             verification_profile=config.lean_verification_profile,
             judge_mode=config.lean_judge_mode,
             require_result_cache_disabled=config.lean_require_result_cache_disabled,
+            profiler=logger.profiler,
         )
     else:
         evaluator = LeanEvaluator(
@@ -2375,6 +3210,7 @@ def run_experiment(
             max_lifecycle_seconds=config.lean_max_lifecycle_seconds,
             verification_profile=config.lean_verification_profile,
             judge_mode=config.lean_judge_mode,
+            profiler=logger.profiler,
         )
     if mock_agent and not callable(
         getattr(evaluator, "expected_task_contract_sha256", None)
@@ -2412,6 +3248,7 @@ def run_experiment(
         selection_store=selection_store,
         selection_enabled=_selection_capabilities(config)[0],
         selection_search=selection_search,
+        profiler=logger.profiler,
     ).start()
     (run_dir / "judge_broker_policy.json").write_text(
         json.dumps(judge_broker.public_policy(), ensure_ascii=False, indent=2, sort_keys=True)
@@ -2439,7 +3276,11 @@ def run_experiment(
         + "\n",
         encoding="utf-8",
     )
-    pi_agent = PiAgent(config, trace_path=run_dir / "pi_events.jsonl")
+    pi_agent = PiAgent(
+        config,
+        trace_path=run_dir / "pi_events.jsonl",
+        profiler=logger.profiler,
+    )
     agent_results: list[AgentResult] = []
     attempt_verdicts: list[Verdict] = []
     verdicts: dict[str, Verdict] = {}
@@ -2809,15 +3650,33 @@ def _run_mono(
 ) -> tuple[AgentResult, dict[str, Verdict]]:
     worker_dir = run_dir / "workers" / "mono"
     worker_dir.mkdir(parents=True, exist_ok=True)
-    for task in tasks:
-        _stage_task(task, worker_dir / "tasks" / task.slug, config=config)
-    _write_mono_bundle(worker_dir, tasks)
-    prompt = build_mono_prompt(
-        tasks,
-        workspace=str(worker_dir),
-        communication_enabled=False,
-        formal_tools_enabled=config.formal_tools_enabled,
-    )
+    with logger.profile_span(
+        "attempt.wrapper.workspace",
+        task_id=f"{config.name}-bundle",
+        actor_id="mono",
+        episode=1,
+        component="runner_wrapper",
+        operation="stage_mono_bundle",
+        phase="mono",
+    ):
+        for task in tasks:
+            _stage_task(task, worker_dir / "tasks" / task.slug, config=config)
+        _write_mono_bundle(worker_dir, tasks)
+    with logger.profile_span(
+        "attempt.wrapper.prompt",
+        task_id=f"{config.name}-bundle",
+        actor_id="mono",
+        episode=1,
+        component="runner_wrapper",
+        operation="build_mono_prompt",
+        phase="mono",
+    ):
+        prompt = build_mono_prompt(
+            tasks,
+            workspace=str(worker_dir),
+            communication_enabled=False,
+            formal_tools_enabled=config.formal_tools_enabled,
+        )
     early_lock = threading.RLock()
     early_proofs: dict[str, _EarlyProofCredit] = {}
     full_score_event = threading.Event()
@@ -2897,6 +3756,7 @@ def _run_mono(
             candidate_snapshots[task.slug] = snapshot
         with judge_broker.session(
             actor_id="mono",
+            episode=1,
             workdir=worker_dir,
             candidates=candidates,
             deadline_monotonic=deadline,
@@ -3047,12 +3907,16 @@ def _run_mono(
             )
             verdict = credit.verdict
         else:
-            verdict = _evaluate_candidate(
+            verdict = _profiled_evaluate_candidate(
+                logger,
                 evaluator,
                 task,
                 candidate,
                 deadline,
                 evaluator_gate,
+                actor_id="mono",
+                episode=1,
+                phase="mono",
                 cancel_event=run_cancel_event,
             )
             _raise_if_remote_settlement_unconfirmed(
@@ -3172,6 +4036,16 @@ def _run_elastic_cps(
 
     assert policy.store is not None
     store = policy.store
+    checkpoint_store = (
+        CheckpointStore(
+            run_dir,
+            max_candidate_bytes=config.checkpoint.max_candidate_bytes,
+            max_summary_chars=config.checkpoint.max_summary_chars,
+            max_context_items=config.checkpoint.max_context_items,
+        )
+        if config.checkpoint.enabled
+        else None
+    )
     selection_enabled, direct_messages, candidate_transfer = _require_selection_runtime(
         config,
         selection_store,
@@ -3190,6 +4064,14 @@ def _run_elastic_cps(
         )
         if selection_runtime is not None
         else None
+    )
+
+    # Semantic termination summaries and private candidate checkpoints are
+    # independently configured side channels.  A checkpoint treatment must
+    # not implicitly enable the same-session semantic closeout prompt, and a
+    # summary-only treatment must not install a filesystem snapshot callback.
+    termination_summary_enabled = bool(
+        config.termination_summary.enabled and policy.enabled
     )
 
     def record_run_failure() -> None:
@@ -3374,7 +4256,7 @@ def _run_elastic_cps(
             scheduler_result_sink.append(result)
         logger.event("allocation_scheduler_finished", **result.as_dict())
 
-    def invoke_scheduler_agent(
+    def _invoke_scheduler_agent_impl(
         snapshot: TaskProgressSnapshot,
         prompt: str,
         index: int,
@@ -3435,12 +4317,63 @@ def _run_elastic_cps(
         record_scheduler_result(result)
         return result
 
-    def invoke_core_scheduler_agent(
+    def invoke_scheduler_agent(
+        snapshot: TaskProgressSnapshot,
+        prompt: str,
+        index: int,
+    ) -> AgentResult:
+        """Profile the complete legacy scheduler invocation, including errors."""
+
+        actor_id = f"allocation-scheduler-{index}"
+        profiling_enabled = _logger_profile_enabled(logger)
+        started = time.monotonic() if profiling_enabled else 0.0
+        if profiling_enabled:
+            logger.profile_event(
+                "scheduler.invoke.start",
+                task_id="__allocation__",
+                actor_id=actor_id,
+                episode=index,
+                component="scheduler_wrapper",
+                operation="legacy_policy",
+            )
+        try:
+            result = _invoke_scheduler_agent_impl(snapshot, prompt, index)
+        except BaseException as exc:
+            if profiling_enabled:
+                logger.profile_event(
+                    "scheduler.invoke.end",
+                    task_id="__allocation__",
+                    actor_id=actor_id,
+                    episode=index,
+                    component="scheduler_wrapper",
+                    operation="legacy_policy",
+                    latency_seconds=_profile_elapsed(started),
+                    status="error",
+                    error_kind=_profile_error_kind(exc),
+                )
+            raise
+        if profiling_enabled:
+            logger.profile_event(
+                "scheduler.invoke.end",
+                task_id="__allocation__",
+                actor_id=actor_id,
+                episode=index,
+                component="scheduler_wrapper",
+                operation="legacy_policy",
+                latency_seconds=_profile_elapsed(started),
+                returncode=result.returncode,
+                timed_out=result.timed_out,
+                cancelled=result.cancelled,
+                status="ok",
+            )
+        return result
+
+    def _invoke_core_scheduler_agent_impl(
         snapshot: AllocationStateSnapshot,
         prompt: str,
     ) -> LLMSchedulerResponse:
-        started = time.monotonic()
         actor_id = f"allocation-scheduler-{snapshot.decision_index}"
+        invoke_started = time.monotonic()
         if mock_agent:
             result = _mock_result(actor_id, "__allocation__", snapshot.decision_index)
             selected = snapshot.eligible_task_ids[0] if snapshot.eligible_task_ids else ""
@@ -3459,16 +4392,25 @@ def _run_elastic_cps(
             policy_deadline = time.monotonic() + config.allocation.agent_timeout_seconds
             scheduler_deadline = min(deadline, policy_deadline)
             run_horizon_is_limiter = deadline <= policy_deadline
-            result = pi_agent.run(
+            with logger.profile_span(
+                "scheduler.agent.invoke",
                 task_id="__allocation__",
                 actor_id=actor_id,
                 episode=snapshot.decision_index,
-                prompt=prompt,
-                workdir=workdir,
-                deadline_monotonic=scheduler_deadline,
-                isolated=True,
-                cancel_event=run_cancel_event,
-            )
+                component="scheduler_agent",
+                operation="pi_run",
+                phase="core_policy",
+            ):
+                result = pi_agent.run(
+                    task_id="__allocation__",
+                    actor_id=actor_id,
+                    episode=snapshot.decision_index,
+                    prompt=prompt,
+                    workdir=workdir,
+                    deadline_monotonic=scheduler_deadline,
+                    isolated=True,
+                    cancel_event=run_cancel_event,
+                )
             result.run_horizon_reached = bool(
                 result.timed_out
                 and run_horizon_is_limiter
@@ -3476,7 +4418,7 @@ def _run_elastic_cps(
             )
         result.decision_index = snapshot.decision_index
         stage_scheduler_result(result)
-        latency = max(0.0, time.monotonic() - started)
+        latency = max(0.0, time.monotonic() - invoke_started)
         return LLMSchedulerResponse(
             output=result.output_tail,
             returncode=result.returncode,
@@ -3485,6 +4427,55 @@ def _run_elastic_cps(
             occupied_slot_seconds=latency,
             run_horizon_reached=result.run_horizon_reached,
         )
+
+    def invoke_core_scheduler_agent(
+        snapshot: AllocationStateSnapshot,
+        prompt: str,
+    ) -> LLMSchedulerResponse:
+        """Profile the complete core scheduler invocation, including staging errors."""
+
+        actor_id = f"allocation-scheduler-{snapshot.decision_index}"
+        profiling_enabled = _logger_profile_enabled(logger)
+        started = time.monotonic() if profiling_enabled else 0.0
+        if profiling_enabled:
+            logger.profile_event(
+                "scheduler.invoke.start",
+                task_id="__allocation__",
+                actor_id=actor_id,
+                episode=snapshot.decision_index,
+                component="scheduler_wrapper",
+                operation="core_policy",
+            )
+        try:
+            response = _invoke_core_scheduler_agent_impl(snapshot, prompt)
+        except BaseException as exc:
+            if profiling_enabled:
+                logger.profile_event(
+                    "scheduler.invoke.end",
+                    task_id="__allocation__",
+                    actor_id=actor_id,
+                    episode=snapshot.decision_index,
+                    component="scheduler_wrapper",
+                    operation="core_policy",
+                    latency_seconds=_profile_elapsed(started),
+                    status="error",
+                    error_kind=_profile_error_kind(exc),
+                )
+            raise
+        if profiling_enabled:
+            logger.profile_event(
+                "scheduler.invoke.end",
+                task_id="__allocation__",
+                actor_id=actor_id,
+                episode=snapshot.decision_index,
+                component="scheduler_wrapper",
+                operation="core_policy",
+                latency_seconds=_profile_elapsed(started),
+                returncode=response.returncode,
+                timed_out=response.timed_out,
+                status="ok",
+            )
+        return response
 
     core_decisions: dict[int, tuple[AllocationStateSnapshot, Any]] = {}
     # Keep one bridge instance for the run, but bind each materialization to
@@ -3498,6 +4489,7 @@ def _run_elastic_cps(
     # comparison arms on one immutable contract while retaining the bridge's
     # fail-closed behavior for unavailable stores.
     trace_projection_bridge = TraceProjectionBridge(
+        profiler=logger.profiler,
         limits=TraceProjectionLimits(
             actionability_saturation=int(normalization["frontier_saturation"]),
             association_saturation=int(normalization["association_saturation"]),
@@ -3687,7 +4679,7 @@ def _run_elastic_cps(
     else:
         allocator = AgentAllocationPolicy(task_order, invoke_scheduler_agent)
 
-    def build_snapshot(index: int) -> TaskProgressSnapshot:
+    def _build_snapshot(index: int) -> TaskProgressSnapshot:
         now_mono = time.monotonic()
         if config.allocation.policy in _FIGURE4_POLICIES:
             # The ordinary Figure 4 state is built without consulting the CPS
@@ -3771,6 +4763,43 @@ def _run_elastic_cps(
             tasks=tuple(progress_rows),
         )
 
+    def build_snapshot(
+        index: int,
+        *,
+        phase: str = "decision",
+    ) -> TaskProgressSnapshot:
+        """Measure allocator snapshot construction without changing its data."""
+
+        with logger.profile_span(
+            "allocation.snapshot",
+            task_id="__allocation__",
+            actor_id="allocator",
+            episode=index,
+            component="allocator_wrapper",
+            operation="build_snapshot",
+            phase=phase,
+            allocation_policy=config.allocation.policy,
+            selection_enabled=selection_enabled,
+        ):
+            snapshot = _build_snapshot(index)
+        logger.profile_event(
+            "allocation.snapshot.summary",
+            task_id="__allocation__",
+            actor_id="allocator",
+            episode=index,
+            component="allocator_wrapper",
+            operation="build_snapshot",
+            phase=phase,
+            allocation_policy=config.allocation.policy,
+            selection_enabled=selection_enabled,
+            task_count=len(snapshot.tasks),
+            candidate_count=len(snapshot.eligible_task_ids),
+            active_slots=scheduler.active_slots,
+            free_slots=snapshot.free_slots,
+            remaining_slots=scheduler.remaining_slots,
+        )
+        return snapshot
+
     def record_assignment(
         assignment: AgentAssignment,
         *,
@@ -3790,22 +4819,31 @@ def _run_elastic_cps(
         }
         if selection_enabled:
             row["selection_config_id"] = config.selection.selection_config_id
-        with assignments_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
-        with roster_lock:
-            roster.append(
-                {
-                    "actor_id": assignment.agent_id,
-                    "task_id": assignment.task_id,
-                    "episode": assignment.generation,
-                }
-            )
-            temporary = roster_path.with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(roster, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
-            temporary.replace(roster_path)
+        with logger.profile_span(
+            "allocation.assignment.persist",
+            task_id=assignment.task_id,
+            actor_id=assignment.agent_id,
+            episode=assignment.generation,
+            component="allocator_wrapper",
+            operation="assignment_artifacts",
+            phase=phase,
+        ):
+            with assignments_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+            with roster_lock:
+                roster.append(
+                    {
+                        "actor_id": assignment.agent_id,
+                        "task_id": assignment.task_id,
+                        "episode": assignment.generation,
+                    }
+                )
+                temporary = roster_path.with_suffix(".tmp")
+                temporary.write_text(
+                    json.dumps(roster, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                temporary.replace(roster_path)
         logger.event(
             "agent_assigned",
             task_id=assignment.task_id,
@@ -3818,6 +4856,21 @@ def _run_elastic_cps(
             selection_config_id=(
                 config.selection.selection_config_id if selection_enabled else None
             ),
+        )
+        logger.profile_event(
+            "attempt.admitted",
+            task_id=assignment.task_id,
+            actor_id=assignment.agent_id,
+            episode=assignment.generation,
+            active_slots=scheduler.active_slots,
+            active_solver_slots=scheduler.active_slots,
+            remaining_slots=scheduler.remaining_slots,
+            max_parallel=config.max_parallel,
+            admitted=True,
+            phase=phase,
+            allocation_phase=phase,
+            allocation_policy=config.allocation.policy,
+            decision_index=decision.decision_index if decision is not None else None,
         )
 
     def record_decision(
@@ -3870,8 +4923,18 @@ def _run_elastic_cps(
             )
         if execution_snapshot is not None:
             row["execution_snapshot"] = execution_snapshot.as_dict()
-        with decisions_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        with logger.profile_span(
+            "allocation.decision.persist",
+            task_id="__allocation__",
+            actor_id="allocator",
+            episode=decision.decision_index,
+            component="allocator_wrapper",
+            operation="decision_artifact",
+            phase=disposition,
+            allocation_policy=decision.policy,
+        ):
+            with decisions_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         logger.event(
             "allocation_decision",
             decision_index=decision.decision_index,
@@ -3968,7 +5031,17 @@ def _run_elastic_cps(
                     return None
                 retire_exhausted_tasks()
                 if initial_fill or scheduler.has_pending_initial:
-                    assignment = scheduler.next_assignment()
+                    with logger.profile_span(
+                        "allocation.admission",
+                        task_id="__allocation__",
+                        actor_id="allocator",
+                        episode=decision_index,
+                        component="allocator_wrapper",
+                        operation="initial_assignment",
+                        phase="initial",
+                        allocation_policy=config.allocation.policy,
+                    ):
+                        assignment = scheduler.next_assignment()
                     if assignment is None:
                         return None
                     state = states[assignment.task_id]
@@ -3981,21 +5054,33 @@ def _run_elastic_cps(
                     return accept_assignment(assignment, phase="initial")
 
                 decision_index += 1
-                pre_reservation_snapshot = build_snapshot(decision_index)
+                pre_reservation_snapshot = build_snapshot(
+                    decision_index, phase="pre_reservation"
+                )
                 if not pre_reservation_snapshot.eligible_task_ids:
                     return None
                 if config.allocation.policy == "llm_scheduler":
-                    scheduler_reservation = scheduler.acquire_reservation(
-                        slots=1,
-                        purpose=f"llm_scheduler_decision_{decision_index}",
-                    )
+                    with logger.profile_span(
+                        "allocation.reservation",
+                        task_id="__allocation__",
+                        actor_id="allocator",
+                        episode=decision_index,
+                        component="allocator_wrapper",
+                        operation="acquire",
+                        phase="scheduler_reservation",
+                        allocation_policy=config.allocation.policy,
+                    ):
+                        scheduler_reservation = scheduler.acquire_reservation(
+                            slots=1,
+                            purpose=f"llm_scheduler_decision_{decision_index}",
+                        )
                     if scheduler_reservation is None:
                         return None
                     # Rebuild after acquiring the physical slot.  The prompt
                     # reports every live reservation and marks exactly the
                     # invoking slot as owned, so capacity stays conserved even
                     # when this is the last free slot.
-                    snapshot = build_snapshot(decision_index)
+                    snapshot = build_snapshot(decision_index, phase="post_reservation")
                 else:
                     snapshot = pre_reservation_snapshot
                 if config.allocation.policy in {"agent", "llm_scheduler"}:
@@ -4005,14 +5090,25 @@ def _run_elastic_cps(
                     # occupied; index/snapshot and final admission remain atomic.
                     allocation_lock.release()
                     try:
-                        if config.allocation.policy == "llm_scheduler":
-                            decision = allocator.choose(
-                                snapshot,
-                                scheduler_reserved_slots=scheduler.reservation_slots,
-                                owned_scheduler_reservation_slots=1,
-                            )
-                        else:
-                            decision = allocator.choose(snapshot)
+                        with logger.profile_span(
+                            "allocation.choose",
+                            task_id="__allocation__",
+                            actor_id="allocator",
+                            episode=decision_index,
+                            component="allocator_wrapper",
+                            operation=config.allocation.policy,
+                            phase="policy_choose",
+                            allocation_policy=config.allocation.policy,
+                            candidate_count=len(snapshot.eligible_task_ids),
+                        ):
+                            if config.allocation.policy == "llm_scheduler":
+                                decision = allocator.choose(
+                                    snapshot,
+                                    scheduler_reserved_slots=scheduler.reservation_slots,
+                                    owned_scheduler_reservation_slots=1,
+                                )
+                            else:
+                                decision = allocator.choose(snapshot)
                     except BaseException:
                         if scheduler_reservation is not None:
                             scheduler.release_reservation(
@@ -4023,7 +5119,18 @@ def _run_elastic_cps(
                     finally:
                         allocation_lock.acquire()
                 else:
-                    decision = allocator.choose(snapshot)
+                    with logger.profile_span(
+                        "allocation.choose",
+                        task_id="__allocation__",
+                        actor_id="allocator",
+                        episode=decision_index,
+                        component="allocator_wrapper",
+                        operation=config.allocation.policy,
+                        phase="policy_choose",
+                        allocation_policy=config.allocation.policy,
+                        candidate_count=len(snapshot.eligible_task_ids),
+                    ):
+                        decision = allocator.choose(snapshot)
                 # Another concurrent scheduler call may have consumed the
                 # selected task's final attempt while this decision reasoned.
                 retire_exhausted_tasks()
@@ -4059,7 +5166,9 @@ def _run_elastic_cps(
                     # Revalidate the entire immutable decision state while the
                     # same capacity slot remains physically held.  Stale model
                     # output is never silently recomputed or admitted.
-                    execution_snapshot = build_snapshot(snapshot.decision_index)
+                    execution_snapshot = build_snapshot(
+                        snapshot.decision_index, phase="llm_revalidation"
+                    )
                     llm_execution_core_snapshot = _core_snapshot_from_legacy(
                         execution_snapshot,
                         config,
@@ -4113,7 +5222,9 @@ def _run_elastic_cps(
                     # invalidate the causal choice.  Keep the invocation's
                     # reserved index even if peer decisions advanced the
                     # global counter while this scheduler agent reasoned.
-                    execution_snapshot = build_snapshot(snapshot.decision_index)
+                    execution_snapshot = build_snapshot(
+                        snapshot.decision_index, phase="agent_revalidation"
+                    )
                     original_fingerprint = snapshot.task_causal_fingerprint(
                         decision.selected_task_id
                     )
@@ -4134,14 +5245,34 @@ def _run_elastic_cps(
                         ):
                             continue
                         return None
-                    assignment = scheduler.next_assignment_for(decision.selected_task_id)
+                    with logger.profile_span(
+                        "allocation.admission",
+                        task_id=decision.selected_task_id,
+                        actor_id="allocator",
+                        episode=decision.decision_index,
+                        component="allocator_wrapper",
+                        operation="next_assignment_for",
+                        phase="adaptive",
+                        allocation_policy=config.allocation.policy,
+                    ):
+                        assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 elif time.monotonic() < deadline and decision.selected_task_id:
                     if scheduler_reservation is not None:
                         try:
-                            assignment = scheduler.admit_reserved(
-                                scheduler_reservation,
-                                decision.selected_task_id,
-                            )
+                            with logger.profile_span(
+                                "allocation.admission",
+                                task_id=decision.selected_task_id,
+                                actor_id="allocator",
+                                episode=decision.decision_index,
+                                component="allocator_wrapper",
+                                operation="admit_reserved",
+                                phase="adaptive_reserved",
+                                allocation_policy=config.allocation.policy,
+                            ):
+                                assignment = scheduler.admit_reserved(
+                                    scheduler_reservation,
+                                    decision.selected_task_id,
+                                )
                         except BaseException:
                             scheduler.release_reservation(
                                 scheduler_reservation,
@@ -4149,7 +5280,17 @@ def _run_elastic_cps(
                             )
                             raise
                     else:
-                        assignment = scheduler.next_assignment_for(decision.selected_task_id)
+                        with logger.profile_span(
+                            "allocation.admission",
+                            task_id=decision.selected_task_id,
+                            actor_id="allocator",
+                            episode=decision.decision_index,
+                            component="allocator_wrapper",
+                            operation="next_assignment_for",
+                            phase="adaptive",
+                            allocation_policy=config.allocation.policy,
+                        ):
+                            assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 if assignment is None and time.monotonic() < deadline:
                     if scheduler.horizon_reached:
                         if scheduler_reservation is not None:
@@ -4166,7 +5307,9 @@ def _run_elastic_cps(
                         )
                         return None
                     if execution_snapshot is None:
-                        execution_snapshot = build_snapshot(snapshot.decision_index)
+                        execution_snapshot = build_snapshot(
+                            snapshot.decision_index, phase="admission_revalidation"
+                        )
                     if valid_agent_decision:
                         record_decision(
                             decision,
@@ -4226,13 +5369,34 @@ def _run_elastic_cps(
                         execution_snapshot.eligible_task_ids
                         and config.allocation.policy != "llm_scheduler"
                     ):
-                        decision = allocator.fallback(
-                            execution_snapshot,
-                            "selected task became ineligible before admission",
-                            prior=decision,
-                        )
+                        with logger.profile_span(
+                            "allocation.choose",
+                            task_id="__allocation__",
+                            actor_id="allocator",
+                            episode=decision_index,
+                            component="allocator_wrapper",
+                            operation="fallback",
+                            phase="fallback_choose",
+                            allocation_policy=config.allocation.policy,
+                            candidate_count=len(execution_snapshot.eligible_task_ids),
+                        ):
+                            decision = allocator.fallback(
+                                execution_snapshot,
+                                "selected task became ineligible before admission",
+                                prior=decision,
+                            )
                         if decision.selected_task_id:
-                            assignment = scheduler.next_assignment_for(decision.selected_task_id)
+                            with logger.profile_span(
+                                "allocation.admission",
+                                task_id=decision.selected_task_id,
+                                actor_id="allocator",
+                                episode=decision.decision_index,
+                                component="allocator_wrapper",
+                                operation="fallback_admission",
+                                phase="fallback",
+                                allocation_policy=config.allocation.policy,
+                            ):
+                                assignment = scheduler.next_assignment_for(decision.selected_task_id)
                 if assignment is None:
                     if scheduler_reservation is not None:
                         scheduler.release_reservation(
@@ -4303,26 +5467,573 @@ def _run_elastic_cps(
             finally:
                 allocation_lock.release()
 
-    def prepare_workspace(state: _ElasticTaskState, assignment: AgentAssignment) -> tuple[Path, Path]:
+    def prepare_workspace(
+        state: _ElasticTaskState, assignment: AgentAssignment
+    ) -> tuple[Path, Path, CheckpointRef | None]:
         workdir = state.task_root / "agents" / assignment.agent_id
         _stage_task(state.task, workdir, config=config)
         assert state.best_candidate is not None
+        checkpoint_ref: CheckpointRef | None = None
         # Selection-enabled arms isolate solver workspaces from candidates
         # produced by other assignments.  The runner still keeps and promotes
         # ``best_candidate`` internally for final closeout and bookkeeping.
-        if candidate_transfer:
-            with state.lock:
+        with state.lock:
+            checkpoint_ref = state.latest_checkpoint
+            if checkpoint_ref is None and checkpoint_store is not None:
+                # Rehydrate the task-wide handoff after a runner restart.  The
+                # store prefers a captured changed candidate over an empty or
+                # unchanged closeout, matching the in-memory carry-forward
+                # rule used while the run is live.
+                checkpoint_ref = checkpoint_store.load_latest(
+                    task_id=state.task.slug,
+                    task_root=state.task_root,
+                )
+                state.latest_checkpoint = checkpoint_ref
+                if checkpoint_ref is not None:
+                    state.checkpoints_by_scope[
+                        (checkpoint_ref.actor_id, checkpoint_ref.episode)
+                    ] = checkpoint_ref
+            if candidate_transfer:
                 shutil.copy2(state.best_candidate, _candidate_path(workdir, state.task))
-        return workdir, state.best_candidate
+        if (
+            checkpoint_store is not None
+            and config.checkpoint.transfer
+            and checkpoint_ref is not None
+        ):
+            # Keep the immutable handoff visible even when the active result
+            # is intentionally left at the verified best candidate (Figure 4
+            # candidate_transfer).  A fresh checkpoint candidate is copied to
+            # ``checkpoint/`` first, then optionally becomes the active file.
+            checkpoint_dir = workdir / "checkpoint"
+            checkpoint_store.materialize_for_agent(
+                checkpoint_ref,
+                checkpoint_dir,
+                candidate_filename=state.task.candidate_filename,
+                transfer_candidate=True,
+            )
+            if (
+                not candidate_transfer
+                and checkpoint_ref.candidate_path is not None
+                and checkpoint_ref.candidate_changed_from_baseline
+            ):
+                raw = checkpoint_ref.candidate_path.read_bytes()
+                digest = hashlib.sha256(raw).hexdigest()
+                if digest != checkpoint_ref.candidate_sha256:
+                    raise ValueError("checkpoint candidate changed before workspace handoff")
+                atomic_write_bytes(
+                    _candidate_path(workdir, state.task),
+                    raw,
+                    mode=0o600,
+                )
+            logger.event(
+                "checkpoint_handoff",
+                task_id=state.task.slug,
+                agent_id=assignment.agent_id,
+                episode=assignment.generation,
+                donor_actor_id=checkpoint_ref.actor_id,
+                donor_episode=checkpoint_ref.episode,
+                handoff_scope="task_latest",
+                same_actor_scope=(
+                    checkpoint_ref.actor_id == assignment.agent_id
+                    and checkpoint_ref.episode == assignment.generation
+                ),
+                sequence=checkpoint_ref.sequence,
+                candidate_sha256=checkpoint_ref.candidate_sha256,
+                candidate_bytes=checkpoint_ref.candidate_bytes,
+                candidate_changed_from_baseline=checkpoint_ref.candidate_changed_from_baseline,
+                transfer_candidate=bool(
+                    not candidate_transfer
+                    and checkpoint_ref.candidate_path is not None
+                    and checkpoint_ref.candidate_changed_from_baseline
+                ),
+                unverified=True,
+            )
+        return workdir, state.best_candidate, checkpoint_ref
 
     def execute_assignment(assignment: AgentAssignment) -> Any:
         """Yield once when solver capacity is releasable, then settle Judge work."""
         callback_failure.raise_if_failed()
         state = states[assignment.task_id]
-        workdir, best_path = prepare_workspace(state, assignment)
+        with logger.profile_span(
+            "attempt.wrapper.workspace",
+            task_id=assignment.task_id,
+            actor_id=assignment.agent_id,
+            episode=assignment.generation,
+            component="runner_wrapper",
+            operation="prepare_workspace",
+            phase="elastic_cps",
+        ):
+            workdir, best_path, checkpoint_ref = prepare_workspace(state, assignment)
         actor = assignment.agent_id
         task = state.task
         candidate_path = _candidate_path(workdir, task)
+        assignment_source_cancel_event = _AnyCancelEvent(
+            run_cancel_event,
+            state.cancel_event,
+            reasons=("runner_failure", "task_solved_by_peer"),
+        )
+        assignment_cancel_event: Any = (
+            _TerminationSummaryCancelEvent(assignment_source_cancel_event)
+            if termination_summary_enabled
+            else assignment_source_cancel_event
+        )
+        baseline_sha256 = hashlib.sha256(
+            task.baseline_code.encode("utf-8")
+        ).hexdigest()
+        last_recovery_attempt = 0
+        termination_closeout_id = uuid.uuid4().hex[:24]
+        termination_piece_ids_before = (
+            _termination_summary_piece_ids(
+                store,
+                task_id=task.slug,
+                actor_id=actor,
+            )
+            if termination_summary_enabled
+            else set()
+        )
+        termination_prompt = (
+            build_termination_summary_prompt(
+                task,
+                reason="termination",
+                closeout_id=termination_closeout_id,
+                max_chars=config.termination_summary.max_prompt_chars,
+            )
+            if termination_summary_enabled
+            else None
+        )
+
+        def save_checkpoint_result(
+            result: AgentResult,
+            recovery_attempt: int,
+            retry_pending: bool,
+            *,
+            feedback_override: str | None = None,
+            validation_status_override: str | None = None,
+            validation_feedback_override: str | None = None,
+            publish: bool | None = None,
+            phase: str = "attempt_result",
+        ) -> None:
+            """Persist one process-result handoff before recovery/closeout."""
+
+            nonlocal last_recovery_attempt
+            last_recovery_attempt = max(last_recovery_attempt, int(recovery_attempt))
+            if checkpoint_store is None:
+                return
+            try:
+                with state.lock:
+                    prior_checkpoint = state.latest_checkpoint
+                    feedback = (
+                        state.last_feedback
+                        if feedback_override is None
+                        else str(feedback_override)
+                    )
+                    validation_status = (
+                        state.last_verdict_status
+                        if validation_status_override is None
+                        else str(validation_status_override)
+                    )
+                    best_sha256 = (
+                        _file_sha256(state.best_candidate)
+                        if state.best_candidate
+                        else None
+                    )
+                checkpoint_candidate_path = candidate_path
+                candidate_source = "attempt_workspace"
+                # A worker may finish without changing the active verified
+                # candidate after a peer already produced a useful partial.
+                # Keep that partial in the new immutable snapshot so the on-disk
+                # latest.json remains as useful as the in-memory handoff.
+                # The size guard avoids an unbounded pre-read; CheckpointStore
+                # remains the authority for the final bounded capture.
+                current_candidate_hash: str | None = None
+                current_candidate_missing = False
+                try:
+                    if candidate_path.stat().st_size <= config.checkpoint.max_candidate_bytes:
+                        current_candidate_hash = _file_sha256(candidate_path)
+                    else:
+                        current_candidate_hash = "__too_large__"
+                except OSError:
+                    current_candidate_missing = True
+                if (
+                    prior_checkpoint is not None
+                    and prior_checkpoint.candidate_changed_from_baseline
+                    and prior_checkpoint.candidate_path is not None
+                    and (
+                        current_candidate_missing
+                        or current_candidate_hash
+                        == (best_sha256 or baseline_sha256)
+                    )
+                ):
+                    checkpoint_candidate_path = prior_checkpoint.candidate_path
+                    candidate_source = "carry_forward_changed_checkpoint"
+                context = _checkpoint_context(
+                    store,
+                    task.slug,
+                    max_items=config.checkpoint.max_context_items,
+                    max_chars=config.checkpoint.max_summary_chars,
+                )
+                # Keep the forced handoff cost separately visible in opt-in
+                # profiling.  The surrounding attempt/agent spans still
+                # include it in their wall time, while this narrow span lets
+                # an A/B report quantify the extra persistence work without
+                # changing the disabled fast path.
+                with logger.profile_span(
+                    "attempt.checkpoint.save",
+                    task_id=task.slug,
+                    actor_id=actor,
+                    episode=assignment.generation,
+                    component="runner_wrapper",
+                    operation="checkpoint_save",
+                    phase=phase,
+                ):
+                    ref = checkpoint_store.save(
+                        task_id=task.slug,
+                        task_root=state.task_root,
+                        candidate_path=checkpoint_candidate_path,
+                        candidate_filename=task.candidate_filename,
+                        baseline_sha256=baseline_sha256,
+                        actor_id=actor,
+                        episode=assignment.generation,
+                        recovery_attempt=recovery_attempt,
+                        result=result.as_dict(),
+                        retry_pending=retry_pending,
+                        context=context,
+                        feedback=feedback,
+                        latest_validation_status=validation_status,
+                        latest_validation_feedback=(
+                            feedback
+                            if validation_feedback_override is None
+                            else str(validation_feedback_override)
+                        ),
+                        best_candidate_sha256=best_sha256,
+                        candidate_source=candidate_source,
+                    )
+                with state.lock:
+                    prior_checkpoint = state.latest_checkpoint
+                    state.checkpoints_by_scope[(actor, assignment.generation)] = ref
+                    # A late successful/empty closeout from another worker
+                    # must not hide the only changed candidate captured from a
+                    # timed-out peer.  Keep the newest snapshot by default,
+                    # but retain a changed artifact until another changed
+                    # artifact supersedes it; all snapshots remain immutable
+                    # in the task ledger.
+                    if not (
+                        prior_checkpoint is not None
+                        and prior_checkpoint.candidate_changed_from_baseline
+                        and not ref.candidate_changed_from_baseline
+                    ):
+                        state.latest_checkpoint = ref
+                    state.checkpoint_count += 1
+                candidate = ref.record.get("candidate", {})
+                candidate = candidate if isinstance(candidate, Mapping) else {}
+                logger.event(
+                    "checkpoint_saved",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    recovery_attempt=recovery_attempt,
+                    retry_pending=bool(retry_pending),
+                    terminal_reason=ref.record.get("terminal_reason"),
+                    candidate_status=candidate.get("status"),
+                    candidate_bytes=candidate.get("bytes"),
+                    candidate_sha256=candidate.get("sha256"),
+                    candidate_source=candidate.get("source"),
+                    candidate_changed_from_baseline=bool(
+                        candidate.get("changed_from_baseline")
+                    ),
+                    best_candidate_sha256=best_sha256,
+                    sequence=ref.sequence,
+                    phase=phase,
+                    unverified=True,
+                )
+            except Exception as exc:
+                # The side channel is fail-open: a checkpoint outage must not
+                # alter recovery, Judge submission, or score accounting.
+                logger.event(
+                    "checkpoint_save_failed",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    recovery_attempt=recovery_attempt,
+                    error_kind=_profile_error_kind(exc),
+                )
+                return
+
+            # A successful Pi return is saved before Judge evaluation, but its
+            # authoritative feedback is not known yet.  The final closeout
+            # calls this function again with ``publish=True`` after that
+            # receipt; keep the pre-evaluation copy on disk without emitting a
+            # stale duplicate CPS checkpoint piece.  Abnormal process exits
+            # publish immediately because there is no later candidate Judge
+            # phase that can provide a better handoff boundary.
+            if publish is None:
+                publish = bool(
+                    result.returncode != 0
+                    or result.timed_out
+                    or result.cancelled
+                    or result.run_horizon_reached
+                )
+            if not publish:
+                return
+            if not config.checkpoint.publish or not policy.enabled:
+                if config.checkpoint.publish and not policy.enabled:
+                    logger.event(
+                        "checkpoint_publish_skipped",
+                        task_id=task.slug,
+                        agent_id=actor,
+                        episode=assignment.generation,
+                        sequence=ref.sequence,
+                        reason="communication_disabled",
+                    )
+                return
+            if assignment_cancel_event.is_set():
+                logger.event(
+                    "checkpoint_publish_skipped",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    sequence=ref.sequence,
+                    reason="cancelled",
+                )
+                return
+            if time.monotonic() >= deadline:
+                logger.event(
+                    "checkpoint_publish_skipped",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    sequence=ref.sequence,
+                    reason="horizon_elapsed",
+                )
+                return
+            try:
+                with logger.profile_span(
+                    "attempt.checkpoint.publish",
+                    task_id=task.slug,
+                    actor_id=actor,
+                    episode=assignment.generation,
+                    component="runner_wrapper",
+                    operation="checkpoint_publish",
+                    phase="termination_handoff",
+                ):
+                    publish_payload = checkpoint_store.publish_payload(ref)
+                    publish_body = json.dumps(
+                        publish_payload,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    published = policy.publish(
+                        task.slug,
+                        "runner",
+                        kind="checkpoint",
+                        title=(
+                            f"checkpoint {task.slug} e{assignment.generation} "
+                            f"r{recovery_attempt}: {ref.record.get('terminal_reason')}"
+                        ),
+                        body=publish_body,
+                        tags=("runner_checkpoint", "unverified", "timeout_recovery"),
+                        deadline_epoch_ms=horizon_epoch_ms,
+                    )
+            except Exception as exc:
+                logger.event(
+                    "checkpoint_publish_failed",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    sequence=ref.sequence,
+                    error_kind=_profile_error_kind(exc),
+                )
+                return
+            logger.event(
+                "checkpoint_published",
+                task_id=task.slug,
+                agent_id=actor,
+                episode=assignment.generation,
+                sequence=ref.sequence,
+                body_bytes=len(publish_body.encode("ascii")),
+                piece_id=(
+                    published.get("id") if isinstance(published, Mapping) else None
+                ),
+                unverified=True,
+            )
+
+        def save_checkpoint_closeout(
+            result: AgentResult,
+            verdict: Verdict,
+            feedback: str,
+            *,
+            publish: bool = True,
+        ) -> None:
+            """Refresh the immutable handoff with the final Judge boundary."""
+
+            if checkpoint_store is None:
+                return
+            save_checkpoint_result(
+                result,
+                last_recovery_attempt,
+                False,
+                feedback_override=feedback,
+                validation_status_override=verdict.status,
+                validation_feedback_override=feedback,
+                publish=publish,
+                phase="final_validation",
+            )
+
+        termination_piece_ids_seen = set(termination_piece_ids_before)
+        termination_summary_recorded_attempts: set[int] = set()
+
+        def record_termination_summary(
+            result: AgentResult,
+            *,
+            recovery_attempt: int = 0,
+        ) -> None:
+            """Audit one process attempt without synthesizing Agent content.
+
+            ``run_with_recovery`` invokes its result hook before launching a
+            replacement process.  Recording at that boundary is essential:
+            otherwise a first timed-out Agent could publish a summary and then
+            be replaced by a normal recovery result, leaving no lifecycle
+            receipt for the publication.  The process-attempt key also keeps
+            independent retries from being collapsed into one logical row.
+            """
+
+            if not termination_summary_enabled:
+                return
+            try:
+                process_attempt = max(0, int(recovery_attempt))
+            except (TypeError, ValueError, OverflowError):
+                process_attempt = 0
+            if process_attempt in termination_summary_recorded_attempts:
+                return
+            termination_summary_recorded_attempts.add(process_attempt)
+
+            def emit(event: str, **fields: Any) -> None:
+                logger.event(
+                    event,
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    process_attempt=process_attempt,
+                    closeout_id=termination_closeout_id,
+                    **fields,
+                )
+
+            if not result.termination_summary_requested:
+                # A process can exit between the last poll and the soft
+                # boundary, or an explicitly disabled trigger can take the
+                # immediate-stop path.  Keep those cases visible without
+                # pretending that the runner reconstructed a summary.
+                if result.timed_out or result.cancelled or result.returncode != 0:
+                    if result.cancelled and not config.termination_summary.on_cancel:
+                        reason = "cancel_trigger_disabled"
+                    elif result.timed_out and not config.termination_summary.on_timeout:
+                        reason = "timeout_trigger_disabled"
+                    elif (
+                        result.returncode != 0
+                        and not result.timed_out
+                        and not result.cancelled
+                        and not config.termination_summary.on_error
+                    ):
+                        reason = "error_trigger_disabled"
+                    else:
+                        reason = "process_exited_before_closeout"
+                    emit(
+                        "termination_summary_unavailable",
+                        reason=reason,
+                        request_sent=False,
+                    )
+                    if reason == "process_exited_before_closeout":
+                        emit(
+                            "termination_summary_missing",
+                            closeout_completed=False,
+                            request_sent=False,
+                        )
+                return
+            reason = result.termination_summary_reason or "termination"
+            request_sent = bool(result.termination_summary_request_sent)
+            emit(
+                "termination_summary_requested",
+                reason=reason,
+                grace_seconds=config.termination_summary.grace_seconds,
+                request_sent=request_sent,
+            )
+            if not request_sent:
+                emit(
+                    "termination_summary_unavailable",
+                    reason="closeout_command_write_failed",
+                    request_sent=False,
+                )
+                emit(
+                    "termination_summary_missing",
+                    closeout_completed=False,
+                    request_sent=False,
+                )
+                return
+            if store is None:
+                emit(
+                    "termination_summary_unavailable",
+                    reason=(
+                        "communication_disabled"
+                        if not policy.enabled
+                        else "cps_store_unavailable"
+                    ),
+                    request_sent=True,
+                )
+                emit(
+                    "termination_summary_missing",
+                    closeout_completed=bool(result.termination_summary_completed),
+                    request_sent=True,
+                )
+                return
+            try:
+                rows = store.piece_headers_by_actor(
+                    task_id=task.slug,
+                    author=actor,
+                    kind="termination_summary",
+                    limit=500,
+                )
+                after_ids = {
+                    str(row.get("id") or "")
+                    for row in rows
+                    if isinstance(row, Mapping)
+                    and str(row.get("id") or "")
+                    and _termination_summary_piece_matches(
+                        row,
+                        closeout_id=termination_closeout_id,
+                    )
+                }
+            except Exception as exc:
+                emit(
+                    "termination_summary_audit_failed",
+                    error_kind=_profile_error_kind(exc),
+                )
+                emit(
+                    "termination_summary_missing",
+                    closeout_completed=bool(result.termination_summary_completed),
+                    request_sent=True,
+                    audit_failed=True,
+                )
+                return
+            new_ids = sorted(after_ids - termination_piece_ids_seen)
+            termination_piece_ids_seen.update(after_ids)
+            result.termination_summary_publish_count = len(new_ids)
+            result.termination_summary_publish_verified = bool(new_ids)
+            if result.termination_summary_completed:
+                emit("termination_summary_completed")
+            if new_ids:
+                emit(
+                    "termination_summary_published",
+                    publish_count=len(new_ids),
+                    piece_ids=new_ids[:16],
+                )
+            else:
+                emit(
+                    "termination_summary_missing",
+                    closeout_completed=bool(result.termination_summary_completed),
+                    request_sent=True,
+                )
 
         def admit_task_proof(
             verdict: Verdict,
@@ -4464,6 +6175,8 @@ def _run_elastic_cps(
             with state.lock:
                 state.completed_attempts += 1
             result = _mock_result(actor, task.slug, assignment.generation)
+            if checkpoint_store is not None:
+                save_checkpoint_result(result, 0, False)
             verdict = Verdict(task.slug, "CANCELLED", 0.0, 0.0, {"reason": "task_already_solved"})
             logger.event("agent_finished", **result.as_dict())
             logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
@@ -4478,45 +6191,241 @@ def _run_elastic_cps(
             yield result
             return result, verdict, False
 
-        digest = (
-            selection_runtime.digest(
-                task_id=task.slug,
-                actor_id=actor,
-                query=task.theorem_name,
-                episode=assignment.generation,
-            )
-            if selection_enabled
-            else policy.digest(task.slug, actor, query=task.theorem_name)
-        )
-        prompt = build_task_prompt(
-            task,
-            task_workspace=str(workdir),
-            agent_id=actor,
+        with logger.profile_span(
+            "attempt.wrapper.prompt",
+            task_id=task.slug,
+            actor_id=actor,
             episode=assignment.generation,
-            communication_enabled=policy.enabled,
-            formal_tools_enabled=config.formal_tools_enabled,
-            direct_messages=direct_messages,
+            component="runner_wrapper",
+            operation="build_task_prompt",
+            phase="elastic_cps",
             selection_enabled=selection_enabled,
-            digest=digest,
-        )
-        if candidate_transfer:
-            prompt += (
-                "\n\nElastic CPS handoff:\n"
-                f"The runner has pre-seeded {task.candidate_filename} with the strongest usable candidate "
-                f"from earlier assignments on this task. Keep your candidate in {task.candidate_filename}; "
-                "the runner will merge the strongest verified candidate."
+        ):
+            digest = (
+                selection_runtime.digest(
+                    task_id=task.slug,
+                    actor_id=actor,
+                    query=task.theorem_name,
+                    episode=assignment.generation,
+                )
+                if selection_enabled
+                else policy.digest(task.slug, actor, query=task.theorem_name)
             )
-
-        assignment_cancel_event = _AnyCancelEvent(
-            run_cancel_event,
-            state.cancel_event,
-            reasons=("runner_failure", "task_solved_by_peer"),
-        )
+            prompt = build_task_prompt(
+                task,
+                task_workspace=str(workdir),
+                agent_id=actor,
+                episode=assignment.generation,
+                communication_enabled=policy.enabled,
+                formal_tools_enabled=config.formal_tools_enabled,
+                direct_messages=direct_messages,
+                selection_enabled=selection_enabled,
+                termination_summary_enabled=termination_summary_enabled,
+                digest=digest,
+            )
+            if candidate_transfer:
+                prompt += (
+                    "\n\nElastic CPS handoff:\n"
+                    f"The runner has pre-seeded {task.candidate_filename} with the strongest usable candidate "
+                    f"from earlier assignments on this task. Keep your candidate in {task.candidate_filename}; "
+                    "the runner will merge the strongest verified candidate."
+                )
+            if checkpoint_ref is not None:
+                prompt += _checkpoint_fresh_handoff_prompt_block(checkpoint_ref)
         if mock_agent:
             result = _mock_result(actor, task.slug, assignment.generation)
+            if checkpoint_store is not None:
+                save_checkpoint_result(result, 0, False)
         else:
+            def on_solver_result(
+                attempt_result: AgentResult,
+                recovery_attempt: int,
+                retry_pending: bool,
+            ) -> None:
+                # Keep the two side channels independent.  A checkpoint hook
+                # may be disabled for this treatment while semantic closeout
+                # still needs one receipt per process attempt.
+                if checkpoint_store is not None:
+                    save_checkpoint_result(
+                        attempt_result,
+                        recovery_attempt,
+                        retry_pending,
+                    )
+                record_termination_summary(
+                    attempt_result,
+                    recovery_attempt=recovery_attempt,
+                )
+
+            def on_pretermination_checkpoint(
+                reason: str,
+                recovery_attempt: int,
+            ) -> None:
+                """Capture the live workspace before Pi is terminated.
+
+                ``PiAgent`` invokes this callback at its soft timeout,
+                cancellation, or live-session error boundary.  The callback
+                receives no model text; the runner snapshots only the
+                candidate file and already durable CPS/Judge metadata.  The
+                ordinary result hook still runs after process drain and may
+                append a final validation snapshot.
+                """
+
+                if checkpoint_store is None:
+                    return
+                now = utc_now()
+                normalized_reason = str(reason or "termination").strip()[:64]
+                partial = AgentResult(
+                    agent_id=actor,
+                    task_id=task.slug,
+                    episode=assignment.generation,
+                    returncode=(
+                        124
+                        if normalized_reason == "timeout"
+                        else 130
+                        if normalized_reason == "cancelled"
+                        else 1
+                    ),
+                    started_at=now,
+                    finished_at=now,
+                    timed_out=normalized_reason == "timeout",
+                    cancelled=normalized_reason == "cancelled",
+                    run_horizon_reached=False,
+                    error_tail=(
+                        f"Pi termination checkpoint: {normalized_reason}"
+                    ),
+                )
+                logger.event(
+                    "checkpoint_pretermination_requested",
+                    task_id=task.slug,
+                    agent_id=actor,
+                    episode=assignment.generation,
+                    recovery_attempt=recovery_attempt,
+                    reason=normalized_reason,
+                )
+                save_checkpoint_result(
+                    partial,
+                    recovery_attempt,
+                    True,
+                    publish=True,
+                    phase="pretermination",
+                )
+
+            def checkpoint_for_recovery() -> CheckpointRef | None:
+                """Resolve this process's checkpoint, never a peer's snapshot."""
+
+                scope = (actor, assignment.generation)
+                with state.lock:
+                    ref = state.checkpoints_by_scope.get(scope)
+                if ref is None and checkpoint_store is not None:
+                    try:
+                        ref = checkpoint_store.load_latest(
+                            task_id=task.slug,
+                            task_root=state.task_root,
+                            actor_id=actor,
+                            episode=assignment.generation,
+                        )
+                    except Exception:
+                        ref = None
+                    if ref is not None:
+                        with state.lock:
+                            state.checkpoints_by_scope[scope] = ref
+                if ref is not None and checkpoint_store is not None:
+                    try:
+                        # A pre-termination callback writes to the durable task
+                        # ledger after the original workspace was prepared.
+                        # Materialize that exact snapshot before the replacement
+                        # process starts so the prompt's checkpoint path exists
+                        # even when the first attempt had no prior handoff.
+                        checkpoint_store.materialize_for_agent(
+                            ref,
+                            workdir / "checkpoint",
+                            candidate_filename=task.candidate_filename,
+                            transfer_candidate=True,
+                        )
+                    except Exception as exc:
+                        logger.event(
+                            "checkpoint_recovery_materialize_failed",
+                            task_id=task.slug,
+                            agent_id=actor,
+                            episode=assignment.generation,
+                            error_kind=_profile_error_kind(exc),
+                            unverified=True,
+                        )
+                return ref
+
+            def invoke_agent(recovery_attempt: int) -> AgentResult:
+                attempt_prompt = prompt
+                if recovery_attempt > 0 and checkpoint_store is not None:
+                    recovery_ref = checkpoint_for_recovery()
+                    attempt_prompt += _checkpoint_recovery_prompt_block(
+                        recovery_ref,
+                        recovery_attempt,
+                    )
+                    logger.event(
+                        "checkpoint_recovery_prompt",
+                        task_id=task.slug,
+                        agent_id=actor,
+                        episode=assignment.generation,
+                        recovery_attempt=recovery_attempt,
+                        sequence=(
+                            recovery_ref.sequence if recovery_ref is not None else None
+                        ),
+                        donor_actor_id=(
+                            recovery_ref.actor_id if recovery_ref is not None else None
+                        ),
+                        donor_episode=(
+                            recovery_ref.episode if recovery_ref is not None else None
+                        ),
+                        checkpoint_available=recovery_ref is not None,
+                        unverified=True,
+                    )
+                return pi_agent.run(
+                    task_id=task.slug,
+                    actor_id=actor,
+                    episode=assignment.generation,
+                    prompt=attempt_prompt,
+                    workdir=workdir,
+                    extra_env=broker_env,
+                    deadline_monotonic=deadline,
+                    cancel_event=assignment_cancel_event,
+                    communication_enabled=policy.enabled,
+                    direct_messages=direct_messages,
+                    selection_enabled=selection_enabled,
+                    termination_summary_prompt=termination_prompt,
+                    termination_summary_grace_seconds=(
+                        config.termination_summary.grace_seconds
+                        if termination_summary_enabled
+                        else 0.0
+                    ),
+                    termination_summary_on_timeout=(
+                        config.termination_summary.on_timeout
+                        if termination_summary_enabled
+                        else False
+                    ),
+                    termination_summary_on_cancel=(
+                        config.termination_summary.on_cancel
+                        if termination_summary_enabled
+                        else False
+                    ),
+                    termination_summary_on_error=(
+                        config.termination_summary.on_error
+                        if termination_summary_enabled
+                        else False
+                    ),
+                    on_termination_checkpoint=(
+                        (
+                            lambda reason: on_pretermination_checkpoint(
+                                reason, recovery_attempt
+                            )
+                        )
+                        if checkpoint_store is not None
+                        else None
+                    ),
+                )
+
             with judge_broker.session(
                 actor_id=actor,
+                episode=assignment.generation,
                 workdir=workdir,
                 candidates={task.slug: (task, candidate_path)},
                 deadline_monotonic=deadline,
@@ -4529,28 +6438,24 @@ def _run_elastic_cps(
                 roster_path=roster_path,
                 on_authoritative_verdict=admit_early_proof,
                 cancel_event=assignment_cancel_event,
+                termination_summary_event=(
+                    assignment_cancel_event if termination_summary_enabled else None
+                ),
             ) as broker_env:
                 result = _run_solver_with_recovery(
                     config,
                     logger,
-                    lambda _recovery_attempt: pi_agent.run(
-                        task_id=task.slug,
-                        actor_id=actor,
-                        episode=assignment.generation,
-                        prompt=prompt,
-                        workdir=workdir,
-                        extra_env=broker_env,
-                        deadline_monotonic=deadline,
-                        cancel_event=assignment_cancel_event,
-                        communication_enabled=policy.enabled,
-                        direct_messages=direct_messages,
-                        selection_enabled=selection_enabled,
-                    ),
+                    invoke_agent,
                     task_id=task.slug,
                     actor_id=actor,
                     episode=assignment.generation,
                     deadline=deadline,
                     cancel_event=assignment_cancel_event,
+                    on_result=(
+                        on_solver_result
+                        if checkpoint_store is not None or termination_summary_enabled
+                        else None
+                    ),
                 )
         _raise_if_remote_settlement_unconfirmed(
             evaluator,
@@ -4569,6 +6474,11 @@ def _run_elastic_cps(
             already_solved = state.solved
         if early_credit is not None:
             verdict = early_credit.verdict
+            save_checkpoint_closeout(
+                result,
+                verdict,
+                _allocation_feedback(verdict),
+            )
             logger.event(
                 "evaluation_finished",
                 **verdict.as_dict(),
@@ -4615,6 +6525,16 @@ def _run_elastic_cps(
                     state.last_feedback = reason
                     if status == "AGENT_FAILURE":
                         state.consecutive_failures += 1
+            # The abnormal result already emitted its checkpoint before the
+            # slot was released.  Refresh only the on-disk metadata with the
+            # runner's terminal classification; publishing a second piece
+            # would duplicate the same process-failure handoff.
+            save_checkpoint_closeout(
+                result,
+                verdict,
+                reason,
+                publish=False,
+            )
             logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
             logger.event(
                 "evaluation_finished",
@@ -4640,12 +6560,16 @@ def _run_elastic_cps(
                 {"reason": "task_solved_by_peer"},
             )
         else:
-            verdict = _evaluate_candidate(
+            verdict = _profiled_evaluate_candidate(
+                logger,
                 evaluator,
                 task,
                 candidate_path,
                 deadline,
                 evaluator_gate,
+                actor_id=actor,
+                episode=assignment.generation,
+                phase="elastic_cps",
                 cancel_event=assignment_cancel_event,
             )
             _raise_if_remote_settlement_unconfirmed(
@@ -4685,6 +6609,7 @@ def _run_elastic_cps(
                 complete_attempt=True,
             )
             if admitted:
+                save_checkpoint_closeout(result, verdict, feedback)
                 logger.event(
                     "evaluation_finished",
                     **verdict.as_dict(),
@@ -4715,6 +6640,11 @@ def _run_elastic_cps(
                 task_contract_sha256=verdict.task_contract_sha256,
                 judge_job_id=verdict.judge_job_id,
                 cache_reused=verdict.cache_reused,
+            )
+            save_checkpoint_closeout(
+                result,
+                verdict,
+                _allocation_feedback(verdict),
             )
             logger.scoreboard(verdict, episode=assignment.generation, agent_id=actor)
             logger.event(
@@ -4809,6 +6739,10 @@ def _run_elastic_cps(
                 and normalize_verdict_status(verdict.status) != "OUT_OF_HORIZON"
             ),
         )
+        # Capture the final candidate-bound Judge status/feedback after the
+        # authoritative validation piece has been published.  The immutable
+        # snapshot is still explicitly unverified and cannot affect score.
+        save_checkpoint_closeout(result, verdict, feedback)
         return result, verdict, False
 
     # All arms receive an identical initial pool.  Only a slot released after
@@ -4837,7 +6771,16 @@ def _run_elastic_cps(
     ) -> None:
         try:
             try:
-                next(execution)
+                with logger.profile_span(
+                    "attempt.wrapper.settlement",
+                    task_id=assignment.task_id,
+                    actor_id=assignment.agent_id,
+                    episode=assignment.generation,
+                    component="runner_wrapper",
+                    operation="post_agent_evaluation_commit",
+                    phase="post_agent",
+                ):
+                    next(execution)
             except StopIteration as stopped:
                 settled = stopped.value
             else:
@@ -4880,11 +6823,32 @@ def _run_elastic_cps(
             lease_released = False
             execution: Any | None = None
             try:
-                execution = execute_assignment(assignment)
-                next(execution)
+                with logger.profile_span(
+                    "attempt.wrapper.dispatch",
+                    task_id=assignment.task_id,
+                    actor_id=assignment.agent_id,
+                    episode=assignment.generation,
+                    component="runner_wrapper",
+                    operation="prepare_and_invoke",
+                    phase="pre_agent_yield",
+                ):
+                    execution = execute_assignment(assignment)
+                    next(execution)
                 with allocation_lock:
                     scheduler.finish(assignment, solved=False)
                 lease_released = True
+                logger.profile_event(
+                    "attempt.solver_slot_released",
+                    task_id=assignment.task_id,
+                    actor_id=assignment.agent_id,
+                    episode=assignment.generation,
+                    active_slots=scheduler.active_slots,
+                    active_solver_slots=scheduler.active_slots,
+                    remaining_slots=scheduler.remaining_slots,
+                    phase="post_agent_pre_evaluation",
+                    allocation_phase="post_agent_pre_evaluation",
+                    allocation_policy=config.allocation.policy,
+                )
 
                 remaining = max(0.0, deadline - time.monotonic())
                 admitted = evaluation_backlog_gate.acquire(blocking=False)
@@ -5116,7 +7080,16 @@ def _run_task_workers(
 
     def execute(task: Task) -> tuple[AgentResult, Verdict]:
         workdir = run_dir / "workers" / task.slug
-        _stage_task(task, workdir, config=config)
+        with logger.profile_span(
+            "attempt.wrapper.workspace",
+            task_id=task.slug,
+            actor_id=f"worker-{task.slug}-e0",
+            episode=0,
+            component="runner_wrapper",
+            operation="stage_task",
+            phase="task_worker",
+        ):
+            _stage_task(task, workdir, config=config)
         best_result: AgentResult | None = None
         best_verdict: Verdict | None = None
         actor = f"worker-{task.slug}-e0"
@@ -5197,27 +7170,37 @@ def _run_task_workers(
                 # directly by a narrow harness rather than normal CPS dispatch.
                 candidate_path.write_text(task.baseline_code, encoding="utf-8")
             actor = f"worker-{task.slug}-e{episode}"
-            digest = (
-                selection_runtime.digest(
-                    task_id=task.slug,
-                    actor_id=actor,
-                    query=task.theorem_name,
-                    episode=episode,
-                )
-                if selection_enabled
-                else policy.digest(task.slug, actor, query=task.theorem_name)
-            )
-            prompt = build_task_prompt(
-                task,
-                task_workspace=str(workdir),
-                agent_id=actor,
+            with logger.profile_span(
+                "attempt.wrapper.prompt",
+                task_id=task.slug,
+                actor_id=actor,
                 episode=episode,
-                communication_enabled=policy.enabled,
-                formal_tools_enabled=config.formal_tools_enabled,
-                direct_messages=direct_messages,
+                component="runner_wrapper",
+                operation="build_task_prompt",
+                phase="task_worker",
                 selection_enabled=selection_enabled,
-                digest=digest,
-            )
+            ):
+                digest = (
+                    selection_runtime.digest(
+                        task_id=task.slug,
+                        actor_id=actor,
+                        query=task.theorem_name,
+                        episode=episode,
+                    )
+                    if selection_enabled
+                    else policy.digest(task.slug, actor, query=task.theorem_name)
+                )
+                prompt = build_task_prompt(
+                    task,
+                    task_workspace=str(workdir),
+                    agent_id=actor,
+                    episode=episode,
+                    communication_enabled=policy.enabled,
+                    formal_tools_enabled=config.formal_tools_enabled,
+                    direct_messages=direct_messages,
+                    selection_enabled=selection_enabled,
+                    digest=digest,
+                )
             # Snapshot the candidate entering this logical attempt.  A failed
             # process may leave a partial file; task-level refill restores the
             # prior candidate while retaining the persisted Pi session state.
@@ -5231,6 +7214,7 @@ def _run_task_workers(
                 else:
                     with judge_broker.session(
                         actor_id=actor,
+                        episode=episode,
                         workdir=workdir,
                         candidates={task.slug: (task, candidate_path)},
                         deadline_monotonic=deadline,
@@ -5384,12 +7368,16 @@ def _run_task_workers(
                 )
                 verdict = credit.verdict
             else:
-                verdict = _evaluate_candidate(
+                verdict = _profiled_evaluate_candidate(
+                    logger,
                     evaluator,
                     task,
                     candidate_path,
                     deadline,
                     evaluator_gate,
+                    actor_id=actor,
+                    episode=episode,
+                    phase="task_worker",
                     cancel_event=run_cancel_event,
                 )
                 _raise_if_remote_settlement_unconfirmed(
@@ -5563,6 +7551,46 @@ def _evaluate_candidate(
     finally:
         if release_gate:
             gate.release()
+
+
+def _profiled_evaluate_candidate(
+    logger: Any,
+    evaluator: Any,
+    task: Task,
+    candidate: Path,
+    deadline: float,
+    gate: threading.BoundedSemaphore,
+    *,
+    actor_id: str,
+    episode: int,
+    phase: str,
+    cancel_event: Any | None = None,
+) -> Verdict:
+    """Measure runner-owned evaluation/gate work around one Judge call.
+
+    The evaluator/Judge implementation emits its own ``judge.*`` rows.  This
+    outer span is intentionally runner-scoped: it includes admission-gate
+    waiting and verdict post-processing, which are wrapper costs and must not
+    be mistaken for the agent process's CPU or memory.
+    """
+
+    with logger.profile_span(
+        "attempt.wrapper.evaluate",
+        task_id=task.slug,
+        actor_id=actor_id,
+        episode=episode,
+        component="runner_wrapper",
+        operation="candidate_evaluation",
+        phase=phase,
+    ):
+        return _evaluate_candidate(
+            evaluator,
+            task,
+            candidate,
+            deadline,
+            gate,
+            cancel_event=cancel_event,
+        )
 
 
 def _evaluator_remote_unsettled_jobs(evaluator: Any) -> int:
@@ -5840,12 +7868,26 @@ def _run_closeout(
             prior_verdicts,
         )
         try:
-            observed = _evaluate_closeout_candidate(
-                evaluator,
-                task,
-                candidate,
-                gate,
-            )
+            # Keep one real span around each fresh closeout evaluator call.
+            # The logger notification below maps to a non-span receipt; using
+            # the same ``.end`` name for both would manufacture a duplicate
+            # lifecycle (the audit reserves ``closeout.evaluation.end`` for
+            # the historical notification spelling).
+            with logger.profile_span(
+                "closeout.evaluation_call",
+                task_id=task.slug,
+                actor_id="closeout",
+                episode=0,
+                component="runner_wrapper",
+                operation="fresh_closeout_evaluation",
+                phase="closeout",
+            ):
+                observed = _evaluate_closeout_candidate(
+                    evaluator,
+                    task,
+                    candidate,
+                    gate,
+                )
         except Exception as exc:
             try:
                 contract_sha256 = _expected_task_contract(evaluator, task)
@@ -6807,6 +8849,8 @@ def _write_final(
             for status in sorted({str(item.get("status")) for item in rows.values()})
         },
         "cps": dict(cps_summary or {"enabled": False}),
+        "checkpoint": _checkpoint_final_evidence(run_dir, config),
+        "termination_summary": _termination_summary_final_evidence(run_dir, config),
         "selection": _selection_final_evidence(
             run_dir,
             config,

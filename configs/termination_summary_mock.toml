@@ -1,0 +1,22 @@
+extends = ["formal_1h_cps32_profiled_termination_summary.toml"]
+
+# Bounded offline plumbing fixture.  This is not a paper arm and does not
+# exercise real Pi/Judge timeouts; it exists only to produce a small,
+# reproducible final.json with the treatment manifest visible.
+[experiment]
+name = "mobench-termination-summary-mock"
+max_parallel = 2
+initial_agents_per_task = 1
+max_attempts_per_task = 1
+episodes_per_task = 1
+max_tasks = 2
+time_limit_seconds = 10
+
+[aisw]
+enabled = false
+
+[formal_tools]
+enabled = false
+
+[pi]
+timeout_seconds = 2

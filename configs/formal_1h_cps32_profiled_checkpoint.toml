@@ -1,0 +1,17 @@
+extends = ["formal_1h_cps32_profiled_clean.toml"]
+
+# Matched one-hour MathOlympiadBench CPS arm.  The only treatment surface is
+# the bounded, explicitly-unverified termination checkpoint: an immutable
+# candidate/result snapshot is written locally, made visible to the next
+# assignment, and (because this is the blackboard arm) published as a typed
+# runner handoff.  It is never a Judge verdict or a score-bearing candidate.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-checkpoint"
+
+[checkpoint]
+enabled = true
+transfer = true
+publish = true
+max_candidate_bytes = 2097152
+max_summary_chars = 6000
+max_context_items = 6

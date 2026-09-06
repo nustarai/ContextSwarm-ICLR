@@ -1,0 +1,27 @@
+extends = ["canary.toml"]
+
+# Real-Pi/real-Judge canary long enough to obtain ordinary Judge feedback
+# before the forced closeout. This remains a one-task operator probe, not a
+# paper-facing 12-task arm.
+[experiment]
+name = "mobench-controlled-judge-termination-summary-canary-progress"
+time_limit_seconds = 120
+
+[pi]
+timeout_seconds = 900
+
+[pi.recovery]
+# Keep one logical process attempt so the closeout receipt is attributable to
+# the actual work that preceded the timeout; recovery is a separate workstream.
+enabled = false
+
+[formal_tools]
+require_decl_index = false
+
+[termination_summary]
+enabled = true
+grace_seconds = 45
+on_timeout = true
+on_cancel = true
+on_error = true
+max_prompt_chars = 4000

@@ -1,0 +1,13 @@
+extends = ["formal_1h_cps32_profiled_checkpoint.toml"]
+
+# Matched checkpoint treatment for the Astra one-hour comparison.
+# The only treatment surface remains checkpoint save/transfer/publish.
+[experiment]
+name = "mobench-formal-1h-cps32-profiled-checkpoint-gpt6-astra"
+
+[pi]
+model = "openai-codex/gpt-6-astra"
+
+[docker]
+# Match the baseline's host-local NuRouter transport.
+network = "host"

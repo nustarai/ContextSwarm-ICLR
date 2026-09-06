@@ -74,11 +74,19 @@ class AgentResult:
     scheduler_outcome: str | None = None
     invalid_output: bool = False
     recoverable_invocation_error: bool = False
+    # A termination summary is a cooperative, same-session closeout request.
+    # It is deliberately separate from checkpoint/recovery state: these fields
+    # describe whether the ending Agent was given a chance to publish durable
+    # CPS knowledge, not whether a later Agent can resume a private workspace.
+    termination_summary_requested: bool = False
+    termination_summary_request_sent: bool = False
+    termination_summary_completed: bool = False
+    termination_summary_reason: str | None = None
+    termination_summary_publish_count: int = 0
+    termination_summary_publish_verified: bool = False
     # Pi may emit a provider/transport diagnostic for an intermediate retry
-    # and then complete the same logical prompt successfully (for example a
-    # WebSocket attempt followed by an SSE fallback).  Keep that lifecycle
-    # evidence separate from the final agent outcome so experiment-level
-    # recovery code cannot mistake recovered noise for a failed slot.
+    # and then complete the same logical prompt successfully. Keep that
+    # lifecycle evidence separate from the final agent outcome.
     settled: bool = False
     assistant_success: bool = False
     assistant_stop_reason: str | None = None
@@ -106,6 +114,12 @@ class AgentResult:
             "scheduler_outcome": self.scheduler_outcome,
             "invalid_output": self.invalid_output,
             "recoverable_invocation_error": self.recoverable_invocation_error,
+            "termination_summary_requested": self.termination_summary_requested,
+            "termination_summary_request_sent": self.termination_summary_request_sent,
+            "termination_summary_completed": self.termination_summary_completed,
+            "termination_summary_reason": self.termination_summary_reason,
+            "termination_summary_publish_count": self.termination_summary_publish_count,
+            "termination_summary_publish_verified": self.termination_summary_publish_verified,
             "settled": self.settled,
             "assistant_success": self.assistant_success,
             "assistant_stop_reason": self.assistant_stop_reason,

@@ -63,6 +63,34 @@ workers/mono/tasks/<task>/result.lean # mono
 
 `--mock-agent` 只验证编排和产物，不代表论文分数。
 
+## 可选资源 profiling（默认关闭）
+
+设置 `CONTEXTSWARM_PROFILE=1` 才会在 run 目录生成受权限保护的
+`profiling.jsonl`；默认路径不会创建 profiling 文件、sampler 线程或额外的
+profiling 写入。事件只保留低基数身份、计数器和资源标量，不写 prompt、candidate、
+secret、provider response 或主机路径。采样周期有界，artifact/JSONL 统计以低频快照
+和单行追加写入控制观测自身的开销。
+
+`resource.sample` 是包含 runner/shared 进程树的 run-level aggregate；注册的
+`resource.process` 行则按 solver/attempt 的 task 与 actor 归属，并可包含该根进程的
+descendants。两者的进程集合可能重叠，不能把 runner aggregate 与 solver rows 直接
+相加；aggregate 用于整体峰值，solver rows 用于归属分析，无法安全分摊的部分单列。
+在 cgroup v2 下优先读取当前进程 `0::` scope，只有 scope 不可用时才回退到层级根。
+
+六个主目标及独立 `record_search_lock` 诊断的事件覆盖矩阵、Agent/wrapper 分界、SQLite
+锁/WAL 解读、互斥分支和一次运行的限制见
+[`docs/profiling_metric_contract.md`](docs/profiling_metric_contract.md)；profile 结束后用
+只读的 [`scripts/audit_profiling.py`](scripts/audit_profiling.py) 检查 coverage、真实性
+等级和退出码。一次 profiling-on 真实 run 的字段清单见
+[`docs/profiling_one_run_checklist.md`](docs/profiling_one_run_checklist.md)；实际运行前的参数/证据交接约束见
+[`docs/profiling_dispatch_checklist.md`](docs/profiling_dispatch_checklist.md)。
+
+外部 formal Judge/Lean backend、router 和 worker 的宿主进程不属于 runner 的进程树，
+需要单独使用只读的 `scripts/external_resource_sampler.py` 采样。它要求操作者显式提供
+各层 root PID，输出 baseline、run-window、delta、RSS/PSS、累计及窗口 CPU、throttle、
+PID/线程和 cgroup counters；不会读取命令行/环境、发送请求或把 warm Judge 内存算到 agent。
+完整字段、边界和离线测试见 [`docs/external_resource_sampler.md`](docs/external_resource_sampler.md)。
+
 ## Docker + NuRouter/AISW Pi
 
 先构建镜像：
@@ -238,6 +266,29 @@ provider circuit breaker 或使 formal artifact 失格。
 可以继续使用。退避时间计入 horizon；正常满分、horizon 到点、runner 主动取消以及
 Judge 返回的候选 verdict 不会触发这层恢复。每次失败、安排重启、恢复成功或耗尽都会
 写入 `events.jsonl`，便于区分 agent 进程故障与候选本身的 PE/WA/超时。
+
+如果需要验证“结束前遗漏的共享知识是否被回收”，CPS arm 可以显式开启
+`[termination_summary]`。在 timeout、cancel 或仍存活的 provider/assistant error
+边界，runner 会向同一 Pi session 发一次 closeout command，要求它停止当前路线、检查
+自己的对话和 task-local CPS，并用 `kind = "termination_summary"` 发布一条带 closeout
+tag 的摘要；正常 `agent_settled` 不发送额外提醒。该摘要是共享知识发布，不是
+checkpoint，也不会把未验证 candidate 直接计分或自动注入另一个 Agent。timeout/cancel
+在原 turn 仍运行时使用 `steer`；已经 `agent_settled` 的 live provider/assistant error
+使用同一 session 的普通 `prompt` 启动 closeout turn。硬崩溃/SIGKILL/通信不可用时无法
+合作总结，或命令写入失败时，runner 会区分记录 `request_sent=false` 与
+`termination_summary_missing`。配置、指标和 A/B 合同见
+[`docs/termination_summary_experiment.md`](docs/termination_summary_experiment.md)，
+recover/checkpoint 的独立交接见 [`docs/recovery_checkpoint_handoff.md`](docs/recovery_checkpoint_handoff.md)。
+
+若要把候选文件也固定在终止边界，CPS runner 可以显式开启
+`[checkpoint] enabled=true`，并按需打开 `transfer`/`publish`。启用后，Pi 在 timeout、
+cancel 或 live RPC error 即将触发 drain 前调用 runner-owned
+`on_termination_checkpoint`；runner 立即对当前 workspace 做一次限大小、不可变、带
+SHA-256 的快照，再执行既有 closeout/recovery 流程。返回后的 attempt snapshot 和
+Judge 后的 `final_validation` snapshot 仍会分别记录，因此终止前保存不会改变 Judge
+权威性。该回调是 fail-open 的诊断/交接旁路；整个进程已被 SIGKILL，或候选/语义从未
+写入文件、CPS 或 session 时，没有可以补造的内容。具体实验合同与 continuation
+harness 见 [`docs/timeout_checkpoint_pretermination_20260905.md`](docs/timeout_checkpoint_pretermination_20260905.md)。
 
 每个 worker 的实际 Pi settings 写入其私有 `.pi/settings.json`；每次调用的原始
 session 进一步隔离在该 worker 的 `.pi/sessions/<session-id>/`，避免 CPS 高并发

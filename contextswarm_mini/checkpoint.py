@@ -1,0 +1,830 @@
+"""Durable, explicitly unverified handoff snapshots for interrupted agents.
+
+The checkpoint path is deliberately separate from the Judge/score path.  A
+checkpoint is useful recovery evidence, but it is never a candidate verdict
+and must not be promoted or credited without a fresh authoritative Judge
+receipt.  The writer keeps immutable per-attempt snapshots and an atomic
+``latest.json`` pointer so a later assignment can resume from a complete
+candidate even when the Pi process was killed while editing its workspace.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import threading
+from typing import Any, Mapping
+
+from .artifacts import append_jsonl, atomic_write_bytes, atomic_write_json
+from .evaluator import sanitize_worker_identifier, sanitize_worker_text
+
+
+CHECKPOINT_SCHEMA_VERSION = "contextswarm_checkpoint_v1"
+_DEFAULT_MAX_CANDIDATE_BYTES = 2 * 1024 * 1024
+_DEFAULT_MAX_SUMMARY_CHARS = 6_000
+_MAX_CONTEXT_ITEMS = 20
+_CANDIDATE_FILENAMES = frozenset({"result.lean", "result.cpp"})
+
+
+def _private_dir(path: Path) -> None:
+    """Create or validate an owner-only checkpoint directory."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        metadata = path.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise OSError("checkpoint directory must be a regular directory")
+    # Existing run roots may have been created with a permissive umask.  A
+    # checkpoint is a private artifact, so tighten only the new subtree.
+    os.chmod(path, 0o700)
+
+
+def _safe_seq(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _read_bounded_regular(path: Path, maximum_bytes: int) -> bytes | None:
+    """Read one regular file without following a symlink or exceeding a cap."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_size > maximum_bytes:
+            return None
+        chunks: list[bytes] = []
+        total = 0
+        while total <= maximum_bytes:
+            chunk = os.read(
+                descriptor,
+                min(256 * 1024, maximum_bytes + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > maximum_bytes:
+                return None
+        closed = os.fstat(descriptor)
+        if closed.st_size != opened.st_size:
+            return None
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class CheckpointRef:
+    """A saved immutable checkpoint and its safe public metadata."""
+
+    task_id: str
+    sequence: int
+    directory: Path
+    metadata_path: Path
+    candidate_path: Path | None
+    record: Mapping[str, Any]
+
+    @property
+    def candidate_sha256(self) -> str | None:
+        value = self.record.get("candidate", {})
+        if not isinstance(value, Mapping):
+            return None
+        digest = value.get("sha256")
+        return str(digest) if isinstance(digest, str) and digest else None
+
+    @property
+    def candidate_bytes(self) -> int | None:
+        value = self.record.get("candidate", {})
+        if not isinstance(value, Mapping):
+            return None
+        raw = value.get("bytes")
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+    @property
+    def candidate_changed_from_baseline(self) -> bool:
+        value = self.record.get("candidate", {})
+        return bool(isinstance(value, Mapping) and value.get("changed_from_baseline"))
+
+    @property
+    def actor_id(self) -> str:
+        value = self.record.get("actor_id")
+        return sanitize_worker_identifier(value) or "unknown-agent"
+
+    @property
+    def episode(self) -> int:
+        return _safe_seq(self.record.get("episode"))
+
+    def public_dict(self) -> dict[str, Any]:
+        """Return a JSON-safe record without host paths."""
+
+        return dict(self.record)
+
+
+class CheckpointStore:
+    """Thread-safe per-run checkpoint writer.
+
+    The store intentionally accepts already bounded context rows.  It applies
+    one additional text/identifier sanitization pass before writing so a
+    malformed agent-authored CPS item cannot smuggle credentials or host paths
+    into the durable handoff artifact.
+    """
+
+    def __init__(
+        self,
+        run_dir: Path,
+        *,
+        max_candidate_bytes: int = _DEFAULT_MAX_CANDIDATE_BYTES,
+        max_summary_chars: int = _DEFAULT_MAX_SUMMARY_CHARS,
+        max_context_items: int = 6,
+    ) -> None:
+        self.run_dir = Path(run_dir)
+        self.root = self.run_dir / "checkpoints"
+        _private_dir(self.root)
+        self.max_candidate_bytes = max(1, min(int(max_candidate_bytes), 16 * 1024 * 1024))
+        self.max_summary_chars = max(256, min(int(max_summary_chars), 32_000))
+        self.max_context_items = max(1, min(int(max_context_items), _MAX_CONTEXT_ITEMS))
+        self._locks: dict[str, threading.RLock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _lock_for(self, task_id: str) -> threading.RLock:
+        with self._locks_guard:
+            return self._locks.setdefault(task_id, threading.RLock())
+
+    @staticmethod
+    def _safe_task_id(task_id: str) -> str:
+        safe = sanitize_worker_identifier(task_id)
+        if safe is None:
+            raise ValueError("checkpoint task id is invalid")
+        return safe
+
+    @staticmethod
+    def _safe_actor_id(actor_id: str) -> str:
+        safe = sanitize_worker_identifier(actor_id)
+        return safe or "unknown-agent"
+
+    @staticmethod
+    def _safe_candidate_filename(candidate_filename: str) -> str:
+        """Allow only the benchmark's known candidate basenames.
+
+        A worker-controlled filename must never be allowed to introduce a
+        separator, ``..`` component, or an arbitrary artifact into the
+        checkpoint subtree.  The Task model already restricts this value, but
+        the store is also used by test/runtime adapters and therefore checks
+        the boundary independently.
+        """
+
+        value = str(candidate_filename or "")
+        if value not in _CANDIDATE_FILENAMES:
+            raise ValueError("checkpoint candidate filename is not supported")
+        return value
+
+    def _sanitize_context(self, context: Mapping[str, Any] | None) -> dict[str, Any]:
+        context = context if isinstance(context, Mapping) else {}
+
+        def rows(name: str) -> list[dict[str, Any]]:
+            raw = context.get(name, [])
+            if not isinstance(raw, (list, tuple)):
+                return []
+            result: list[dict[str, Any]] = []
+            for item in raw[: self.max_context_items]:
+                if not isinstance(item, Mapping):
+                    continue
+                piece_id = sanitize_worker_identifier(item.get("piece_id"))
+                kind = sanitize_worker_text(item.get("kind"), 64)
+                title = sanitize_worker_text(item.get("title"), 300)
+                body = sanitize_worker_text(item.get("body"), max(128, self.max_summary_chars // 4))
+                created_at = sanitize_worker_text(item.get("created_at"), 64)
+                row: dict[str, Any] = {
+                    "kind": kind,
+                    "title": title,
+                    "body": body,
+                }
+                if piece_id:
+                    row["piece_id"] = piece_id
+                author = sanitize_worker_identifier(item.get("author"))
+                if author:
+                    row["author"] = author
+                recipient = sanitize_worker_identifier(item.get("recipient"))
+                if recipient:
+                    row["recipient"] = recipient
+                if created_at:
+                    row["created_at"] = created_at
+                for key, maximum in (
+                    ("status", 64),
+                    ("claim", 700),
+                    ("evidence", 900),
+                    ("preconditions", 700),
+                    ("next_action", 700),
+                    ("relation", 96),
+                ):
+                    value = sanitize_worker_text(item.get(key), maximum)
+                    if value:
+                        row[key] = value
+                for key in ("source_message_id", "route_claim_id"):
+                    value = sanitize_worker_identifier(item.get(key))
+                    if value:
+                        row[key] = value
+                result.append(row)
+            return result
+
+        next_step = sanitize_worker_text(
+            context.get("next_step"), max(256, self.max_summary_chars // 3)
+        )
+        if not next_step:
+            next_step = (
+                "Open the unverified candidate, run judge_check, and continue from "
+                "the recorded evidence; do not treat the checkpoint as a proof."
+            )
+        return {
+            "completed_work": rows("completed_work"),
+            "ruled_out": rows("ruled_out"),
+            "next_step": next_step,
+            "source": sanitize_worker_text(context.get("source"), 128) or "runner",
+        }
+
+    def save(
+        self,
+        *,
+        task_id: str,
+        task_root: Path,
+        candidate_path: Path,
+        candidate_filename: str,
+        baseline_sha256: str,
+        actor_id: str,
+        episode: int,
+        recovery_attempt: int,
+        result: Mapping[str, Any],
+        retry_pending: bool,
+        context: Mapping[str, Any] | None = None,
+        feedback: str = "",
+        latest_validation_status: str = "",
+        latest_validation_feedback: str = "",
+        best_candidate_sha256: str | None = None,
+        candidate_source: str = "attempt_workspace",
+    ) -> CheckpointRef:
+        """Save one bounded candidate/result snapshot.
+
+        ``result`` is expected to contain only the scalar AgentResult fields;
+        command lines and raw request/response payloads are intentionally not
+        accepted.  The method raises on an artifact I/O failure; the caller's
+        checkpoint callback catches that failure and records it without
+        changing the solver/score lifecycle.
+        """
+
+        safe_task = self._safe_task_id(task_id)
+        safe_actor = self._safe_actor_id(actor_id)
+        safe_candidate_filename = self._safe_candidate_filename(candidate_filename)
+        safe_candidate_source = (
+            sanitize_worker_text(candidate_source, 96) or "attempt_workspace"
+        )
+        # Check lexical containment without resolving the final component: a
+        # symlink candidate inside the task root must be reported as
+        # ``not_regular`` below, not followed (or rejected as an opaque path)
+        # before the store can record that safe outcome.
+        task_root_absolute = Path(os.path.abspath(os.fspath(task_root)))
+        candidate_absolute = Path(os.path.abspath(os.fspath(candidate_path)))
+        if not candidate_absolute.is_relative_to(task_root_absolute):
+            raise ValueError("checkpoint candidate must stay inside its task root")
+        with self._lock_for(safe_task):
+            task_checkpoint_root = Path(task_root) / "checkpoints"
+            _private_dir(task_checkpoint_root)
+            sequence_path = task_checkpoint_root / "sequence"
+            # Sequence is local to the task and protected by the per-task lock.
+            # Keep it as a tiny regular file, never a symlink or an append race.
+            try:
+                current = _safe_seq(sequence_path.read_text(encoding="ascii"))
+            except (FileNotFoundError, OSError, UnicodeError):
+                current = 0
+            # Recover from a truncated/missing sequence marker without ever
+            # overwriting an immutable snapshot directory.  This also makes a
+            # crash between candidate publication and marker update safe.
+            try:
+                existing = [
+                    _safe_seq(item.name)
+                    for item in task_checkpoint_root.iterdir()
+                    if item.is_dir() and not item.is_symlink() and item.name.isdigit()
+                ]
+            except OSError:
+                existing = []
+            sequence = max([current, *existing], default=0) + 1
+            atomic_write_bytes(sequence_path, str(sequence).encode("ascii"), mode=0o600)
+
+            directory = task_checkpoint_root / f"{sequence:06d}"
+            _private_dir(directory)
+            candidate_record: dict[str, Any] = {
+                "filename": safe_candidate_filename,
+                "source": safe_candidate_source,
+                "status": "missing",
+                "bytes": None,
+                "sha256": None,
+                "changed_from_baseline": False,
+                "relative_path": None,
+            }
+            candidate_snapshot: Path | None = None
+            try:
+                metadata = candidate_path.lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                    candidate_record["status"] = "not_regular"
+                elif metadata.st_size > self.max_candidate_bytes:
+                    candidate_record["status"] = "too_large"
+                    candidate_record["bytes"] = int(metadata.st_size)
+                else:
+                    # Read through an O_NOFOLLOW descriptor and cap the read at
+                    # max+1 bytes.  The prior lstat is only a classification;
+                    # it must not become a symlink/TOCTOU escape before the
+                    # immutable snapshot is published.
+                    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                    flags |= getattr(os, "O_NOFOLLOW", 0)
+                    try:
+                        descriptor = os.open(candidate_path, flags)
+                    except OSError as exc:
+                        if exc.errno == errno.ELOOP:
+                            candidate_record["status"] = "not_regular"
+                        else:
+                            candidate_record["status"] = "read_error"
+                    else:
+                        try:
+                            opened = os.fstat(descriptor)
+                            if not stat.S_ISREG(opened.st_mode):
+                                candidate_record["status"] = "not_regular"
+                            elif opened.st_size > self.max_candidate_bytes:
+                                candidate_record["status"] = "too_large"
+                                candidate_record["bytes"] = int(opened.st_size)
+                            else:
+                                chunks: list[bytes] = []
+                                total = 0
+                                while total <= self.max_candidate_bytes:
+                                    chunk = os.read(
+                                        descriptor,
+                                        min(256 * 1024, self.max_candidate_bytes + 1 - total),
+                                    )
+                                    if not chunk:
+                                        break
+                                    chunks.append(chunk)
+                                    total += len(chunk)
+                                    if total > self.max_candidate_bytes:
+                                        break
+                                if total > self.max_candidate_bytes:
+                                    candidate_record["status"] = "too_large"
+                                    candidate_record["bytes"] = total
+                                else:
+                                    closed = os.fstat(descriptor)
+                                    if closed.st_size != opened.st_size:
+                                        candidate_record["status"] = "read_error"
+                                    else:
+                                        raw = b"".join(chunks)
+                                        digest = hashlib.sha256(raw).hexdigest()
+                                        candidate_snapshot = directory / candidate_record["filename"]
+                                        atomic_write_bytes(candidate_snapshot, raw, mode=0o600)
+                                        candidate_record.update(
+                                            {
+                                                "status": "captured",
+                                                "bytes": len(raw),
+                                                "sha256": digest,
+                                                "changed_from_baseline": digest != str(baseline_sha256).lower(),
+                                                "relative_path": f"{sequence:06d}/{candidate_record['filename']}",
+                                            }
+                                        )
+                        finally:
+                            os.close(descriptor)
+            except FileNotFoundError:
+                candidate_record["status"] = "missing"
+            except OSError:
+                candidate_record["status"] = "read_error"
+
+            scalar_result = {
+                key: result.get(key)
+                for key in (
+                    "returncode",
+                    "timed_out",
+                    "cancelled",
+                    "run_horizon_reached",
+                    "events",
+                    "mocked",
+                )
+            }
+            scalar_result["returncode"] = (
+                int(scalar_result["returncode"])
+                if isinstance(scalar_result.get("returncode"), int)
+                and not isinstance(scalar_result.get("returncode"), bool)
+                else None
+            )
+            for key in ("timed_out", "cancelled", "run_horizon_reached", "mocked"):
+                scalar_result[key] = bool(scalar_result.get(key, False))
+            scalar_result["events"] = _safe_seq(scalar_result.get("events"))
+            if scalar_result["timed_out"]:
+                reason = "timeout"
+            elif scalar_result["cancelled"]:
+                reason = "cancelled"
+            elif scalar_result["run_horizon_reached"]:
+                reason = "horizon"
+            elif scalar_result["returncode"] == 0:
+                reason = "completed"
+            else:
+                reason = "process_failure"
+
+            record: dict[str, Any] = {
+                "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "unverified": True,
+                "score_eligible": False,
+                "task_id": safe_task,
+                "sequence": sequence,
+                "actor_id": safe_actor,
+                "episode": _safe_seq(episode),
+                "recovery_attempt": _safe_seq(recovery_attempt),
+                "retry_pending": bool(retry_pending),
+                "terminal_reason": reason,
+                "result": scalar_result,
+                "candidate": candidate_record,
+                "feedback": sanitize_worker_text(feedback, max(128, self.max_summary_chars // 4)),
+                "latest_validation": {
+                    "status": sanitize_worker_text(latest_validation_status, 96)
+                    or "NONE",
+                    "feedback": sanitize_worker_text(
+                        latest_validation_feedback,
+                        max(128, self.max_summary_chars // 4),
+                    ),
+                    "best_candidate_sha256": (
+                        str(best_candidate_sha256).lower()
+                        if isinstance(best_candidate_sha256, str)
+                        and len(best_candidate_sha256) == 64
+                        and all(
+                            character in "0123456789abcdefABCDEF"
+                            for character in best_candidate_sha256
+                        )
+                        else None
+                    ),
+                },
+                "output_tail": sanitize_worker_text(
+                    result.get("output_tail"), max(128, self.max_summary_chars // 4)
+                ),
+                "error_tail": sanitize_worker_text(
+                    result.get("error_tail"), max(128, self.max_summary_chars // 4), tail=True
+                ),
+                "context": self._sanitize_context(context),
+            }
+            metadata_path = directory / "checkpoint.json"
+            atomic_write_json(metadata_path, record, mode=0o600)
+            # ``latest.json`` is a pointer, not a mutable candidate.  Readers
+            # can resolve the immutable sequence directory and verify the hash.
+            atomic_write_json(
+                task_checkpoint_root / "latest.json",
+                {
+                    "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                    "task_id": safe_task,
+                    "sequence": sequence,
+                    "metadata": f"{sequence:06d}/checkpoint.json",
+                    "candidate": candidate_record.get("relative_path"),
+                    "candidate_sha256": candidate_record.get("sha256"),
+                    "unverified": True,
+                },
+                mode=0o600,
+            )
+            append_jsonl(task_checkpoint_root / "index.jsonl", record, mode=0o600)
+            return CheckpointRef(
+                task_id=safe_task,
+                sequence=sequence,
+                directory=directory,
+                metadata_path=metadata_path,
+                candidate_path=candidate_snapshot,
+                record=record,
+            )
+
+    def load_latest(
+        self,
+        *,
+        task_id: str,
+        task_root: Path,
+        actor_id: str | None = None,
+        episode: int | None = None,
+    ) -> CheckpointRef | None:
+        """Load the newest valid immutable snapshot for an explicit scope.
+
+        ``latest.json`` is intentionally task-wide because it is a cheap
+        publication pointer, but concurrent actors can advance it for one
+        another.  Recovery therefore scans the immutable ledger and filters on
+        ``(task_id, actor_id, episode)`` when a process-specific handoff is
+        requested.  Among matching snapshots, a captured changed candidate is
+        preferred over a later empty/unchanged closeout so a useful partial is
+        not hidden by a process that exited without editing its workspace.
+        """
+
+        safe_task = self._safe_task_id(task_id)
+        safe_actor = self._safe_actor_id(actor_id) if actor_id is not None else None
+        expected_episode = _safe_seq(episode) if episode is not None else None
+        root = Path(task_root) / "checkpoints"
+        try:
+            metadata = root.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            return None
+
+        refs: list[CheckpointRef] = []
+        try:
+            entries = sorted(
+                (
+                    item
+                    for item in root.iterdir()
+                    if item.is_dir() and not item.is_symlink() and item.name.isdigit()
+                ),
+                key=lambda item: _safe_seq(item.name),
+                reverse=True,
+            )
+        except OSError:
+            return None
+        for directory in entries:
+            sequence = _safe_seq(directory.name)
+            if sequence <= 0:
+                continue
+            metadata_path = directory / "checkpoint.json"
+            try:
+                metadata_stat = metadata_path.lstat()
+                if stat.S_ISLNK(metadata_stat.st_mode) or not stat.S_ISREG(
+                    metadata_stat.st_mode
+                ):
+                    continue
+                if metadata_stat.st_size > 1_048_576:
+                    continue
+                raw = _read_bounded_regular(metadata_path, 1_048_576)
+                if raw is None:
+                    continue
+                record = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            try:
+                record_task = self._safe_task_id(str(record.get("task_id") or ""))
+            except ValueError:
+                continue
+            if record_task != safe_task:
+                continue
+            if _safe_seq(record.get("sequence")) != sequence:
+                continue
+            record_actor = self._safe_actor_id(str(record.get("actor_id") or ""))
+            record_episode = _safe_seq(record.get("episode"))
+            if safe_actor is not None and record_actor != safe_actor:
+                continue
+            if expected_episode is not None and record_episode != expected_episode:
+                continue
+
+            candidate_path: Path | None = None
+            candidate = record.get("candidate")
+            if isinstance(candidate, Mapping) and candidate.get("status") == "captured":
+                try:
+                    filename = self._safe_candidate_filename(
+                        str(candidate.get("filename") or "")
+                    )
+                    relative_path = str(candidate.get("relative_path") or "")
+                    if relative_path != f"{sequence:06d}/{filename}":
+                        continue
+                    candidate_path = directory / filename
+                    candidate_stat = candidate_path.lstat()
+                    if stat.S_ISLNK(candidate_stat.st_mode) or not stat.S_ISREG(
+                        candidate_stat.st_mode
+                    ):
+                        candidate_path = None
+                    elif candidate_stat.st_size > self.max_candidate_bytes:
+                        candidate_path = None
+                    else:
+                        candidate_raw = _read_bounded_regular(
+                            candidate_path, self.max_candidate_bytes
+                        )
+                        if candidate_raw is None or hashlib.sha256(
+                            candidate_raw
+                        ).hexdigest() != str(candidate.get("sha256") or "").lower():
+                            candidate_path = None
+                except (OSError, ValueError):
+                    candidate_path = None
+            refs.append(
+                CheckpointRef(
+                    task_id=safe_task,
+                    sequence=sequence,
+                    directory=directory,
+                    metadata_path=metadata_path,
+                    candidate_path=candidate_path,
+                    record=record,
+                )
+            )
+
+        if not refs:
+            return None
+        changed = [
+            ref
+            for ref in refs
+            if ref.candidate_changed_from_baseline and ref.candidate_path is not None
+        ]
+        return changed[0] if changed else refs[0]
+
+    def materialize_for_agent(
+        self,
+        ref: CheckpointRef,
+        destination: Path,
+        *,
+        candidate_filename: str,
+        transfer_candidate: bool,
+    ) -> None:
+        """Copy a checkpoint into a fresh worker workspace atomically."""
+
+        safe_candidate_filename = self._safe_candidate_filename(candidate_filename)
+        _private_dir(destination)
+        metadata = destination / "checkpoint.json"
+        atomic_write_json(metadata, ref.public_dict(), mode=0o600)
+        if not transfer_candidate:
+            return
+        if ref.candidate_path is None or not ref.candidate_path.exists():
+            return
+        raw = ref.candidate_path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest != ref.candidate_sha256:
+            raise ValueError("checkpoint candidate changed after publication")
+        snapshot = destination / safe_candidate_filename
+        atomic_write_bytes(snapshot, raw, mode=0o600)
+
+    def publish_payload(
+        self,
+        ref: CheckpointRef,
+        *,
+        max_bytes: int = 7_500,
+    ) -> dict[str, Any]:
+        """Return a machine-readable CPS payload that fits the piece limit.
+
+        CPS bodies have their own bounded text contract.  Serializing the full
+        on-disk record and letting :meth:`CPSStore.create_piece` clip it would
+        produce invalid JSON exactly when a context summary is richest.  Keep
+        the durable disk record complete, but publish a progressively reduced
+        summary whose *encoded* UTF-8/ASCII representation is guaranteed to fit
+        below the CPS clipping threshold.
+        """
+
+        maximum = max(512, min(int(max_bytes), 7_500))
+        record = ref.record if isinstance(ref.record, Mapping) else {}
+        candidate = record.get("candidate")
+        candidate = candidate if isinstance(candidate, Mapping) else {}
+        validation = record.get("latest_validation")
+        validation = validation if isinstance(validation, Mapping) else {}
+        result = record.get("result")
+        result = result if isinstance(result, Mapping) else {}
+        context = record.get("context")
+        context = context if isinstance(context, Mapping) else {}
+
+        def row_list(name: str, row_limit: int, body_limit: int) -> list[dict[str, Any]]:
+            raw_rows = context.get(name, [])
+            if not isinstance(raw_rows, (list, tuple)):
+                return []
+            rows: list[dict[str, Any]] = []
+            for raw in raw_rows[:row_limit]:
+                if not isinstance(raw, Mapping):
+                    continue
+                row: dict[str, Any] = {
+                    "kind": sanitize_worker_text(raw.get("kind"), 48),
+                    "title": sanitize_worker_text(raw.get("title"), 180),
+                    "body": sanitize_worker_text(raw.get("body"), body_limit),
+                }
+                piece_id = sanitize_worker_identifier(raw.get("piece_id"))
+                if piece_id:
+                    row["piece_id"] = piece_id
+                for key, maximum in (
+                    ("status", 64),
+                    ("claim", 700),
+                    ("evidence", 900),
+                    ("preconditions", 700),
+                    ("next_action", 700),
+                    ("relation", 96),
+                ):
+                    value = sanitize_worker_text(raw.get(key), maximum)
+                    if value:
+                        row[key] = value
+                for key in ("source_message_id", "route_claim_id"):
+                    value = sanitize_worker_identifier(raw.get(key))
+                    if value:
+                        row[key] = value
+                rows.append(row)
+            return rows
+
+        def payload(row_limit: int, body_limit: int) -> dict[str, Any]:
+            return {
+                "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "task_id": sanitize_worker_identifier(record.get("task_id"))
+                or "unknown-task",
+                "sequence": _safe_seq(record.get("sequence")),
+                "actor_id": sanitize_worker_identifier(record.get("actor_id"))
+                or "unknown-agent",
+                "episode": _safe_seq(record.get("episode")),
+                "recovery_attempt": _safe_seq(record.get("recovery_attempt")),
+                "retry_pending": bool(record.get("retry_pending")),
+                "terminal_reason": sanitize_worker_text(
+                    record.get("terminal_reason"), 64
+                ),
+                "unverified": True,
+                "score_eligible": False,
+                "result": {
+                    "returncode": result.get("returncode")
+                    if isinstance(result.get("returncode"), int)
+                    and not isinstance(result.get("returncode"), bool)
+                    else None,
+                    "timed_out": bool(result.get("timed_out")),
+                    "cancelled": bool(result.get("cancelled")),
+                    "run_horizon_reached": bool(result.get("run_horizon_reached")),
+                },
+                "candidate": {
+                    "filename": sanitize_worker_text(candidate.get("filename"), 32),
+                    "source": sanitize_worker_text(candidate.get("source"), 96)
+                    or "attempt_workspace",
+                    "status": sanitize_worker_text(candidate.get("status"), 32),
+                    "bytes": candidate.get("bytes")
+                    if isinstance(candidate.get("bytes"), int)
+                    and not isinstance(candidate.get("bytes"), bool)
+                    else None,
+                    "sha256": candidate.get("sha256")
+                    if isinstance(candidate.get("sha256"), str)
+                    and len(candidate.get("sha256")) == 64
+                    else None,
+                    "changed_from_baseline": bool(
+                        candidate.get("changed_from_baseline")
+                    ),
+                },
+                "latest_validation": {
+                    "status": sanitize_worker_text(validation.get("status"), 64)
+                    or "NONE",
+                    "feedback": sanitize_worker_text(
+                        validation.get("feedback"), body_limit
+                    ),
+                    "best_candidate_sha256": validation.get("best_candidate_sha256")
+                    if isinstance(validation.get("best_candidate_sha256"), str)
+                    and len(validation.get("best_candidate_sha256")) == 64
+                    else None,
+                },
+                "context": {
+                    "completed_work": row_list("completed_work", row_limit, body_limit),
+                    "ruled_out": row_list("ruled_out", row_limit, body_limit),
+                    "next_step": sanitize_worker_text(
+                        context.get("next_step"), max(96, body_limit)
+                    ),
+                    "source": sanitize_worker_text(context.get("source"), 64)
+                    or "runner",
+                },
+            }
+
+        # Try the useful summary first, then shed rows/body text until the
+        # encoded representation is safely below CPSStore's 8,000-character
+        # clipping boundary.  ensure_ascii keeps the byte/character bound
+        # identical even when a finding contains non-ASCII text.
+        for row_limit in (
+            self.max_context_items,
+            min(self.max_context_items, 4),
+            min(self.max_context_items, 2),
+            1,
+            0,
+        ):
+            for body_limit in (
+                max(96, min(self.max_summary_chars // 4, 600)),
+                400,
+                200,
+                96,
+                0,
+            ):
+                candidate_payload = payload(row_limit, body_limit)
+                encoded = json.dumps(
+                    candidate_payload,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if len(encoded.encode("ascii")) <= maximum:
+                    return candidate_payload
+        # The fixed scalar fields above are comfortably below the bound.  Keep
+        # this final fallback defensive in case a future schema adds a large
+        # constant field; it remains valid JSON and never exposes host paths.
+        return {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "task_id": "unknown-task",
+            "sequence": _safe_seq(record.get("sequence")),
+            "unverified": True,
+            "score_eligible": False,
+            "candidate": {"status": "omitted_for_bound"},
+            "context": {"completed_work": [], "ruled_out": [], "next_step": "inspect checkpoint files"},
+        }
+
+
+__all__ = ["CHECKPOINT_SCHEMA_VERSION", "CheckpointRef", "CheckpointStore"]

@@ -99,6 +99,15 @@ class RunDockerManifestTests(unittest.TestCase):
         env.pop("CONTEXTSWARM_MINI_IMAGE", None)
         env.pop("CONTEXTSWARM_MINI_MEMORY", None)
         env.pop("CONTEXTSWARM_MINI_RUNS_ROOT", None)
+        for profiling_env in (
+            "CONTEXTSWARM_PROFILE",
+            "CONTEXTSWARM_RESOURCE_PROFILING",
+            "CONTEXTSWARM_PROFILING",
+            "CONTEXTSWARM_PROFILE_HEARTBEAT_SECONDS",
+            "CONTEXTSWARM_PROFILE_INTERVAL_SECONDS",
+            "CONTEXTSWARM_PROFILE_PATH",
+        ):
+            env.pop(profiling_env, None)
         env.update(overrides)
         env.update(
             {
@@ -168,6 +177,36 @@ class RunDockerManifestTests(unittest.TestCase):
             "registry.example:5000/paper/mini:operator",
         )
 
+    def test_opt_in_profiling_environment_is_forwarded_by_name_only(self) -> None:
+        private_profile_path = str(self.temp / "operator-private-profile.jsonl")
+        result = self._run(
+            CONTEXTSWARM_PROFILE="1",
+            CONTEXTSWARM_RESOURCE_PROFILING="1",
+            CONTEXTSWARM_PROFILING="1",
+            CONTEXTSWARM_PROFILE_HEARTBEAT_SECONDS="0.25",
+            CONTEXTSWARM_PROFILE_INTERVAL_SECONDS="2",
+            CONTEXTSWARM_PROFILE_PATH=private_profile_path,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self._captured_argv()
+        for variable in (
+            "CONTEXTSWARM_PROFILE",
+            "CONTEXTSWARM_RESOURCE_PROFILING",
+            "CONTEXTSWARM_PROFILING",
+            "CONTEXTSWARM_PROFILE_HEARTBEAT_SECONDS",
+            "CONTEXTSWARM_PROFILE_INTERVAL_SECONDS",
+            "CONTEXTSWARM_PROFILE_PATH",
+        ):
+            variable_index = argv.index(variable)
+            self.assertEqual(argv[variable_index - 1], "-e")
+            self.assertNotIn(f"{variable}=", argv)
+        self.assertNotIn("0.25", argv)
+        self.assertNotIn("2", argv)
+        self.assertNotIn(private_profile_path, argv)
+        self.assertNotIn(private_profile_path, result.stdout)
+        self.assertNotIn(private_profile_path, result.stderr)
+
     def test_pid_limit_has_cps48_headroom_and_remains_operator_overridable(self) -> None:
         result = self._run()
 
@@ -182,27 +221,31 @@ class RunDockerManifestTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--pids-limit") + 1], "3072")
 
     def test_external_results_mount_keeps_tracked_manifest_identity(self) -> None:
-        output = self.temp / 'external results'
-        result = self._run(config=ROOT / 'configs/smoke.toml',
-                           CONTEXTSWARM_MINI_RUNS_ROOT=str(output))
+        output = self.temp / "external results"
+        result = self._run(
+            config=ROOT / "configs/smoke.toml",
+            CONTEXTSWARM_MINI_RUNS_ROOT=str(output),
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         argv = self._captured_argv()
-        self.assertIn(f'{output}:/opt/contextswarm/runs', argv)
-        self.assertEqual(argv[argv.index('--config') + 1], 'configs/smoke.toml')
+        self.assertIn(f"{output}:/opt/contextswarm/runs", argv)
+        self.assertEqual(argv[argv.index("--config") + 1], "configs/smoke.toml")
 
     def test_external_results_mount_cannot_hide_operator_manifest(self) -> None:
-        result = self._run(CONTEXTSWARM_MINI_RUNS_ROOT=str(self.temp / 'external'))
+        result = self._run(CONTEXTSWARM_MINI_RUNS_ROOT=str(self.temp / "external"))
         self.assertEqual(result.returncode, 2)
-        self.assertIn('requires a source-tree manifest', result.stderr)
+        self.assertIn("requires a source-tree manifest", result.stderr)
         self.assertFalse(self.capture.exists())
 
     def test_external_results_mount_rejects_source_and_ancestors(self) -> None:
-        for output in (ROOT, ROOT.parent, Path('/')):
+        for output in (ROOT, ROOT.parent, Path("/")):
             with self.subTest(output=output):
-                result = self._run(config=ROOT / 'configs/smoke.toml',
-                                   CONTEXTSWARM_MINI_RUNS_ROOT=str(output))
+                result = self._run(
+                    config=ROOT / "configs/smoke.toml",
+                    CONTEXTSWARM_MINI_RUNS_ROOT=str(output),
+                )
                 self.assertEqual(result.returncode, 2)
-                self.assertIn('must not expose a source checkout', result.stderr)
+                self.assertIn("must not expose a source checkout", result.stderr)
                 self.assertFalse(self.capture.exists())
 
     def test_bridge_network_is_manifest_selected_with_host_gateway_alias(self) -> None:
