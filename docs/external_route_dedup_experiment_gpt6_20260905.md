@@ -135,19 +135,12 @@ profiling 文件本身是 real 记录，主要 agent wrapper、CPS、Judge 和 m
 
 完整证据：
 
-- [逐题原因分析附录](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/strong-activity-feedback-20260905/docs/external_route_dedup_cause_analysis_20260906.md)
-- [六个 run 的逐题结构化分析 JSON](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-detail-20260906.json)
-- [control run_meta.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-control-20260905/runs/strong-activity-paired-20260905/control/20260905T071908Z-df7b2db9/run_meta.json)
-- [control final.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-control-20260905/runs/strong-activity-paired-20260905/control/20260905T071908Z-df7b2db9/final.json)
-- [treatment run_meta.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/strong-activity-feedback-20260905/runs/strong-activity-paired-20260905/treatment/20260905T071908Z-e6b3eb73/run_meta.json)
-- [treatment final.json](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/strong-activity-feedback-20260905/runs/strong-activity-paired-20260905/treatment/20260905T071908Z-e6b3eb73/final.json)
-- [control profiling exact audit](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-r3/evidence/control-profiling-audit-exact.json)
-- [treatment profiling exact audit](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-r3/evidence/treatment-profiling-audit-exact.json)
-- [新增两轮四臂汇总](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-reruns-20260905-v2/rerun-summary-clean.json)
-- [新增两轮批次合同](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-reruns-20260905-v2/batch-contract.json)
-- [新增两轮 control r1 final](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-reruns-r1-control-20260905/runs/external-dedup-gpt6-reruns-20260905/r1-control/20260905T110222Z-52921f61/final.json)
-- [新增两轮 treatment r1 final](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-reruns-r1-treatment-20260905/runs/external-dedup-gpt6-reruns-20260905/r1-treatment/20260905T110222Z-9ad7d14a/final.json)
-- [新增两轮 control r2 final](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-reruns-r2-control-20260905/runs/external-dedup-gpt6-reruns-20260905/r2-control/20260905T110222Z-ecbd77b5/final.json)
-- [新增两轮 treatment r2 final](/home/ubuntu/workspace/.workspace/worktrees/ContextSwarm-ICLR/external-dedup-reruns-r2-treatment-20260905/runs/external-dedup-gpt6-reruns-20260905/r2-treatment/20260905T110222Z-28a36314/final.json)
-- [新增四个 profiling audit 结果](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-reruns-20260905-v2/evidence/)
-- [并发批次的 quiet-gate bypass 记录](/home/ubuntu/workspace/.workspace/builds/external-dedup-gpt6-reruns-20260905-v2/evidence/quiet-gate-bypass.txt)
+- [逐题原因分析附录](external_route_dedup_cause_analysis_20260906.md)
+
+六个 arm 的原始 `run_meta.json`、`final.json`、profiling audit、四臂汇总、批次合同以及
+quiet-gate 记录保存在实验归档中，但没有随本 PR 分发。为避免把本机路径或原始运行数据写入
+公共描述，本文直接嵌入了决策所需的聚合指标、run ID、逐题结果和审计限制；逐题解释见上面的
+仓库内附录。可用的逻辑证据 ID 为 `r0-control-final`、`r0-treatment-final`、
+`r1-control-final`、`r1-treatment-final`、`r2-control-final`、`r2-treatment-final`、
+`six-arm-detail-20260906`、`rerun-batch-contract-20260905` 和
+`rerun-quiet-gate-bypass-20260905`。
