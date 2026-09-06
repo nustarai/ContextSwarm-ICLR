@@ -3068,6 +3068,18 @@ def _settled_outcome(
     proved = _is_proved(payload)
     if proved:
         return "PROVED", True, None
+    # The Lean service uses a successful lifecycle status for candidates that
+    # elaborate only because they still contain `sorry`.  That is useful
+    # solver feedback, but it is not a proof and must remain scoreless.  Keep
+    # this distinct from an ambiguous success envelope so the CPS scheduler
+    # can learn from a real kernel elaboration instead of treating every
+    # placeholder candidate as an infrastructure failure.
+    if (
+        status in {"SUCCEEDED", "COMPLETED"}
+        and _nested_value(payload, "is_valid_with_sorry") is True
+        and _nested_value(payload, "is_valid_no_sorry") is not True
+    ):
+        return "COMPILES_WITH_SORRY", False, None
     if status in {"SUCCEEDED", "COMPLETED", "FAILED", "ERROR", "UNKNOWN"}:
         return (
             "EVALUATOR_ERROR",
