@@ -2,7 +2,7 @@
 
 日期：2026-09-05（Asia/Shanghai）
 
-报告修订：activity-feedback-pr-20260907
+报告修订：activity-feedback-pr-20260907-r1
 
 实验对象：12 道 MathOlympiadBench 数学奥林匹克竞赛题；CPS；每臂 1 小时
 
