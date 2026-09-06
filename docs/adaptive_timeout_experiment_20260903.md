@@ -1,6 +1,6 @@
 # MathOlympiadBench 验证预算与 Judge 长尾治理实验报告
 
-日期：2026-09-05
+日期：2026-09-07
 
 实验对象：12 道数学奥林匹克题的 `judge_check` / `evaluate_local` 验证调用
 
@@ -47,7 +47,7 @@
 | confirmation | 验证 prompt、Pi schema、helper 和 broker 都从 manifest cap 读取，而不是写死 300 秒 |
 | 模型与运行配置 | `openai-codex/gpt-5.6-sol`、thinking=`max`、seed=0、`max_parallel=32` |
 | 真实性 | baseline、treatment、confirmation 都是真实一小时 formal workload；最终 PR head 的 mock smoke 仅用于启动/生命周期验证，不计入质量结果 |
-| 版本边界 | baseline 主要参考 source `33296b0`；r2/r3/r4 冻结在 `1de0079`；confirmation 启动于 `57b115e`；后续 hardening 和报告提交由 PR 另行验证 |
+| 版本边界 | baseline 主要参考 source `33296b0`；r2/r3/r4 冻结在 `1de0079`；confirmation 启动于 `57b115e`；PR 随后同步最新 `main`，当前 head 未跑正式一小时 workload，仅通过代码门禁和 mock smoke 验证 |
 | 可比性边界 | 任务、horizon、模型和 Judge 合同保持一致，但 treatment 还伴随 recovery/cache 路径和 Agent 轨迹变化；r3/r4 并发时共享宿主机及外部 NuRouter/model capacity，因此这是方向性对照，不是严格单因素因果实验 |
 
 统计口径：`fresh` 指 accepted 且没有 completed/probe/remote cache reuse；tail share 指超过阈值的 fresh `elapsed_seconds` 总和除以全部 fresh elapsed。详细逐轮原始分母和运行身份见[详细实验记录附录](adaptive_timeout_experiment_20260903_details.md)。
