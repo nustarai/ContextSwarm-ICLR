@@ -182,7 +182,7 @@ the subsequent detailed reads are restricted to selected members and the
 configured member limit. The `observer` counters make the resulting cost
 visible so a high-PID host does not hide observer CPU in a service bucket.
 
-As a local calibration on `qiwen` (2026-08-29), `/proc` contained 240 numeric
+As a local calibration on a representative Linux host (2026-08-29), `/proc` contained 240 numeric
 PID directories. Twenty snapshots of one explicitly selected local process
 group took a median of 24.1 ms wall time and a p95 of 31.0 ms; this is roughly
 0.5% of one core at a 5-second interval for that process table. It is only a

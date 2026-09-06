@@ -56,7 +56,7 @@
   `configs/iclr/figure3_3min_smoke.toml`，以及独立的
   `reproduction/offline_smoke.sh`。后者已经通过，因此这是两个仓库 smoke 入口不同，
   不是 checksum 或归档损坏。
-- 包中的 `README` 明确说明 `127.0.0.1` 只是目标机 operator-local 服务占位，不能
+- 包中的 `README` 明确说明 loopback 地址只是目标机 operator-local 服务占位，不能
   直接当作原实验机器地址。
 
 ### 不能仅凭本包启动官方真实评分的项
