@@ -2,6 +2,8 @@
 
 日期：2026-09-05
 
+报告修订：selection-snapshot-dedup-20260907
+
 实现基线：`8432d83b9b3f14f0a7367c47557826a3941269bc`（`Deduplicate selection snapshot watermarks`）
 
 范围：只处理一个 `search_event`/selection 内的重复存储；跨 selection 或全局内容寻址去重不在本次任务内。
@@ -65,7 +67,7 @@
 
 child 文本的理论重复量是 12,043,000 B；compact file 的回收量略有不同，因为 SQLite 页、索引和表布局也会改变。因此“字段 payload 节省”和“文件大小节省”是两条独立的测量，不能混为一个性能数字。
 
-独立的 scaling sanity check（不同 watermark 形状，仅用于检查趋势）在 `N=1/10/100/500` 时观察到 compact-file reduction 分别为 `1.85%/18.46%/60.78%/87.25%`。这些点不是额外的真实数据库样本，也不与 N=1000 结果合并估计总体收益。
+独立的 scaling sanity check（不同 watermark 形状，仅用于检查趋势）在 `N∈{1, 10, 100, 500}` 时观察到 compact-file reduction 分别为 `1.85%、18.46%、60.78%、87.25%`。这些点不是额外的真实数据库样本，也不与 N=1000 结果合并估计总体收益。
 
 ### 2. 逻辑等价、迁移和并发证据
 
@@ -112,11 +114,11 @@ child 文本的理论重复量是 12,043,000 B；compact file 的回收量略有
 
 代码与测试（仓库内）：
 
-- [`selection_store.py`](../contextswarm_mini/selection_store.py)
-- [`selection_artifacts.py`](../contextswarm_mini/selection_artifacts.py)
-- [`test_selection_store_candidates.py`](../tests/test_selection_store_candidates.py)
-- [`test_selection_artifacts_trace.py`](../tests/test_selection_artifacts_trace.py)
-- [脱敏证据摘要](selection_snapshot_dedup_evidence.json)
+- [`selection_store.py`](https://github.com/nustarai/ContextSwarm-ICLR/blob/8432d83b9b3f14f0a7367c47557826a3941269bc/contextswarm_mini/selection_store.py)
+- [`selection_artifacts.py`](https://github.com/nustarai/ContextSwarm-ICLR/blob/8432d83b9b3f14f0a7367c47557826a3941269bc/contextswarm_mini/selection_artifacts.py)
+- [`test_selection_store_candidates.py`](https://github.com/nustarai/ContextSwarm-ICLR/blob/8432d83b9b3f14f0a7367c47557826a3941269bc/tests/test_selection_store_candidates.py)
+- [`test_selection_artifacts_trace.py`](https://github.com/nustarai/ContextSwarm-ICLR/blob/8432d83b9b3f14f0a7367c47557826a3941269bc/tests/test_selection_artifacts_trace.py)
+- [脱敏证据摘要](https://github.com/nustarai/ContextSwarm-ICLR/blob/2d1e50c514f25de9061f54c00ae10cecb827fc00/docs/selection_snapshot_dedup_evidence.json)
 
 脱敏 owner-only 原始证据（仅在实验工作站可访问，不复制到仓库）：
 
