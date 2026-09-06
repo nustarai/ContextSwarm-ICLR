@@ -1,0 +1,10 @@
+# Infrastructure check only; never include this run in paper aggregates.
+extends = ["parallel.toml"]
+
+[experiment]
+name = "maintenance-smoke-parallel-matholympiadbench"
+output_root = "runs/maintenance_smoke/parallel"
+time_limit_seconds = 180
+
+[pi]
+timeout_seconds = 180

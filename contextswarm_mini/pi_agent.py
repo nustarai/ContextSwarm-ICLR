@@ -72,6 +72,11 @@ Complete a mandatory early Judge checkpoint after initial file inspection and be
 extended proof search or CPS communication; do not wait for a polished proof. Any
 job-bound terminal candidate feedback, including a bounded resource or execution
 failure, is useful feedback even when it is not a proof.
+Independent proof construction does not ban Lean tactics, known Mathlib APIs, or
+bounded `find`/`exact`/`apply` searches. Do not inspect unrelated files, host paths,
+other workers, or external completed proofs. If an environment search becomes
+expensive, stop it and leave the strongest candidate so it does not monopolize Judge
+capacity.
 If that tool is busy or unavailable, continue static proof reasoning or leave the best
 candidate for the runner; never create a local or raw-network fallback. The user prompt
 defines the assigned proof task and, when present, the controlled CPS protocol."""
@@ -117,6 +122,11 @@ Complete a mandatory early judge_check checkpoint after initial file inspection 
 before helper diagnostics, extended proof search, or CPS communication; do not wait
 for a polished proof. Any job-bound terminal candidate feedback, including a bounded
 resource or execution failure, is useful feedback even when it is not a proof.
+Independent proof construction does not ban Lean tactics, known Mathlib APIs, or
+bounded `find`/`exact`/`apply` searches. Do not inspect unrelated files, host paths,
+other workers, or external completed proofs. If an environment search becomes
+expensive, stop it and leave the strongest candidate so it does not monopolize Judge
+capacity.
 If a controlled tool is busy or unavailable, continue static proof reasoning or leave
 the best candidate for the runner; never create a local or raw-network fallback. The
 user prompt defines the assigned proof task and, when present, the controlled CPS

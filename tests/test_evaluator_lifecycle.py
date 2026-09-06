@@ -15,6 +15,7 @@ from contextswarm_mini.evaluator import (
     EvaluatorError,
     LeanEvaluator,
     _safe_response,
+    _settled_outcome,
     _terminal,
     safe_worker_response,
 )
@@ -1309,6 +1310,33 @@ class EvaluatorLifecycleTests(unittest.TestCase):
         self.assertEqual(verdict.status, "EVALUATOR_ERROR")
         self.assertEqual(verdict.score, 0.0)
         self.assertIn("lacks an authoritative verdict", verdict.error or "")
+
+    def test_success_with_sorry_is_a_scoreless_elaboration(self) -> None:
+        status, proved, error = _settled_outcome(
+            {
+                "status": "succeeded",
+                "terminal_reason": "verified_with_sorry",
+                "is_valid_with_sorry": True,
+                "is_valid_no_sorry": False,
+            }
+        )
+
+        self.assertEqual(status, "COMPILES_WITH_SORRY")
+        self.assertFalse(proved)
+        self.assertIsNone(error)
+
+    def test_kernel_verification_failure_is_a_candidate_failure(self) -> None:
+        status, proved, error = _settled_outcome(
+            {
+                "status": "failed",
+                "terminal_reason": "verification_failed",
+                "error_kind": "verification_failed",
+            }
+        )
+
+        self.assertEqual(status, "VERIFY_FAIL")
+        self.assertFalse(proved)
+        self.assertIsNone(error)
 
     def test_nonterminal_admission_without_job_id_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

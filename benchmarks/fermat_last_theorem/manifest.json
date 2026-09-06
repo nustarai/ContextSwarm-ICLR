@@ -1,0 +1,19 @@
+{
+  "benchmark_revision": "flt-statement-only-v1",
+  "candidate_filename": "result.lean",
+  "contextswarm_source": {
+    "repository": "https://github.com/anthropics/fermats-last-theorem",
+    "revision": "aa2d8b34692b16c70f699536de0d8e75a3e9ef"
+  },
+  "dataset": "fermat_last_theorem",
+  "integrity_manifest": "benchmark_integrity.json",
+  "language": "lean",
+  "lean_env_id": "formal_flt",
+  "problem_ids": "problem_ids.json",
+  "provenance": "PROVENANCE.md",
+  "runnable_with_contextswarm_mini": true,
+  "schema_version": "contextswarm_mini_benchmark_bundle_v1",
+  "subset": "full",
+  "task_count": 1,
+  "verification_profile": "formal_flt"
+}
