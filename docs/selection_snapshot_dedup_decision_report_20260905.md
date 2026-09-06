@@ -45,7 +45,7 @@
 ## 结论
 
 1. **存储机制层：已达到目标。** 在受控的 N=1000 对比中，child watermark payload 从 12,043,000 B 变为 0；checkpoint + `VACUUM` 后 compact SQLite 从 13,402,112 B 变为 1,286,144 B，回收 12,115,968 B（90.4034%）。
-2. **语义与兼容层：没有观察到回归。** 1,000 个 candidate rows、payload/feedback 字节、parent/candidate replay chain、1,005 条 export 记录及其 bytes/SHA、validator summary 均保持等价；16 个并发 opener 全部成功，迁移后的 parent watermark 和 candidate rows 保持不变。
+2. **目标路径的语义与兼容层：没有观察到回归。** 1,000 个 candidate rows、payload/feedback 字节、parent/candidate replay chain、1,005 条 export 记录及其 bytes/SHA、validator summary 均保持等价；16 个并发 opener 全部成功，迁移后的 parent watermark 和 candidate rows 保持不变。
 3. **运行性能层：本次没有证明收益。** 文件大小下降不能直接换算成 latency、WAL、lock-wait 或 throughput 下降；这些指标需要另一个匹配的并发实验，不能从本报告的 synthetic A/B 外推。
 4. **决策：可以接受同一 selection 范围内的实现并继续 PR review/merge。** 先保留 parent-only schema、可重启且 fail-closed 的旧库迁移和 legacy export 兼容；生产迁移前必须冻结 SQLite 能力、旧 writer 停止窗口、备份/回滚和 `VACUUM` 维护流程。跨 selection 去重不应借此变更扩大。
 
@@ -92,9 +92,10 @@ child 文本的理论重复量是 12,043,000 B；compact file 的回收量略有
 | static checks | `py_compile`、`compileall`、`git diff --check` 通过 | 仅是静态/格式门禁 |
 | mock smoke | exit `0` | 只验证编排 plumbing，不是 real workload |
 | authoritative full discovery（实现 exact head） | `672` tests，`1` skipped，`OK` | 历史 exact-head 证据，记录于独立、串行、唯一输出目录 |
-| 当前 PR/report worktree 重跑 | `708` tests，`1` skipped，`OK` | 使用磁盘支持的独立 `TMPDIR`；早先同一套 timing-sensitive 测试曾出现 2 个失败，当前重跑通过 |
+| 当前 PR/report worktree（旧 base `66a1fb4`）重跑 | `708` tests，`1` skipped，`OK` | 这是 rebase 前的历史验证，不是当前 PR head；使用独立 `TMPDIR` |
+| 当前 PR head（rebase 到 `7bffa5e`） | `720` tests，`1` failure，`1` skipped | 唯一失败为 `test_unlimited_fast_agents_have_bounded_evaluator_backlog`；当前 `main` 基线 3 次独立运行中 2 次失败、1 次通过，属于既有 timing-sensitive 波动；selection focused suite 仍为 `114/114` |
 
-这些测试的“通过”只说明当前 checkout 的代码、迁移和离线行为满足检查；历史 timing-sensitive 波动仍是环境边界。它不表示任何生产数据库已经执行迁移，也不表示 PR 已 merge/release/deploy。
+selection-specific 测试的通过说明目标代码、迁移和离线行为满足检查；full discovery 的已知 timing-sensitive 失败已在当前 `main` 基线复现，因此没有被归因于本次去重改动，也不能把本次 full discovery 表述为全绿。它不表示任何生产数据库已经执行迁移，也不表示 PR 已 merge/release/deploy。
 
 ### 4. 历史证据、限制与下一步
 
